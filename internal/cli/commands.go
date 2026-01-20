@@ -44,7 +44,7 @@ func (a *App) cmdStatus(args []string) int {
 			"status":    status,
 			"processes": processes.Processes,
 		}
-		json.NewEncoder(os.Stdout).Encode(output)
+		_ = json.NewEncoder(os.Stdout).Encode(output)
 		return 0
 	}
 
@@ -120,7 +120,7 @@ func (a *App) cmdLogs(args []string) int {
 		// Stream logs
 		err := client.StreamLogs(params, func(entry api.LogEntryResponse) {
 			if jsonOutput {
-				json.NewEncoder(os.Stdout).Encode(entry)
+				_ = json.NewEncoder(os.Stdout).Encode(entry)
 			} else {
 				printLogEntry(entry)
 			}
@@ -138,7 +138,7 @@ func (a *App) cmdLogs(args []string) int {
 		}
 
 		if jsonOutput {
-			json.NewEncoder(os.Stdout).Encode(logs)
+			_ = json.NewEncoder(os.Stdout).Encode(logs)
 		} else {
 			for _, entry := range logs.Logs {
 				printLogEntry(entry)

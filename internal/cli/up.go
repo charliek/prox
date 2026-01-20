@@ -262,7 +262,9 @@ func (a *App) cmdUp(args []string) int {
 	defer shutdownCancel()
 
 	// Stop API server
-	apiServer.Shutdown(shutdownCtx)
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error stopping API server: %v\n", err)
+	}
 
 	// Stop supervisor
 	if err := sup.Stop(shutdownCtx); err != nil {

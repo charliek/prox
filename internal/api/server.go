@@ -121,7 +121,7 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 			if authHeader == "" {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				w.Write([]byte(`{"error":"missing authorization header","code":"UNAUTHORIZED"}`))
+				_, _ = w.Write([]byte(`{"error":"missing authorization header","code":"UNAUTHORIZED"}`))
 				return
 			}
 
@@ -130,7 +130,7 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 			if !strings.HasPrefix(authHeader, prefix) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				w.Write([]byte(`{"error":"invalid authorization header format","code":"UNAUTHORIZED"}`))
+				_, _ = w.Write([]byte(`{"error":"invalid authorization header format","code":"UNAUTHORIZED"}`))
 				return
 			}
 
@@ -139,7 +139,7 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 			if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				w.Write([]byte(`{"error":"invalid token","code":"UNAUTHORIZED"}`))
+				_, _ = w.Write([]byte(`{"error":"invalid token","code":"UNAUTHORIZED"}`))
 				return
 			}
 
@@ -153,7 +153,7 @@ func (s *Server) registerRoutes() {
 	// Health check at root (no auth required)
 	s.router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	s.router.Route("/api/v1", func(r chi.Router) {

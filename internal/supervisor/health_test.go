@@ -118,4 +118,3 @@ func TestHealthChecker_StartPeriod(t *testing.T) {
 
 	checker.Stop()
 }
-

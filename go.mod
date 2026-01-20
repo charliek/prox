@@ -1,6 +1,8 @@
 module github.com/charliek/prox
 
-go 1.25.6
+go 1.24.0
+
+toolchain go1.24.12
 
 require (
 	github.com/charmbracelet/bubbles v0.21.0

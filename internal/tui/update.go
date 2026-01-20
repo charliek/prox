@@ -129,7 +129,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.soloProcess != "" {
 			go func() {
 				ctx := context.Background()
-				m.supervisor.RestartProcess(ctx, m.soloProcess)
+				_ = m.supervisor.RestartProcess(ctx, m.soloProcess)
 			}()
 		}
 		return m, nil

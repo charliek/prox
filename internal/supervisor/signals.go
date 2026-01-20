@@ -9,5 +9,4 @@ import (
 var (
 	sigterm os.Signal = syscall.SIGTERM
 	sigkill os.Signal = syscall.SIGKILL
-	sigint  os.Signal = syscall.SIGINT
 )

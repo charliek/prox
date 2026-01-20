@@ -17,13 +17,13 @@ import (
 // mockSupervisor implements the minimum interface needed for handler tests
 type mockSupervisor struct{}
 
-func (m *mockSupervisor) Status() interface{} { return nil }
+func (m *mockSupervisor) Status() interface{}             { return nil }
 func (m *mockSupervisor) Processes() []domain.ProcessInfo { return nil }
 func (m *mockSupervisor) Process(name string) (domain.ProcessInfo, error) {
 	return domain.ProcessInfo{}, nil
 }
-func (m *mockSupervisor) StartProcess(ctx context.Context, name string) error { return nil }
-func (m *mockSupervisor) StopProcess(ctx context.Context, name string) error { return nil }
+func (m *mockSupervisor) StartProcess(ctx context.Context, name string) error   { return nil }
+func (m *mockSupervisor) StopProcess(ctx context.Context, name string) error    { return nil }
 func (m *mockSupervisor) RestartProcess(ctx context.Context, name string) error { return nil }
 
 func TestStreamLogs_Headers(t *testing.T) {

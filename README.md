@@ -20,7 +20,7 @@ Or build from source:
 ```bash
 git clone https://github.com/charliek/prox.git
 cd prox
-go build -o prox ./cmd/prox
+make build
 ```
 
 ## Quick Start
@@ -121,6 +121,15 @@ When binding to non-localhost interfaces, authentication is automatically enable
 Full documentation is available at [charliek.github.io/prox](https://charliek.github.io/prox/).
 
 See [docs/spec.md](docs/spec.md) for the complete specification including TUI keybindings, API details, and architecture.
+
+## Development
+
+```bash
+make build    # Build the binary
+make test     # Run tests
+make lint     # Run linters
+make clean    # Remove build artifacts
+```
 
 ## Documentation Development
 

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.23 or later
+- Go 1.24 or later
 - mise (optional, for version management)
 
 ## Clone and Build
@@ -10,6 +10,12 @@
 ```bash
 git clone https://github.com/charliek/prox.git
 cd prox
+make build
+```
+
+Or without make:
+
+```bash
 go build -o prox ./cmd/prox
 ```
 
@@ -17,7 +23,7 @@ If using mise:
 
 ```bash
 mise install
-go build -o prox ./cmd/prox
+make build
 ```
 
 ## Project Structure
@@ -43,10 +49,10 @@ prox/
 ## Running Tests
 
 ```bash
-go test ./...
+make test
 ```
 
-With verbose output:
+Or without make:
 
 ```bash
 go test -v ./...
@@ -61,6 +67,12 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 ```
 
 Run linter:
+
+```bash
+make lint
+```
+
+Or without make:
 
 ```bash
 golangci-lint run

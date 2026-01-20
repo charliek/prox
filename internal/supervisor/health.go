@@ -161,4 +161,3 @@ func (h *HealthChecker) runCheck(ctx context.Context) {
 		h.status = domain.HealthStatusHealthy
 	}
 }
-

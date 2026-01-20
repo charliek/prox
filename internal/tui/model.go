@@ -51,9 +51,6 @@ type Model struct {
 	width  int
 	height int
 	ready  bool
-
-	// For periodic refresh
-	lastRefresh time.Time
 }
 
 // NewModel creates a new TUI model

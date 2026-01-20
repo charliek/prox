@@ -403,8 +403,8 @@ type SupervisorStatus struct {
 
 // StartResult contains information about process startup results
 type StartResult struct {
-	Started []string            // Names of processes that started successfully
-	Failed  map[string]error    // Names and errors of processes that failed to start
+	Started []string         // Names of processes that started successfully
+	Failed  map[string]error // Names and errors of processes that failed to start
 }
 
 // HasFailures returns true if any processes failed to start
