@@ -13,3 +13,9 @@ coverage.out
 
 # OS files
 .DS_Store
+
+# Python/uv
+.venv/
+
+# MkDocs build output
+site-build/

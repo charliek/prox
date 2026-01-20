@@ -118,7 +118,26 @@ When binding to non-localhost interfaces, authentication is automatically enable
 
 ## Documentation
 
+Full documentation is available at [charliek.github.io/prox](https://charliek.github.io/prox/).
+
 See [docs/spec.md](docs/spec.md) for the complete specification including TUI keybindings, API details, and architecture.
+
+## Documentation Development
+
+The documentation site uses MkDocs with Material theme.
+
+```bash
+# Install dependencies
+uv sync --group docs
+
+# Local preview (http://127.0.0.1:7070)
+uv run mkdocs serve
+
+# Build static site
+uv run mkdocs build
+```
+
+Documentation is automatically published to GitHub Pages on push to main.
 
 ## License
 
