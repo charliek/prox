@@ -1,0 +1,11 @@
+# Example prox configuration
+api:
+  port: 5555
+  host: 127.0.0.1
+
+processes:
+  # Simple form
+  echo: echo "Hello from prox!"
+
+  # A process that stays running
+  ticker: bash -c 'while true; do echo "tick $(date)"; sleep 2; done'

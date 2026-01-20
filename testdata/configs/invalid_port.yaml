@@ -1,0 +1,5 @@
+api:
+  port: 99999
+
+processes:
+  web: npm run dev

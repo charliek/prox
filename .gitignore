@@ -1,0 +1,15 @@
+# Binary
+prox
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+coverage.out
+*.test
+
+# OS files
+.DS_Store

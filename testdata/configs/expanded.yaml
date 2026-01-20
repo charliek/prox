@@ -1,0 +1,20 @@
+api:
+  port: 8080
+  host: 0.0.0.0
+
+env_file: .env
+
+processes:
+  web: npm run dev
+
+  api:
+    cmd: go run ./cmd/server
+    env:
+      PORT: "8080"
+      DEBUG: "true"
+    healthcheck:
+      cmd: curl -f http://localhost:8080/health
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

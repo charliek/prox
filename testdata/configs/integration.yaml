@@ -1,0 +1,9 @@
+api:
+  port: 15555  # Use non-standard port for testing
+  host: 127.0.0.1
+
+processes:
+  long:
+    cmd: ./testdata/scripts/long_running.sh
+  echo:
+    cmd: ./testdata/scripts/echo_hello.sh
