@@ -242,7 +242,11 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		wg.Add(1)
 		go func(mp *ManagedProcess) {
 			defer wg.Done()
-			if err := mp.Stop(shutdownCtx); err != nil {
+			info := mp.Info()
+			if info.PID > 0 {
+				s.SystemLog("sending SIGTERM to %s (pid %d)", mp.Name(), info.PID)
+			}
+			if err := mp.Stop(shutdownCtx); err != nil && err != domain.ErrProcessNotRunning {
 				s.logManager.Write(domain.LogEntry{
 					Timestamp: time.Now(),
 					Process:   mp.Name(),
@@ -448,6 +452,17 @@ func (s *Supervisor) emit(event SupervisorEvent) {
 			// Channel full, skip
 		}
 	}
+}
+
+// SystemLog writes a system-level log message (displayed as coming from "system")
+func (s *Supervisor) SystemLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	s.logManager.Write(domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "system",
+		Stream:    domain.StreamStdout,
+		Line:      msg,
+	})
 }
 
 // Wait blocks until the supervisor stops or context is cancelled

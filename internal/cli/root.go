@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
 )
 
@@ -12,8 +13,9 @@ var Version = "dev"
 
 // App represents the CLI application
 type App struct {
-	configPath string
-	apiAddr    string
+	configPath           string
+	apiAddr              string
+	apiAddrExplicitlySet bool
 }
 
 // NewApp creates a new CLI application
@@ -41,6 +43,16 @@ func (a *App) Run(args []string) int {
 
 	cmd := remainingArgs[0]
 	cmdArgs := remainingArgs[1:]
+
+	// For client commands, try to load API address from config if not explicitly set
+	switch cmd {
+	case "status", "logs", "stop", "restart":
+		if !a.apiAddrExplicitlySet {
+			if addr := a.loadAPIAddrFromConfig(); addr != "" {
+				a.apiAddr = addr
+			}
+		}
+	}
 
 	switch cmd {
 	case "up":
@@ -82,6 +94,7 @@ func (a *App) parseGlobalFlags(args []string) []string {
 		} else if arg == "--addr" {
 			if i+1 < len(args) {
 				a.apiAddr = args[i+1]
+				a.apiAddrExplicitlySet = true
 				i += 2
 				continue
 			}
@@ -147,4 +160,24 @@ Examples:
 func (a *App) cmdVersion(args []string) int {
 	fmt.Printf("prox version %s\n", Version)
 	return 0
+}
+
+// loadAPIAddrFromConfig attempts to read the API address from the config file.
+// Returns empty string if config doesn't exist or can't be read.
+func (a *App) loadAPIAddrFromConfig() string {
+	cfg, err := config.Load(a.configPath)
+	if err != nil {
+		return "" // Config doesn't exist or is invalid, use default
+	}
+
+	host := cfg.API.Host
+	if host == "" {
+		host = constants.DefaultAPIHost
+	}
+	port := cfg.API.Port
+	if port == 0 {
+		port = constants.DefaultAPIPort
+	}
+
+	return fmt.Sprintf("http://%s:%d", host, port)
 }

@@ -1,0 +1,7 @@
+api:
+  port: 15556  # Use different port to avoid conflicts with other tests
+  host: 127.0.0.1
+
+processes:
+  graceful:
+    cmd: python3 ./testdata/scripts/graceful_shutdown.py

@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -79,6 +80,47 @@ func startProx(t *testing.T, binary string, args ...string) *exec.Cmd {
 	}
 
 	return cmd
+}
+
+// proxWithOutput holds a prox command and its captured output
+type proxWithOutput struct {
+	cmd    *exec.Cmd
+	stdout *bytes.Buffer
+	stderr *bytes.Buffer
+}
+
+// startProxWithOutput starts prox and captures its stdout/stderr
+func startProxWithOutput(t *testing.T, binary string, args ...string) *proxWithOutput {
+	t.Helper()
+
+	// Get project root
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	projectRoot := filepath.Join(wd, "..", "..")
+
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = projectRoot
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start prox: %v", err)
+	}
+
+	return &proxWithOutput{
+		cmd:    cmd,
+		stdout: &stdout,
+		stderr: &stderr,
+	}
+}
+
+// Output returns the combined stdout and stderr
+func (p *proxWithOutput) Output() string {
+	return p.stdout.String() + p.stderr.String()
 }
 
 // stopProx sends shutdown request to prox via API

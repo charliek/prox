@@ -3,6 +3,7 @@ package integration
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,5 +161,59 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 	}
 	if runningCount != 1 {
 		t.Errorf("expected 1 running process, got %d", runningCount)
+	}
+}
+
+// TestUpCommand_GrandchildOutputCapture verifies that output from grandchild
+// processes (like Python spawned via shell) is captured during graceful shutdown.
+// This is the key feature that manual pipes (vs cmd.StdoutPipe) enables.
+func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	// Use a different API address for this test to avoid port conflicts
+	grandchildAPIAddr := "http://127.0.0.1:15556"
+
+	prox := startProxWithOutput(t, binary, "up", "-c", configPath("grandchild"), "--no-tui")
+	defer killProx(prox.cmd)
+
+	// Wait for API to be ready
+	waitForAPI(t, grandchildAPIAddr, 10*time.Second)
+
+	// Give the process time to print its startup message
+	time.Sleep(500 * time.Millisecond)
+
+	// Request graceful shutdown via API
+	err := stopProx(t, grandchildAPIAddr)
+	requireNoError(t, err, "failed to request shutdown")
+
+	// Wait for process to exit
+	done := make(chan error, 1)
+	go func() {
+		done <- prox.cmd.Wait()
+	}()
+
+	select {
+	case <-done:
+		// Process exited
+	case <-time.After(15 * time.Second):
+		killProx(prox.cmd)
+		t.Fatal("process did not shut down within timeout")
+	}
+
+	// Verify the output contains the grandchild's shutdown messages
+	output := prox.Output()
+
+	// The Python script prints these distinctive markers during shutdown
+	expectedMarkers := []string{
+		"PROCESS_STARTED_PID=",
+		"GRACEFUL_SHUTDOWN_START",
+		"GRACEFUL_SHUTDOWN_COMPLETE",
+	}
+
+	for _, marker := range expectedMarkers {
+		if !strings.Contains(output, marker) {
+			t.Errorf("expected output to contain %q, but it didn't.\nOutput:\n%s", marker, output)
+		}
 	}
 }

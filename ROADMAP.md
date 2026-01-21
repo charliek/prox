@@ -49,3 +49,36 @@ processes:
 
 - Startup order based on dependencies
 - Wait for health before starting dependents
+
+## Instance Registry & Dynamic Ports
+
+Track running prox instances and dynamically assign API ports.
+
+**Storage**: `~/.local/state/prox/instances/`
+- JSON files with project-hash naming: `{hash}.json`
+- Hash derived from canonical project path (SHA256, first 12 chars)
+
+**Instance State**:
+```json
+{
+  "pid": 12345,
+  "port": 5555,
+  "host": "127.0.0.1",
+  "projectPath": "/path/to/project",
+  "startedAt": "2025-01-19T10:30:00Z",
+  "configFile": "prox.yaml"
+}
+```
+
+**Dynamic Port Allocation**:
+- `port: 0` in config means auto-assign
+- Scan port range (default 5550-5650) and test socket binding
+- Store assigned port in instance state
+
+**Features**:
+- `prox list` - show all running instances across projects
+- `prox status` - show status of current project's instance
+- Auto-cleanup of stale state files (validate PID with signal 0)
+- Graceful shutdown updates state before exit
+
+**Inspiration**: codelens project's ServerStateRepository pattern

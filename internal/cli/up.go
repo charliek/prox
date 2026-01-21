@@ -251,9 +251,11 @@ func (a *App) cmdUp(args []string) int {
 		// Wait for shutdown signal
 		select {
 		case sig := <-sigCh:
-			fmt.Printf("\nReceived %s, shutting down...\n", sig)
+			fmt.Println() // Print newline after ^C
+			sup.SystemLog("%s received", sig)
 		case <-shutdownCh:
-			fmt.Println("\nShutdown requested via API...")
+			fmt.Println() // Print newline
+			sup.SystemLog("shutdown requested via API")
 		}
 	}
 
@@ -271,10 +273,15 @@ func (a *App) cmdUp(args []string) int {
 		fmt.Fprintf(os.Stderr, "Error stopping supervisor: %v\n", err)
 	}
 
+	// Log shutdown complete before closing the log manager
+	sup.SystemLog("shutdown complete")
+
+	// Give a moment for the log to be printed
+	time.Sleep(50 * time.Millisecond)
+
 	// Close log manager
 	logMgr.Close()
 
-	fmt.Println("Shutdown complete")
 	return 0
 }
 
@@ -301,15 +308,9 @@ func (a *App) printLogs(logMgr *logs.Manager) {
 		ts := entry.Timestamp.Format("15:04:05")
 
 		// Format output
-		// Check if stderr (show in red)
-		lineColor := ""
-		if entry.Stream == domain.StreamStderr {
-			lineColor = constants.ColorBrightRed
-		}
-
-		fmt.Printf("%s %s%-8s%s │ %s%s%s\n",
+		fmt.Printf("%s %s%-8s%s │ %s\n",
 			ts,
 			color, entry.Process, constants.ColorReset,
-			lineColor, entry.Line, constants.ColorReset)
+			entry.Line)
 	}
 }

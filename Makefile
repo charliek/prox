@@ -11,3 +11,7 @@ lint:
 
 clean:
 	rm -f prox
+
+install: build
+	mkdir -p ~/.local/bin
+	cp prox ~/.local/bin/prox

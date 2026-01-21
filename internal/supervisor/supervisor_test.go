@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,4 +208,66 @@ func TestSupervisor_StartSelectedProcesses(t *testing.T) {
 
 	_, err = sup.Process("worker")
 	assert.ErrorIs(t, err, domain.ErrProcessNotFound)
+}
+
+func TestSupervisor_SystemLog(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := makeTestConfig(map[string]string{})
+	sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+	sup.SystemLog("test message %d", 42)
+
+	// Wait a moment for log to be written
+	time.Sleep(50 * time.Millisecond)
+
+	// Check the log was written as "system"
+	entries, _, _ := logMgr.Query(domain.LogFilter{Processes: []string{"system"}}, 0)
+
+	var foundMessage bool
+	for _, e := range entries {
+		if e.Process == "system" && e.Line == "test message 42" {
+			foundMessage = true
+			break
+		}
+	}
+
+	assert.True(t, foundMessage, "SystemLog should write log entry with process name 'system'")
+}
+
+func TestSupervisor_StopLogsSIGTERM(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := makeTestConfig(map[string]string{
+		"test": "sleep 30",
+	})
+
+	sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+	ctx := context.Background()
+	_, err := sup.Start(ctx)
+	require.NoError(t, err)
+
+	// Stop
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sup.Stop(stopCtx)
+
+	// Wait a moment for logs to be written
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that "sending SIGTERM" message was logged
+	entries, _, _ := logMgr.Query(domain.LogFilter{Processes: []string{"system"}}, 0)
+
+	var foundSIGTERMMessage bool
+	for _, e := range entries {
+		if e.Process == "system" && strings.HasPrefix(e.Line, "sending SIGTERM to test (pid ") {
+			foundSIGTERMMessage = true
+			break
+		}
+	}
+
+	assert.True(t, foundSIGTERMMessage, "Stop should log 'sending SIGTERM to test (pid X)' message")
 }

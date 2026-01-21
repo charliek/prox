@@ -141,7 +141,10 @@ func TestExecRunner_Start(t *testing.T) {
 		assert.Contains(t, err.Error(), "42")
 	})
 
-	t.Run("context cancellation kills process", func(t *testing.T) {
+	t.Run("context cancellation does not kill process", func(t *testing.T) {
+		// ExecRunner intentionally does NOT use exec.CommandContext so that
+		// context cancellation doesn't automatically kill processes. This
+		// allows for graceful shutdown via Signal() instead.
 		ctx, cancel := context.WithCancel(context.Background())
 
 		proc, err := runner.Start(ctx, domain.ProcessConfig{
@@ -154,10 +157,10 @@ func TestExecRunner_Start(t *testing.T) {
 		// Give it time to start
 		time.Sleep(100 * time.Millisecond)
 
-		// Cancel context
+		// Cancel context - process should NOT be killed
 		cancel()
 
-		// Wait should return (process killed)
+		// Wait briefly to verify process is still running
 		done := make(chan error, 1)
 		go func() {
 			done <- proc.Wait()
@@ -165,9 +168,13 @@ func TestExecRunner_Start(t *testing.T) {
 
 		select {
 		case <-done:
-			// Process exited due to context cancel
-		case <-time.After(2 * time.Second):
-			t.Fatal("process did not exit after context cancel")
+			t.Fatal("process should NOT be killed by context cancellation alone")
+		case <-time.After(200 * time.Millisecond):
+			// Good - process is still running as expected
 		}
+
+		// Now explicitly signal the process to clean up
+		proc.Signal(sigterm)
+		<-done
 	})
 }

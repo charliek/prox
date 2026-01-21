@@ -186,25 +186,16 @@ func (a *App) cmdRestart(args []string) int {
 
 // printLogEntry prints a log entry with colors
 func printLogEntry(entry api.LogEntryResponse) {
-	// Parse timestamp
+	color := processColor(entry.Process)
 	ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
 	if err != nil {
 		ts = time.Now()
 	}
 
-	// Color for process
-	color := processColor(entry.Process)
-
-	// Red for stderr
-	lineColor := ""
-	if entry.Stream == "stderr" {
-		lineColor = constants.ColorBrightRed
-	}
-
-	fmt.Printf("%s %s%-8s%s │ %s%s%s\n",
+	fmt.Printf("%s %s%-8s%s │ %s\n",
 		ts.Format("15:04:05"),
 		color, entry.Process, constants.ColorReset,
-		lineColor, entry.Line, constants.ColorReset)
+		entry.Line)
 }
 
 // processColor returns a color for a process name

@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"gopkg.in/yaml.v3"
 )
@@ -86,10 +87,10 @@ func Parse(data []byte) (*Config, error) {
 
 	// Apply defaults
 	if config.API.Port == 0 {
-		config.API.Port = 5555
+		config.API.Port = constants.DefaultAPIPort
 	}
 	if config.API.Host == "" {
-		config.API.Host = "127.0.0.1"
+		config.API.Host = constants.DefaultAPIHost
 	}
 
 	// Parse processes (can be string or expanded form)

@@ -42,10 +42,15 @@ func NewExecRunner() *ExecRunner {
 	return &ExecRunner{}
 }
 
-// Start starts a new process
+// Start starts a new process.
+// Note: The ctx parameter is accepted for interface compatibility but is not used.
+// Process lifecycle is managed explicitly via Signal() to allow graceful shutdown.
+// Using exec.CommandContext would send SIGKILL on context cancellation, which
+// prevents processes from running their shutdown handlers.
 func (r *ExecRunner) Start(ctx context.Context, config domain.ProcessConfig, env map[string]string) (Process, error) {
-	// Parse command - use shell to handle complex commands
-	cmd := exec.CommandContext(ctx, "sh", "-c", config.Cmd)
+	_ = ctx // Explicitly mark as unused - lifecycle managed via Signal()
+
+	cmd := exec.Command("sh", "-c", config.Cmd)
 
 	// Set up environment
 	cmd.Env = os.Environ()
@@ -53,31 +58,53 @@ func (r *ExecRunner) Start(ctx context.Context, config domain.ProcessConfig, env
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 
-	// Create pipes for stdout and stderr
-	stdout, err := cmd.StdoutPipe()
+	// Create manual pipes for stdout and stderr.
+	// Unlike cmd.StdoutPipe(), manual pipes are NOT closed by cmd.Wait().
+	// This allows grandchild processes (like uvicorn spawned by a shell)
+	// to continue writing output after the shell exits.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("creating stdout pipe: %w", err)
 	}
 
-	stderr, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
 		return nil, fmt.Errorf("creating stderr pipe: %w", err)
 	}
 
-	// Set process group so we can kill all children
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
+	// Set process group so we can kill all children.
+	// Note: Pdeathsig is intentionally NOT set because it would kill grandchildren
+	// (like uvicorn/node) when the shell wrapper exits, preventing graceful shutdown.
+	// We rely on process groups to clean up orphans instead.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 
 	// Start the process
 	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return nil, fmt.Errorf("starting process: %w", err)
 	}
 
+	// Close write ends in parent - child process has inherited them.
+	// The pipe stays open as long as ANY process holds the write end,
+	// including grandchildren. This is what allows graceful shutdown
+	// output to be captured.
+	stdoutW.Close()
+	stderrW.Close()
+
 	return &execProcess{
 		cmd:    cmd,
-		stdout: stdout,
-		stderr: stderr,
+		stdout: stdoutR,
+		stderr: stderrR,
 	}, nil
 }
 

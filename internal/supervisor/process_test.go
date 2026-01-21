@@ -145,3 +145,74 @@ func TestManagedProcess_Info(t *testing.T) {
 	assert.Equal(t, domain.ProcessStateStopped, info.State)
 	assert.Equal(t, domain.HealthStatusUnknown, info.Health)
 }
+
+func TestManagedProcess_StopLogsExitCode(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	runner := NewExecRunner()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name: "test",
+		Cmd:  "sleep 30",
+	}, nil, runner, logMgr)
+
+	ctx := context.Background()
+	err := mp.Start(ctx)
+	require.NoError(t, err)
+
+	// Stop the process
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = mp.Stop(stopCtx)
+	require.NoError(t, err)
+
+	// Wait a moment for logs to be written
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that the stopped message was logged with exit code
+	entries, _, _ := logMgr.Query(domain.LogFilter{Processes: []string{"test"}}, 0)
+
+	var foundStoppedMessage bool
+	for _, e := range entries {
+		if e.Stream == domain.StreamStdout && e.Line == "stopped (rc=-15)" {
+			foundStoppedMessage = true
+			break
+		}
+	}
+
+	assert.True(t, foundStoppedMessage, "should log 'stopped (rc=-15)' message when process is terminated by SIGTERM")
+}
+
+func TestManagedProcess_CrashLogsExitCode(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	runner := NewExecRunner()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name: "test",
+		Cmd:  "exit 42",
+	}, nil, runner, logMgr)
+
+	ctx := context.Background()
+	err := mp.Start(ctx)
+	require.NoError(t, err)
+
+	// Wait for process to exit on its own
+	time.Sleep(500 * time.Millisecond)
+
+	// Check that the crashed message was logged with exit code
+	entries, _, _ := logMgr.Query(domain.LogFilter{Processes: []string{"test"}}, 0)
+
+	var foundCrashedMessage bool
+	for _, e := range entries {
+		if e.Stream == domain.StreamStderr && e.Line == "exited unexpectedly (rc=42)" {
+			foundCrashedMessage = true
+			break
+		}
+	}
+
+	assert.True(t, foundCrashedMessage, "should log 'exited unexpectedly (rc=42)' message when process exits with error code")
+}

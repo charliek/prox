@@ -3,13 +3,21 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"fmt"
+	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 )
+
+// outputDrainTimeout is the maximum time to wait for output readers to finish
+// after a process exits. This allows grandchild processes to complete their
+// final writes before we stop reading.
+const outputDrainTimeout = 5 * time.Second
 
 // ManagedProcess handles the lifecycle of a single process
 type ManagedProcess struct {
@@ -34,6 +42,9 @@ type ManagedProcess struct {
 	// Channel to signal when process exits
 	done     chan struct{}
 	doneOnce sync.Once // Ensures done channel is closed only once
+
+	// outputWg tracks completion of output reader goroutines
+	outputWg sync.WaitGroup
 }
 
 // NewManagedProcess creates a new managed process
@@ -127,9 +138,16 @@ func (p *ManagedProcess) Start(ctx context.Context) error {
 	p.startedAt = time.Now()
 	p.state = domain.ProcessStateRunning
 
-	// Start output readers
-	go p.readOutput(proc.Stdout(), domain.StreamStdout)
-	go p.readOutput(proc.Stderr(), domain.StreamStderr)
+	// Start output readers with WaitGroup tracking
+	p.outputWg.Add(2)
+	go func() {
+		defer p.outputWg.Done()
+		p.readOutput(proc.Stdout(), domain.StreamStdout)
+	}()
+	go func() {
+		defer p.outputWg.Done()
+		p.readOutput(proc.Stderr(), domain.StreamStderr)
+	}()
 
 	// Start health checker if configured
 	if p.config.Healthcheck != nil && p.config.Healthcheck.Cmd != "" {
@@ -197,6 +215,12 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 		// Process exited
 	case <-ctx.Done():
 		// Timeout - send SIGKILL
+		p.logManager.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   "system",
+			Stream:    domain.StreamStdout,
+			Line:      fmt.Sprintf("sending SIGKILL to %s (graceful shutdown timed out)", p.config.Name),
+		})
 		if err := proc.Signal(sigkill); err != nil {
 			p.logManager.Write(domain.LogEntry{
 				Timestamp: time.Now(),
@@ -242,11 +266,62 @@ func (p *ManagedProcess) monitor() {
 
 	err := proc.Wait()
 
+	// Wait for output readers to finish draining pipes with a timeout.
+	// With manual pipes (not cmd.StdoutPipe), the pipes stay open until
+	// all processes (including grandchildren) close them. This ensures
+	// graceful shutdown messages from child processes are captured.
+	// However, if a grandchild holds the pipe open indefinitely, we don't
+	// want to block forever.
+	outputDone := make(chan struct{})
+	go func() {
+		p.outputWg.Wait()
+		close(outputDone)
+	}()
+
+	select {
+	case <-outputDone:
+		// Output readers finished normally
+	case <-time.After(outputDrainTimeout):
+		p.logManager.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   p.config.Name,
+			Stream:    domain.StreamStderr,
+			Line:      "output capture timed out (some logs may be missing)",
+		})
+	}
+
+	// Extract exit code from error
+	// For signal termination, we use negative signal number (e.g., -15 for SIGTERM)
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				if status.Signaled() {
+					// Process was killed by signal - use negative signal number
+					exitCode = -int(status.Signal())
+				} else {
+					exitCode = status.ExitStatus()
+				}
+			} else {
+				exitCode = exitErr.ExitCode()
+			}
+		} else {
+			exitCode = 1 // Generic error
+		}
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.state == domain.ProcessStateStopping {
 		p.state = domain.ProcessStateStopped
+		// Log the stopped message with exit code
+		p.logManager.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   p.config.Name,
+			Stream:    domain.StreamStdout,
+			Line:      fmt.Sprintf("stopped (rc=%d)", exitCode),
+		})
 	} else {
 		// Unexpected exit
 		p.state = domain.ProcessStateCrashed
@@ -254,7 +329,7 @@ func (p *ManagedProcess) monitor() {
 			Timestamp: time.Now(),
 			Process:   p.config.Name,
 			Stream:    domain.StreamStderr,
-			Line:      "Process exited unexpectedly: " + errString(err),
+			Line:      fmt.Sprintf("exited unexpectedly (rc=%d)", exitCode),
 		})
 	}
 
@@ -282,13 +357,16 @@ func (p *ManagedProcess) readOutput(r interface{}, stream domain.Stream) {
 			Line:      line,
 		})
 	}
-}
 
-func errString(err error) string {
-	if err == nil {
-		return "exit status 0"
+	// Log any scanner errors (e.g., I/O errors during output capture)
+	if err := scanner.Err(); err != nil {
+		p.logManager.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   p.config.Name,
+			Stream:    domain.StreamStderr,
+			Line:      fmt.Sprintf("output reader error: %v", err),
+		})
 	}
-	return err.Error()
 }
 
 // closeDone safely closes the done channel using sync.Once to prevent double-close panic
