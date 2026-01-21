@@ -38,12 +38,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 
 	case LogEntryMsg:
+		// Check if we're at/near bottom BEFORE adding new content
+		// If user scrolled to bottom, re-enable follow mode
+		wasNearBottom := m.isNearBottom()
+
 		m.logEntries = append(m.logEntries, domain.LogEntry(msg))
 		// Keep only last 1000 entries
 		if len(m.logEntries) > 1000 {
 			m.logEntries = m.logEntries[len(m.logEntries)-1000:]
 		}
 		m.updateViewport()
+
+		// If user was at bottom, re-enable follow mode and stay at bottom
+		if wasNearBottom {
+			m.followMode = true
+			m.viewport.GotoBottom()
+		} else if m.followMode {
+			// followMode was already on (via keyboard toggle)
+			m.viewport.GotoBottom()
+		}
 
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()
@@ -144,6 +157,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "up", "k":
 		m.viewport.LineUp(1)
+		m.followMode = false
 		return m, nil
 
 	case "down", "j":
@@ -152,6 +166,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "pgup":
 		m.viewport.HalfViewUp()
+		m.followMode = false
 		return m, nil
 
 	case "pgdown":
@@ -160,10 +175,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "home", "g":
 		m.viewport.GotoTop()
+		m.followMode = false
 		return m, nil
 
 	case "end", "G":
 		m.viewport.GotoBottom()
+		m.followMode = true
+		return m, nil
+
+	case "F":
+		m.followMode = !m.followMode
+		if m.followMode {
+			m.viewport.GotoBottom()
+		}
 		return m, nil
 	}
 
@@ -307,4 +331,17 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// nearBottomThreshold is the scroll percentage (0.0-1.0) at which we consider
+// the viewport to be "near" the bottom for auto-follow purposes.
+const nearBottomThreshold = 0.98
+
+// isNearBottom checks if the viewport is at or near the bottom.
+// Uses a threshold to handle cases where scrolling doesn't land exactly at the bottom.
+func (m Model) isNearBottom() bool {
+	if m.viewport.AtBottom() {
+		return true
+	}
+	return m.viewport.ScrollPercent() >= nearBottomThreshold
 }

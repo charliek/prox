@@ -202,3 +202,84 @@ func TestUpdateSearchMatches(t *testing.T) {
 	assert.Equal(t, 0, model.searchMatches[0])
 	assert.Equal(t, 2, model.searchMatches[1])
 }
+
+func TestFollowModeDefaults(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+
+	model := NewModel(sup, logMgr)
+
+	// followMode should default to true
+	assert.True(t, model.followMode)
+}
+
+func TestFollowModeDisabledOnScrollUp(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{"k key", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}}},
+		{"up arrow", tea.KeyMsg{Type: tea.KeyUp}},
+		{"g key", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}}},
+		{"home key", tea.KeyMsg{Type: tea.KeyHome}},
+		{"pgup key", tea.KeyMsg{Type: tea.KeyPgUp}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := NewModel(sup, logMgr)
+			assert.True(t, model.followMode) // starts true
+
+			newModel, _ := model.Update(tt.key)
+			m := newModel.(Model)
+
+			assert.False(t, m.followMode, "followMode should be false after %s", tt.name)
+		})
+	}
+}
+
+func TestFollowModeEnabledOnGoToBottom(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{"G key", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}}},
+		{"end key", tea.KeyMsg{Type: tea.KeyEnd}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := NewModel(sup, logMgr)
+			model.followMode = false // start with followMode disabled
+
+			newModel, _ := model.Update(tt.key)
+			m := newModel.(Model)
+
+			assert.True(t, m.followMode, "followMode should be true after %s", tt.name)
+		})
+	}
+}
+
+func TestFollowModeToggle(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+
+	model := NewModel(sup, logMgr)
+	assert.True(t, model.followMode) // starts true
+
+	// First toggle - should disable
+	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	m := newModel.(Model)
+	assert.False(t, m.followMode)
+
+	// Second toggle - should enable
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	m = newModel.(Model)
+	assert.True(t, m.followMode)
+}

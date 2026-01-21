@@ -85,10 +85,14 @@ func (m Model) statusBar() string {
 		}
 	}
 
-	// Right side: log count
+	// Right side: follow mode and log count
 	visible := len(m.filteredEntries())
 	total := len(m.logEntries)
-	right = fmt.Sprintf("%d/%d lines", visible, total)
+	followIndicator := "[FOLLOW]"
+	if !m.followMode {
+		followIndicator = "[PAUSED]"
+	}
+	right = fmt.Sprintf("%s %d/%d lines", followIndicator, visible, total)
 
 	// Calculate widths
 	leftWidth := m.width - len(right) - 4
@@ -109,10 +113,11 @@ Prox - Process Manager
 
 Navigation:
   j/↓        Scroll down
-  k/↑        Scroll up
-  g/Home     Go to top
-  G/End      Go to bottom
+  k/↑        Scroll up (pauses auto-follow)
+  g/Home     Go to top (pauses auto-follow)
+  G/End      Go to bottom (resumes auto-follow)
   PgUp/PgDn  Page up/down
+  F          Toggle auto-follow mode
 
 Filtering:
   1-9        Solo process (toggle)

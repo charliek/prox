@@ -123,7 +123,7 @@ func (a *App) cmdUp(args []string) int {
 	// Create log manager
 	logMgr := logs.NewManager(logs.ManagerConfig{
 		BufferSize:         1000,
-		SubscriptionBuffer: 100,
+		SubscriptionBuffer: 1000,
 	})
 
 	// Get config directory for resolving relative paths in env files

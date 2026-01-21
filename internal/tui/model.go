@@ -47,6 +47,9 @@ type Model struct {
 	searchPattern   string          // Current search/filter pattern
 	searchMatches   []int           // Line indices matching search
 
+	// Auto-scroll
+	followMode bool // Auto-scroll to bottom on new logs
+
 	// Dimensions
 	width  int
 	height int
@@ -74,6 +77,7 @@ func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
 		textInput:       ti,
 		mode:            ModeNormal,
 		filterProcesses: filterProcesses,
+		followMode:      true,
 	}
 }
 
