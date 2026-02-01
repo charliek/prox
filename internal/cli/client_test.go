@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/domain"
 )
 
 func TestNewClient(t *testing.T) {
@@ -269,7 +271,7 @@ func TestClient_GetLogs(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	logs, err := client.GetLogs(LogParams{
+	logs, err := client.GetLogs(domain.LogParams{
 		Process: "web",
 		Lines:   50,
 		Pattern: "error",
@@ -359,5 +361,179 @@ func TestClient_NoAuthHeaderWhenNoToken(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseSSELogEntry_ValidJSON(t *testing.T) {
+	data := `{"timestamp":"2024-01-01T12:00:00Z","process":"web","stream":"stdout","line":"hello world"}`
+
+	entry, ok := parseSSELogEntry(data)
+
+	if !ok {
+		t.Fatal("expected parsing to succeed")
+	}
+	if entry.Timestamp != "2024-01-01T12:00:00Z" {
+		t.Errorf("expected timestamp '2024-01-01T12:00:00Z', got %q", entry.Timestamp)
+	}
+	if entry.Process != "web" {
+		t.Errorf("expected process 'web', got %q", entry.Process)
+	}
+	if entry.Stream != "stdout" {
+		t.Errorf("expected stream 'stdout', got %q", entry.Stream)
+	}
+	if entry.Line != "hello world" {
+		t.Errorf("expected line 'hello world', got %q", entry.Line)
+	}
+}
+
+func TestParseSSELogEntry_InvalidJSON(t *testing.T) {
+	data := `not valid json`
+
+	_, ok := parseSSELogEntry(data)
+
+	if ok {
+		t.Error("expected parsing to fail for invalid JSON")
+	}
+}
+
+func TestParseSSELogEntry_EmptyObject(t *testing.T) {
+	data := `{}`
+
+	entry, ok := parseSSELogEntry(data)
+
+	if !ok {
+		t.Fatal("expected parsing to succeed for empty object")
+	}
+	if entry.Process != "" || entry.Line != "" {
+		t.Errorf("expected empty fields, got process=%q, line=%q", entry.Process, entry.Line)
+	}
+}
+
+func TestBuildLogQueryParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		params   domain.LogParams
+		expected map[string]string
+	}{
+		{
+			name:     "empty params",
+			params:   domain.LogParams{},
+			expected: map[string]string{},
+		},
+		{
+			name: "process only",
+			params: domain.LogParams{
+				Process: "web",
+			},
+			expected: map[string]string{
+				"process": "web",
+			},
+		},
+		{
+			name: "all params",
+			params: domain.LogParams{
+				Process: "api",
+				Lines:   100,
+				Pattern: "error",
+				Regex:   true,
+			},
+			expected: map[string]string{
+				"process": "api",
+				"lines":   "100",
+				"pattern": "error",
+				"regex":   "true",
+			},
+		},
+		{
+			name: "lines zero not included",
+			params: domain.LogParams{
+				Process: "web",
+				Lines:   0,
+			},
+			expected: map[string]string{
+				"process": "web",
+			},
+		},
+		{
+			name: "regex false not included",
+			params: domain.LogParams{
+				Pattern: "test",
+				Regex:   false,
+			},
+			expected: map[string]string{
+				"pattern": "test",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query := buildLogQueryParams(tt.params)
+
+			// Check expected values are present
+			for key, expectedVal := range tt.expected {
+				if query.Get(key) != expectedVal {
+					t.Errorf("expected %s=%q, got %q", key, expectedVal, query.Get(key))
+				}
+			}
+
+			// Check no unexpected values
+			if len(query) != len(tt.expected) {
+				t.Errorf("expected %d params, got %d: %v", len(tt.expected), len(query), query)
+			}
+		})
+	}
+}
+
+func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
+	var receivedQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/logs/stream" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		receivedQuery = r.URL.RawQuery
+
+		// Send headers for SSE
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		// Send one log entry then close
+		flusher, ok := w.(http.Flusher)
+		if ok {
+			w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"test\"}\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamLogsChannel(domain.LogParams{
+		Process: "web",
+		Lines:   50,
+		Pattern: "error",
+		Regex:   true,
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Check query params were sent correctly
+	if receivedQuery == "" {
+		t.Fatal("expected query params to be sent")
+	}
+	if !strings.Contains(receivedQuery, "process=web") {
+		t.Errorf("expected process=web in query, got %s", receivedQuery)
+	}
+	if !strings.Contains(receivedQuery, "lines=50") {
+		t.Errorf("expected lines=50 in query, got %s", receivedQuery)
+	}
+	if !strings.Contains(receivedQuery, "pattern=error") {
+		t.Errorf("expected pattern=error in query, got %s", receivedQuery)
+	}
+	if !strings.Contains(receivedQuery, "regex=true") {
+		t.Errorf("expected regex=true in query, got %s", receivedQuery)
 	}
 }

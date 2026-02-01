@@ -82,6 +82,8 @@ Start with the interactive terminal UI:
 prox up --tui
 ```
 
+Note: The `--tui` flag works in foreground mode only and is mutually exclusive with `--detach`. For background + TUI workflow, use `prox up -d` then `prox attach`.
+
 The TUI provides:
 
 - Real-time log viewing with scrollback
@@ -89,6 +91,34 @@ The TUI provides:
 - Search with `/` and filter with `s`
 - Process restart with `r`
 - Press `?` for help, `q` to quit
+
+## Background Mode
+
+Run prox as a background daemon:
+
+```bash
+# Start in background
+prox up -d
+
+# Check status
+prox status
+
+# View logs
+prox logs -f
+
+# Attach TUI to running daemon
+prox attach
+
+# Stop the daemon
+prox down
+```
+
+Background mode features:
+
+- Processes continue running after terminal closes
+- Multiple prox instances can run (different projects, different ports)
+- CLI commands auto-discover the running daemon
+- Daemon logs are written to `.prox/prox.log`
 
 ## HTTP API
 

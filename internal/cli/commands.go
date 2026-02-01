@@ -11,6 +11,9 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/tui"
 )
 
 // cmdStatus handles the 'status' command
@@ -27,7 +30,7 @@ func (a *App) cmdStatus(args []string) int {
 	// Get status
 	status, err := client.GetStatus()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to prox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Is prox running? Try 'prox up' first.\n")
 		return 1
 	}
@@ -35,7 +38,7 @@ func (a *App) cmdStatus(args []string) int {
 	// Get processes
 	processes, err := client.GetProcesses()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting processes: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 
@@ -44,7 +47,9 @@ func (a *App) cmdStatus(args []string) int {
 			"status":    status,
 			"processes": processes.Processes,
 		}
-		_ = json.NewEncoder(os.Stdout).Encode(output)
+		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to encode output: %v\n", err)
+		}
 		return 0
 	}
 
@@ -71,7 +76,7 @@ func (a *App) cmdStatus(args []string) int {
 
 // cmdLogs handles the 'logs' command
 func (a *App) cmdLogs(args []string) int {
-	params := LogParams{
+	params := domain.LogParams{
 		Lines: constants.DefaultLogLimit,
 	}
 	follow := false
@@ -85,25 +90,34 @@ func (a *App) cmdLogs(args []string) int {
 		case arg == "--json":
 			jsonOutput = true
 		case arg == "-n" || arg == "--lines":
-			if i+1 < len(args) {
-				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-					params.Lines = n
-				} else {
-					fmt.Fprintf(os.Stderr, "Invalid lines value: %s (must be a positive integer)\n", args[i+1])
-					return 1
-				}
-				i++
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
 			}
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 1 {
+				fmt.Fprintf(os.Stderr, "Error: invalid lines value %q (must be a positive integer)\n", val)
+				return 1
+			}
+			params.Lines = n
+			i = newIdx
 		case arg == "--process":
-			if i+1 < len(args) {
-				params.Process = args[i+1]
-				i++
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
 			}
+			params.Process = val
+			i = newIdx
 		case arg == "--pattern":
-			if i+1 < len(args) {
-				params.Pattern = args[i+1]
-				i++
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
 			}
+			params.Pattern = val
+			i = newIdx
 		case arg == "--regex":
 			params.Regex = true
 		case !strings.HasPrefix(arg, "-"):
@@ -120,25 +134,29 @@ func (a *App) cmdLogs(args []string) int {
 		// Stream logs
 		err := client.StreamLogs(params, func(entry api.LogEntryResponse) {
 			if jsonOutput {
-				_ = json.NewEncoder(os.Stdout).Encode(entry)
+				if err := json.NewEncoder(os.Stdout).Encode(entry); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to encode log entry: %v\n", err)
+				}
 			} else {
 				printLogEntry(entry)
 			}
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error streaming logs: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 	} else {
 		// Get logs
 		logs, err := client.GetLogs(params)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting logs: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 
 		if jsonOutput {
-			_ = json.NewEncoder(os.Stdout).Encode(logs)
+			if err := json.NewEncoder(os.Stdout).Encode(logs); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to encode logs: %v\n", err)
+			}
 		} else {
 			for _, entry := range logs.Logs {
 				printLogEntry(entry)
@@ -157,7 +175,7 @@ func (a *App) cmdStop(args []string) int {
 	client := NewClient(a.apiAddr)
 
 	if err := client.Shutdown(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error stopping prox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 
@@ -176,7 +194,7 @@ func (a *App) cmdRestart(args []string) int {
 	client := NewClient(a.apiAddr)
 
 	if err := client.RestartProcess(processName); err != nil {
-		fmt.Fprintf(os.Stderr, "Error restarting %s: %v\n", processName, err)
+		fmt.Fprintf(os.Stderr, "Error: failed to restart %s: %v\n", processName, err)
 		return 1
 	}
 
@@ -218,4 +236,55 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// cmdDown handles the 'down' command (alias for stop)
+func (a *App) cmdDown(args []string) int {
+	return a.cmdStop(args)
+}
+
+// cmdAttach handles the 'attach' command - connects TUI to running daemon
+func (a *App) cmdAttach(args []string) int {
+	// Get working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Check if daemon is running
+	state, err := daemon.GetRunningState(cwd)
+	if err != nil {
+		if err == daemon.ErrNotRunning {
+			fmt.Fprintf(os.Stderr, "Error: prox is not running\n")
+			fmt.Fprintf(os.Stderr, "Start it with 'prox up -d' first\n")
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Use discovered API address or explicitly set one
+	apiAddr := a.apiAddr
+	if !a.apiAddrExplicitlySet {
+		apiAddr = fmt.Sprintf("http://%s:%d", state.Host, state.Port)
+	}
+
+	// Create client
+	client := NewClient(apiAddr)
+
+	// Verify connection
+	_, err = client.GetStatus()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Run TUI in client mode
+	if err := tui.RunClient(client); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	return 0
 }

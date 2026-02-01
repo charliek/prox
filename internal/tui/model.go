@@ -3,8 +3,6 @@ package tui
 import (
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/domain"
@@ -25,59 +23,30 @@ const (
 
 // Model is the bubbletea model for the TUI
 type Model struct {
+	BaseModel
+
 	// Dependencies
 	supervisor *supervisor.Supervisor
 	logManager *logs.Manager
 
-	// State
-	processes  []domain.ProcessInfo
-	logEntries []domain.LogEntry
-	subID      string
-
-	// UI components
-	viewport  viewport.Model
-	textInput textinput.Model
-
-	// Mode
-	mode Mode
-
-	// Filtering
-	filterProcesses map[string]bool // Which processes to show
-	soloProcess     string          // Single process to show (1-9 keys)
-	searchPattern   string          // Current search/filter pattern
-	searchMatches   []int           // Line indices matching search
-
-	// Auto-scroll
-	followMode bool // Auto-scroll to bottom on new logs
-
-	// Dimensions
-	width  int
-	height int
-	ready  bool
+	// Subscription ID for log tracking
+	subID string
 }
 
 // NewModel creates a new TUI model
 func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Type to filter..."
-	ti.CharLimit = 100
-	ti.Width = 40
+	base := newBaseModel()
 
 	// Initialize filter to show all processes
-	filterProcesses := make(map[string]bool)
 	for _, p := range sup.Processes() {
-		filterProcesses[p.Name] = true
+		base.filterProcesses[p.Name] = true
 	}
+	base.processes = sup.Processes()
 
 	return Model{
-		supervisor:      sup,
-		logManager:      logMgr,
-		processes:       sup.Processes(),
-		logEntries:      make([]domain.LogEntry, 0),
-		textInput:       ti,
-		mode:            ModeNormal,
-		filterProcesses: filterProcesses,
-		followMode:      true,
+		BaseModel:  base,
+		supervisor: sup,
+		logManager: logMgr,
 	}
 }
 
@@ -98,6 +67,25 @@ type ProcessesMsg []domain.ProcessInfo
 
 // TickMsg is sent periodically
 type TickMsg time.Time
+
+// RestartResultMsg is sent when a restart operation completes
+type RestartResultMsg struct {
+	Process string
+	Err     error
+}
+
+// RestartResultClearMsg is sent to clear the restart result after a delay
+type RestartResultClearMsg struct{}
+
+// restartResultClearDelay is how long to show restart result before clearing
+const restartResultClearDelay = 3 * time.Second
+
+// restartResultClearCmd returns a command that clears the restart result after a delay
+func restartResultClearCmd() tea.Cmd {
+	return tea.Tick(restartResultClearDelay, func(t time.Time) tea.Msg {
+		return RestartResultClearMsg{}
+	})
+}
 
 // subscribeToLogs starts log subscription (returns subscription ID for tracking)
 // Note: Actual log forwarding is handled by forwardLogs in app.go
