@@ -73,6 +73,10 @@ func (a *App) Run(args []string) int {
 		return a.cmdAttach(cmdArgs)
 	case "restart":
 		return a.cmdRestart(cmdArgs)
+	case "certs":
+		return a.cmdCerts(cmdArgs)
+	case "hosts":
+		return a.cmdHosts(cmdArgs)
 	case "version":
 		return a.cmdVersion(cmdArgs)
 	case "help", "-h", "--help":
@@ -146,6 +150,8 @@ Commands:
   stop                 Stop running instance (via API)
   down                 Alias for stop
   restart <process>    Restart a process (via API)
+  certs                Manage HTTPS certificates
+  hosts                Manage /etc/hosts entries
   version              Show version
   help                 Show this help
 
@@ -157,6 +163,7 @@ Global Options:
 Up Options:
   --tui                Enable interactive TUI mode (mutually exclusive with --detach)
   --port PORT          Override API port (otherwise dynamic)
+  --no-proxy           Disable HTTPS proxy even if configured
 
 Logs Options:
   -f, --follow         Stream logs continuously
@@ -169,9 +176,18 @@ Logs Options:
 Status Options:
   --json               Output as JSON
 
+Certs Options:
+  --regenerate         Force regenerate certificates
+
+Hosts Options:
+  --add                Add entries to /etc/hosts (requires sudo)
+  --remove             Remove entries from /etc/hosts (requires sudo)
+  --show               Show entries that would be added
+
 Examples:
   prox up                     # Start all processes (foreground)
   prox up -d                  # Start in background (daemon mode)
+  prox up --no-proxy          # Start without HTTPS proxy
   prox attach                 # Attach TUI to running daemon
   prox up --tui               # Start with TUI (foreground)
   prox up web api             # Start specific processes
@@ -179,6 +195,8 @@ Examples:
   prox logs -f                # Stream all logs
   prox restart worker         # Restart worker process
   prox down                   # Stop the daemon
+  prox certs                  # Show certificate status
+  prox hosts --add            # Add proxy hosts to /etc/hosts
 `)
 }
 

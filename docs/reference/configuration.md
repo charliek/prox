@@ -134,6 +134,97 @@ The `.prox/` directory is project-local, so add it to your `.gitignore`:
 .prox/
 ```
 
+## HTTPS Proxy Configuration
+
+prox can act as an HTTPS reverse proxy, providing friendly subdomain URLs for your services.
+
+### Proxy Example
+
+```yaml
+processes:
+  frontend: npm run dev
+  backend: go run ./cmd/server
+
+proxy:
+  enabled: true
+  https_port: 6789
+  domain: local.myapp.dev
+
+services:
+  app: 3000                    # Simple: subdomain → port
+  api:                         # Expanded: with options
+    port: 8000
+    host: localhost
+
+certs:
+  dir: ~/.prox/certs
+  auto_generate: true
+```
+
+With this configuration:
+- `https://app.local.myapp.dev:6789` → `http://localhost:3000`
+- `https://api.local.myapp.dev:6789` → `http://localhost:8000`
+
+### Proxy Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `proxy.enabled` | bool | `false` | Enable HTTPS reverse proxy |
+| `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server |
+| `proxy.domain` | string | required | Base domain for subdomain routing |
+
+### Service Fields
+
+Services can be defined in simple form (port only) or expanded form (object).
+
+#### Simple Form
+
+```yaml
+services:
+  app: 3000
+```
+
+#### Expanded Form
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `port` | int | required | Target port to proxy to |
+| `host` | string | `localhost` | Target host to proxy to |
+
+### Certificate Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `certs.dir` | string | `~/.prox/certs` | Directory for storing certificates |
+| `certs.auto_generate` | bool | `true` | Automatically generate certificates using mkcert |
+
+### Prerequisites
+
+The proxy requires [mkcert](https://github.com/FiloSottile/mkcert) for certificate generation:
+
+```bash
+# macOS
+brew install mkcert
+
+# Linux
+# See https://github.com/FiloSottile/mkcert#installation
+
+# Install the CA (run once)
+mkcert -install
+```
+
+### DNS Setup
+
+Add entries to `/etc/hosts` for your subdomains:
+
+```bash
+# View required entries
+prox hosts --show
+
+# Add entries (requires sudo)
+prox hosts --add
+```
+
 ## Security Note
 
 Commands in `prox.yaml` are executed via shell. Only use configuration files from trusted sources, similar to Makefiles or Procfiles.

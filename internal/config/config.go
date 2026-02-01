@@ -15,6 +15,29 @@ type Config struct {
 	API       APIConfig                `yaml:"api"`
 	EnvFile   string                   `yaml:"env_file"`
 	Processes map[string]ProcessConfig `yaml:"processes"`
+	Proxy     *ProxyConfig             `yaml:"proxy,omitempty"`
+	Services  map[string]ServiceConfig `yaml:"services,omitempty"`
+	Certs     *CertsConfig             `yaml:"certs,omitempty"`
+}
+
+// ProxyConfig defines the HTTPS reverse proxy configuration
+type ProxyConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	HTTPSPort int    `yaml:"https_port"`
+	Domain    string `yaml:"domain"`
+}
+
+// ServiceConfig represents a service routing configuration that can be either
+// a simple port number or an expanded form with additional options
+type ServiceConfig struct {
+	Port int    `yaml:"port"`
+	Host string `yaml:"host"`
+}
+
+// CertsConfig defines certificate configuration
+type CertsConfig struct {
+	Dir          string `yaml:"dir"`
+	AutoGenerate bool   `yaml:"auto_generate"`
 }
 
 // APIConfig defines the HTTP API configuration
@@ -42,11 +65,14 @@ type HealthcheckConfig struct {
 	StartPeriod string `yaml:"start_period"`
 }
 
-// rawConfig is used for initial YAML parsing to handle the flexible process format
+// rawConfig is used for initial YAML parsing to handle the flexible process/service format
 type rawConfig struct {
 	API       APIConfig              `yaml:"api"`
 	EnvFile   string                 `yaml:"env_file"`
 	Processes map[string]interface{} `yaml:"processes"`
+	Proxy     *ProxyConfig           `yaml:"proxy,omitempty"`
+	Services  map[string]interface{} `yaml:"services,omitempty"`
+	Certs     *CertsConfig           `yaml:"certs,omitempty"`
 }
 
 // Load reads and parses a configuration file
@@ -83,6 +109,9 @@ func Parse(data []byte) (*Config, error) {
 		API:       raw.API,
 		EnvFile:   raw.EnvFile,
 		Processes: make(map[string]ProcessConfig),
+		Proxy:     raw.Proxy,
+		Services:  make(map[string]ServiceConfig),
+		Certs:     raw.Certs,
 	}
 
 	// Apply defaults
@@ -100,6 +129,34 @@ func Parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("process %q: %w", name, err)
 		}
 		config.Processes[name] = proc
+	}
+
+	// Parse services (can be int port or expanded form)
+	for name, value := range raw.Services {
+		svc, err := parseServiceConfig(name, value)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", name, err)
+		}
+		config.Services[name] = svc
+	}
+
+	// Apply proxy defaults
+	if config.Proxy != nil {
+		if config.Proxy.HTTPSPort == 0 {
+			config.Proxy.HTTPSPort = constants.DefaultProxyPort
+		}
+	}
+
+	// Apply certs defaults
+	if config.Certs == nil && config.Proxy != nil {
+		config.Certs = &CertsConfig{
+			AutoGenerate: true, // Default to auto-generating certs
+		}
+	}
+	if config.Certs != nil {
+		if config.Certs.Dir == "" {
+			config.Certs.Dir = constants.DefaultCertsDir
+		}
 	}
 
 	if err := Validate(config); err != nil {
@@ -128,6 +185,35 @@ func parseProcessConfig(name string, value interface{}) (ProcessConfig, error) {
 		return proc, nil
 	default:
 		return ProcessConfig{}, fmt.Errorf("invalid process configuration type: %T", value)
+	}
+}
+
+// parseServiceConfig handles both simple (port only) and expanded service definitions
+func parseServiceConfig(name string, value interface{}) (ServiceConfig, error) {
+	switch v := value.(type) {
+	case int:
+		// Simple form: app: 3000
+		return ServiceConfig{Port: v, Host: "localhost"}, nil
+	case float64:
+		// YAML may parse integers as float64
+		return ServiceConfig{Port: int(v), Host: "localhost"}, nil
+	case map[string]interface{}:
+		// Expanded form: re-marshal and unmarshal to struct
+		data, err := yaml.Marshal(v)
+		if err != nil {
+			return ServiceConfig{}, fmt.Errorf("marshaling service config: %w", err)
+		}
+		var svc ServiceConfig
+		if err := yaml.Unmarshal(data, &svc); err != nil {
+			return ServiceConfig{}, fmt.Errorf("unmarshaling service config: %w", err)
+		}
+		// Apply default host if not specified
+		if svc.Host == "" {
+			svc.Host = "localhost"
+		}
+		return svc, nil
+	default:
+		return ServiceConfig{}, fmt.Errorf("invalid service configuration type: %T", value)
 	}
 }
 

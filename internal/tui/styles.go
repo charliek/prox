@@ -18,6 +18,12 @@ var (
 	errorColor = lipgloss.Color("9")
 	dimColor   = lipgloss.Color("8")
 
+	// HTTP status colors
+	successColor  = lipgloss.Color("10") // Green for 2xx
+	redirectColor = lipgloss.Color("14") // Cyan for 3xx
+	warningColor  = lipgloss.Color("11") // Yellow for 4xx
+	// errorColor already defined above for 5xx
+
 	// Process name colors (for log lines)
 	processColorList = []lipgloss.Color{
 		lipgloss.Color("14"),  // Cyan
@@ -81,6 +87,19 @@ var (
 	// Dim style for timestamps
 	dimStyle = lipgloss.NewStyle().
 			Foreground(dimColor)
+
+	// HTTP status styles
+	httpSuccessStyle = lipgloss.NewStyle().
+				Foreground(successColor)
+
+	httpRedirectStyle = lipgloss.NewStyle().
+				Foreground(redirectColor)
+
+	httpWarningStyle = lipgloss.NewStyle().
+				Foreground(warningColor)
+
+	httpErrorStyle = lipgloss.NewStyle().
+			Foreground(errorColor)
 
 	// Process colors for log lines
 	processColors []lipgloss.Style

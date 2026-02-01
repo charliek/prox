@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -15,15 +16,17 @@ import (
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
+	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
 // Handlers contains all HTTP handlers
 type Handlers struct {
-	supervisor *supervisor.Supervisor
-	logManager *logs.Manager
-	configFile string
-	shutdownFn func()
+	supervisor     *supervisor.Supervisor
+	logManager     *logs.Manager
+	requestManager *proxy.RequestManager
+	configFile     string
+	shutdownFn     func()
 }
 
 // NewHandlers creates new HTTP handlers
@@ -34,6 +37,14 @@ func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile st
 		configFile: configFile,
 		shutdownFn: shutdownFn,
 	}
+}
+
+// SetRequestManager sets the proxy request manager for request inspection.
+// This uses a setter pattern rather than constructor injection because the
+// proxy service is initialized after the API handlers, and the request
+// manager comes from the proxy service.
+func (h *Handlers) SetRequestManager(rm *proxy.RequestManager) {
+	h.requestManager = rm
 }
 
 // GetStatus handles GET /api/v1/status
@@ -245,4 +256,125 @@ func writeError(w http.ResponseWriter, err error) {
 		Error: message,
 		Code:  code,
 	})
+}
+
+// GetProxyRequests handles GET /api/v1/proxy/requests
+func (h *Handlers) GetProxyRequests(w http.ResponseWriter, r *http.Request) {
+	if h.requestManager == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "proxy not enabled",
+			Code:  domain.ErrCodeProxyNotEnabled,
+		})
+		return
+	}
+
+	filter := parseProxyRequestParams(r)
+
+	requests := h.requestManager.Recent(filter)
+	total := h.requestManager.Count()
+
+	resp := ProxyRequestsResponse{
+		Requests:      make([]ProxyRequestResponse, len(requests)),
+		FilteredCount: len(requests),
+		TotalCount:    total,
+	}
+
+	for i, req := range requests {
+		resp.Requests[i] = ToProxyRequestResponse(req)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// StreamProxyRequests handles GET /api/v1/proxy/requests/stream (SSE)
+func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
+	if h.requestManager == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "proxy not enabled",
+			Code:  domain.ErrCodeProxyNotEnabled,
+		})
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error: "streaming not supported",
+			Code:  domain.ErrCodeStreamingNotSupported,
+		})
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	filter := parseProxyRequestParams(r)
+	sub := h.requestManager.Subscribe(filter)
+	defer h.requestManager.Unsubscribe(sub.ID)
+
+	// Send initial comment to establish connection
+	fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case req, ok := <-sub.Ch:
+			if !ok {
+				return
+			}
+
+			resp := ToProxyRequestResponse(req)
+
+			data, err := json.Marshal(resp)
+			if err != nil {
+				continue
+			}
+
+			if _, err := w.Write([]byte("data: " + string(data) + "\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// parseProxyRequestParams extracts proxy request filter parameters
+func parseProxyRequestParams(r *http.Request) proxy.RequestFilter {
+	filter := proxy.RequestFilter{}
+
+	filter.Subdomain = r.URL.Query().Get("subdomain")
+	filter.Method = r.URL.Query().Get("method")
+
+	if minStatus := r.URL.Query().Get("min_status"); minStatus != "" {
+		if v, err := strconv.Atoi(minStatus); err == nil {
+			filter.MinStatus = v
+		}
+	}
+
+	if maxStatus := r.URL.Query().Get("max_status"); maxStatus != "" {
+		if v, err := strconv.Atoi(maxStatus); err == nil {
+			filter.MaxStatus = v
+		}
+	}
+
+	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, sinceStr); err == nil {
+			filter.Since = t
+		}
+	}
+
+	limit := constants.DefaultProxyRequestLimit
+	if linesStr := r.URL.Query().Get("limit"); linesStr != "" {
+		if l, err := strconv.Atoi(linesStr); err == nil && l > 0 && l <= constants.MaxProxyRequests {
+			limit = l
+		}
+	}
+	filter.Limit = limit
+
+	return filter
 }

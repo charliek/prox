@@ -14,7 +14,7 @@ func (m Model) View() string {
 
 	switch m.mode {
 	case ModeHelp:
-		return m.helpView()
+		return m.BaseModel.helpView()
 	default:
 		statusInfo := ""
 		if m.lastRestartProcess != "" {
@@ -26,36 +26,6 @@ func (m Model) View() string {
 		}
 		return m.BaseModel.mainView(statusInfo)
 	}
-}
-
-// helpView renders the help overlay
-func (m Model) helpView() string {
-	help := `
-Prox - Process Manager
-
-Navigation:
-  j/↓        Scroll down
-  k/↑        Scroll up (pauses auto-follow)
-  g/Home     Go to top (pauses auto-follow)
-  G/End      Go to bottom (resumes auto-follow)
-  PgUp/PgDn  Page up/down
-  F          Toggle auto-follow mode
-
-Filtering:
-  1-9        Solo process (toggle)
-  f          Filter mode (process selection)
-  /          Pattern filter (regex)
-  s          String filter (substring)
-  ESC        Clear filters
-
-Other:
-  r          Restart selected process (1-9 to select)
-  ?          Toggle help
-  q/Ctrl+C   Quit
-
-Press any key to close help...
-`
-	return helpStyle.Render(help)
 }
 
 // getProcessStyle returns the style for a process name

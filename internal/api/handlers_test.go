@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
+	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -423,4 +426,340 @@ func TestProcessControl_Conflict(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.ErrCodeProcessAlreadyRunning, resp.Code)
 	})
+}
+
+func TestGetProxyRequests(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	// Create request manager and add some test requests
+	rm := proxy.NewRequestManager(100)
+	handlers.SetRequestManager(rm)
+
+	now := time.Now()
+	rm.Record(proxy.RequestRecord{
+		Timestamp:  now.Add(-2 * time.Minute),
+		Method:     "GET",
+		URL:        "/api/users",
+		Subdomain:  "app",
+		StatusCode: 200,
+		Duration:   50 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+	})
+	rm.Record(proxy.RequestRecord{
+		Timestamp:  now.Add(-1 * time.Minute),
+		Method:     "POST",
+		URL:        "/api/orders",
+		Subdomain:  "api",
+		StatusCode: 201,
+		Duration:   100 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+	})
+	rm.Record(proxy.RequestRecord{
+		Timestamp:  now,
+		Method:     "GET",
+		URL:        "/api/products",
+		Subdomain:  "app",
+		StatusCode: 500,
+		Duration:   200 * time.Millisecond,
+		RemoteAddr: "192.168.1.1",
+	})
+
+	t.Run("get all requests", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 3)
+		assert.Equal(t, 3, resp.TotalCount)
+		assert.Equal(t, 3, resp.FilteredCount)
+	})
+
+	t.Run("filter by subdomain", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?subdomain=app", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 2)
+		for _, r := range resp.Requests {
+			assert.Equal(t, "app", r.Subdomain)
+		}
+	})
+
+	t.Run("filter by method", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?method=POST", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 1)
+		assert.Equal(t, "POST", resp.Requests[0].Method)
+	})
+
+	t.Run("filter by min_status", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?min_status=400", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 1)
+		assert.Equal(t, 500, resp.Requests[0].StatusCode)
+	})
+
+	t.Run("filter by limit", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?limit=2", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 2)
+		assert.Equal(t, 3, resp.TotalCount)
+	})
+
+	t.Run("filter by since", func(t *testing.T) {
+		// Only get requests from last 90 seconds
+		since := now.Add(-90 * time.Second).Format(time.RFC3339)
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?since="+since, nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 2)
+	})
+}
+
+func TestGetProxyRequests_ProxyNotEnabled(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	// Don't set request manager to simulate proxy not enabled
+
+	req := httptest.NewRequest("GET", "/api/v1/proxy/requests", nil)
+	w := httptest.NewRecorder()
+
+	handlers.GetProxyRequests(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var resp ErrorResponse
+	err := json.NewDecoder(w.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ErrCodeProxyNotEnabled, resp.Code)
+}
+
+func TestStreamProxyRequests(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	rm := proxy.NewRequestManager(100)
+	handlers.SetRequestManager(rm)
+
+	t.Run("SSE headers set correctly", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream", nil)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		// Run handler in goroutine so we can cancel it
+		done := make(chan struct{})
+		go func() {
+			handlers.StreamProxyRequests(w, req)
+			close(done)
+		}()
+
+		// Give handler time to set headers and write initial event
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		<-done
+
+		assert.Equal(t, "text/event-stream", w.Header().Get("Content-Type"))
+		assert.Equal(t, "no-cache", w.Header().Get("Cache-Control"))
+		assert.Equal(t, "keep-alive", w.Header().Get("Connection"))
+		assert.Equal(t, "no", w.Header().Get("X-Accel-Buffering"))
+		assert.Contains(t, w.Body.String(), ": connected")
+	})
+
+	t.Run("receives streamed requests", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream", nil)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		done := make(chan struct{})
+		go func() {
+			handlers.StreamProxyRequests(w, req)
+			close(done)
+		}()
+
+		// Wait for handler to start
+		time.Sleep(50 * time.Millisecond)
+
+		// Record a new request
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/streamed",
+			Subdomain:  "test",
+			StatusCode: 200,
+			Duration:   10 * time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		// Give time for the event to be written
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		<-done
+
+		body := w.Body.String()
+		assert.Contains(t, body, ": connected")
+		assert.Contains(t, body, "/streamed")
+		assert.Contains(t, body, "test")
+	})
+
+	t.Run("filters streamed requests", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream?subdomain=match", nil)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		done := make(chan struct{})
+		go func() {
+			handlers.StreamProxyRequests(w, req)
+			close(done)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Record a request that doesn't match the filter
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/nomatch",
+			Subdomain:  "other",
+			StatusCode: 200,
+			Duration:   10 * time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		// Record a request that matches
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/matched",
+			Subdomain:  "match",
+			StatusCode: 200,
+			Duration:   10 * time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		<-done
+
+		body := w.Body.String()
+		// Parse SSE events - look for request data lines (not the connected event)
+		reader := bufio.NewScanner(strings.NewReader(body))
+		var requestDataLines []string
+		for reader.Scan() {
+			line := reader.Text()
+			// Filter for data lines that contain actual request data (have a URL)
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"url":`) {
+				requestDataLines = append(requestDataLines, line)
+			}
+		}
+
+		// Should only have one request data line (the matched request)
+		assert.Len(t, requestDataLines, 1)
+		assert.Contains(t, requestDataLines[0], "/matched")
+		assert.NotContains(t, body, "/nomatch")
+	})
+}
+
+func TestStreamProxyRequests_ProxyNotEnabled(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	// Don't set request manager
+
+	req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream", nil)
+	w := httptest.NewRecorder()
+
+	handlers.StreamProxyRequests(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var resp ErrorResponse
+	err := json.NewDecoder(w.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ErrCodeProxyNotEnabled, resp.Code)
 }

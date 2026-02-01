@@ -4,6 +4,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/proxy"
 )
 
 // ClientModel is the bubbletea model for TUI client mode (connected via API)
@@ -20,8 +21,11 @@ type ClientModel struct {
 // NewClientModel creates a new TUI model for client mode
 func NewClientModel(client TUIClient) ClientModel {
 	return ClientModel{
-		BaseModel: newBaseModel(),
-		client:    client,
+		BaseModel: newBaseModel(HelpConfig{
+			TitleSuffix: "(Client Mode)",
+			QuitMessage: "Quit (daemon continues running)",
+		}),
+		client: client,
 	}
 }
 
@@ -79,6 +83,9 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case LogEntryMsg:
 		m.handleLogEntry(domain.LogEntry(msg))
+
+	case ProxyRequestMsg:
+		m.handleProxyRequest(proxy.RequestRecord(msg))
 
 	case ProcessesMsg:
 		m.processes = []domain.ProcessInfo(msg)
@@ -175,7 +182,7 @@ func (m ClientModel) View() string {
 
 	switch m.mode {
 	case ModeHelp:
-		return m.helpView()
+		return m.BaseModel.helpView()
 	default:
 		statusInfo := "Connected via API"
 		if m.connectionError != nil {
@@ -189,34 +196,4 @@ func (m ClientModel) View() string {
 		}
 		return m.BaseModel.mainView(statusInfo)
 	}
-}
-
-// helpView renders the help overlay
-func (m ClientModel) helpView() string {
-	help := `
-Prox - Process Manager (Client Mode)
-
-Navigation:
-  j/↓        Scroll down
-  k/↑        Scroll up (pauses auto-follow)
-  g/Home     Go to top (pauses auto-follow)
-  G/End      Go to bottom (resumes auto-follow)
-  PgUp/PgDn  Page up/down
-  F          Toggle auto-follow mode
-
-Filtering:
-  1-9        Solo process (toggle)
-  f          Filter mode (process selection)
-  /          Pattern filter (regex)
-  s          String filter (substring)
-  ESC        Clear filters
-
-Other:
-  r          Restart selected process (1-9 to select)
-  ?          Toggle help
-  q/Ctrl+C   Quit (daemon continues running)
-
-Press any key to close help...
-`
-	return helpStyle.Render(help)
 }

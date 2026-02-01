@@ -7,6 +7,7 @@ A modern process manager for development with an API-first design, enabling both
 - **Simple by default** - Procfile-like experience with minimal YAML configuration
 - **API-first** - Full process control and log access via HTTP, always available
 - **Interactive TUI** - Real-time log viewing with filtering and search
+- **HTTPS Proxy** - Subdomain routing with locally-trusted certificates
 - **Health checks** - Optional health monitoring for processes
 - **LLM-friendly** - Structured output and filtering to support AI-assisted debugging
 
@@ -31,7 +32,6 @@ prox up
 
 prox is designed for local development. It intentionally does not include:
 
-- Daemon mode (runs in foreground only)
 - Log persistence to disk
 - Process dependencies or startup ordering
 - Distributed or multi-machine operation

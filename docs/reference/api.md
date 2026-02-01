@@ -10,7 +10,7 @@ Default: `http://127.0.0.1:5555/api/v1`
 
 ## Authentication
 
-When prox binds to a non-localhost interface, authentication is required. A bearer token is generated and stored in `~/.config/prox/token`.
+When prox binds to a non-localhost interface, authentication is required. A bearer token is generated and stored in `~/.prox/token`.
 
 Include the token in requests:
 
@@ -205,6 +205,75 @@ data: {"timestamp":"2025-01-19T10:32:01.456Z","process":"api","stream":"stderr",
 curl -N http://localhost:5555/api/v1/logs/stream
 curl -N "http://localhost:5555/api/v1/logs/stream?process=web,api"
 curl -N "http://localhost:5555/api/v1/logs/stream?pattern=ERROR"
+```
+
+### GET /proxy/requests
+
+Retrieve recent proxy requests (requires proxy to be enabled).
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `subdomain` | string | all | Filter by subdomain |
+| `method` | string | all | Filter by HTTP method (GET, POST, etc.) |
+| `min_status` | int | — | Minimum status code |
+| `max_status` | int | — | Maximum status code |
+| `limit` | int | 100 | Max requests to return (max 1000) |
+
+**Response:**
+
+```json
+{
+  "requests": [
+    {
+      "timestamp": "2025-01-19T10:32:01.123Z",
+      "method": "GET",
+      "url": "/api/users",
+      "subdomain": "api",
+      "status_code": 200,
+      "duration_ms": 45,
+      "remote_addr": "127.0.0.1"
+    }
+  ],
+  "filtered_count": 50,
+  "total_count": 250
+}
+```
+
+**Example:**
+
+```bash
+# Get all recent requests
+curl http://localhost:5555/api/v1/proxy/requests
+
+# Filter by subdomain
+curl "http://localhost:5555/api/v1/proxy/requests?subdomain=api"
+
+# Filter for errors (5xx)
+curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
+```
+
+### GET /proxy/requests/stream
+
+Stream proxy requests via Server-Sent Events (SSE).
+
+**Query Parameters:** Same as `GET /proxy/requests` (except `limit`)
+
+**Response:** SSE stream
+
+```
+event: connected
+data: {}
+
+data: {"timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
+```
+
+**Example:**
+
+```bash
+curl -N http://localhost:5555/api/v1/proxy/requests/stream
+curl -N "http://localhost:5555/api/v1/proxy/requests/stream?subdomain=api"
 ```
 
 ### POST /shutdown
