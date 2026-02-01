@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -289,6 +290,97 @@ func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
 	return entry, true
 }
 
+// parseSSEProxyRequest parses a single SSE data line into a proxy request.
+// Returns the parsed request and true if successful, or an empty request and false if parsing failed.
+func parseSSEProxyRequest(data string) (api.ProxyRequestResponse, bool) {
+	var req api.ProxyRequestResponse
+	if err := json.Unmarshal([]byte(data), &req); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE proxy request: %v\n", err)
+		return req, false
+	}
+	return req, true
+}
+
+// streamSSE creates an SSE connection and returns a channel of parsed events.
+// The channel is closed when the connection ends or times out.
+func streamSSE[T any](req *http.Request, parse func(string) (T, bool)) (<-chan T, error) {
+	// Custom transport to capture connection for read deadlines
+	var conn net.Conn
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var err error
+			conn, err = dialer.DialContext(ctx, network, addr)
+			return conn, err
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0, // SSE streams are long-lived
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, httpStatusError(resp.StatusCode, nil)
+	}
+
+	ch := make(chan T, 100)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		bodyReader := &deadlineReader{
+			r:       resp.Body,
+			conn:    conn,
+			timeout: sseReadTimeout,
+		}
+		reader := bufio.NewReader(bodyReader)
+
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				if item, ok := parse(data); ok {
+					ch <- item
+				}
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+// StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.
+// The channel is closed when the connection ends or the read times out.
+func (c *Client) StreamProxyRequestsChannel() (<-chan api.ProxyRequestResponse, error) {
+	req, err := http.NewRequest("GET", c.baseURL+"/api/v1/proxy/requests/stream", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	c.addAuthHeader(req)
+	return streamSSE(req, parseSSEProxyRequest)
+}
+
 // StreamLogsChannel returns a channel that streams log entries via SSE.
 // The channel is closed when the connection ends or the read times out.
 func (c *Client) StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error) {
@@ -305,71 +397,5 @@ func (c *Client) StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntry
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	c.addAuthHeader(req)
-
-	// Use a custom transport to get access to the underlying connection for read deadlines.
-	// This allows us to detect dead connections when the server stops sending heartbeats.
-	var conn net.Conn
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		Dial: func(network, addr string) (net.Conn, error) {
-			var err error
-			conn, err = net.DialTimeout(network, addr, 30*time.Second)
-			return conn, err
-		},
-	}
-
-	sseClient := &http.Client{
-		Transport: transport,
-		Timeout:   0, // No overall timeout - SSE streams are long-lived
-	}
-
-	resp, err := sseClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, httpStatusError(resp.StatusCode, nil)
-	}
-
-	ch := make(chan api.LogEntryResponse, 100)
-
-	go func() {
-		defer resp.Body.Close()
-		defer close(ch)
-
-		// Wrap the body in a deadline reader to detect dead connections
-		bodyReader := &deadlineReader{
-			r:       resp.Body,
-			conn:    conn,
-			timeout: sseReadTimeout,
-		}
-		reader := bufio.NewReader(bodyReader)
-
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				// Timeout or connection error - exit gracefully
-				return
-			}
-
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, ":") {
-				continue
-			}
-
-			if strings.HasPrefix(line, "data: ") {
-				data := strings.TrimPrefix(line, "data: ")
-				if entry, ok := parseSSELogEntry(data); ok {
-					ch <- entry
-				}
-			}
-		}
-	}()
-
-	return ch, nil
+	return streamSSE(req, parseSSELogEntry)
 }

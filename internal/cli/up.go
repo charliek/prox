@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
+	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/supervisor"
 	"github.com/charliek/prox/internal/tui"
 )
@@ -111,6 +113,7 @@ func ensureNotAlreadyRunning(cwd string) error {
 func (a *App) cmdUp(args []string) int {
 	// Parse flags
 	useTUI := false
+	noProxy := false
 	port := 0
 	var processes []string
 
@@ -118,6 +121,8 @@ func (a *App) cmdUp(args []string) int {
 		arg := args[i]
 		if arg == "--tui" {
 			useTUI = true
+		} else if arg == "--no-proxy" {
+			noProxy = true
 		} else if arg == "--port" || arg == "-p" {
 			val, newIdx, err := parseFlagValue(args, i, arg)
 			if err != nil {
@@ -391,10 +396,34 @@ func (a *App) cmdUp(args []string) int {
 		}
 	}()
 
+	// Start proxy server if configured and not disabled
+	var proxyService *proxy.Service
+	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		var err error
+		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating proxy service: %v\n", err)
+			// Continue without proxy - this is not fatal
+		} else if err := proxyService.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting proxy: %v\n", err)
+			proxyService = nil
+			// Continue without proxy - this is not fatal
+		} else {
+			fmt.Printf("Proxy server: https://*.%s:%d\n", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort)
+			// Wire up request manager to API handlers for request inspection
+			handlers.SetRequestManager(proxyService.RequestManager())
+		}
+	}
+
 	// Handle TUI vs terminal output
 	if useTUI {
 		// Run TUI - it blocks until quit
-		if err := tui.Run(sup, logMgr); err != nil {
+		var reqMgr *proxy.RequestManager
+		if proxyService != nil {
+			reqMgr = proxyService.RequestManager()
+		}
+		if err := tui.Run(sup, logMgr, reqMgr); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
@@ -418,6 +447,13 @@ func (a *App) cmdUp(args []string) int {
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
+
+	// Stop proxy server
+	if proxyService != nil {
+		if err := proxyService.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
+		}
+	}
 
 	// Stop API server
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {

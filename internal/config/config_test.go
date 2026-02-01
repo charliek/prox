@@ -129,3 +129,116 @@ func TestConfig_ToDomainProcesses(t *testing.T) {
 	assert.Equal(t, "8080", apiProc.env["PORT"])
 	assert.True(t, apiProc.hc)
 }
+
+func TestParse_ProxyConfig(t *testing.T) {
+	t.Run("parses full proxy config", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  https_port: 8443
+  domain: local.myapp.dev
+
+services:
+  app: 3000
+  api:
+    port: 8000
+    host: 127.0.0.1
+
+certs:
+  dir: /custom/certs
+  auto_generate: true
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// Check proxy
+		require.NotNil(t, cfg.Proxy)
+		assert.True(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 8443, cfg.Proxy.HTTPSPort)
+		assert.Equal(t, "local.myapp.dev", cfg.Proxy.Domain)
+
+		// Check services
+		assert.Len(t, cfg.Services, 2)
+		assert.Equal(t, 3000, cfg.Services["app"].Port)
+		assert.Equal(t, "localhost", cfg.Services["app"].Host) // Default host
+		assert.Equal(t, 8000, cfg.Services["api"].Port)
+		assert.Equal(t, "127.0.0.1", cfg.Services["api"].Host)
+
+		// Check certs
+		require.NotNil(t, cfg.Certs)
+		assert.Equal(t, "/custom/certs", cfg.Certs.Dir)
+		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+
+	t.Run("applies proxy defaults", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.test.dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		assert.Equal(t, 6789, cfg.Proxy.HTTPSPort) // Default port
+		require.NotNil(t, cfg.Certs)
+		assert.Equal(t, "~/.prox/certs", cfg.Certs.Dir) // Default certs dir
+		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+
+	t.Run("no proxy config is valid", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+		assert.Nil(t, cfg.Proxy)
+		assert.Empty(t, cfg.Services)
+		assert.Nil(t, cfg.Certs)
+	})
+
+	t.Run("service with integer port as float64", func(t *testing.T) {
+		// YAML parsers may parse integers as float64
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+		assert.Equal(t, 3000, cfg.Services["app"].Port)
+	})
+
+	t.Run("proxy auto-creates certs config", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// Certs config should be auto-created when proxy is enabled
+		require.NotNil(t, cfg.Certs)
+		assert.Equal(t, "~/.prox/certs", cfg.Certs.Dir)
+		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+}

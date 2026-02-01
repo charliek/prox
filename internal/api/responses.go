@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/proxy"
 )
 
 // sensitiveEnvPatterns contains patterns that indicate sensitive environment variables
@@ -167,5 +168,36 @@ func ToLogEntryResponse(entry domain.LogEntry) LogEntryResponse {
 		Process:   entry.Process,
 		Stream:    string(entry.Stream),
 		Line:      entry.Line,
+	}
+}
+
+// ProxyRequestResponse represents a single proxy request
+type ProxyRequestResponse struct {
+	Timestamp  string `json:"timestamp"`
+	Method     string `json:"method"`
+	URL        string `json:"url"`
+	Subdomain  string `json:"subdomain"`
+	StatusCode int    `json:"status_code"`
+	DurationMs int64  `json:"duration_ms"`
+	RemoteAddr string `json:"remote_addr"`
+}
+
+// ProxyRequestsResponse represents the response for GET /proxy/requests
+type ProxyRequestsResponse struct {
+	Requests      []ProxyRequestResponse `json:"requests"`
+	FilteredCount int                    `json:"filtered_count"`
+	TotalCount    int                    `json:"total_count"`
+}
+
+// ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse
+func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
+	return ProxyRequestResponse{
+		Timestamp:  req.Timestamp.Format(time.RFC3339Nano),
+		Method:     req.Method,
+		URL:        req.URL,
+		Subdomain:  req.Subdomain,
+		StatusCode: req.StatusCode,
+		DurationMs: req.Duration.Milliseconds(),
+		RemoteAddr: req.RemoteAddr,
 	}
 }

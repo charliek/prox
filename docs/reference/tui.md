@@ -1,6 +1,6 @@
 # TUI Reference
 
-The interactive terminal UI provides real-time log viewing with filtering and search.
+The interactive terminal UI provides real-time log viewing with filtering and search, plus a proxy request viewer when the proxy is enabled.
 
 ## Starting the TUI
 
@@ -14,9 +14,16 @@ Or start specific processes:
 prox up --tui web api
 ```
 
-## Layout
+## Views
 
-```
+The TUI has two views you can switch between with `Tab`:
+
+- **Logs View** - Real-time process logs with filtering
+- **Requests View** - Real-time HTTP proxy requests (when proxy is enabled)
+
+## Logs View Layout
+
+```text
 ┌─ processes ──────────────────────────────────────────────┐
 │ [1] ● web     running   [2] ● api    running             │
 │ [3] ● worker  starting  [4] ○ cron   stopped             │
@@ -28,33 +35,66 @@ prox up --tui web api
 │ 10:32:03 api    │ WARN: connection pool running low      │
 │ ...                                                      │
 ├──────────────────────────────────────────────────────────┤
-│ [f]ilter [/]search [s]tring filter [r]estart [?]help [q] │
+│ Tab: switch view | ? for help  [Logs] [FOLLOW] 45 lines  │
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Requests View Layout
+
+```text
+┌─ processes ──────────────────────────────────────────────┐
+│ ● web     running   ● api    running                     │
+├─ requests ───────────────────────────────────────────────┤
+│ 15:04:05  api        GET  200   45ms  /api/v1/users      │
+│ 15:04:05  app        POST 201  120ms  /api/v1/posts      │
+│ 15:04:06  api        GET  404   12ms  /api/v1/missing    │
+│ 15:04:07  web        GET  200   23ms  /assets/main.js    │
+│ ...                                                      │
+├──────────────────────────────────────────────────────────┤
+│ Tab: switch view | ? for help  [Requests] [FOLLOW] 12    │
+└──────────────────────────────────────────────────────────┘
+```
+
+Status codes are color-coded: green (2xx), cyan (3xx), yellow (4xx), red (5xx), gray (0/unknown).
+
 ## Keybindings
 
+### General
+
 | Key | Action |
-|-----|--------|
-| `↑` / `↓` / `j` / `k` | Scroll logs |
+| --- | ------ |
+| `Tab` | Switch between Logs and Requests views |
+| `↑` / `↓` / `j` / `k` | Scroll |
 | `PgUp` / `PgDn` | Scroll page |
-| `scroll wheel` | Scroll logs |
+| `scroll wheel` | Scroll |
 | `Home` / `End` / `g` / `G` | Jump to start/end |
+| `F` | Toggle auto-follow mode |
+| `Esc` | Clear filter/search, exit mode |
+| `?` | Show help overlay |
+| `q` | Quit |
+
+### Logs View
+
+| Key | Action |
+| --- | ------ |
 | `1-9` | Solo process (press again for all) |
 | `f` | Open process filter (multi-select) |
 | `/` | Search (highlight matches) |
 | `n` / `N` | Next/previous search match |
 | `s` | String filter (hide non-matching) |
-| `Esc` | Clear filter/search, exit mode |
 | `r` | Restart highlighted process |
-| `?` | Show help overlay |
-| `q` | Quit |
+
+### Requests View
+
+| Key | Action |
+| --- | ------ |
+| `s` | String filter (on URL/method/subdomain) |
 
 ## Process Filter Mode
 
 Press `f` to open the multi-select process filter:
 
-```
+```text
 ┌─ filter processes ───────────────────┐
 │ [x] web                              │
 │ [x] api                              │
@@ -67,7 +107,7 @@ Press `f` to open the multi-select process filter:
 ```
 
 | Key | Action |
-|-----|--------|
+| --- | ------ |
 | `↑` / `↓` | Navigate list |
 | `Space` | Toggle selection |
 | `a` | Select all |

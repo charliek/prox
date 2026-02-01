@@ -174,6 +174,10 @@ func (s *Server) registerRoutes() {
 		r.Get("/logs", s.handlers.GetLogs)
 		r.Get("/logs/stream", s.handlers.StreamLogs)
 
+		// Proxy requests
+		r.Get("/proxy/requests", s.handlers.GetProxyRequests)
+		r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
+
 		// Shutdown
 		r.Post("/shutdown", s.handlers.Shutdown)
 	})

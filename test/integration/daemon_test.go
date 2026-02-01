@@ -433,9 +433,28 @@ processes:
 		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
 	}
 
-	// Wait for state file to be created
+	// Wait for state file to contain valid port (retry for partial writes)
 	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
+	var state struct {
+		Port int `json:"port"`
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		stateData, err := os.ReadFile(statePath)
+		if err == nil {
+			if json.Unmarshal(stateData, &state) == nil && state.Port != 0 {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if state.Port == 0 {
+		t.Fatalf("failed to get valid port from state file")
+	}
+
+	// Wait for API to be ready before running CLI command
+	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
+	waitForAPI(t, apiAddr, 10*time.Second)
 
 	// Run status command without specifying --addr
 	// It should auto-discover the API address from .prox/prox.state

@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/proxy"
 )
 
 // restartTimeout is the maximum time to wait for a restart operation
@@ -27,6 +28,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case LogEntryMsg:
 		m.handleLogEntry(domain.LogEntry(msg))
+
+	case ProxyRequestMsg:
+		m.handleProxyRequest(proxy.RequestRecord(msg))
 
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()

@@ -7,6 +7,7 @@ import (
 
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
+	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -19,6 +20,14 @@ const (
 	ModeSearch
 	ModeStringFilter
 	ModeHelp
+)
+
+// ViewMode represents which content is being displayed
+type ViewMode int
+
+const (
+	ViewModeLogs ViewMode = iota
+	ViewModeRequests
 )
 
 // Model is the bubbletea model for the TUI
@@ -35,7 +44,10 @@ type Model struct {
 
 // NewModel creates a new TUI model
 func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
-	base := newBaseModel()
+	base := newBaseModel(HelpConfig{
+		TitleSuffix: "",
+		QuitMessage: "Quit",
+	})
 
 	// Initialize filter to show all processes
 	for _, p := range sup.Processes() {
@@ -61,6 +73,9 @@ func (m Model) Init() tea.Cmd {
 
 // LogEntryMsg is sent when a new log entry arrives
 type LogEntryMsg domain.LogEntry
+
+// ProxyRequestMsg is sent when a new proxy request is recorded
+type ProxyRequestMsg proxy.RequestRecord
 
 // ProcessesMsg is sent when processes should be refreshed
 type ProcessesMsg []domain.ProcessInfo

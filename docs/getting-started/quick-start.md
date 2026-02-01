@@ -120,6 +120,64 @@ Background mode features:
 - CLI commands auto-discover the running daemon
 - Daemon logs are written to `.prox/prox.log`
 
+## HTTPS Proxy (Optional)
+
+prox can provide friendly HTTPS URLs for your services via subdomain routing.
+
+### Prerequisites
+
+Install mkcert for local certificate generation:
+
+```bash
+# macOS
+brew install mkcert
+
+# Install the CA (run once)
+mkcert -install
+```
+
+### Configuration
+
+Add proxy settings to your `prox.yaml`:
+
+```yaml
+processes:
+  frontend: npm run dev
+  backend: go run ./cmd/server
+
+proxy:
+  enabled: true
+  https_port: 6789
+  domain: local.myapp.dev
+
+services:
+  app: 3000
+  api: 8000
+```
+
+### DNS Setup
+
+Add entries to `/etc/hosts`:
+
+```bash
+prox hosts --add
+```
+
+### Usage
+
+Start prox:
+
+```bash
+prox up
+```
+
+Access your services:
+
+- `https://app.local.myapp.dev:6789` → `http://localhost:3000`
+- `https://api.local.myapp.dev:6789` → `http://localhost:8000`
+
+See the [Configuration Reference](../reference/configuration.md#https-proxy-configuration) for full details.
+
 ## HTTP API
 
 The API runs at `http://127.0.0.1:5555/api/v1` by default.

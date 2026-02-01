@@ -85,6 +85,61 @@ This document describes the internal design of prox for contributors.
 - Mark healthy after one success
 - Health state exposed via API and TUI
 
+## HTTPS Reverse Proxy
+
+The optional HTTPS reverse proxy provides subdomain-based routing to local services.
+
+### Proxy Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    HTTPS Reverse Proxy                            │
+│                                                                    │
+│  Browser Request                                                   │
+│  https://app.local.dev:6789/api/users                             │
+│         │                                                          │
+│         ▼                                                          │
+│  ┌─────────────────────┐                                          │
+│  │  Subdomain Router   │  Extract "app" from host                 │
+│  │  (extract + lookup) │                                          │
+│  └──────────┬──────────┘                                          │
+│             │                                                      │
+│             ▼                                                      │
+│  ┌─────────────────────┐     ┌─────────────────────┐              │
+│  │   Route Table       │────▶│   Request Manager   │              │
+│  │   app → :3000       │     │   (ring buffer)     │              │
+│  │   api → :8000       │     └─────────────────────┘              │
+│  └──────────┬──────────┘                                          │
+│             │                                                      │
+│             ▼                                                      │
+│  ┌─────────────────────┐                                          │
+│  │ httputil.ReverseProxy│                                         │
+│  │ → localhost:3000    │                                          │
+│  └─────────────────────┘                                          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Package Structure
+
+```
+internal/proxy/
+├── proxy.go          # Main proxy service, router, request handling
+├── requests.go       # Request manager (ring buffer, subscriptions)
+├── certs/
+│   └── certs.go      # mkcert integration for certificate management
+└── hosts/
+    └── hosts.go      # /etc/hosts management
+```
+
+### Request Flow
+
+1. Incoming HTTPS request to `*.domain:port`
+2. Extract subdomain from Host header
+3. Look up service in route table
+4. Forward request via `httputil.ReverseProxy`
+5. Record request in RequestManager
+6. Return response to client
+
 ## Technologies
 
 | Component | Technology | Notes |
@@ -93,5 +148,7 @@ This document describes the internal design of prox for contributors.
 | TUI | [bubbletea](https://github.com/charmbracelet/bubbletea) | Elm-architecture TUI framework |
 | TUI styling | [lipgloss](https://github.com/charmbracelet/lipgloss) | Styling for bubbletea |
 | HTTP router | [chi](https://github.com/go-chi/chi) or stdlib | Lightweight, idiomatic |
+| Reverse Proxy | [net/http/httputil](https://pkg.go.dev/net/http/httputil) | Standard library reverse proxy |
 | YAML parsing | [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3) | Standard YAML library |
 | Env file | [godotenv](https://github.com/joho/godotenv) | .env file loading |
+| Certificates | [mkcert](https://github.com/FiloSottile/mkcert) | Local CA for development certs |

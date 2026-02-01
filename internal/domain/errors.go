@@ -20,6 +20,11 @@ const (
 	ErrCodeProcessNotRunning     = "PROCESS_NOT_RUNNING"
 	ErrCodeInvalidPattern        = "INVALID_PATTERN"
 	ErrCodeShutdownInProgress    = "SHUTDOWN_IN_PROGRESS"
+
+	// Proxy-related error codes (API-only, no sentinel errors as they
+	// are only used for HTTP response formatting in the API layer)
+	ErrCodeProxyNotEnabled       = "PROXY_NOT_ENABLED"
+	ErrCodeStreamingNotSupported = "STREAMING_NOT_SUPPORTED"
 )
 
 // ErrorCode returns the API error code for a domain error
