@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,10 +18,18 @@ import (
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/supervisor"
 	"github.com/charliek/prox/internal/tui"
+)
+
+const (
+	// shutdownTimeout is the maximum time to wait for graceful shutdown
+	shutdownTimeout = 10 * time.Second
+	// logFlushDelay is the time to wait for logs to be printed before closing
+	logFlushDelay = 50 * time.Millisecond
 )
 
 // proxDir returns the prox config directory path (~/.prox)
@@ -82,6 +92,21 @@ func isAuthRequired(cfg *config.Config) bool {
 	return !isLocalhost(cfg.API.Host)
 }
 
+// ensureNotAlreadyRunning checks if prox is already running and cleans up stale files.
+// Returns nil if the caller can proceed, or an error describing the problem.
+func ensureNotAlreadyRunning(cwd string) error {
+	if daemon.IsRunning(cwd) {
+		return fmt.Errorf("prox is already running\nUse 'prox status' to check or 'prox stop' to stop it")
+	}
+
+	// Clean up any stale files from previous crashed instance
+	if err := daemon.CleanupStaleFiles(cwd); err != nil && err != daemon.ErrAlreadyRunning {
+		return fmt.Errorf("error cleaning up stale files: %w", err)
+	}
+
+	return nil
+}
+
 // cmdUp handles the 'up' command
 func (a *App) cmdUp(args []string) int {
 	// Parse flags
@@ -94,31 +119,159 @@ func (a *App) cmdUp(args []string) int {
 		if arg == "--tui" {
 			useTUI = true
 		} else if arg == "--port" || arg == "-p" {
-			if i+1 < len(args) {
-				if p, err := strconv.Atoi(args[i+1]); err == nil && p > 0 && p <= 65535 {
-					port = p
-				} else {
-					fmt.Fprintf(os.Stderr, "Invalid port: %s (must be 1-65535)\n", args[i+1])
-					return 1
-				}
-				i++
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
 			}
+			p, err := strconv.Atoi(val)
+			if err != nil || p < 1 || p > 65535 {
+				fmt.Fprintf(os.Stderr, "Error: invalid port %q (must be 1-65535)\n", val)
+				return 1
+			}
+			port = p
+			i = newIdx
+		} else if arg == "-d" || arg == "--detach" {
+			a.detach = true
 		} else if !strings.HasPrefix(arg, "-") {
 			processes = append(processes, arg)
 		}
 	}
 
-	// Load config
-	cfg, err := config.Load(a.configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+	// Validate mutually exclusive flags
+	if useTUI && a.detach {
+		fmt.Fprintf(os.Stderr, "Error: --tui and --detach are mutually exclusive\n")
 		return 1
 	}
 
-	// Override port if specified
+	// Get working directory for state files
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// If daemon mode and we're the parent process, handle daemonization
+	if a.detach && !daemon.IsDaemonChild() {
+		if err := ensureNotAlreadyRunning(cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+
+		// Daemonize - this will re-exec and exit the parent
+		if err := daemon.Daemonize(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		// Parent exits in Daemonize(), this is unreachable for parent
+	}
+
+	// If we're the daemon child, set up logging
+	var logFile *os.File
+	if daemon.IsDaemonChild() {
+		var err error
+		logFile, err = daemon.SetupLogging(cwd)
+		if err != nil {
+			// Can't write to stderr in daemon mode, but try anyway
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		defer logFile.Close()
+	}
+
+	// Load config
+	cfg, err := config.Load(a.configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Determine port: CLI flag > config > dynamic
 	if port > 0 {
 		cfg.API.Port = port
+	} else if cfg.API.Port == 0 {
+		// Dynamic port allocation
+		host := cfg.API.Host
+		if host == "" {
+			host = constants.DefaultAPIHost
+		}
+		dynamicPort, err := daemon.FindAvailablePort(host)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		cfg.API.Port = dynamicPort
 	}
+
+	// For foreground mode, also check if already running and handle state
+	if !a.detach {
+		if err := ensureNotAlreadyRunning(cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+	}
+
+	// Create state directory
+	if err := daemon.EnsureStateDir(cwd); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Get host for state file
+	host := cfg.API.Host
+	if host == "" {
+		host = constants.DefaultAPIHost
+	}
+
+	// Resolve config path to absolute for storage in state file
+	absConfigPath, err := filepath.Abs(a.configPath)
+	if err != nil {
+		absConfigPath = a.configPath // Fall back to original if resolution fails
+	}
+
+	// Validate config file exists
+	if _, err := os.Stat(absConfigPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: config file not accessible: %v\n", err)
+		return 1
+	}
+
+	// Create and lock PID file FIRST (before state file) to prevent race conditions
+	// Note: Defers execute LIFO, so we register cleanup FIRST, then PID release.
+	// This ensures: PID release runs first, then cleanup runs (correct order).
+	pidFile := daemon.NewPIDFile(daemon.PIDPath(cwd))
+	if err := pidFile.Create(); err != nil {
+		if err == daemon.ErrPIDFileLocked {
+			fmt.Fprintf(os.Stderr, "Error: prox is already running (PID file locked)\n")
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Write state file after PID file is locked
+	state := &daemon.State{
+		PID:        os.Getpid(),
+		Port:       cfg.API.Port,
+		Host:       host,
+		StartedAt:  time.Now(),
+		ConfigFile: absConfigPath,
+	}
+	if err := state.Write(cwd); err != nil {
+		// Clean up PID file on state file failure
+		_ = pidFile.Release()
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Register cleanup defer FIRST (will run LAST due to LIFO)
+	defer func() {
+		_ = daemon.CleanupStateDir(cwd)
+	}()
+
+	// Register PID release defer SECOND (will run FIRST due to LIFO)
+	defer func() {
+		_ = pidFile.Release()
+	}()
 
 	// Create log manager
 	logMgr := logs.NewManager(logs.ManagerConfig{
@@ -154,11 +307,11 @@ func (a *App) cmdUp(args []string) int {
 	if authEnabled {
 		token, err = generateToken()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating auth token: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 		if err := saveToken(token); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving auth token: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 	} else if !isLocalhost(cfg.API.Host) && cfg.API.Auth != nil && !*cfg.API.Auth {
@@ -207,23 +360,23 @@ func (a *App) cmdUp(args []string) int {
 		fmt.Printf("Starting processes: %s\n", strings.Join(processes, ", "))
 		result, err := sup.StartProcesses(ctx, processes)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting supervisor: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 		if result.HasFailures() {
 			for name, procErr := range result.Failed {
-				fmt.Fprintf(os.Stderr, "Failed to start process %s: %v\n", name, procErr)
+				fmt.Fprintf(os.Stderr, "Error: failed to start process %s: %v\n", name, procErr)
 			}
 		}
 	} else {
 		result, err := sup.Start(ctx)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting supervisor: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return 1
 		}
 		if result.HasFailures() {
 			for name, procErr := range result.Failed {
-				fmt.Fprintf(os.Stderr, "Failed to start process %s: %v\n", name, procErr)
+				fmt.Fprintf(os.Stderr, "Error: failed to start process %s: %v\n", name, procErr)
 			}
 		}
 	}
@@ -232,7 +385,7 @@ func (a *App) cmdUp(args []string) int {
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			// Server closed is expected on shutdown
-			if !strings.Contains(err.Error(), "Server closed") {
+			if !errors.Is(err, http.ErrServerClosed) {
 				fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
 			}
 		}
@@ -242,7 +395,7 @@ func (a *App) cmdUp(args []string) int {
 	if useTUI {
 		// Run TUI - it blocks until quit
 		if err := tui.Run(sup, logMgr); err != nil {
-			fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
 		// Subscribe to logs and print to terminal
@@ -259,25 +412,28 @@ func (a *App) cmdUp(args []string) int {
 		}
 	}
 
+	// Stop signal handler to prevent additional signals during shutdown
+	signal.Stop(sigCh)
+
 	// Graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
 	// Stop API server
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error stopping API server: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 
 	// Stop supervisor
 	if err := sup.Stop(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error stopping supervisor: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 
 	// Log shutdown complete before closing the log manager
 	sup.SystemLog("shutdown complete")
 
 	// Give a moment for the log to be printed
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(logFlushDelay)
 
 	// Close log manager
 	logMgr.Close()

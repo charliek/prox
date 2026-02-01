@@ -5,13 +5,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/domain"
 )
+
+// sseReadTimeout is the timeout for SSE reads. If no data is received within
+// this duration, the connection is considered dead. SSE servers send heartbeats,
+// so this should be longer than the heartbeat interval.
+const sseReadTimeout = 60 * time.Second
+
+// deadlineReader wraps an io.Reader and sets a read deadline on each read.
+// This prevents indefinite hangs when the server dies without closing the connection.
+type deadlineReader struct {
+	r       io.Reader
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (d *deadlineReader) Read(p []byte) (n int, err error) {
+	if d.conn != nil {
+		if err := d.conn.SetReadDeadline(time.Now().Add(d.timeout)); err != nil {
+			return 0, err
+		}
+	}
+	return d.r.Read(p)
+}
 
 // Client is an HTTP client for the prox API
 type Client struct {
@@ -85,16 +110,8 @@ func (c *Client) Shutdown() error {
 	return c.post("/api/v1/shutdown", &resp)
 }
 
-// LogParams contains parameters for log queries
-type LogParams struct {
-	Process string
-	Lines   int
-	Pattern string
-	Regex   bool
-}
-
-// GetLogs gets logs with optional filtering
-func (c *Client) GetLogs(params LogParams) (*api.LogsResponse, error) {
+// buildLogQueryParams builds URL query parameters from LogParams
+func buildLogQueryParams(params domain.LogParams) url.Values {
 	query := url.Values{}
 	if params.Process != "" {
 		query.Set("process", params.Process)
@@ -108,6 +125,12 @@ func (c *Client) GetLogs(params LogParams) (*api.LogsResponse, error) {
 	if params.Regex {
 		query.Set("regex", "true")
 	}
+	return query
+}
+
+// GetLogs gets logs with optional filtering
+func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
+	query := buildLogQueryParams(params)
 
 	path := "/api/v1/logs"
 	if len(query) > 0 {
@@ -122,17 +145,8 @@ func (c *Client) GetLogs(params LogParams) (*api.LogsResponse, error) {
 }
 
 // StreamLogs streams logs and calls the callback for each entry
-func (c *Client) StreamLogs(params LogParams, callback func(api.LogEntryResponse)) error {
-	query := url.Values{}
-	if params.Process != "" {
-		query.Set("process", params.Process)
-	}
-	if params.Pattern != "" {
-		query.Set("pattern", params.Pattern)
-	}
-	if params.Regex {
-		query.Set("regex", "true")
-	}
+func (c *Client) StreamLogs(params domain.LogParams, callback func(api.LogEntryResponse)) error {
+	query := buildLogQueryParams(params)
 
 	path := "/api/v1/logs/stream"
 	if len(query) > 0 {
@@ -161,7 +175,7 @@ func (c *Client) StreamLogs(params LogParams, callback func(api.LogEntryResponse
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return io.EOF
 			}
 			return err
 		}
@@ -173,11 +187,32 @@ func (c *Client) StreamLogs(params LogParams, callback func(api.LogEntryResponse
 
 		if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
-			var entry api.LogEntryResponse
-			if err := json.Unmarshal([]byte(data), &entry); err == nil {
+			if entry, ok := parseSSELogEntry(data); ok {
 				callback(entry)
 			}
 		}
+	}
+}
+
+// httpStatusError maps HTTP status codes to user-friendly error messages
+func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
+	if errResp != nil && errResp.Error != "" {
+		return fmt.Errorf("%s: %s", errResp.Code, errResp.Error)
+	}
+
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("authentication failed: invalid or missing token")
+	case http.StatusForbidden:
+		return fmt.Errorf("access denied: insufficient permissions")
+	case http.StatusNotFound:
+		return fmt.Errorf("not found: the requested resource does not exist")
+	case http.StatusInternalServerError:
+		return fmt.Errorf("server error: the prox daemon encountered an internal error")
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("service unavailable: the prox daemon is not ready")
+	default:
+		return fmt.Errorf("request failed with status %d", statusCode)
 	}
 }
 
@@ -197,12 +232,15 @@ func (c *Client) get(path string, v interface{}) error {
 	if resp.StatusCode >= 400 {
 		var errResp api.ErrorResponse
 		if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
-			return fmt.Errorf("%s: %s", errResp.Code, errResp.Error)
+			return httpStatusError(resp.StatusCode, &errResp)
 		}
-		return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		return httpStatusError(resp.StatusCode, nil)
 	}
 
-	return json.NewDecoder(resp.Body).Decode(v)
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) post(path string, v interface{}) error {
@@ -222,12 +260,15 @@ func (c *Client) post(path string, v interface{}) error {
 	if resp.StatusCode >= 400 {
 		var errResp api.ErrorResponse
 		if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
-			return fmt.Errorf("%s: %s", errResp.Code, errResp.Error)
+			return httpStatusError(resp.StatusCode, &errResp)
 		}
-		return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		return httpStatusError(resp.StatusCode, nil)
 	}
 
-	return json.NewDecoder(resp.Body).Decode(v)
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	return nil
 }
 
 // addAuthHeader adds the Authorization header if a token is available
@@ -235,4 +276,100 @@ func (c *Client) addAuthHeader(req *http.Request) {
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+}
+
+// parseSSELogEntry parses a single SSE data line into a log entry.
+// Returns the parsed entry and true if successful, or an empty entry and false if parsing failed.
+func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
+	var entry api.LogEntryResponse
+	if err := json.Unmarshal([]byte(data), &entry); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE log entry: %v\n", err)
+		return entry, false
+	}
+	return entry, true
+}
+
+// StreamLogsChannel returns a channel that streams log entries via SSE.
+// The channel is closed when the connection ends or the read times out.
+func (c *Client) StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error) {
+	query := buildLogQueryParams(params)
+
+	path := "/api/v1/logs/stream"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	c.addAuthHeader(req)
+
+	// Use a custom transport to get access to the underlying connection for read deadlines.
+	// This allows us to detect dead connections when the server stops sending heartbeats.
+	var conn net.Conn
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		Dial: func(network, addr string) (net.Conn, error) {
+			var err error
+			conn, err = net.DialTimeout(network, addr, 30*time.Second)
+			return conn, err
+		},
+	}
+
+	sseClient := &http.Client{
+		Transport: transport,
+		Timeout:   0, // No overall timeout - SSE streams are long-lived
+	}
+
+	resp, err := sseClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, httpStatusError(resp.StatusCode, nil)
+	}
+
+	ch := make(chan api.LogEntryResponse, 100)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		// Wrap the body in a deadline reader to detect dead connections
+		bodyReader := &deadlineReader{
+			r:       resp.Body,
+			conn:    conn,
+			timeout: sseReadTimeout,
+		}
+		reader := bufio.NewReader(bodyReader)
+
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				// Timeout or connection error - exit gracefully
+				return
+			}
+
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				if entry, ok := parseSSELogEntry(data); ok {
+					ch <- entry
+				}
+			}
+		}
+	}()
+
+	return ch, nil
 }

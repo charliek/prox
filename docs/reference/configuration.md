@@ -46,7 +46,7 @@ processes:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api.port` | int | `5555` | HTTP API port |
+| `api.port` | int | dynamic | HTTP API port (auto-assigned if not specified or port in use) |
 | `api.host` | string | `127.0.0.1` | API bind address |
 | `env_file` | string | — | Global .env file path, loaded for all processes |
 | `processes` | map | required | Process definitions |
@@ -98,8 +98,44 @@ Duration fields accept Go duration strings:
 - `10m` - 10 minutes
 - `1h30m` - 1 hour 30 minutes
 
+## Runtime State
+
+When prox is running (in either foreground or daemon mode), runtime state is stored in the `.prox/` directory within your project:
+
+| File | Description |
+|------|-------------|
+| `.prox/prox.state` | JSON file with port, PID, host, start time, config path |
+| `.prox/prox.pid` | Process ID with file locking to prevent multiple instances |
+| `.prox/prox.log` | Daemon logs (stdout/stderr redirected here in background mode) |
+
+When running in daemon mode (`prox up -d`), all output that would normally go to stdout/stderr is redirected to `.prox/prox.log`. This is useful for debugging startup issues or reviewing daemon activity.
+
+**State File Format:**
+
+```json
+{
+  "pid": 12345,
+  "port": 5555,
+  "host": "127.0.0.1",
+  "started_at": "2024-01-15T10:30:00Z",
+  "config_file": "prox.yaml"
+}
+```
+
+CLI commands automatically discover the API address by reading `.prox/prox.state`. This enables:
+
+- Running multiple prox instances (different projects) simultaneously
+- Dynamic port allocation without port conflicts
+- No need to specify `--addr` for local commands
+
+The `.prox/` directory is project-local, so add it to your `.gitignore`:
+
+```gitignore
+.prox/
+```
+
 ## Security Note
 
 Commands in `prox.yaml` are executed via shell. Only use configuration files from trusted sources, similar to Makefiles or Procfiles.
 
-When binding to non-localhost interfaces (`host: 0.0.0.0`), authentication is automatically enabled. A bearer token is generated and stored in `~/.config/prox/`.
+When binding to non-localhost interfaces (`host: 0.0.0.0`), authentication is automatically enabled. A bearer token is generated and stored in `~/.prox/token`.

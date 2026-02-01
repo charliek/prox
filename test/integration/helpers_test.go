@@ -191,6 +191,20 @@ func skipShort(t *testing.T) {
 	}
 }
 
+// waitForStateFile waits for the state file to be created
+func waitForStateFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("state file %s not created within %v", path, timeout)
+}
+
 // withTimeout runs the test with a timeout
 func withTimeout(t *testing.T, timeout time.Duration, f func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)

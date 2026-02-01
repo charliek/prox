@@ -11,13 +11,14 @@ prox <command> [options]
 | Flag | Description |
 |------|-------------|
 | `--config, -c` | Config file path (default: `prox.yaml`) |
-| `--addr` | API address for client commands (default: `127.0.0.1:5555`) |
+| `--addr` | API address for client commands (auto-discovered from `.prox/prox.state`) |
+| `--detach, -d` | Run in background (daemon mode) |
 
 ## Commands
 
 ### up
 
-Start processes in the foreground.
+Start processes. By default runs in the foreground; use `--detach` for background/daemon mode.
 
 ```bash
 prox up [processes...]
@@ -25,19 +26,23 @@ prox up [processes...]
 
 | Flag | Description |
 |------|-------------|
-| `--tui` | Enable interactive TUI mode |
-| `--port, -p` | Override API port |
+| `--detach, -d` | Run in background (daemon mode) |
+| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`) |
+| `--port, -p` | Override API port (otherwise dynamic) |
 
 **Examples:**
 
 ```bash
-# Start all processes
+# Start all processes (foreground)
 prox up
+
+# Start in background (daemon mode)
+prox up -d
 
 # Start specific processes
 prox up web api
 
-# Start with TUI
+# Start with TUI (foreground only)
 prox up --tui
 
 # Start specific processes with TUI
@@ -45,7 +50,14 @@ prox up --tui web api
 
 # Override API port
 prox up --port 6000
+
+# Daemon mode with specific port
+prox up -d --port 6000
 ```
+
+**Dynamic Port Allocation:**
+
+When no port is specified (via `--port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
 
 ### status
 
@@ -81,7 +93,7 @@ prox logs [process]
 |------|-------------|
 | `-f, --follow` | Stream logs continuously |
 | `-n, --lines` | Number of lines (default: 100) |
-| `--process` | Filter by process name(s), comma-separated |
+| `--process` | Filter by process name |
 | `--pattern` | Filter by pattern (substring match) |
 | `--regex` | Treat pattern as regex |
 | `--json` | Output as JSON |
@@ -98,8 +110,8 @@ prox logs --process api --lines 50
 # Stream all logs
 prox logs -f
 
-# Stream logs from web and api
-prox logs -f --process web,api
+# Stream logs from api
+prox logs -f --process api
 
 # Filter for errors
 prox logs --pattern ERROR
@@ -120,6 +132,39 @@ prox stop
 ```
 
 Sends a shutdown signal via the API. All processes receive SIGTERM, then SIGKILL after a timeout.
+
+### down
+
+Alias for `stop`. Provides symmetry with `prox up --detach`.
+
+```bash
+prox down
+```
+
+### attach
+
+Attach TUI to a running daemon. Opens an interactive terminal UI connected via the API.
+
+```bash
+prox attach
+```
+
+**Examples:**
+
+```bash
+# Start daemon
+prox up -d
+
+# Attach TUI to running daemon
+prox attach
+
+# TUI operations work the same as `prox up --tui`
+# Press q to detach (daemon continues running)
+```
+
+**Connection Errors:**
+
+If the daemon stops while the TUI is attached, the TUI will show a connection error. Press `q` to quit, then restart the daemon with `prox up -d`.
 
 ### restart
 

@@ -2,12 +2,15 @@ package tui
 
 import (
 	"context"
+	"time"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/domain"
 )
+
+// restartTimeout is the maximum time to wait for a restart operation
+const restartTimeout = 30 * time.Second
 
 // Update handles messages
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -19,44 +22,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-		headerHeight := 4 // Process panel
-		footerHeight := 2 // Status bar
-		verticalMargins := headerHeight + footerHeight
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-verticalMargins)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - verticalMargins
-		}
-
+		m.handleWindowSize(msg)
 		m.updateViewport()
 
 	case LogEntryMsg:
-		// Check if we're at/near bottom BEFORE adding new content
-		// If user scrolled to bottom, re-enable follow mode
-		wasNearBottom := m.isNearBottom()
-
-		m.logEntries = append(m.logEntries, domain.LogEntry(msg))
-		// Keep only last 1000 entries
-		if len(m.logEntries) > 1000 {
-			m.logEntries = m.logEntries[len(m.logEntries)-1000:]
-		}
-		m.updateViewport()
-
-		// If user was at bottom, re-enable follow mode and stay at bottom
-		if wasNearBottom {
-			m.followMode = true
-			m.viewport.GotoBottom()
-		} else if m.followMode {
-			// followMode was already on (via keyboard toggle)
-			m.viewport.GotoBottom()
-		}
+		m.handleLogEntry(domain.LogEntry(msg))
 
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()
@@ -67,6 +37,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case subIDMsg:
 		m.subID = string(msg)
+
+	case RestartResultMsg:
+		m.lastRestartProcess = msg.Process
+		m.lastRestartError = msg.Err
+		cmds = append(cmds, restartResultClearCmd())
+
+	case RestartResultClearMsg:
+		m.lastRestartProcess = ""
+		m.lastRestartError = nil
 	}
 
 	// Handle viewport updates
@@ -87,13 +66,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Handle mode-specific keys first
 	switch m.mode {
 	case ModeFilter:
-		return m.handleFilterKey(msg)
+		_, cmd := m.BaseModel.handleFilterKey(msg)
+		return m, cmd
 	case ModeSearch:
-		return m.handleSearchKey(msg)
+		_, cmd := m.BaseModel.handleSearchKey(msg)
+		return m, cmd
 	case ModeStringFilter:
-		return m.handleStringFilterKey(msg)
+		_, cmd := m.BaseModel.handleStringFilterKey(msg)
+		return m, cmd
 	case ModeHelp:
-		return m.handleHelpKey(msg)
+		m.BaseModel.handleHelpKey(msg)
+		return m, nil
 	}
 
 	// Normal mode keys
@@ -101,247 +84,28 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
-	case "?":
-		m.mode = ModeHelp
-		return m, nil
-
-	case "f":
-		m.mode = ModeFilter
-		m.textInput.Focus()
-		return m, nil
-
-	case "/":
-		m.mode = ModeSearch
-		m.textInput.SetValue("")
-		m.textInput.Focus()
-		return m, nil
-
-	case "s":
-		m.mode = ModeStringFilter
-		m.textInput.SetValue("")
-		m.textInput.Focus()
-		return m, nil
-
-	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-		// Solo process
-		idx := int(msg.String()[0] - '1')
-		if idx < len(m.processes) {
-			name := m.processes[idx].Name
-			if m.soloProcess == name {
-				// Toggle off
-				m.soloProcess = ""
-			} else {
-				m.soloProcess = name
-			}
-			m.updateViewport()
-		}
-		return m, nil
-
 	case "r":
 		// Restart the solo'd process (selected via 1-9 keys)
 		if m.soloProcess != "" {
-			go func() {
-				ctx := context.Background()
-				_ = m.supervisor.RestartProcess(ctx, m.soloProcess)
-			}()
+			processName := m.soloProcess
+			return m, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
+				defer cancel()
+				err := m.supervisor.RestartProcess(ctx, processName)
+				return RestartResultMsg{Process: processName, Err: err}
+			}
 		}
 		return m, nil
+	}
 
-	case "esc":
-		// Clear filters
-		m.soloProcess = ""
-		m.searchPattern = ""
-		m.searchMatches = nil
-		m.updateViewport()
-		return m, nil
-
-	case "up", "k":
-		m.viewport.LineUp(1)
-		m.followMode = false
-		return m, nil
-
-	case "down", "j":
-		m.viewport.LineDown(1)
-		return m, nil
-
-	case "pgup":
-		m.viewport.HalfViewUp()
-		m.followMode = false
-		return m, nil
-
-	case "pgdown":
-		m.viewport.HalfViewDown()
-		return m, nil
-
-	case "home", "g":
-		m.viewport.GotoTop()
-		m.followMode = false
-		return m, nil
-
-	case "end", "G":
-		m.viewport.GotoBottom()
-		m.followMode = true
-		return m, nil
-
-	case "F":
-		m.followMode = !m.followMode
-		if m.followMode {
-			m.viewport.GotoBottom()
-		}
+	// Handle common navigation keys
+	if m.BaseModel.handleNavigationKey(msg) {
 		return m, nil
 	}
 
 	return m, nil
-}
-
-// handleFilterKey handles keys in filter mode
-func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		return m, nil
-
-	case "enter":
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		m.updateViewport()
-		return m, nil
-
-	case " ":
-		// Space is passed to text input for normal typing
-		// Multi-select is done via 'a' (all) and 'n' (none) keys
-
-	case "a":
-		// Select all
-		for name := range m.filterProcesses {
-			m.filterProcesses[name] = true
-		}
-		return m, nil
-
-	case "n":
-		// Select none
-		for name := range m.filterProcesses {
-			m.filterProcesses[name] = false
-		}
-		return m, nil
-	}
-
-	var cmd tea.Cmd
-	m.textInput, cmd = m.textInput.Update(msg)
-	return m, cmd
-}
-
-// handleSearchKey handles keys in search mode
-func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		return m, nil
-
-	case "enter":
-		m.searchPattern = m.textInput.Value()
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		m.updateSearchMatches()
-		m.updateViewport()
-		return m, nil
-	}
-
-	var cmd tea.Cmd
-	m.textInput, cmd = m.textInput.Update(msg)
-	return m, cmd
-}
-
-// handleStringFilterKey handles keys in string filter mode
-func (m Model) handleStringFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		m.searchPattern = ""
-		m.updateViewport()
-		return m, nil
-
-	case "enter":
-		m.searchPattern = m.textInput.Value()
-		m.mode = ModeNormal
-		m.textInput.Blur()
-		m.updateViewport()
-		return m, nil
-	}
-
-	var cmd tea.Cmd
-	m.textInput, cmd = m.textInput.Update(msg)
-	// Live update filter
-	m.searchPattern = m.textInput.Value()
-	m.updateViewport()
-	return m, cmd
-}
-
-// handleHelpKey handles keys in help mode
-func (m Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "?", "q", "enter":
-		m.mode = ModeNormal
-		return m, nil
-	}
-	return m, nil
-}
-
-// updateSearchMatches updates the search match indices
-func (m *Model) updateSearchMatches() {
-	m.searchMatches = nil
-	if m.searchPattern == "" {
-		return
-	}
-
-	// Find matching lines
-	for i, entry := range m.logEntries {
-		if containsIgnoreCase(entry.Line, m.searchPattern) {
-			m.searchMatches = append(m.searchMatches, i)
-		}
-	}
-}
-
-func containsIgnoreCase(s, substr string) bool {
-	// Simple case-insensitive contains
-	sLower := toLower(s)
-	substrLower := toLower(substr)
-	return contains(sLower, substrLower)
-}
-
-func toLower(s string) string {
-	result := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		result[i] = c
-	}
-	return string(result)
-}
-
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // nearBottomThreshold is the scroll percentage (0.0-1.0) at which we consider
 // the viewport to be "near" the bottom for auto-follow purposes.
 const nearBottomThreshold = 0.98
-
-// isNearBottom checks if the viewport is at or near the bottom.
-// Uses a threshold to handle cases where scrolling doesn't land exactly at the bottom.
-func (m Model) isNearBottom() bool {
-	if m.viewport.AtBottom() {
-		return true
-	}
-	return m.viewport.ScrollPercent() >= nearBottomThreshold
-}

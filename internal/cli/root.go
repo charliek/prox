@@ -6,6 +6,7 @@ import (
 
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/daemon"
 )
 
 // Version is set during build
@@ -16,6 +17,7 @@ type App struct {
 	configPath           string
 	apiAddr              string
 	apiAddrExplicitlySet bool
+	detach               bool
 }
 
 // NewApp creates a new CLI application
@@ -35,6 +37,10 @@ func (a *App) Run(args []string) int {
 
 	// Parse global flags
 	remainingArgs := a.parseGlobalFlags(args[1:])
+	if remainingArgs == nil {
+		// Flag parsing error (already printed to stderr)
+		return 1
+	}
 
 	if len(remainingArgs) == 0 {
 		a.printUsage()
@@ -44,13 +50,11 @@ func (a *App) Run(args []string) int {
 	cmd := remainingArgs[0]
 	cmdArgs := remainingArgs[1:]
 
-	// For client commands, try to load API address from config if not explicitly set
+	// For client commands, try to discover API address
 	switch cmd {
-	case "status", "logs", "stop", "restart":
+	case "status", "logs", "stop", "restart", "down", "attach":
 		if !a.apiAddrExplicitlySet {
-			if addr := a.loadAPIAddrFromConfig(); addr != "" {
-				a.apiAddr = addr
-			}
+			a.apiAddr = a.discoverAPIAddress()
 		}
 	}
 
@@ -63,6 +67,10 @@ func (a *App) Run(args []string) int {
 		return a.cmdLogs(cmdArgs)
 	case "stop":
 		return a.cmdStop(cmdArgs)
+	case "down":
+		return a.cmdDown(cmdArgs)
+	case "attach":
+		return a.cmdAttach(cmdArgs)
 	case "restart":
 		return a.cmdRestart(cmdArgs)
 	case "version":
@@ -77,7 +85,8 @@ func (a *App) Run(args []string) int {
 	}
 }
 
-// parseGlobalFlags parses global flags and returns remaining args
+// parseGlobalFlags parses global flags and returns remaining args.
+// Returns nil if there's a flag parsing error (error already printed to stderr).
 func (a *App) parseGlobalFlags(args []string) []string {
 	var remaining []string
 	i := 0
@@ -86,18 +95,28 @@ func (a *App) parseGlobalFlags(args []string) []string {
 		arg := args[i]
 
 		if arg == "-c" || arg == "--config" {
-			if i+1 < len(args) {
-				a.configPath = args[i+1]
-				i += 2
-				continue
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return nil
 			}
+			a.configPath = val
+			i = newIdx + 1
+			continue
 		} else if arg == "--addr" {
-			if i+1 < len(args) {
-				a.apiAddr = args[i+1]
-				a.apiAddrExplicitlySet = true
-				i += 2
-				continue
+			val, newIdx, err := parseFlagValue(args, i, arg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return nil
 			}
+			a.apiAddr = val
+			a.apiAddrExplicitlySet = true
+			i = newIdx + 1
+			continue
+		} else if arg == "-d" || arg == "--detach" {
+			a.detach = true
+			i++
+			continue
 		} else if arg == "-h" || arg == "--help" {
 			remaining = append(remaining, "help")
 			i++
@@ -118,22 +137,26 @@ func (a *App) printUsage() {
 Usage: prox [options] <command> [arguments]
 
 Commands:
-  up [processes...]     Start processes (foreground)
+  up [processes...]     Start processes (foreground by default)
+  up -d [processes...]  Start processes in background (daemon mode)
   up --tui [processes...] Start processes with TUI
+  attach               Attach TUI to running daemon
   status               Show process status
   logs [process]       Show recent logs
   stop                 Stop running instance (via API)
+  down                 Alias for stop
   restart <process>    Restart a process (via API)
   version              Show version
   help                 Show this help
 
 Global Options:
   -c, --config FILE    Config file (default: prox.yaml)
-  --addr URL           API address for remote commands (default: http://127.0.0.1:5555)
+  --addr URL           API address for remote commands (auto-discovered from .prox/prox.state)
+  -d, --detach         Run in background (daemon mode)
 
 Up Options:
-  --tui                Enable interactive TUI mode
-  --port PORT          Override API port
+  --tui                Enable interactive TUI mode (mutually exclusive with --detach)
+  --port PORT          Override API port (otherwise dynamic)
 
 Logs Options:
   -f, --follow         Stream logs continuously
@@ -147,12 +170,15 @@ Status Options:
   --json               Output as JSON
 
 Examples:
-  prox up                     # Start all processes
+  prox up                     # Start all processes (foreground)
+  prox up -d                  # Start in background (daemon mode)
+  prox attach                 # Attach TUI to running daemon
+  prox up --tui               # Start with TUI (foreground)
   prox up web api             # Start specific processes
-  prox up --tui               # Start with TUI
   prox logs --process web -n 50  # Last 50 lines from web
   prox logs -f                # Stream all logs
   prox restart worker         # Restart worker process
+  prox down                   # Stop the daemon
 `)
 }
 
@@ -180,4 +206,28 @@ func (a *App) loadAPIAddrFromConfig() string {
 	}
 
 	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// discoverAPIAddress attempts to discover the API address.
+// Priority:
+// 1. State file (.prox/prox.state) - for running instances
+// 2. Config file (prox.yaml) - for configured port
+// 3. Default address
+func (a *App) discoverAPIAddress() string {
+	// First, try to load from state file
+	cwd, err := os.Getwd()
+	if err == nil {
+		state, err := daemon.LoadState(cwd)
+		if err == nil {
+			return fmt.Sprintf("http://%s:%d", state.Host, state.Port)
+		}
+	}
+
+	// Fall back to config file
+	if addr := a.loadAPIAddrFromConfig(); addr != "" {
+		return addr
+	}
+
+	// Fall back to default
+	return constants.DefaultAPIAddress
 }
