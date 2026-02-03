@@ -4,45 +4,49 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/tui"
+	"github.com/spf13/cobra"
 )
 
-// cmdStatus handles the 'status' command
-func (a *App) cmdStatus(args []string) int {
-	jsonOutput := false
-	for _, arg := range args {
-		if arg == "--json" {
-			jsonOutput = true
-		}
-	}
+// Status command flags
+var statusJSON bool
 
-	client := NewClient(a.apiAddr)
+// statusCmd represents the status command
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show process status",
+	Long: `Show the status of all running processes.
+
+Displays process names, status, PIDs, uptime, restart counts, and health checks.
+
+Examples:
+  prox status          # Show status in table format
+  prox status --json   # Output as JSON`,
+	RunE: runStatus,
+}
+
+func runStatus(cmd *cobra.Command, args []string) error {
+	client := NewClient(apiAddr)
 
 	// Get status
 	status, err := client.GetStatus()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Is prox running? Try 'prox up' first.\n")
-		return 1
+		return clientError(err, "Is prox running? Try 'prox up' first.")
 	}
 
 	// Get processes
 	processes, err := client.GetProcesses()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		return fmt.Errorf("failed to get processes: %w", err)
 	}
 
-	if jsonOutput {
+	if statusJSON {
 		output := map[string]interface{}{
 			"status":    status,
 			"processes": processes.Processes,
@@ -50,7 +54,7 @@ func (a *App) cmdStatus(args []string) int {
 		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to encode output: %v\n", err)
 		}
-		return 0
+		return nil
 	}
 
 	// Print status
@@ -70,161 +74,247 @@ func (a *App) cmdStatus(args []string) int {
 			p.Name, p.Status, p.PID, uptime, p.Restarts, p.Health)
 	}
 	w.Flush()
-
-	return 0
+	return nil
 }
 
-// cmdLogs handles the 'logs' command
-func (a *App) cmdLogs(args []string) int {
+// Logs command flags
+var (
+	logsFollow  bool
+	logsLines   int
+	logsProcess string
+	logsPattern string
+	logsRegex   bool
+	logsJSON    bool
+)
+
+// logsCmd represents the logs command
+var logsCmd = &cobra.Command{
+	Use:   "logs [process]",
+	Short: "Show recent logs",
+	Long: `Show recent logs from all or specific processes.
+
+Logs can be filtered by process name, pattern, or regex. Use -f to stream
+logs continuously.
+
+Examples:
+  prox logs                    # All logs
+  prox logs web                # Logs from web process
+  prox logs -f                 # Stream logs continuously
+  prox logs --process web -n 50 # Last 50 lines from web
+  prox logs --pattern error    # Filter by pattern
+  prox logs --pattern "err.*" --regex  # Filter by regex`,
+	Args:              cobra.MaximumNArgs(1),
+	RunE:              runLogs,
+	ValidArgsFunction: completeProcessNames,
+}
+
+func runLogs(cmd *cobra.Command, args []string) error {
 	params := domain.LogParams{
-		Lines: constants.DefaultLogLimit,
+		Lines:   logsLines,
+		Process: logsProcess,
+		Pattern: logsPattern,
+		Regex:   logsRegex,
 	}
-	follow := false
-	jsonOutput := false
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "-f" || arg == "--follow":
-			follow = true
-		case arg == "--json":
-			jsonOutput = true
-		case arg == "-n" || arg == "--lines":
-			val, newIdx, err := parseFlagValue(args, i, arg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return 1
-			}
-			n, err := strconv.Atoi(val)
-			if err != nil || n < 1 {
-				fmt.Fprintf(os.Stderr, "Error: invalid lines value %q (must be a positive integer)\n", val)
-				return 1
-			}
-			params.Lines = n
-			i = newIdx
-		case arg == "--process":
-			val, newIdx, err := parseFlagValue(args, i, arg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return 1
-			}
-			params.Process = val
-			i = newIdx
-		case arg == "--pattern":
-			val, newIdx, err := parseFlagValue(args, i, arg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return 1
-			}
-			params.Pattern = val
-			i = newIdx
-		case arg == "--regex":
-			params.Regex = true
-		case !strings.HasPrefix(arg, "-"):
-			// Treat as process name if not already set
-			if params.Process == "" {
-				params.Process = arg
-			}
+	// If a positional argument is provided, use it as the process filter
+	if len(args) > 0 && params.Process == "" {
+		params.Process = args[0]
+	}
+
+	client := NewClient(apiAddr)
+
+	printer := NewLogPrinter()
+
+	if logsFollow {
+		// Stream logs via channel
+		ch, err := client.StreamLogsChannel(params)
+		if err != nil {
+			return clientError(err, "Is prox running? Try 'prox up' first.")
 		}
-	}
-
-	client := NewClient(a.apiAddr)
-
-	if follow {
-		// Stream logs
-		err := client.StreamLogs(params, func(entry api.LogEntryResponse) {
-			if jsonOutput {
+		for entry := range ch {
+			if logsJSON {
 				if err := json.NewEncoder(os.Stdout).Encode(entry); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to encode log entry: %v\n", err)
 				}
 			} else {
-				printLogEntry(entry)
+				printer.PrintAPIEntry(entry)
 			}
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
 		}
 	} else {
 		// Get logs
 		logs, err := client.GetLogs(params)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
+			return clientError(err, "Is prox running? Try 'prox up' first.")
 		}
 
-		if jsonOutput {
+		if logsJSON {
 			if err := json.NewEncoder(os.Stdout).Encode(logs); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to encode logs: %v\n", err)
 			}
 		} else {
 			for _, entry := range logs.Logs {
-				printLogEntry(entry)
+				printer.PrintAPIEntry(entry)
 			}
 			if logs.FilteredCount < logs.TotalCount {
 				fmt.Printf("\n(showing %d of %d entries)\n", logs.FilteredCount, logs.TotalCount)
 			}
 		}
 	}
-
-	return 0
+	return nil
 }
 
-// cmdStop handles the 'stop' command
-func (a *App) cmdStop(args []string) int {
-	client := NewClient(a.apiAddr)
+// stopCmd represents the stop command
+var stopCmd = &cobra.Command{
+	Use:   "stop",
+	Short: "Stop running instance",
+	Long: `Stop the running prox instance.
+
+This sends a shutdown signal to the daemon, which will gracefully stop
+all processes before exiting.
+
+Examples:
+  prox stop`,
+	RunE: runStop,
+}
+
+func runStop(cmd *cobra.Command, args []string) error {
+	client := NewClient(apiAddr)
 
 	if err := client.Shutdown(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		return clientError(err, "Is prox running? Try 'prox up' first.")
 	}
 
 	fmt.Println("Shutdown initiated")
-	return 0
+	return nil
 }
 
-// cmdRestart handles the 'restart' command
-func (a *App) cmdRestart(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: prox restart <process>\n")
-		return 1
-	}
+// downCmd represents the down command (alias for stop)
+var downCmd = &cobra.Command{
+	Use:   "down",
+	Short: "Stop running instance (alias for stop)",
+	Long: `Stop the running prox instance.
 
+This is an alias for the 'stop' command.
+
+Examples:
+  prox down`,
+	RunE: runStop,
+}
+
+// restartCmd represents the restart command
+var restartCmd = &cobra.Command{
+	Use:   "restart <process>",
+	Short: "Restart a process",
+	Long: `Restart a specific process by name.
+
+The process will be stopped and then started again.
+
+Examples:
+  prox restart web
+  prox restart worker`,
+	Args:              cobra.ExactArgs(1),
+	RunE:              runRestart,
+	ValidArgsFunction: completeProcessNames,
+}
+
+func runRestart(cmd *cobra.Command, args []string) error {
 	processName := args[0]
-	client := NewClient(a.apiAddr)
+	client := NewClient(apiAddr)
 
 	if err := client.RestartProcess(processName); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to restart %s: %v\n", processName, err)
-		return 1
+		return clientError(err, "Is prox running? Try 'prox up' first.")
 	}
 
 	fmt.Printf("Restarted process: %s\n", processName)
-	return 0
+	return nil
 }
 
-// printLogEntry prints a log entry with colors
-func printLogEntry(entry api.LogEntryResponse) {
-	color := processColor(entry.Process)
-	ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+// attachCmd represents the attach command
+var attachCmd = &cobra.Command{
+	Use:   "attach",
+	Short: "Attach TUI to running daemon",
+	Long: `Attach the interactive TUI to a running prox daemon.
+
+This allows you to monitor and interact with processes started with
+'prox up -d' (daemon mode).
+
+Examples:
+  prox attach`,
+	RunE: runAttach,
+}
+
+func runAttach(cmd *cobra.Command, args []string) error {
+	// Get working directory
+	cwd, err := os.Getwd()
 	if err != nil {
-		ts = time.Now()
+		return fmt.Errorf("failed to get working directory: %w", err)
 	}
 
-	fmt.Printf("%s %s%-8s%s │ %s\n",
-		ts.Format("15:04:05"),
-		color, entry.Process, constants.ColorReset,
-		entry.Line)
+	// Check if daemon is running
+	state, err := daemon.GetRunningState(cwd)
+	if err != nil {
+		if err == daemon.ErrNotRunning {
+			return fmt.Errorf("prox is not running\nStart it with 'prox up -d' first")
+		}
+		return fmt.Errorf("failed to get daemon state: %w", err)
+	}
+
+	// Use discovered API address or explicitly set one
+	addr := apiAddr
+	if !apiAddrExplicitlySet {
+		addr = fmt.Sprintf("http://%s:%d", state.Host, state.Port)
+	}
+
+	// Create client
+	client := NewClient(addr)
+
+	// Verify connection
+	_, err = client.GetStatus()
+	if err != nil {
+		return clientError(err, "Is prox running? Try 'prox up -d' first.")
+	}
+
+	// Run TUI in client mode
+	if err := tui.RunClient(client); err != nil {
+		return fmt.Errorf("TUI error: %w", err)
+	}
+	return nil
 }
 
-// processColor returns a color for a process name
-func processColor(name string) string {
-	// Simple hash
-	hash := 0
-	for _, c := range name {
-		hash += int(c)
-	}
+func init() {
+	// Register all commands
+	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(logsCmd)
+	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(downCmd)
+	rootCmd.AddCommand(restartCmd)
+	rootCmd.AddCommand(attachCmd)
 
-	return constants.ProcessColors[hash%len(constants.ProcessColors)]
+	// Status command flags
+	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output as JSON")
+
+	// Logs command flags
+	logsCmd.Flags().BoolVarP(&logsFollow, "follow", "f", false, "Stream logs continuously")
+	logsCmd.Flags().IntVarP(&logsLines, "lines", "n", constants.DefaultLogLimit, "Number of lines to show")
+	logsCmd.Flags().StringVar(&logsProcess, "process", "", "Filter by process (comma-separated)")
+	logsCmd.Flags().StringVar(&logsPattern, "pattern", "", "Filter by pattern")
+	logsCmd.Flags().BoolVar(&logsRegex, "regex", false, "Treat pattern as regex")
+	logsCmd.Flags().BoolVar(&logsJSON, "json", false, "Output as JSON")
+
+	// Register completion for --process flag
+	// Error is ignored as it only fails for invalid flag names, which would be a programming error
+	_ = logsCmd.RegisterFlagCompletionFunc("process", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return getProcessNames(), cobra.ShellCompDirectiveNoFileComp
+	})
+}
+
+// clientError wraps an error with an optional hint for the user.
+// This provides consistent error messages for client commands.
+func clientError(err error, hint string) error {
+	if hint != "" {
+		return fmt.Errorf("%w\n%s", err, hint)
+	}
+	return err
 }
 
 // formatDuration formats a duration nicely
@@ -236,55 +326,4 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
-}
-
-// cmdDown handles the 'down' command (alias for stop)
-func (a *App) cmdDown(args []string) int {
-	return a.cmdStop(args)
-}
-
-// cmdAttach handles the 'attach' command - connects TUI to running daemon
-func (a *App) cmdAttach(args []string) int {
-	// Get working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Check if daemon is running
-	state, err := daemon.GetRunningState(cwd)
-	if err != nil {
-		if err == daemon.ErrNotRunning {
-			fmt.Fprintf(os.Stderr, "Error: prox is not running\n")
-			fmt.Fprintf(os.Stderr, "Start it with 'prox up -d' first\n")
-			return 1
-		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Use discovered API address or explicitly set one
-	apiAddr := a.apiAddr
-	if !a.apiAddrExplicitlySet {
-		apiAddr = fmt.Sprintf("http://%s:%d", state.Host, state.Port)
-	}
-
-	// Create client
-	client := NewClient(apiAddr)
-
-	// Verify connection
-	_, err = client.GetStatus()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Run TUI in client mode
-	if err := tui.RunClient(client); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	return 0
 }

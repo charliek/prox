@@ -174,7 +174,7 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	// Use a different API address for this test to avoid port conflicts
 	grandchildAPIAddr := "http://127.0.0.1:15556"
 
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("grandchild"), "--no-tui")
+	prox := startProxWithOutput(t, binary, "up", "-c", configPath("grandchild"))
 	defer killProx(prox.cmd)
 
 	// Wait for API to be ready

@@ -145,56 +145,6 @@ func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
 	return &resp, nil
 }
 
-// StreamLogs streams logs and calls the callback for each entry
-func (c *Client) StreamLogs(params domain.LogParams, callback func(api.LogEntryResponse)) error {
-	query := buildLogQueryParams(params)
-
-	path := "/api/v1/logs/stream"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
-
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	c.addAuthHeader(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return io.EOF
-			}
-			return err
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			if entry, ok := parseSSELogEntry(data); ok {
-				callback(entry)
-			}
-		}
-	}
-}
-
 // httpStatusError maps HTTP status codes to user-friendly error messages
 func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
 	if errResp != nil && errResp.Error != "" {
@@ -217,10 +167,13 @@ func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
 	}
 }
 
-func (c *Client) get(path string, v interface{}) error {
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+func (c *Client) doRequest(method, path string, v interface{}) error {
+	req, err := http.NewRequest(method, c.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
+	}
+	if method == "POST" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	c.addAuthHeader(req)
 
@@ -244,32 +197,12 @@ func (c *Client) get(path string, v interface{}) error {
 	return nil
 }
 
+func (c *Client) get(path string, v interface{}) error {
+	return c.doRequest("GET", path, v)
+}
+
 func (c *Client) post(path string, v interface{}) error {
-	req, err := http.NewRequest("POST", c.baseURL+path, nil)
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	c.addAuthHeader(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		var errResp api.ErrorResponse
-		if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
-			return httpStatusError(resp.StatusCode, &errResp)
-		}
-		return httpStatusError(resp.StatusCode, nil)
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-		return fmt.Errorf("decoding response: %w", err)
-	}
-	return nil
+	return c.doRequest("POST", path, v)
 }
 
 // addAuthHeader adds the Authorization header if a token is available

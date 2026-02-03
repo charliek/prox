@@ -9,49 +9,40 @@ import (
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/proxy/certs"
 	"github.com/charliek/prox/internal/proxy/hosts"
+	"github.com/spf13/cobra"
 )
 
-// cmdCerts handles the 'certs' command
-func (a *App) cmdCerts(args []string) int {
-	regenerate := false
-	for _, arg := range args {
-		switch arg {
-		case "-h", "--help", "help":
-			fmt.Print(`prox certs - Manage HTTPS certificates
+// Certs command flags
+var certsRegenerate bool
 
-Usage: prox certs [options]
+// certsCmd represents the certs command
+var certsCmd = &cobra.Command{
+	Use:   "certs",
+	Short: "Manage HTTPS certificates",
+	Long: `Manage HTTPS certificates for the reverse proxy.
 
-Options:
-  --regenerate    Force regenerate certificates
-  -h, --help      Show this help
+Shows certificate status and allows regeneration of certificates.
 
 Examples:
   prox certs              # Show certificate status
-  prox certs --regenerate # Regenerate certificates
-`)
-			return 0
-		case "--regenerate":
-			regenerate = true
-		}
-	}
+  prox certs --regenerate # Regenerate certificates`,
+	RunE: runCerts,
+}
 
+func runCerts(cmd *cobra.Command, args []string) error {
 	// Load config
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
 	// Check if proxy is configured
 	if cfg.Proxy == nil || !cfg.Proxy.Enabled {
-		fmt.Println("Proxy is not configured or not enabled.")
-		fmt.Println("Add a 'proxy' section to your prox.yaml to enable HTTPS proxy.")
-		return 0
+		return fmt.Errorf("proxy is not configured or not enabled\nAdd a 'proxy' section to your prox.yaml to enable HTTPS proxy")
 	}
 
 	if cfg.Certs == nil {
-		fmt.Fprintf(os.Stderr, "Error: certs configuration missing\n")
-		return 1
+		return fmt.Errorf("certs configuration missing")
 	}
 
 	// Create cert manager
@@ -59,12 +50,11 @@ Examples:
 
 	// Check mkcert installation
 	if err := certMgr.CheckMkcert(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		fmt.Println("\nTo install mkcert:")
 		fmt.Println("  macOS:   brew install mkcert")
 		fmt.Println("  Linux:   See https://github.com/FiloSottile/mkcert#installation")
 		fmt.Println("  Windows: choco install mkcert")
-		return 1
+		return fmt.Errorf("mkcert not available: %w", err)
 	}
 
 	// Check CA installation
@@ -81,7 +71,7 @@ Examples:
 	if !caInstalled {
 		fmt.Println("CA Status: Not installed")
 		fmt.Println("Run 'mkcert -install' to install the CA (requires sudo)")
-		return 0
+		return nil
 	}
 	fmt.Println("CA Status: Installed")
 
@@ -90,22 +80,20 @@ Examples:
 	fmt.Printf("Key: %s\n", paths.KeyFile)
 	fmt.Println()
 
-	if regenerate {
+	if certsRegenerate {
 		fmt.Println("Regenerating certificates...")
 		_, err := certMgr.RegenerateCerts()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
+			return fmt.Errorf("failed to regenerate certificates: %w", err)
 		}
 		fmt.Println("Certificates regenerated successfully.")
-		return 0
+		return nil
 	}
 
 	// Check if certs exist
 	certPaths, err := certMgr.EnsureCerts()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error ensuring certificates: %v\n", err)
-		return 1
+		return fmt.Errorf("failed to ensure certificates: %w", err)
 	}
 
 	// Verify files exist
@@ -114,56 +102,72 @@ Examples:
 	} else {
 		fmt.Println("Status: Certificates will be generated on first use")
 	}
-
-	return 0
+	return nil
 }
 
-// cmdHosts handles the 'hosts' command
-func (a *App) cmdHosts(args []string) int {
-	add := false
-	remove := false
-	show := false
+// Hosts command flags
+var (
+	hostsAdd    bool
+	hostsRemove bool
+	hostsShow   bool
+)
 
-	for _, arg := range args {
-		switch arg {
-		case "-h", "--help", "help":
-			fmt.Print(`prox hosts - Manage /etc/hosts entries
+// hostsCmd represents the hosts command
+var hostsCmd = &cobra.Command{
+	Use:   "hosts",
+	Short: "Manage /etc/hosts entries",
+	Long: `Manage /etc/hosts entries for the reverse proxy.
 
-Usage: prox hosts [options]
-
-Options:
-  --add       Add entries to /etc/hosts (requires sudo)
-  --remove    Remove entries from /etc/hosts (requires sudo)
-  --show      Show entries that would be added
-  -h, --help  Show this help
+Adds or removes hostname entries that point to localhost for the
+configured proxy services.
 
 Examples:
   prox hosts          # Show current status and entries
   prox hosts --add    # Add proxy hosts to /etc/hosts
   prox hosts --remove # Remove proxy hosts from /etc/hosts
-`)
-			return 0
-		case "--add":
-			add = true
-		case "--remove":
-			remove = true
-		case "--show":
-			show = true
-		}
+  prox hosts --show   # Show entries that would be added`,
+	RunE: runHosts,
+}
+
+func init() {
+	// Register commands
+	rootCmd.AddCommand(certsCmd)
+	rootCmd.AddCommand(hostsCmd)
+
+	// Certs command flags
+	certsCmd.Flags().BoolVar(&certsRegenerate, "regenerate", false, "Force regenerate certificates")
+
+	// Hosts command flags
+	hostsCmd.Flags().BoolVar(&hostsAdd, "add", false, "Add entries to /etc/hosts (requires sudo)")
+	hostsCmd.Flags().BoolVar(&hostsRemove, "remove", false, "Remove entries from /etc/hosts (requires sudo)")
+	hostsCmd.Flags().BoolVar(&hostsShow, "show", false, "Show entries that would be added")
+}
+
+func runHosts(cmd *cobra.Command, args []string) error {
+	// Load config
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Load config
-	cfg, err := config.Load(a.configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+	// Validate mutually exclusive flags
+	flagsSet := 0
+	if hostsAdd {
+		flagsSet++
+	}
+	if hostsRemove {
+		flagsSet++
+	}
+	if hostsShow {
+		flagsSet++
+	}
+	if flagsSet > 1 {
+		return fmt.Errorf("--add, --remove, and --show are mutually exclusive")
 	}
 
 	// Check if proxy is configured
 	if cfg.Proxy == nil || !cfg.Proxy.Enabled {
-		fmt.Println("Proxy is not configured or not enabled.")
-		fmt.Println("Add a 'proxy' section to your prox.yaml to enable HTTPS proxy.")
-		return 0
+		return fmt.Errorf("proxy is not configured or not enabled\nAdd a 'proxy' section to your prox.yaml to enable HTTPS proxy")
 	}
 
 	// Get service names
@@ -176,13 +180,13 @@ Examples:
 	if len(serviceNames) == 0 {
 		fmt.Println("No services configured.")
 		fmt.Println("Add a 'services' section to your prox.yaml to define service routing.")
-		return 0
+		return nil
 	}
 
 	// Create hosts manager
 	hostsMgr := hosts.NewManager(cfg.Proxy.Domain, serviceNames)
 
-	if show || (!add && !remove) {
+	if hostsShow || (!hostsAdd && !hostsRemove) {
 		// Show current status and entries
 		exists, upToDate, err := hostsMgr.Check()
 		if err != nil {
@@ -215,10 +219,10 @@ Examples:
 			fmt.Println("Run 'prox hosts --add' to add entries (requires sudo)")
 		}
 
-		return 0
+		return nil
 	}
 
-	if add {
+	if hostsAdd {
 		fmt.Println("Adding entries to /etc/hosts...")
 		fmt.Println()
 		fmt.Println("This will add the following block:")
@@ -226,32 +230,29 @@ Examples:
 
 		if err := hostsMgr.Add(); err != nil {
 			// Likely permission error - print sudo instructions
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			fmt.Println()
 			fmt.Println("You need elevated privileges to modify /etc/hosts.")
 			fmt.Println("Run the following command manually:")
 			fmt.Println()
 			fmt.Println("  " + hostsMgr.GenerateAddCommand())
-			return 1
+			return fmt.Errorf("failed to add hosts entries: %w", err)
 		}
 		fmt.Println("Entries added successfully.")
-		return 0
+		return nil
 	}
 
-	if remove {
+	if hostsRemove {
 		fmt.Println("Removing entries from /etc/hosts...")
 		if err := hostsMgr.Remove(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			fmt.Println()
 			fmt.Println("You need elevated privileges to modify /etc/hosts.")
 			fmt.Println("Run the following command manually:")
 			fmt.Println()
 			fmt.Println("  " + hostsMgr.GenerateRemoveCommand())
-			return 1
+			return fmt.Errorf("failed to remove hosts entries: %w", err)
 		}
 		fmt.Println("Entries removed successfully.")
-		return 0
+		return nil
 	}
-
-	return 0
+	return nil
 }

@@ -7,11 +7,15 @@ import (
 )
 
 func TestLoadAPIAddrFromConfig(t *testing.T) {
+	// Save original configPath and restore after test
+	originalConfigPath := configPath
+	defer func() { configPath = originalConfigPath }()
+
 	t.Run("returns address from config with custom port", func(t *testing.T) {
 		// Create temp config file
 		tmpDir := t.TempDir()
-		configPath := filepath.Join(tmpDir, "prox.yaml")
-		err := os.WriteFile(configPath, []byte(`
+		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
+		err := os.WriteFile(testConfigPath, []byte(`
 api:
   port: 5552
   host: 127.0.0.1
@@ -22,8 +26,8 @@ processes:
 			t.Fatal(err)
 		}
 
-		app := &App{configPath: configPath}
-		addr := app.loadAPIAddrFromConfig()
+		configPath = testConfigPath
+		addr := loadAPIAddrFromConfig()
 
 		if addr != "http://127.0.0.1:5552" {
 			t.Errorf("expected http://127.0.0.1:5552, got %s", addr)
@@ -32,8 +36,8 @@ processes:
 
 	t.Run("returns address with default port when not specified", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		configPath := filepath.Join(tmpDir, "prox.yaml")
-		err := os.WriteFile(configPath, []byte(`
+		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
+		err := os.WriteFile(testConfigPath, []byte(`
 processes:
   test: echo hello
 `), 0644)
@@ -41,8 +45,8 @@ processes:
 			t.Fatal(err)
 		}
 
-		app := &App{configPath: configPath}
-		addr := app.loadAPIAddrFromConfig()
+		configPath = testConfigPath
+		addr := loadAPIAddrFromConfig()
 
 		if addr != "http://127.0.0.1:5555" {
 			t.Errorf("expected http://127.0.0.1:5555, got %s", addr)
@@ -50,8 +54,8 @@ processes:
 	})
 
 	t.Run("returns empty string when config not found", func(t *testing.T) {
-		app := &App{configPath: "/nonexistent/prox.yaml"}
-		addr := app.loadAPIAddrFromConfig()
+		configPath = "/nonexistent/prox.yaml"
+		addr := loadAPIAddrFromConfig()
 
 		if addr != "" {
 			t.Errorf("expected empty string, got %s", addr)
@@ -60,8 +64,8 @@ processes:
 
 	t.Run("uses custom host from config", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		configPath := filepath.Join(tmpDir, "prox.yaml")
-		err := os.WriteFile(configPath, []byte(`
+		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
+		err := os.WriteFile(testConfigPath, []byte(`
 api:
   port: 8080
   host: 0.0.0.0
@@ -72,8 +76,8 @@ processes:
 			t.Fatal(err)
 		}
 
-		app := &App{configPath: configPath}
-		addr := app.loadAPIAddrFromConfig()
+		configPath = testConfigPath
+		addr := loadAPIAddrFromConfig()
 
 		if addr != "http://0.0.0.0:8080" {
 			t.Errorf("expected http://0.0.0.0:8080, got %s", addr)
@@ -81,25 +85,51 @@ processes:
 	})
 }
 
-func TestParseGlobalFlags_AddrExplicitlySet(t *testing.T) {
-	t.Run("sets apiAddrExplicitlySet when --addr provided", func(t *testing.T) {
-		app := NewApp()
-		app.parseGlobalFlags([]string{"--addr", "http://localhost:9999", "status"})
+func TestGetProcessNames(t *testing.T) {
+	// Save original configPath and restore after test
+	originalConfigPath := configPath
+	defer func() { configPath = originalConfigPath }()
 
-		if !app.apiAddrExplicitlySet {
-			t.Error("expected apiAddrExplicitlySet to be true")
+	t.Run("returns process names from config", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
+		err := os.WriteFile(testConfigPath, []byte(`
+processes:
+  web: npm run dev
+  api: go run ./cmd/api
+  worker: python worker.py
+`), 0644)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if app.apiAddr != "http://localhost:9999" {
-			t.Errorf("expected apiAddr to be http://localhost:9999, got %s", app.apiAddr)
+
+		configPath = testConfigPath
+		names := getProcessNames()
+
+		if len(names) != 3 {
+			t.Errorf("expected 3 process names, got %d", len(names))
+		}
+
+		// Check that all expected names are present
+		nameSet := make(map[string]bool)
+		for _, name := range names {
+			nameSet[name] = true
+		}
+
+		expected := []string{"web", "api", "worker"}
+		for _, exp := range expected {
+			if !nameSet[exp] {
+				t.Errorf("expected process name %q not found", exp)
+			}
 		}
 	})
 
-	t.Run("apiAddrExplicitlySet false when --addr not provided", func(t *testing.T) {
-		app := NewApp()
-		app.parseGlobalFlags([]string{"status"})
+	t.Run("returns nil when config not found", func(t *testing.T) {
+		configPath = "/nonexistent/prox.yaml"
+		names := getProcessNames()
 
-		if app.apiAddrExplicitlySet {
-			t.Error("expected apiAddrExplicitlySet to be false")
+		if names != nil {
+			t.Errorf("expected nil, got %v", names)
 		}
 	})
 }
