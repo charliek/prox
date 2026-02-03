@@ -15,3 +15,20 @@ type LogParams struct {
 	Pattern string
 	Regex   bool
 }
+
+// ProxyRequestParams holds parameters for proxy request retrieval and streaming.
+// This type is shared between the TUI and CLI packages.
+//
+// Fields:
+//   - Subdomain: Filter to requests for a specific subdomain. Empty string means all.
+//   - Method: Filter to requests with a specific HTTP method. Empty string means all.
+//   - MinStatus: Filter to requests with status code >= this value. 0 means no minimum.
+//   - MaxStatus: Filter to requests with status code <= this value. 0 means no maximum.
+//   - Limit: Maximum number of requests to return. 0 means use server default.
+type ProxyRequestParams struct {
+	Subdomain string
+	Method    string
+	MinStatus int
+	MaxStatus int
+	Limit     int
+}

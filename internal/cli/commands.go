@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
@@ -165,21 +167,38 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 // stopCmd represents the stop command
 var stopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop running instance",
-	Long: `Stop the running prox instance.
+	Use:   "stop [process]",
+	Short: "Stop running instance or a single process",
+	Long: `Stop the running prox instance or a specific process.
 
-This sends a shutdown signal to the daemon, which will gracefully stop
-all processes before exiting.
+Without arguments, this sends a shutdown signal to the daemon, which will
+gracefully stop all processes before exiting.
+
+With a process name, this stops only the specified process while keeping
+prox and other processes running.
 
 Examples:
-  prox stop`,
-	RunE: runStop,
+  prox stop          # Stop the entire prox instance
+  prox stop api      # Stop only the api process`,
+	Args:              cobra.MaximumNArgs(1),
+	RunE:              runStop,
+	ValidArgsFunction: completeProcessNames,
 }
 
 func runStop(cmd *cobra.Command, args []string) error {
 	client := NewClient(apiAddr)
 
+	// If a process name is provided, stop just that process
+	if len(args) > 0 {
+		processName := args[0]
+		if err := client.StopProcess(processName); err != nil {
+			return clientError(err, "Is prox running? Try 'prox up' first.")
+		}
+		fmt.Printf("Stopped process: %s\n", processName)
+		return nil
+	}
+
+	// No args: stop the entire supervisor
 	if err := client.Shutdown(); err != nil {
 		return clientError(err, "Is prox running? Try 'prox up' first.")
 	}
@@ -188,17 +207,44 @@ func runStop(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// downCmd represents the down command (alias for stop)
+// downCmd represents the down command (alias for stop without arguments)
 var downCmd = &cobra.Command{
 	Use:   "down",
 	Short: "Stop running instance (alias for stop)",
 	Long: `Stop the running prox instance.
 
-This is an alias for the 'stop' command.
+This is an alias for the 'stop' command (without arguments).
 
 Examples:
   prox down`,
+	Args: cobra.NoArgs,
 	RunE: runStop,
+}
+
+// startProcessCmd represents the start command for individual processes
+var startProcessCmd = &cobra.Command{
+	Use:   "start <process>",
+	Short: "Start a stopped process",
+	Long: `Start a specific process that is currently stopped.
+
+Examples:
+  prox start web
+  prox start worker`,
+	Args:              cobra.ExactArgs(1),
+	RunE:              runStartProcess,
+	ValidArgsFunction: completeProcessNames,
+}
+
+func runStartProcess(cmd *cobra.Command, args []string) error {
+	processName := args[0]
+	client := NewClient(apiAddr)
+
+	if err := client.StartProcess(processName); err != nil {
+		return clientError(err, "Is prox running? Try 'prox up' first.")
+	}
+
+	fmt.Printf("Started process: %s\n", processName)
+	return nil
 }
 
 // restartCmd represents the restart command
@@ -281,14 +327,147 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// Requests command flags
+var (
+	requestsFollow    bool
+	requestsSubdomain string
+	requestsMethod    string
+	requestsMinStatus int
+	requestsLimit     int
+	requestsJSON      bool
+)
+
+// requestsCmd represents the requests command
+var requestsCmd = &cobra.Command{
+	Use:   "requests",
+	Short: "Show proxy requests",
+	Long: `Show recent proxy requests or stream them in real-time.
+
+Displays HTTP requests that have been proxied through the HTTPS reverse proxy.
+Use filters to narrow down the results.
+
+Examples:
+  prox requests                    # Show recent requests
+  prox requests -f                 # Stream requests in real-time
+  prox requests --subdomain api    # Filter by subdomain
+  prox requests --method GET       # Filter by HTTP method
+  prox requests --min-status 400   # Show errors only (4xx and 5xx)
+  prox requests --json             # Output as JSON`,
+	RunE: runRequests,
+}
+
+func runRequests(cmd *cobra.Command, args []string) error {
+	// Validate min-status is within valid HTTP status code range
+	if requestsMinStatus != 0 && (requestsMinStatus < 100 || requestsMinStatus > 599) {
+		return fmt.Errorf("invalid --min-status value %d: must be between 100 and 599", requestsMinStatus)
+	}
+
+	params := domain.ProxyRequestParams{
+		Subdomain: requestsSubdomain,
+		Method:    strings.ToUpper(requestsMethod),
+		MinStatus: requestsMinStatus,
+		Limit:     requestsLimit,
+	}
+
+	client := NewClient(apiAddr)
+
+	if requestsFollow {
+		// Stream requests via SSE
+		ch, err := client.StreamProxyRequestsChannel(params)
+		if err != nil {
+			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
+		}
+		for req := range ch {
+			if requestsJSON {
+				if err := json.NewEncoder(os.Stdout).Encode(req); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to encode request: %v\n", err)
+				}
+			} else {
+				printProxyRequest(req)
+			}
+		}
+	} else {
+		// Get recent requests
+		resp, err := client.GetProxyRequests(params)
+		if err != nil {
+			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
+		}
+
+		if requestsJSON {
+			if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to encode requests: %v\n", err)
+			}
+		} else {
+			if len(resp.Requests) == 0 {
+				fmt.Println("No proxy requests recorded")
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "ID\tTIME\tMETHOD\tSTATUS\tDURATION\tURL")
+			fmt.Fprintln(w, "-------\t--------\t------\t------\t--------\t---")
+
+			for _, req := range resp.Requests {
+				ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
+				timeStr := ts.Format("15:04:05")
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%dms\t%s\n",
+					req.ID, timeStr, req.Method, req.StatusCode, req.DurationMs, req.URL)
+			}
+			w.Flush()
+
+			if resp.FilteredCount < resp.TotalCount {
+				fmt.Printf("\n(showing %d of %d requests)\n", resp.FilteredCount, resp.TotalCount)
+			}
+		}
+	}
+	return nil
+}
+
+// isTerminal returns true if stdout is connected to a terminal.
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func printProxyRequest(req api.ProxyRequestResponse) {
+	ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
+	timeStr := ts.Format("15:04:05")
+
+	// Only use colors if stdout is a terminal
+	statusColor := ""
+	resetColor := ""
+	if isTerminal() {
+		resetColor = constants.ColorReset
+		switch {
+		case req.StatusCode >= 500:
+			statusColor = constants.ColorStatusServer
+		case req.StatusCode >= 400:
+			statusColor = constants.ColorStatusClient
+		case req.StatusCode >= 300:
+			statusColor = constants.ColorStatusRedirect
+		case req.StatusCode >= 200:
+			statusColor = constants.ColorStatusSuccess
+		}
+	}
+
+	fmt.Printf("%s %s %s%d%s %s (%dms)\n",
+		req.ID, timeStr, statusColor, req.StatusCode, resetColor, req.Method, req.DurationMs)
+	fmt.Printf("       %s\n", req.URL)
+}
+
 func init() {
 	// Register all commands
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(downCmd)
+	rootCmd.AddCommand(startProcessCmd)
 	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(attachCmd)
+	rootCmd.AddCommand(requestsCmd)
 
 	// Status command flags
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output as JSON")
@@ -300,6 +479,14 @@ func init() {
 	logsCmd.Flags().StringVar(&logsPattern, "pattern", "", "Filter by pattern")
 	logsCmd.Flags().BoolVar(&logsRegex, "regex", false, "Treat pattern as regex")
 	logsCmd.Flags().BoolVar(&logsJSON, "json", false, "Output as JSON")
+
+	// Requests command flags
+	requestsCmd.Flags().BoolVarP(&requestsFollow, "follow", "f", false, "Stream requests continuously")
+	requestsCmd.Flags().StringVar(&requestsSubdomain, "subdomain", "", "Filter by subdomain")
+	requestsCmd.Flags().StringVar(&requestsMethod, "method", "", "Filter by HTTP method (GET, POST, etc.)")
+	requestsCmd.Flags().IntVar(&requestsMinStatus, "min-status", 0, "Filter by minimum status code (e.g., 400 for errors)")
+	requestsCmd.Flags().IntVarP(&requestsLimit, "limit", "n", constants.DefaultProxyRequestLimit, "Number of requests to show")
+	requestsCmd.Flags().BoolVar(&requestsJSON, "json", false, "Output as JSON")
 
 	// Register completion for --process flag
 	// Error is ignored as it only fails for invalid flag names, which would be a programming error

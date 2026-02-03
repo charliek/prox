@@ -485,6 +485,182 @@ func TestBuildLogQueryParams(t *testing.T) {
 	}
 }
 
+func TestBuildProxyRequestQueryParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		params   domain.ProxyRequestParams
+		expected map[string]string
+	}{
+		{
+			name:     "empty params",
+			params:   domain.ProxyRequestParams{},
+			expected: map[string]string{},
+		},
+		{
+			name: "subdomain only",
+			params: domain.ProxyRequestParams{
+				Subdomain: "api",
+			},
+			expected: map[string]string{
+				"subdomain": "api",
+			},
+		},
+		{
+			name: "method only",
+			params: domain.ProxyRequestParams{
+				Method: "GET",
+			},
+			expected: map[string]string{
+				"method": "GET",
+			},
+		},
+		{
+			name: "all params",
+			params: domain.ProxyRequestParams{
+				Subdomain: "api",
+				Method:    "POST",
+				MinStatus: 400,
+				MaxStatus: 599,
+				Limit:     50,
+			},
+			expected: map[string]string{
+				"subdomain":  "api",
+				"method":     "POST",
+				"min_status": "400",
+				"max_status": "599",
+				"limit":      "50",
+			},
+		},
+		{
+			name: "zero values not included",
+			params: domain.ProxyRequestParams{
+				Subdomain: "api",
+				MinStatus: 0,
+				Limit:     0,
+			},
+			expected: map[string]string{
+				"subdomain": "api",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query := buildProxyRequestQueryParams(tt.params)
+
+			// Check expected values are present
+			for key, expectedVal := range tt.expected {
+				if query.Get(key) != expectedVal {
+					t.Errorf("expected %s=%q, got %q", key, expectedVal, query.Get(key))
+				}
+			}
+
+			// Check no unexpected values
+			if len(query) != len(tt.expected) {
+				t.Errorf("expected %d params, got %d: %v", len(tt.expected), len(query), query)
+			}
+		})
+	}
+}
+
+func TestClient_GetProxyRequests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/proxy/requests" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+
+		// Check query params
+		if r.URL.Query().Get("subdomain") != "api" {
+			t.Errorf("expected subdomain=api, got %q", r.URL.Query().Get("subdomain"))
+		}
+		if r.URL.Query().Get("method") != "GET" {
+			t.Errorf("expected method=GET, got %q", r.URL.Query().Get("method"))
+		}
+		if r.URL.Query().Get("min_status") != "400" {
+			t.Errorf("expected min_status=400, got %q", r.URL.Query().Get("min_status"))
+		}
+		if r.URL.Query().Get("limit") != "50" {
+			t.Errorf("expected limit=50, got %q", r.URL.Query().Get("limit"))
+		}
+
+		resp := api.ProxyRequestsResponse{
+			Requests: []api.ProxyRequestResponse{
+				{
+					ID:         "a1b2c3d",
+					Timestamp:  "2024-01-01T00:00:00Z",
+					Method:     "GET",
+					URL:        "/api/users",
+					Subdomain:  "api",
+					StatusCode: 404,
+					DurationMs: 45,
+					RemoteAddr: "127.0.0.1",
+				},
+			},
+			FilteredCount: 1,
+			TotalCount:    100,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	resp, err := client.GetProxyRequests(domain.ProxyRequestParams{
+		Subdomain: "api",
+		Method:    "GET",
+		MinStatus: 400,
+		Limit:     50,
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Requests) != 1 {
+		t.Errorf("expected 1 request, got %d", len(resp.Requests))
+	}
+	if resp.Requests[0].ID != "a1b2c3d" {
+		t.Errorf("expected ID 'a1b2c3d', got %q", resp.Requests[0].ID)
+	}
+	if resp.FilteredCount != 1 {
+		t.Errorf("expected FilteredCount 1, got %d", resp.FilteredCount)
+	}
+	if resp.TotalCount != 100 {
+		t.Errorf("expected TotalCount 100, got %d", resp.TotalCount)
+	}
+}
+
+func TestParseSSEProxyRequest_ValidJSON(t *testing.T) {
+	data := `{"id":"a1b2c3d","timestamp":"2024-01-01T12:00:00Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}`
+
+	req, ok := parseSSEProxyRequest(data)
+
+	if !ok {
+		t.Fatal("expected parsing to succeed")
+	}
+	if req.ID != "a1b2c3d" {
+		t.Errorf("expected ID 'a1b2c3d', got %q", req.ID)
+	}
+	if req.Method != "GET" {
+		t.Errorf("expected method 'GET', got %q", req.Method)
+	}
+	if req.Subdomain != "api" {
+		t.Errorf("expected subdomain 'api', got %q", req.Subdomain)
+	}
+	if req.StatusCode != 200 {
+		t.Errorf("expected status_code 200, got %d", req.StatusCode)
+	}
+}
+
+func TestParseSSEProxyRequest_InvalidJSON(t *testing.T) {
+	data := `not valid json`
+
+	_, ok := parseSSEProxyRequest(data)
+
+	if ok {
+		t.Error("expected parsing to fail for invalid JSON")
+	}
+}
+
 func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
 	var receivedQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

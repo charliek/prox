@@ -82,3 +82,25 @@ Track running prox instances and dynamically assign API ports.
 - Graceful shutdown updates state before exit
 
 **Inspiration**: codelens project's ServerStateRepository pattern
+
+## Request Details & Body Inspection
+
+View detailed request/response information including bodies.
+
+**CLI:**
+- `prox requests <id>` - Show request details by short hash
+- `prox requests <id> --body` - Include request/response body
+
+**API:**
+- `GET /proxy/requests/{id}` - Get single request details
+- `GET /proxy/requests/{id}?include=body` - Include body content
+
+**Storage enhancements:**
+- Store request/response bodies (configurable max size)
+- Persist requests to disk for post-mortem debugging
+- Configurable retention policy
+
+**Use cases:**
+- Debug API payloads without external tools
+- Replay requests for testing
+- Post-mortem analysis of failed requests
