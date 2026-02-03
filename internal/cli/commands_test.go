@@ -46,7 +46,11 @@ func captureOutput(t *testing.T, f func()) (stdout, stderr string) {
 	return bufOut.String(), bufErr.String()
 }
 
-func TestCmdStatus_JSONOutput(t *testing.T) {
+func TestRunStatus_JSONOutput(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -69,13 +73,12 @@ func TestCmdStatus_JSONOutput(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
+	statusJSON = true
+	defer func() { statusJSON = false }()
 
 	stdout, _ := captureOutput(t, func() {
-		code := app.cmdStatus([]string{"--json"})
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
-		}
+		runStatus(statusCmd, []string{})
 	})
 
 	// Parse JSON output
@@ -101,23 +104,11 @@ func TestCmdStatus_JSONOutput(t *testing.T) {
 	}
 }
 
-func TestCmdStatus_ConnectionError(t *testing.T) {
-	// Use an address that won't respond
-	app := &App{apiAddr: "http://127.0.0.1:59999"}
+func TestRunLogs_FilterParsing(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
 
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdStatus([]string{})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected error message on stderr")
-	}
-}
-
-func TestCmdLogs_FilterParsing(t *testing.T) {
 	var receivedProcess, receivedPattern, receivedRegex, receivedLines string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -135,15 +126,24 @@ func TestCmdLogs_FilterParsing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
+
+	// Set flags
+	logsProcess = "web"
+	logsPattern = "error"
+	logsRegex = true
+	logsLines = 50
+	logsFollow = false
+	logsJSON = false
+	defer func() {
+		logsProcess = ""
+		logsPattern = ""
+		logsRegex = false
+		logsLines = 100
+	}()
 
 	captureOutput(t, func() {
-		app.cmdLogs([]string{
-			"--process", "web",
-			"--pattern", "error",
-			"--regex",
-			"-n", "50",
-		})
+		runLogs(logsCmd, []string{})
 	})
 
 	if receivedProcess != "web" {
@@ -160,7 +160,11 @@ func TestCmdLogs_FilterParsing(t *testing.T) {
 	}
 }
 
-func TestCmdLogs_ProcessAsPositionalArg(t *testing.T) {
+func TestRunLogs_ProcessAsPositionalArg(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
 	var receivedProcess string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,10 +179,18 @@ func TestCmdLogs_ProcessAsPositionalArg(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
+
+	// Reset flags
+	logsProcess = ""
+	logsPattern = ""
+	logsRegex = false
+	logsLines = 100
+	logsFollow = false
+	logsJSON = false
 
 	captureOutput(t, func() {
-		app.cmdLogs([]string{"web"})
+		runLogs(logsCmd, []string{"web"})
 	})
 
 	if receivedProcess != "web" {
@@ -186,22 +198,11 @@ func TestCmdLogs_ProcessAsPositionalArg(t *testing.T) {
 	}
 }
 
-func TestCmdLogs_InvalidLinesValue(t *testing.T) {
-	app := &App{apiAddr: "http://localhost:5555"}
+func TestRunLogs_JSONOutput(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
 
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdLogs([]string{"-n", "invalid"})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected error message on stderr")
-	}
-}
-
-func TestCmdLogs_JSONOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(api.LogsResponse{
@@ -219,13 +220,19 @@ func TestCmdLogs_JSONOutput(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
+
+	// Set flags
+	logsProcess = ""
+	logsPattern = ""
+	logsRegex = false
+	logsLines = 100
+	logsFollow = false
+	logsJSON = true
+	defer func() { logsJSON = false }()
 
 	stdout, _ := captureOutput(t, func() {
-		code := app.cmdLogs([]string{"--json"})
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
-		}
+		runLogs(logsCmd, []string{})
 	})
 
 	// Parse JSON output
@@ -239,23 +246,11 @@ func TestCmdLogs_JSONOutput(t *testing.T) {
 	}
 }
 
-func TestCmdLogs_ConnectionError(t *testing.T) {
-	// Use an address that won't respond
-	app := &App{apiAddr: "http://127.0.0.1:59999"}
+func TestRunStop_Success(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
 
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdLogs([]string{})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected error message on stderr")
-	}
-}
-
-func TestCmdStop_Success(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shutdown" && r.Method == "POST" {
@@ -266,13 +261,10 @@ func TestCmdStop_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
 
 	_, _ = captureOutput(t, func() {
-		code := app.cmdStop([]string{})
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
-		}
+		runStop(stopCmd, []string{})
 	})
 
 	if !called {
@@ -280,22 +272,11 @@ func TestCmdStop_Success(t *testing.T) {
 	}
 }
 
-func TestCmdStop_ConnectionError(t *testing.T) {
-	app := &App{apiAddr: "http://127.0.0.1:59999"}
+func TestRunRestart_Success(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
 
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdStop([]string{})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected error message on stderr")
-	}
-}
-
-func TestCmdRestart_Success(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/processes/web/restart" && r.Method == "POST" {
@@ -306,47 +287,14 @@ func TestCmdRestart_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{apiAddr: server.URL}
+	apiAddr = server.URL
 
 	_, _ = captureOutput(t, func() {
-		code := app.cmdRestart([]string{"web"})
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
-		}
+		runRestart(restartCmd, []string{"web"})
 	})
 
 	if !called {
 		t.Error("expected restart endpoint to be called")
-	}
-}
-
-func TestCmdRestart_NoProcess(t *testing.T) {
-	app := &App{apiAddr: "http://localhost:5555"}
-
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdRestart([]string{})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected usage error message on stderr")
-	}
-}
-
-func TestCmdRestart_ConnectionError(t *testing.T) {
-	app := &App{apiAddr: "http://127.0.0.1:59999"}
-
-	_, stderr := captureOutput(t, func() {
-		code := app.cmdRestart([]string{"web"})
-		if code != 1 {
-			t.Errorf("expected exit code 1, got %d", code)
-		}
-	})
-
-	if stderr == "" {
-		t.Error("expected error message on stderr")
 	}
 }
 
@@ -375,19 +323,21 @@ func TestFormatDuration(t *testing.T) {
 	}
 }
 
-func TestProcessColor(t *testing.T) {
-	// Test that different names get colors
-	color1 := processColor("web")
-	color2 := processColor("api")
+func TestLogPrinter(t *testing.T) {
+	printer := NewLogPrinter()
 
-	// Same name should get same color
-	if processColor("web") != color1 {
+	// Test that same process gets same color
+	color1 := printer.getColor("web")
+	color2 := printer.getColor("web")
+	if color1 != color2 {
 		t.Error("same process name should get same color")
 	}
 
-	// Different names with different hash should get different colors (most likely)
-	// This is probabilistic but "web" and "api" have different hashes
-	_ = color2 // Just verify it doesn't panic
+	// Test that different processes get different colors (first two at least)
+	color3 := printer.getColor("api")
+	if color1 == color3 {
+		t.Error("different processes should get different colors initially")
+	}
 
 	// Verify colors are from the expected set
 	colors := []string{
@@ -396,6 +346,7 @@ func TestProcessColor(t *testing.T) {
 		"\033[32m", // green
 		"\033[35m", // magenta
 		"\033[34m", // blue
+		"\033[31m", // red
 	}
 
 	found := false

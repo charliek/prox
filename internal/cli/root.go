@@ -7,209 +7,91 @@ import (
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/spf13/cobra"
 )
 
 // Version is set during build
 var Version = "dev"
 
-// App represents the CLI application
-type App struct {
+// Global flags
+var (
 	configPath           string
 	apiAddr              string
 	apiAddrExplicitlySet bool
 	detach               bool
-}
+	verbose              bool
+)
 
-// NewApp creates a new CLI application
-func NewApp() *App {
-	return &App{
-		configPath: constants.DefaultConfigFile,
-		apiAddr:    constants.DefaultAPIAddress,
-	}
-}
-
-// Run executes the CLI application
-func (a *App) Run(args []string) int {
-	if len(args) < 2 {
-		a.printUsage()
-		return 1
-	}
-
-	// Parse global flags
-	remainingArgs := a.parseGlobalFlags(args[1:])
-	if remainingArgs == nil {
-		// Flag parsing error (already printed to stderr)
-		return 1
-	}
-
-	if len(remainingArgs) == 0 {
-		a.printUsage()
-		return 1
-	}
-
-	cmd := remainingArgs[0]
-	cmdArgs := remainingArgs[1:]
-
-	// For client commands, try to discover API address
-	switch cmd {
-	case "status", "logs", "stop", "restart", "down", "attach":
-		if !a.apiAddrExplicitlySet {
-			a.apiAddr = a.discoverAPIAddress()
+// rootCmd represents the base command
+var rootCmd = &cobra.Command{
+	Use:   "prox",
+	Short: "A modern process manager",
+	Long: `prox is a modern process manager that helps you manage multiple
+processes for local development. It supports:
+  - Process supervision with automatic restarts
+  - Real-time log aggregation and filtering
+  - HTTPS reverse proxy with subdomain routing
+  - Interactive TUI for monitoring
+  - Background daemon mode`,
+	Version:       Version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Check if --addr was explicitly provided
+		if cmd.Flags().Changed("addr") {
+			apiAddrExplicitlySet = true
 		}
-	}
 
-	switch cmd {
-	case "up":
-		return a.cmdUp(cmdArgs)
-	case "status":
-		return a.cmdStatus(cmdArgs)
-	case "logs":
-		return a.cmdLogs(cmdArgs)
-	case "stop":
-		return a.cmdStop(cmdArgs)
-	case "down":
-		return a.cmdDown(cmdArgs)
-	case "attach":
-		return a.cmdAttach(cmdArgs)
-	case "restart":
-		return a.cmdRestart(cmdArgs)
-	case "certs":
-		return a.cmdCerts(cmdArgs)
-	case "hosts":
-		return a.cmdHosts(cmdArgs)
-	case "version":
-		return a.cmdVersion(cmdArgs)
-	case "help", "-h", "--help":
-		a.printUsage()
-		return 0
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		a.printUsage()
-		return 1
-	}
-}
-
-// parseGlobalFlags parses global flags and returns remaining args.
-// Returns nil if there's a flag parsing error (error already printed to stderr).
-func (a *App) parseGlobalFlags(args []string) []string {
-	var remaining []string
-	i := 0
-
-	for i < len(args) {
-		arg := args[i]
-
-		if arg == "-c" || arg == "--config" {
-			val, newIdx, err := parseFlagValue(args, i, arg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return nil
-			}
-			a.configPath = val
-			i = newIdx + 1
-			continue
-		} else if arg == "--addr" {
-			val, newIdx, err := parseFlagValue(args, i, arg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return nil
-			}
-			a.apiAddr = val
-			a.apiAddrExplicitlySet = true
-			i = newIdx + 1
-			continue
-		} else if arg == "-d" || arg == "--detach" {
-			a.detach = true
-			i++
-			continue
-		} else if arg == "-h" || arg == "--help" {
-			remaining = append(remaining, "help")
-			i++
-			continue
-		} else {
-			remaining = append(remaining, arg)
+		// For client commands, try to discover API address if not explicitly set
+		clientCommands := map[string]bool{
+			"status":  true,
+			"logs":    true,
+			"stop":    true,
+			"restart": true,
+			"down":    true,
+			"attach":  true,
 		}
-		i++
+		if clientCommands[cmd.Name()] && !apiAddrExplicitlySet {
+			apiAddr = discoverAPIAddress()
+		}
+	},
+}
+
+// Execute runs the root command
+func Execute() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
-
-	return remaining
 }
 
-// printUsage prints usage information
-func (a *App) printUsage() {
-	fmt.Print(`prox - a modern process manager
-
-Usage: prox [options] <command> [arguments]
-
-Commands:
-  up [processes...]     Start processes (foreground by default)
-  up -d [processes...]  Start processes in background (daemon mode)
-  up --tui [processes...] Start processes with TUI
-  attach               Attach TUI to running daemon
-  status               Show process status
-  logs [process]       Show recent logs
-  stop                 Stop running instance (via API)
-  down                 Alias for stop
-  restart <process>    Restart a process (via API)
-  certs                Manage HTTPS certificates
-  hosts                Manage /etc/hosts entries
-  version              Show version
-  help                 Show this help
-
-Global Options:
-  -c, --config FILE    Config file (default: prox.yaml)
-  --addr URL           API address for remote commands (auto-discovered from .prox/prox.state)
-  -d, --detach         Run in background (daemon mode)
-
-Up Options:
-  --tui                Enable interactive TUI mode (mutually exclusive with --detach)
-  --port PORT          Override API port (otherwise dynamic)
-  --no-proxy           Disable HTTPS proxy even if configured
-
-Logs Options:
-  -f, --follow         Stream logs continuously
-  -n, --lines N        Number of lines (default: 100)
-  --process NAMES      Filter by process (comma-separated)
-  --pattern PATTERN    Filter by pattern
-  --regex              Treat pattern as regex
-  --json               Output as JSON
-
-Status Options:
-  --json               Output as JSON
-
-Certs Options:
-  --regenerate         Force regenerate certificates
-
-Hosts Options:
-  --add                Add entries to /etc/hosts (requires sudo)
-  --remove             Remove entries from /etc/hosts (requires sudo)
-  --show               Show entries that would be added
-
-Examples:
-  prox up                     # Start all processes (foreground)
-  prox up -d                  # Start in background (daemon mode)
-  prox up --no-proxy          # Start without HTTPS proxy
-  prox attach                 # Attach TUI to running daemon
-  prox up --tui               # Start with TUI (foreground)
-  prox up web api             # Start specific processes
-  prox logs --process web -n 50  # Last 50 lines from web
-  prox logs -f                # Stream all logs
-  prox restart worker         # Restart worker process
-  prox down                   # Stop the daemon
-  prox certs                  # Show certificate status
-  prox hosts --add            # Add proxy hosts to /etc/hosts
-`)
+// versionCmd represents the version command
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Show version",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("prox version %s\n", Version)
+	},
 }
 
-// cmdVersion shows version
-func (a *App) cmdVersion(args []string) int {
-	fmt.Printf("prox version %s\n", Version)
-	return 0
+func init() {
+	// Persistent flags available to all subcommands
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", constants.DefaultConfigFile, "Config file")
+	rootCmd.PersistentFlags().StringVar(&apiAddr, "addr", constants.DefaultAPIAddress, "API address for remote commands")
+	rootCmd.PersistentFlags().BoolVarP(&detach, "detach", "d", false, "Run in background (daemon mode)")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
+
+	// Set version template
+	rootCmd.SetVersionTemplate("prox version {{.Version}}\n")
+
+	// Add subcommands
+	rootCmd.AddCommand(versionCmd)
 }
 
 // loadAPIAddrFromConfig attempts to read the API address from the config file.
 // Returns empty string if config doesn't exist or can't be read.
-func (a *App) loadAPIAddrFromConfig() string {
-	cfg, err := config.Load(a.configPath)
+func loadAPIAddrFromConfig() string {
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return "" // Config doesn't exist or is invalid, use default
 	}
@@ -231,7 +113,7 @@ func (a *App) loadAPIAddrFromConfig() string {
 // 1. State file (.prox/prox.state) - for running instances
 // 2. Config file (prox.yaml) - for configured port
 // 3. Default address
-func (a *App) discoverAPIAddress() string {
+func discoverAPIAddress() string {
 	// First, try to load from state file
 	cwd, err := os.Getwd()
 	if err == nil {
@@ -242,10 +124,24 @@ func (a *App) discoverAPIAddress() string {
 	}
 
 	// Fall back to config file
-	if addr := a.loadAPIAddrFromConfig(); addr != "" {
+	if addr := loadAPIAddrFromConfig(); addr != "" {
 		return addr
 	}
 
 	// Fall back to default
 	return constants.DefaultAPIAddress
+}
+
+// getProcessNames returns process names from config for shell completion
+func getProcessNames() []string {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(cfg.Processes))
+	for name := range cfg.Processes {
+		names = append(names, name)
+	}
+	return names
 }
