@@ -129,6 +129,27 @@ func buildLogQueryParams(params domain.LogParams) url.Values {
 	return query
 }
 
+// buildProxyRequestQueryParams builds URL query parameters from ProxyRequestParams
+func buildProxyRequestQueryParams(params domain.ProxyRequestParams) url.Values {
+	query := url.Values{}
+	if params.Subdomain != "" {
+		query.Set("subdomain", params.Subdomain)
+	}
+	if params.Method != "" {
+		query.Set("method", params.Method)
+	}
+	if params.MinStatus > 0 {
+		query.Set("min_status", fmt.Sprintf("%d", params.MinStatus))
+	}
+	if params.MaxStatus > 0 {
+		query.Set("max_status", fmt.Sprintf("%d", params.MaxStatus))
+	}
+	if params.Limit > 0 {
+		query.Set("limit", fmt.Sprintf("%d", params.Limit))
+	}
+	return query
+}
+
 // GetLogs gets logs with optional filtering
 func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
 	query := buildLogQueryParams(params)
@@ -139,6 +160,22 @@ func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
 	}
 
 	var resp api.LogsResponse
+	if err := c.get(path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetProxyRequests gets recent proxy requests with optional filtering
+func (c *Client) GetProxyRequests(params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+	query := buildProxyRequestQueryParams(params)
+
+	path := "/api/v1/proxy/requests"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	var resp api.ProxyRequestsResponse
 	if err := c.get(path, &resp); err != nil {
 		return nil, err
 	}
@@ -304,8 +341,15 @@ func streamSSE[T any](req *http.Request, parse func(string) (T, bool)) (<-chan T
 
 // StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.
 // The channel is closed when the connection ends or the read times out.
-func (c *Client) StreamProxyRequestsChannel() (<-chan api.ProxyRequestResponse, error) {
-	req, err := http.NewRequest("GET", c.baseURL+"/api/v1/proxy/requests/stream", nil)
+func (c *Client) StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
+	query := buildProxyRequestQueryParams(params)
+
+	path := "/api/v1/proxy/requests/stream"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequest("GET", c.baseURL+path, nil)
 	if err != nil {
 		return nil, err
 	}

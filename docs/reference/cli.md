@@ -124,19 +124,46 @@ prox logs --pattern "GET|POST" --regex
 prox logs -f --json | jq .
 ```
 
-### stop
+### start
 
-Stop the running prox instance.
+Start a stopped process.
 
 ```bash
-prox stop
+prox start <process>
 ```
 
-Sends a shutdown signal via the API. All processes receive SIGTERM, then SIGKILL after a timeout.
+**Examples:**
+
+```bash
+prox start api
+prox start worker
+```
+
+### stop
+
+Stop the running prox instance or a specific process.
+
+```bash
+prox stop [process]
+```
+
+Without arguments, sends a shutdown signal to the daemon. All processes receive SIGTERM, then SIGKILL after a timeout.
+
+With a process name, stops only that process while keeping prox and other processes running.
+
+**Examples:**
+
+```bash
+# Stop entire prox instance
+prox stop
+
+# Stop only the api process
+prox stop api
+```
 
 ### down
 
-Alias for `stop`. Provides symmetry with `prox up --detach`.
+Alias for `stop` (without arguments). Provides symmetry with `prox up --detach`.
 
 ```bash
 prox down
@@ -181,6 +208,49 @@ prox restart <process>
 prox restart api
 prox restart worker
 ```
+
+### requests
+
+Show or stream proxy requests.
+
+```bash
+prox requests [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-f, --follow` | Stream requests continuously |
+| `-n, --limit` | Number of requests to show (default: 100) |
+| `--subdomain` | Filter by subdomain |
+| `--method` | Filter by HTTP method (GET, POST, etc.) |
+| `--min-status` | Filter by minimum status code (e.g., 400 for errors) |
+| `--json` | Output as JSON |
+
+**Examples:**
+
+```bash
+# Show recent requests
+prox requests
+
+# Stream requests in real-time
+prox requests -f
+
+# Filter by subdomain
+prox requests --subdomain api
+
+# Filter by HTTP method
+prox requests --method GET
+
+# Show only errors (4xx and 5xx)
+prox requests --min-status 400
+
+# JSON output for piping
+prox requests --json | jq .
+```
+
+**Request IDs:**
+
+Each request is assigned a short hash ID (7 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
 
 ### version
 

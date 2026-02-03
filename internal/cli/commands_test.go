@@ -323,6 +323,143 @@ func TestFormatDuration(t *testing.T) {
 	}
 }
 
+func TestRunRequests_MinStatusValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		minStatus   int
+		expectError bool
+	}{
+		{"valid min 100", 100, false},
+		{"valid min 200", 200, false},
+		{"valid min 400", 400, false},
+		{"valid min 599", 599, false},
+		{"invalid min 0 (treated as no filter)", 0, false},
+		{"invalid min 99", 99, true},
+		{"invalid min 600", 600, true},
+		{"invalid min 1000", 1000, true},
+		{"invalid min negative", -1, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Save and restore flags
+			origMinStatus := requestsMinStatus
+			origFollow := requestsFollow
+			origJSON := requestsJSON
+			defer func() {
+				requestsMinStatus = origMinStatus
+				requestsFollow = origFollow
+				requestsJSON = origJSON
+			}()
+
+			requestsMinStatus = tt.minStatus
+			requestsFollow = false
+			requestsJSON = false
+
+			// For valid cases, we need a server to respond
+			if !tt.expectError {
+				originalApiAddr := apiAddr
+				defer func() { apiAddr = originalApiAddr }()
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+						Requests:      []api.ProxyRequestResponse{},
+						FilteredCount: 0,
+						TotalCount:    0,
+					})
+				}))
+				defer server.Close()
+				apiAddr = server.URL
+			}
+
+			_, _ = captureOutput(t, func() {
+				err := runRequests(requestsCmd, []string{})
+				if tt.expectError {
+					if err == nil {
+						t.Error("expected error for invalid min-status")
+					}
+				} else {
+					if err != nil {
+						t.Errorf("unexpected error: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestDownCmd_NoArgs(t *testing.T) {
+	// Verify downCmd has NoArgs validation
+	if downCmd.Args == nil {
+		t.Error("expected downCmd to have Args validator")
+	}
+
+	// Test that args are rejected
+	err := downCmd.Args(downCmd, []string{"api"})
+	if err == nil {
+		t.Error("expected error when passing args to down command")
+	}
+
+	// Test that no args is accepted
+	err = downCmd.Args(downCmd, []string{})
+	if err != nil {
+		t.Errorf("unexpected error with no args: %v", err)
+	}
+}
+
+func TestRunStartProcess_Success(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/processes/web/start" && r.Method == "POST" {
+			called = true
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
+		}
+	}))
+	defer server.Close()
+
+	apiAddr = server.URL
+
+	_, _ = captureOutput(t, func() {
+		runStartProcess(startProcessCmd, []string{"web"})
+	})
+
+	if !called {
+		t.Error("expected start endpoint to be called")
+	}
+}
+
+func TestRunStop_StopSingleProcess(t *testing.T) {
+	// Save original apiAddr and restore after test
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/processes/api/stop" && r.Method == "POST" {
+			called = true
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
+		}
+	}))
+	defer server.Close()
+
+	apiAddr = server.URL
+
+	_, _ = captureOutput(t, func() {
+		runStop(stopCmd, []string{"api"})
+	})
+
+	if !called {
+		t.Error("expected stop process endpoint to be called")
+	}
+}
+
 func TestLogPrinter(t *testing.T) {
 	printer := NewLogPrinter()
 

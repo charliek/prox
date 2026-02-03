@@ -227,6 +227,7 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 {
   "requests": [
     {
+      "id": "a1b2c3d",
       "timestamp": "2025-01-19T10:32:01.123Z",
       "method": "GET",
       "url": "/api/users",
@@ -266,7 +267,7 @@ Stream proxy requests via Server-Sent Events (SSE).
 event: connected
 data: {}
 
-data: {"timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
+data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```
 
 **Example:**

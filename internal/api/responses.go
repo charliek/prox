@@ -173,6 +173,7 @@ func ToLogEntryResponse(entry domain.LogEntry) LogEntryResponse {
 
 // ProxyRequestResponse represents a single proxy request
 type ProxyRequestResponse struct {
+	ID         string `json:"id"`
 	Timestamp  string `json:"timestamp"`
 	Method     string `json:"method"`
 	URL        string `json:"url"`
@@ -192,6 +193,7 @@ type ProxyRequestsResponse struct {
 // ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse
 func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 	return ProxyRequestResponse{
+		ID:         req.ID,
 		Timestamp:  req.Timestamp.Format(time.RFC3339Nano),
 		Method:     req.Method,
 		URL:        req.URL,

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/charliek/prox/internal/api"
@@ -24,19 +25,27 @@ func NewLogPrinter() *LogPrinter {
 
 // PrintEntry prints a log entry with consistent color assignment
 func (lp *LogPrinter) PrintEntry(entry domain.LogEntry) {
-	color := lp.getColor(entry.Process)
 	ts := entry.Timestamp.Format("15:04:05")
-	fmt.Printf("%s %s%-8s%s | %s\n", ts, color, entry.Process, constants.ColorReset, entry.Line)
+	if lp.isTerminal() {
+		color := lp.getColor(entry.Process)
+		fmt.Printf("%s %s%-8s%s | %s\n", ts, color, entry.Process, constants.ColorReset, entry.Line)
+	} else {
+		fmt.Printf("%s %-8s | %s\n", ts, entry.Process, entry.Line)
+	}
 }
 
 // PrintAPIEntry prints an API log entry response
 func (lp *LogPrinter) PrintAPIEntry(entry api.LogEntryResponse) {
-	color := lp.getColor(entry.Process)
 	ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
 	if err != nil {
 		ts = time.Now()
 	}
-	fmt.Printf("%s %s%-8s%s | %s\n", ts.Format("15:04:05"), color, entry.Process, constants.ColorReset, entry.Line)
+	if lp.isTerminal() {
+		color := lp.getColor(entry.Process)
+		fmt.Printf("%s %s%-8s%s | %s\n", ts.Format("15:04:05"), color, entry.Process, constants.ColorReset, entry.Line)
+	} else {
+		fmt.Printf("%s %-8s | %s\n", ts.Format("15:04:05"), entry.Process, entry.Line)
+	}
 }
 
 func (lp *LogPrinter) getColor(process string) string {
@@ -47,4 +56,13 @@ func (lp *LogPrinter) getColor(process string) string {
 		lp.colorIndex++
 	}
 	return color
+}
+
+// isTerminal returns true if stdout is connected to a terminal.
+func (lp *LogPrinter) isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }

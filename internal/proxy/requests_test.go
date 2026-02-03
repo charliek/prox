@@ -152,3 +152,71 @@ func TestRequestManager_Unsubscribe(t *testing.T) {
 	_, ok := <-sub.Ch
 	assert.False(t, ok)
 }
+
+func TestGenerateRequestID(t *testing.T) {
+	timestamp := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
+
+	t.Run("generates 7 character ID", func(t *testing.T) {
+		id := generateRequestID(timestamp, "GET", "/api/users")
+		assert.Len(t, id, 7)
+	})
+
+	t.Run("same inputs produce same ID", func(t *testing.T) {
+		id1 := generateRequestID(timestamp, "GET", "/api/users")
+		id2 := generateRequestID(timestamp, "GET", "/api/users")
+		assert.Equal(t, id1, id2)
+	})
+
+	t.Run("different inputs produce different IDs", func(t *testing.T) {
+		id1 := generateRequestID(timestamp, "GET", "/api/users")
+		id2 := generateRequestID(timestamp, "POST", "/api/users")
+		id3 := generateRequestID(timestamp.Add(time.Second), "GET", "/api/users")
+		assert.NotEqual(t, id1, id2)
+		assert.NotEqual(t, id1, id3)
+	})
+
+	t.Run("ID is valid hex", func(t *testing.T) {
+		id := generateRequestID(timestamp, "GET", "/api/users")
+		for _, c := range id {
+			assert.True(t, (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+				"expected hex character, got %c", c)
+		}
+	})
+}
+
+func TestRequestManager_Record_GeneratesID(t *testing.T) {
+	m := NewRequestManager(10)
+
+	record := RequestRecord{
+		Timestamp:  time.Now(),
+		Method:     "GET",
+		URL:        "/api/users",
+		Subdomain:  "api",
+		StatusCode: 200,
+	}
+
+	m.Record(record)
+
+	records := m.Recent(RequestFilter{})
+	require.Len(t, records, 1)
+	assert.Len(t, records[0].ID, 7, "expected ID to be generated")
+}
+
+func TestRequestManager_Record_PreservesExistingID(t *testing.T) {
+	m := NewRequestManager(10)
+
+	record := RequestRecord{
+		ID:         "custom1",
+		Timestamp:  time.Now(),
+		Method:     "GET",
+		URL:        "/api/users",
+		Subdomain:  "api",
+		StatusCode: 200,
+	}
+
+	m.Record(record)
+
+	records := m.Recent(RequestFilter{})
+	require.Len(t, records, 1)
+	assert.Equal(t, "custom1", records[0].ID, "expected existing ID to be preserved")
+}

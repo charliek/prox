@@ -96,7 +96,7 @@ type TUIClient interface {
 	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
 	StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error)
-	StreamProxyRequestsChannel() (<-chan api.ProxyRequestResponse, error)
+	StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
 }
 
 // RunClient starts the TUI application in client mode (connected via API)
@@ -174,7 +174,7 @@ func forwardClientLogs(ctx context.Context, p *tea.Program, client TUIClient) {
 // forwardClientProxyRequests streams proxy requests from the API and sends them to the TUI program.
 // It exits when the context is cancelled or the channel is closed.
 func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamProxyRequestsChannel()
+	ch, err := client.StreamProxyRequestsChannel(domain.ProxyRequestParams{})
 	if err != nil {
 		// Proxy may not be enabled - this is not an error, just silently return
 		return
@@ -202,6 +202,7 @@ func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIC
 				}))
 			}
 			record := proxy.RequestRecord{
+				ID:         req.ID,
 				Timestamp:  ts,
 				Method:     req.Method,
 				URL:        req.URL,

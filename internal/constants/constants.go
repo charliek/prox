@@ -127,4 +127,10 @@ var (
 
 	// ColorBrightRed is used for stderr output
 	ColorBrightRed = "\033[91m"
+
+	// HTTP status code colors
+	ColorStatusSuccess  = "\033[32m" // green (2xx)
+	ColorStatusRedirect = "\033[36m" // cyan (3xx)
+	ColorStatusClient   = "\033[33m" // yellow (4xx)
+	ColorStatusServer   = "\033[31m" // red (5xx)
 )

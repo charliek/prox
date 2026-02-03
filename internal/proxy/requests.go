@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -8,6 +10,8 @@ import (
 
 // RequestRecord represents a single proxied request.
 type RequestRecord struct {
+	// ID is a 7-character hash generated from timestamp, method, and URL.
+	ID         string        `json:"id"`
 	Timestamp  time.Time     `json:"timestamp"`
 	Method     string        `json:"method"`
 	URL        string        `json:"url"`
@@ -15,6 +19,13 @@ type RequestRecord struct {
 	StatusCode int           `json:"status_code"`
 	Duration   time.Duration `json:"duration"`
 	RemoteAddr string        `json:"remote_addr"`
+}
+
+// generateRequestID creates a short hash ID (7 chars, git-style) from request data.
+func generateRequestID(timestamp time.Time, method, url string) string {
+	data := fmt.Sprintf("%d:%s:%s", timestamp.UnixNano(), method, url)
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])[:7]
 }
 
 // RequestFilter specifies criteria for filtering requests.
@@ -60,7 +71,12 @@ func NewRequestManager(capacity int) *RequestManager {
 }
 
 // Record adds a new request record to the buffer and notifies subscribers.
+// If the record doesn't have an ID, one is generated.
 func (m *RequestManager) Record(record RequestRecord) {
+	if record.ID == "" {
+		record.ID = generateRequestID(record.Timestamp, record.Method, record.URL)
+	}
+
 	m.mu.Lock()
 	m.buffer[m.head] = record
 	m.head = (m.head + 1) % m.capacity

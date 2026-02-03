@@ -19,3 +19,9 @@ coverage.out
 
 # MkDocs build output
 site-build/
+
+# Prox runtime data
+.prox/
+
+# Claude Code local settings (user-specific)
+.claude/settings.local.json
