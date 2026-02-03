@@ -1,4 +1,4 @@
-.PHONY: build test lint clean
+.PHONY: build test lint clean install
 
 build:
 	go build -o prox ./cmd/prox
@@ -15,3 +15,4 @@ clean:
 install: build
 	mkdir -p ~/.local/bin
 	cp prox ~/.local/bin/prox
+	sudo setcap 'cap_net_bind_service=+ep' ~/.local/bin/prox
