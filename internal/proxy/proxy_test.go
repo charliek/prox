@@ -74,9 +74,10 @@ func TestGetClientIP(t *testing.T) {
 
 func TestNewService(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	workDir := t.TempDir()
 
 	t.Run("nil config is allowed", func(t *testing.T) {
-		svc, err := NewService(nil, nil, nil, logger)
+		svc, err := NewService(nil, nil, nil, logger, workDir)
 		require.NoError(t, err)
 		assert.NotNil(t, svc)
 	})
@@ -85,7 +86,7 @@ func TestNewService(t *testing.T) {
 		cfg := &config.ProxyConfig{
 			Enabled: false,
 		}
-		svc, err := NewService(cfg, nil, nil, logger)
+		svc, err := NewService(cfg, nil, nil, logger, workDir)
 		require.NoError(t, err)
 		assert.NotNil(t, svc)
 	})
@@ -95,7 +96,7 @@ func TestNewService(t *testing.T) {
 			Enabled:   true,
 			HTTPSPort: 6789,
 		}
-		svc, err := NewService(cfg, nil, nil, logger)
+		svc, err := NewService(cfg, nil, nil, logger, workDir)
 		require.Error(t, err)
 		assert.Nil(t, svc)
 		assert.Contains(t, err.Error(), "domain")
@@ -110,7 +111,7 @@ func TestNewService(t *testing.T) {
 		services := map[string]config.ServiceConfig{
 			"app": {Port: 3000, Host: "localhost"},
 		}
-		svc, err := NewService(cfg, services, nil, logger)
+		svc, err := NewService(cfg, services, nil, logger, workDir)
 		require.NoError(t, err)
 		assert.NotNil(t, svc)
 	})

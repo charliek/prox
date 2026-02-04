@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ type Handlers struct {
 	supervisor     *supervisor.Supervisor
 	logManager     *logs.Manager
 	requestManager *proxy.RequestManager
+	captureManager *proxy.CaptureManager
 	configFile     string
 	shutdownFn     func()
 }
@@ -45,6 +47,11 @@ func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile st
 // manager comes from the proxy service.
 func (h *Handlers) SetRequestManager(rm *proxy.RequestManager) {
 	h.requestManager = rm
+}
+
+// SetCaptureManager sets the capture manager for loading captured body data.
+func (h *Handlers) SetCaptureManager(cm *proxy.CaptureManager) {
+	h.captureManager = cm
 }
 
 // GetStatus handles GET /api/v1/status
@@ -286,6 +293,110 @@ func (h *Handlers) GetProxyRequests(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// GetProxyRequest handles GET /api/v1/proxy/requests/{id}
+func (h *Handlers) GetProxyRequest(w http.ResponseWriter, r *http.Request) {
+	if h.requestManager == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "proxy not enabled",
+			Code:  domain.ErrCodeProxyNotEnabled,
+		})
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "missing request id",
+			Code:  domain.ErrCodeMissingRequestID,
+		})
+		return
+	}
+
+	record, found := h.requestManager.GetByID(id)
+	if !found {
+		writeJSON(w, http.StatusNotFound, ErrorResponse{
+			Error: "request not found",
+			Code:  domain.ErrCodeRequestNotFound,
+		})
+		return
+	}
+
+	// Check if body content should be included
+	includeBody := r.URL.Query().Get("include") == "body"
+
+	resp := ProxyRequestDetailResponse{
+		ProxyRequestResponse: ToProxyRequestResponse(record),
+	}
+
+	// Include details if available
+	if record.Details != nil {
+		resp.Details = h.convertRequestDetails(record.Details, includeBody)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// convertRequestDetails converts proxy.RequestDetails to RequestDetailsResponse
+func (h *Handlers) convertRequestDetails(details *proxy.RequestDetails, includeBody bool) *RequestDetailsResponse {
+	if details == nil {
+		return nil
+	}
+
+	resp := &RequestDetailsResponse{
+		RequestHeaders:  details.RequestHeaders,
+		ResponseHeaders: details.ResponseHeaders,
+	}
+
+	if details.RequestBody != nil {
+		resp.RequestBody = h.convertCapturedBody(details.RequestBody, includeBody)
+	}
+
+	if details.ResponseBody != nil {
+		resp.ResponseBody = h.convertCapturedBody(details.ResponseBody, includeBody)
+	}
+
+	return resp
+}
+
+// convertCapturedBody converts proxy.CapturedBody to CapturedBodyResponse
+func (h *Handlers) convertCapturedBody(body *proxy.CapturedBody, includeData bool) *CapturedBodyResponse {
+	if body == nil {
+		return nil
+	}
+
+	resp := &CapturedBodyResponse{
+		Size:        body.Size,
+		Truncated:   body.Truncated,
+		ContentType: body.ContentType,
+		IsBinary:    body.IsBinary,
+	}
+
+	if includeData {
+		// Load body data (may be from disk)
+		var data []byte
+		var err error
+
+		if h.captureManager != nil {
+			data, err = h.captureManager.LoadBody(body)
+		} else if body.Data != nil {
+			data = body.Data
+		}
+
+		if err != nil {
+			log.Printf("Error loading captured body: %v", err)
+		} else if data != nil {
+			if body.IsBinary {
+				// Encode binary data as base64
+				resp.Data = base64Encode(data)
+			} else {
+				resp.Data = string(data)
+			}
+		}
+	}
+
+	return resp
+}
+
 // StreamProxyRequests handles GET /api/v1/proxy/requests/stream (SSE)
 func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 	if h.requestManager == nil {
@@ -377,4 +488,9 @@ func parseProxyRequestParams(r *http.Request) proxy.RequestFilter {
 	filter.Limit = limit
 
 	return filter
+}
+
+// base64Encode encodes data to base64 string
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
 }

@@ -175,8 +175,11 @@ func (s *Server) registerRoutes() {
 		r.Get("/logs/stream", s.handlers.StreamLogs)
 
 		// Proxy requests
+		// Note: /proxy/requests/stream must come before /proxy/requests/{id}
+		// to prevent the parameterized route from matching "stream" as an ID
 		r.Get("/proxy/requests", s.handlers.GetProxyRequests)
 		r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
+		r.Get("/proxy/requests/{id}", s.handlers.GetProxyRequest)
 
 		// Shutdown
 		r.Post("/shutdown", s.handlers.Shutdown)

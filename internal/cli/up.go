@@ -36,9 +36,10 @@ const (
 
 // Up command flags
 var (
-	useTUI  bool
-	noProxy bool
-	port    int
+	useTUI        bool
+	noProxy       bool
+	port          int
+	enableCapture bool
 )
 
 // upCmd represents the up command
@@ -55,7 +56,8 @@ Examples:
   prox up -d                  # Start in background (daemon mode)
   prox up --tui               # Start with interactive TUI
   prox up web api             # Start specific processes
-  prox up --no-proxy          # Start without HTTPS proxy`,
+  prox up --no-proxy          # Start without HTTPS proxy
+  prox up --capture           # Enable request/response capture`,
 	Args:              cobra.ArbitraryArgs,
 	RunE:              runUp,
 	ValidArgsFunction: completeProcessNames,
@@ -67,6 +69,7 @@ func init() {
 	upCmd.Flags().BoolVar(&useTUI, "tui", false, "Enable interactive TUI mode")
 	upCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "Disable HTTPS proxy even if configured")
 	upCmd.Flags().IntVarP(&port, "port", "p", 0, "Override API port (otherwise dynamic)")
+	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Enable request/response body capture")
 }
 
 // completeProcessNames provides shell completion for process names
@@ -133,6 +136,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to find available port: %w", err)
 		}
 		cfg.API.Port = dynamicPort
+	}
+
+	// Enable capture if --capture flag is set
+	if enableCapture && cfg.Proxy != nil {
+		if cfg.Proxy.Capture == nil {
+			cfg.Proxy.Capture = &config.CaptureConfig{}
+		}
+		cfg.Proxy.Capture.Enabled = true
 	}
 
 	// For foreground mode, also check if already running and handle state
@@ -322,7 +333,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 		var err error
-		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger)
+		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating proxy service: %v\n", err)
 			// Continue without proxy - this is not fatal
@@ -332,8 +343,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 			// Continue without proxy - this is not fatal
 		} else {
 			fmt.Printf("Proxy server: https://*.%s:%d\n", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort)
-			// Wire up request manager to API handlers for request inspection
+			// Wire up request manager and capture manager to API handlers
 			handlers.SetRequestManager(proxyService.RequestManager())
+			handlers.SetCaptureManager(proxyService.CaptureManager())
 		}
 	}
 

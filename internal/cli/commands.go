@@ -335,16 +335,17 @@ var (
 	requestsMinStatus int
 	requestsLimit     int
 	requestsJSON      bool
+	requestsBody      bool
 )
 
 // requestsCmd represents the requests command
 var requestsCmd = &cobra.Command{
-	Use:   "requests",
+	Use:   "requests [id]",
 	Short: "Show proxy requests",
 	Long: `Show recent proxy requests or stream them in real-time.
 
 Displays HTTP requests that have been proxied through the HTTPS reverse proxy.
-Use filters to narrow down the results.
+Use filters to narrow down the results. Pass a request ID to show details.
 
 Examples:
   prox requests                    # Show recent requests
@@ -352,11 +353,21 @@ Examples:
   prox requests --subdomain api    # Filter by subdomain
   prox requests --method GET       # Filter by HTTP method
   prox requests --min-status 400   # Show errors only (4xx and 5xx)
-  prox requests --json             # Output as JSON`,
+  prox requests --json             # Output as JSON
+  prox requests abc1234            # Show details for request abc1234
+  prox requests abc1234 --body     # Include captured request/response bodies`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runRequests,
 }
 
 func runRequests(cmd *cobra.Command, args []string) error {
+	client := NewClient(apiAddr)
+
+	// If an ID is provided, show request details
+	if len(args) > 0 {
+		return showRequestDetail(client, args[0], requestsBody, requestsJSON)
+	}
+
 	// Validate min-status is within valid HTTP status code range
 	if requestsMinStatus != 0 && (requestsMinStatus < 100 || requestsMinStatus > 599) {
 		return fmt.Errorf("invalid --min-status value %d: must be between 100 and 599", requestsMinStatus)
@@ -368,8 +379,6 @@ func runRequests(cmd *cobra.Command, args []string) error {
 		MinStatus: requestsMinStatus,
 		Limit:     requestsLimit,
 	}
-
-	client := NewClient(apiAddr)
 
 	if requestsFollow {
 		// Stream requests via SSE
@@ -421,6 +430,93 @@ func runRequests(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+// showRequestDetail displays details for a specific request
+func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) error {
+	resp, err := client.GetProxyRequest(id, includeBody)
+	if err != nil {
+		return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
+	}
+
+	if jsonOutput {
+		if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to encode request: %v\n", err)
+		}
+		return nil
+	}
+
+	// Print formatted output
+	ts, _ := time.Parse(time.RFC3339Nano, resp.Timestamp)
+
+	fmt.Printf("Request: %s\n", resp.ID)
+	fmt.Printf("Time:    %s\n", ts.Format("2006-01-02 15:04:05.000"))
+	fmt.Printf("Method:  %s\n", resp.Method)
+	fmt.Printf("URL:     %s\n", resp.URL)
+	fmt.Printf("Status:  %d\n", resp.StatusCode)
+	fmt.Printf("Duration: %dms\n", resp.DurationMs)
+	fmt.Printf("Remote:  %s\n", resp.RemoteAddr)
+
+	if resp.Details != nil {
+		// Print request headers
+		if len(resp.Details.RequestHeaders) > 0 {
+			fmt.Println("\n--- Request Headers ---")
+			printHeaders(resp.Details.RequestHeaders)
+		}
+
+		// Print response headers
+		if len(resp.Details.ResponseHeaders) > 0 {
+			fmt.Println("\n--- Response Headers ---")
+			printHeaders(resp.Details.ResponseHeaders)
+		}
+
+		// Print request body
+		if resp.Details.RequestBody != nil {
+			fmt.Printf("\n--- Request Body (%d bytes", resp.Details.RequestBody.Size)
+			if resp.Details.RequestBody.Truncated {
+				fmt.Print(", truncated")
+			}
+			fmt.Println(") ---")
+			if includeBody && resp.Details.RequestBody.Data != "" {
+				if resp.Details.RequestBody.IsBinary {
+					fmt.Println("[binary data, base64 encoded]")
+				}
+				fmt.Println(resp.Details.RequestBody.Data)
+			} else if !includeBody && resp.Details.RequestBody.Size > 0 {
+				fmt.Println("(use --body to show content)")
+			}
+		}
+
+		// Print response body
+		if resp.Details.ResponseBody != nil {
+			fmt.Printf("\n--- Response Body (%d bytes", resp.Details.ResponseBody.Size)
+			if resp.Details.ResponseBody.Truncated {
+				fmt.Print(", truncated")
+			}
+			fmt.Println(") ---")
+			if includeBody && resp.Details.ResponseBody.Data != "" {
+				if resp.Details.ResponseBody.IsBinary {
+					fmt.Println("[binary data, base64 encoded]")
+				}
+				fmt.Println(resp.Details.ResponseBody.Data)
+			} else if !includeBody && resp.Details.ResponseBody.Size > 0 {
+				fmt.Println("(use --body to show content)")
+			}
+		}
+	} else {
+		fmt.Println("\n(capture not enabled - use 'prox up --capture' to enable)")
+	}
+
+	return nil
+}
+
+// printHeaders prints HTTP headers in a readable format
+func printHeaders(headers map[string][]string) {
+	for name, values := range headers {
+		for _, value := range values {
+			fmt.Printf("  %s: %s\n", name, value)
+		}
+	}
 }
 
 // isTerminal returns true if stdout is connected to a terminal.
@@ -487,6 +583,7 @@ func init() {
 	requestsCmd.Flags().IntVar(&requestsMinStatus, "min-status", 0, "Filter by minimum status code (e.g., 400 for errors)")
 	requestsCmd.Flags().IntVarP(&requestsLimit, "limit", "n", constants.DefaultProxyRequestLimit, "Number of requests to show")
 	requestsCmd.Flags().BoolVar(&requestsJSON, "json", false, "Output as JSON")
+	requestsCmd.Flags().BoolVar(&requestsBody, "body", false, "Include request/response bodies when showing details")
 
 	// Register completion for --process flag
 	// Error is ignored as it only fails for invalid flag names, which would be a programming error

@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
@@ -22,9 +24,16 @@ type Config struct {
 
 // ProxyConfig defines the HTTPS reverse proxy configuration
 type ProxyConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	HTTPSPort int    `yaml:"https_port"`
-	Domain    string `yaml:"domain"`
+	Enabled   bool           `yaml:"enabled"`
+	HTTPSPort int            `yaml:"https_port"`
+	Domain    string         `yaml:"domain"`
+	Capture   *CaptureConfig `yaml:"capture,omitempty"`
+}
+
+// CaptureConfig defines request/response capture settings
+type CaptureConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	MaxBodySize string `yaml:"max_body_size"` // e.g., "1MB", "512KB"
 }
 
 // ServiceConfig represents a service routing configuration that can be either
@@ -252,4 +261,59 @@ func (c *Config) ToDomainProcesses() []domain.ProcessConfig {
 		processes = append(processes, domainProc)
 	}
 	return processes
+}
+
+// ParseSize parses a human-readable size string (e.g., "1MB", "512KB", "1024")
+// into bytes. Supported suffixes: B, KB, MB, GB (case-insensitive).
+// If no suffix is provided, the value is treated as bytes.
+func ParseSize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+
+	s = strings.TrimSpace(s)
+	s = strings.ToUpper(s)
+
+	var multiplier int64
+	suffix := ""
+
+	// Find where the numeric part ends
+	numEnd := 0
+	for i, c := range s {
+		if c < '0' || c > '9' {
+			numEnd = i
+			suffix = s[i:]
+			break
+		}
+		numEnd = i + 1
+	}
+
+	if numEnd == 0 {
+		return 0, fmt.Errorf("invalid size: %s", s)
+	}
+
+	numStr := s[:numEnd]
+	value, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size number: %s", numStr)
+	}
+
+	if value < 0 {
+		return 0, fmt.Errorf("size cannot be negative: %s", s)
+	}
+
+	switch strings.TrimSpace(suffix) {
+	case "", "B":
+		multiplier = 1
+	case "KB", "K":
+		multiplier = 1024
+	case "MB", "M":
+		multiplier = 1024 * 1024
+	case "GB", "G":
+		multiplier = 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("invalid size suffix: %s", suffix)
+	}
+
+	return value * multiplier, nil
 }

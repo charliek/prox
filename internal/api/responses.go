@@ -203,3 +203,26 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 		RemoteAddr: req.RemoteAddr,
 	}
 }
+
+// CapturedBodyResponse represents a captured request or response body in API responses
+type CapturedBodyResponse struct {
+	Size        int64  `json:"size"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	IsBinary    bool   `json:"is_binary,omitempty"`
+	Data        string `json:"data,omitempty"` // base64 for binary, plain text otherwise
+}
+
+// RequestDetailsResponse represents captured request/response details in API responses
+type RequestDetailsResponse struct {
+	RequestHeaders  map[string][]string   `json:"request_headers,omitempty"`
+	ResponseHeaders map[string][]string   `json:"response_headers,omitempty"`
+	RequestBody     *CapturedBodyResponse `json:"request_body,omitempty"`
+	ResponseBody    *CapturedBodyResponse `json:"response_body,omitempty"`
+}
+
+// ProxyRequestDetailResponse extends ProxyRequestResponse with captured details
+type ProxyRequestDetailResponse struct {
+	ProxyRequestResponse
+	Details *RequestDetailsResponse `json:"details,omitempty"`
+}

@@ -97,6 +97,7 @@ type TUIClient interface {
 	RestartProcess(name string) error
 	StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error)
 	StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
+	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
 }
 
 // RunClient starts the TUI application in client mode (connected via API)
