@@ -112,6 +112,21 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastRestartProcess = ""
 		m.lastRestartError = nil
 
+	case RequestDetailMsg:
+		m.detailLoading = false
+		if msg.ID == m.selectedRequestID {
+			m.requestDetail = msg.Details
+			m.detailError = nil
+			m.updateViewport()
+		}
+
+	case RequestDetailErrorMsg:
+		m.detailLoading = false
+		if msg.ID == m.selectedRequestID {
+			m.detailError = msg.Err
+			m.updateViewport()
+		}
+
 	case TickMsg:
 		// Refresh processes periodically
 		cmds = append(cmds, m.fetchProcesses())
@@ -164,6 +179,22 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case "enter":
+		// In requests view, show detail for selected request
+		if m.viewMode == ViewModeRequests {
+			requestID := m.getSelectedRequest()
+			if requestID != "" {
+				m.selectedRequestID = requestID
+				m.viewMode = ViewModeRequestDetail
+				m.detailLoading = true
+				m.requestDetail = nil
+				m.detailError = nil
+				m.updateViewport()
+				return m, m.fetchRequestDetail(requestID)
+			}
+		}
+		return m, nil
 	}
 
 	// Handle common navigation keys
@@ -172,6 +203,55 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// fetchRequestDetail returns a command to fetch request details from the API
+func (m ClientModel) fetchRequestDetail(id string) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := m.client.GetProxyRequest(id, true) // Include body
+		if err != nil {
+			return RequestDetailErrorMsg{ID: id, Err: err}
+		}
+
+		// Convert API response to RequestDetailData
+		detail := &RequestDetailData{
+			ID:         resp.ID,
+			Timestamp:  resp.Timestamp,
+			Method:     resp.Method,
+			URL:        resp.URL,
+			Subdomain:  resp.Subdomain,
+			StatusCode: resp.StatusCode,
+			DurationMs: resp.DurationMs,
+			RemoteAddr: resp.RemoteAddr,
+		}
+
+		if resp.Details != nil {
+			detail.RequestHeaders = resp.Details.RequestHeaders
+			detail.ResponseHeaders = resp.Details.ResponseHeaders
+
+			if resp.Details.RequestBody != nil {
+				detail.RequestBody = &BodyData{
+					Size:        resp.Details.RequestBody.Size,
+					Truncated:   resp.Details.RequestBody.Truncated,
+					ContentType: resp.Details.RequestBody.ContentType,
+					IsBinary:    resp.Details.RequestBody.IsBinary,
+					Data:        resp.Details.RequestBody.Data,
+				}
+			}
+
+			if resp.Details.ResponseBody != nil {
+				detail.ResponseBody = &BodyData{
+					Size:        resp.Details.ResponseBody.Size,
+					Truncated:   resp.Details.ResponseBody.Truncated,
+					ContentType: resp.Details.ResponseBody.ContentType,
+					IsBinary:    resp.Details.ResponseBody.IsBinary,
+					Data:        resp.Details.ResponseBody.Data,
+				}
+			}
+		}
+
+		return RequestDetailMsg{ID: id, Details: detail}
+	}
 }
 
 // View renders the TUI

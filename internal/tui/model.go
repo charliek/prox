@@ -28,6 +28,7 @@ type ViewMode int
 const (
 	ViewModeLogs ViewMode = iota
 	ViewModeRequests
+	ViewModeRequestDetail
 )
 
 // Model is the bubbletea model for the TUI
@@ -91,6 +92,43 @@ type RestartResultMsg struct {
 
 // RestartResultClearMsg is sent to clear the restart result after a delay
 type RestartResultClearMsg struct{}
+
+// RequestDetailMsg is sent when request details are loaded
+type RequestDetailMsg struct {
+	ID      string
+	Details *RequestDetailData
+}
+
+// RequestDetailErrorMsg is sent when loading request details fails
+type RequestDetailErrorMsg struct {
+	ID  string
+	Err error
+}
+
+// RequestDetailData holds the detailed information about a request for TUI display
+type RequestDetailData struct {
+	ID              string
+	Timestamp       string
+	Method          string
+	URL             string
+	Subdomain       string
+	StatusCode      int
+	DurationMs      int64
+	RemoteAddr      string
+	RequestHeaders  map[string][]string
+	ResponseHeaders map[string][]string
+	RequestBody     *BodyData
+	ResponseBody    *BodyData
+}
+
+// BodyData holds captured body information
+type BodyData struct {
+	Size        int64
+	Truncated   bool
+	ContentType string
+	IsBinary    bool
+	Data        string
+}
 
 // restartResultClearDelay is how long to show restart result before clearing
 const restartResultClearDelay = 3 * time.Second

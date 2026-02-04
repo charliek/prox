@@ -19,6 +19,27 @@ type RequestRecord struct {
 	StatusCode int           `json:"status_code"`
 	Duration   time.Duration `json:"duration"`
 	RemoteAddr string        `json:"remote_addr"`
+
+	// Details contains captured headers and bodies (nil when capture is disabled)
+	Details *RequestDetails `json:"details,omitempty"`
+}
+
+// RequestDetails contains captured request/response headers and bodies.
+type RequestDetails struct {
+	RequestHeaders  map[string][]string `json:"request_headers,omitempty"`
+	ResponseHeaders map[string][]string `json:"response_headers,omitempty"`
+	RequestBody     *CapturedBody       `json:"request_body,omitempty"`
+	ResponseBody    *CapturedBody       `json:"response_body,omitempty"`
+}
+
+// CapturedBody represents a captured request or response body.
+type CapturedBody struct {
+	Size        int64  `json:"size"`         // Original body size
+	Truncated   bool   `json:"truncated"`    // True if body was truncated due to size limit
+	ContentType string `json:"content_type"` // Content-Type header value
+	IsBinary    bool   `json:"is_binary"`    // True if body appears to be binary data
+	Data        []byte `json:"data"`         // Inline data for small bodies
+	FilePath    string `json:"file_path"`    // Disk path for large bodies (Data is nil when set)
 }
 
 // generateRequestID creates a short hash ID (7 chars, git-style) from request data.
@@ -45,6 +66,10 @@ type RequestSubscription struct {
 	Ch     chan RequestRecord
 }
 
+// EvictionCallback is called when a request is evicted from the ring buffer.
+// It receives the request ID for cleanup purposes.
+type EvictionCallback func(id string)
+
 // RequestManager tracks proxied requests in a ring buffer and supports subscriptions.
 type RequestManager struct {
 	mu       sync.RWMutex
@@ -56,6 +81,9 @@ type RequestManager struct {
 	subMu  sync.RWMutex
 	subs   map[string]*RequestSubscription
 	nextID int
+
+	// onEvict is called when a request is evicted from the buffer
+	onEvict EvictionCallback
 }
 
 // NewRequestManager creates a new request manager with the specified buffer capacity.
@@ -70,6 +98,13 @@ func NewRequestManager(capacity int) *RequestManager {
 	}
 }
 
+// SetEvictionCallback sets the callback to be invoked when requests are evicted.
+func (m *RequestManager) SetEvictionCallback(fn EvictionCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvict = fn
+}
+
 // Record adds a new request record to the buffer and notifies subscribers.
 // If the record doesn't have an ID, one is generated.
 func (m *RequestManager) Record(record RequestRecord) {
@@ -77,13 +112,30 @@ func (m *RequestManager) Record(record RequestRecord) {
 		record.ID = generateRequestID(record.Timestamp, record.Method, record.URL)
 	}
 
+	var evictedID string
+	var onEvict EvictionCallback
+
 	m.mu.Lock()
+	// Check if we're about to overwrite an existing record
+	if m.count == m.capacity {
+		evicted := m.buffer[m.head]
+		if evicted.ID != "" && evicted.Details != nil {
+			evictedID = evicted.ID
+			onEvict = m.onEvict
+		}
+	}
+
 	m.buffer[m.head] = record
 	m.head = (m.head + 1) % m.capacity
 	if m.count < m.capacity {
 		m.count++
 	}
 	m.mu.Unlock()
+
+	// Call eviction callback outside of lock
+	if evictedID != "" && onEvict != nil {
+		onEvict(evictedID)
+	}
 
 	// Notify subscribers
 	m.notifySubscribers(record)
@@ -112,6 +164,24 @@ func (m *RequestManager) Recent(filter RequestFilter) []RequestRecord {
 	}
 
 	return result
+}
+
+// GetByID returns a request record by its ID.
+// Returns the record and true if found, or an empty record and false if not found.
+func (m *RequestManager) GetByID(id string) (RequestRecord, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Search from newest to oldest for better typical case
+	for i := 0; i < m.count; i++ {
+		idx := (m.head - 1 - i + m.capacity) % m.capacity
+		record := m.buffer[idx]
+		if record.ID == id {
+			return record, true
+		}
+	}
+
+	return RequestRecord{}, false
 }
 
 // Subscribe creates a subscription for real-time request updates.

@@ -100,6 +100,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case "enter":
+		// In requests view, show detail for selected request
+		if m.viewMode == ViewModeRequests {
+			requestID := m.getSelectedRequest()
+			if requestID != "" {
+				m.selectedRequestID = requestID
+				m.viewMode = ViewModeRequestDetail
+				// Find the request in our local list
+				for _, req := range m.proxyRequests {
+					if req.ID == requestID {
+						m.requestDetail = convertRequestRecordToDetail(req)
+						break
+					}
+				}
+				m.updateViewport()
+			}
+		}
+		return m, nil
 	}
 
 	// Handle common navigation keys

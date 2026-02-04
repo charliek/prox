@@ -71,6 +71,19 @@ const (
 	DefaultProxyRequestBufferSize = 1000
 )
 
+// Request capture configuration
+const (
+	// DefaultCaptureMaxBodySize is the maximum body size to capture per request/response (1MB)
+	DefaultCaptureMaxBodySize = 1 * 1024 * 1024
+
+	// DefaultCaptureInlineThreshold is the maximum body size to store inline in memory (64KB)
+	// Bodies larger than this are stored on disk
+	DefaultCaptureInlineThreshold = 64 * 1024
+
+	// CaptureDirectory is the directory name for storing captured body files
+	CaptureDirectory = ".prox/capture"
+)
+
 // Proxy timeouts
 const (
 	// DefaultProxyBackendTimeout is the timeout for backend connections

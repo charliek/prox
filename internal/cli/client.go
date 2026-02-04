@@ -182,6 +182,20 @@ func (c *Client) GetProxyRequests(params domain.ProxyRequestParams) (*api.ProxyR
 	return &resp, nil
 }
 
+// GetProxyRequest gets a specific proxy request by ID
+func (c *Client) GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error) {
+	path := "/api/v1/proxy/requests/" + url.PathEscape(id)
+	if includeBody {
+		path += "?include=body"
+	}
+
+	var resp api.ProxyRequestDetailResponse
+	if err := c.get(path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // httpStatusError maps HTTP status codes to user-friendly error messages
 func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
 	if errResp != nil && errResp.Error != "" {

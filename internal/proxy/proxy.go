@@ -35,11 +35,15 @@ type Service struct {
 
 	// Request tracking
 	requestManager *RequestManager
+
+	// Request/response capture
+	captureManager *CaptureManager
 }
 
 // NewService creates a new proxy service.
 // Returns an error if cfg is nil when proxy is expected to be enabled.
-func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfig, certsCfg *config.CertsConfig, logger *slog.Logger) (*Service, error) {
+// workDir is used for storing captured request/response bodies on disk.
+func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfig, certsCfg *config.CertsConfig, logger *slog.Logger, workDir string) (*Service, error) {
 	// Allow nil cfg only if proxy won't be started
 	if cfg != nil && cfg.Enabled && cfg.Domain == "" {
 		return nil, fmt.Errorf("proxy config requires domain when enabled")
@@ -61,13 +65,31 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 		IdleConnTimeout:       constants.DefaultProxyIdleConnTimeout,
 	}
 
+	// Create capture manager if capture is configured
+	var captureCfg *config.CaptureConfig
+	if cfg != nil {
+		captureCfg = cfg.Capture
+	}
+	captureMgr, err := NewCaptureManager(captureCfg, workDir)
+	if err != nil {
+		return nil, fmt.Errorf("creating capture manager: %w", err)
+	}
+
+	requestMgr := NewRequestManager(constants.DefaultProxyRequestBufferSize)
+
+	// Set up eviction callback to clean up captured body files
+	if captureMgr.Enabled() {
+		requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
+	}
+
 	return &Service{
 		cfg:            cfg,
 		services:       services,
 		certs:          certsMgr,
 		logger:         logger,
 		transport:      transport,
-		requestManager: NewRequestManager(constants.DefaultProxyRequestBufferSize),
+		requestManager: requestMgr,
+		captureManager: captureMgr,
 	}, nil
 }
 
@@ -158,6 +180,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	// Close the request manager to clean up subscriptions
 	s.requestManager.Close()
 
+	// Clean up captured body files
+	if s.captureManager != nil {
+		if err := s.captureManager.Cleanup(); err != nil {
+			s.logger.Error("failed to cleanup capture files", "error", err)
+		}
+	}
+
 	return server.Shutdown(ctx)
 }
 
@@ -166,15 +195,23 @@ func (s *Service) RequestManager() *RequestManager {
 	return s.requestManager
 }
 
+// CaptureManager returns the capture manager for loading captured bodies.
+func (s *Service) CaptureManager() *CaptureManager {
+	return s.captureManager
+}
+
 // createRouter creates the HTTP handler that routes requests based on subdomain.
 func (s *Service) createRouter() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
+		// Generate request ID early for capture
+		requestID := generateRequestID(startTime, r.Method, r.URL.String())
+
 		// Extract subdomain from host
 		subdomain := s.extractSubdomain(r.Host)
 		if subdomain == "" {
-			s.recordRequest(r, subdomain, http.StatusNotFound, startTime)
+			s.recordRequest(r, subdomain, http.StatusNotFound, startTime, requestID, nil)
 			http.Error(w, "No subdomain specified", http.StatusNotFound)
 			return
 		}
@@ -182,7 +219,7 @@ func (s *Service) createRouter() http.Handler {
 		// Look up service
 		svc, ok := s.services[subdomain]
 		if !ok {
-			s.recordRequest(r, subdomain, http.StatusNotFound, startTime)
+			s.recordRequest(r, subdomain, http.StatusNotFound, startTime, requestID, nil)
 			http.Error(w, fmt.Sprintf("Unknown service: %s", subdomain), http.StatusNotFound)
 			return
 		}
@@ -198,6 +235,15 @@ func (s *Service) createRouter() http.Handler {
 		// Use shared transport for connection pooling
 		proxy.Transport = s.transport
 
+		// Capture request body and headers if capture is enabled
+		var reqBody *CapturedBody
+		var reqHeaders http.Header
+		if s.captureManager != nil && s.captureManager.Enabled() {
+			reqBody, r.Body, reqHeaders = s.captureManager.CaptureRequest(requestID, r)
+		} else {
+			reqHeaders = cloneHeaders(r.Header)
+		}
+
 		// Customize the director to preserve the original request info
 		originalDirector := proxy.Director
 		proxy.Director = func(req *http.Request) {
@@ -208,26 +254,54 @@ func (s *Service) createRouter() http.Handler {
 			req.Header.Set("X-Real-IP", getClientIP(r))
 		}
 
-		// Wrap response writer to capture status code (before ErrorHandler so it can set status)
-		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		// Choose response writer based on capture mode
+		var rw http.ResponseWriter
+		var crw *capturingResponseWriter
+		if s.captureManager != nil && s.captureManager.Enabled() {
+			crw = newCapturingResponseWriter(w, s.captureManager.maxBodySize)
+			rw = crw
+		} else {
+			rw = &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		}
 
 		// Custom error handler - log detailed error but return generic message to client
-		// Note: We set rw.statusCode here instead of calling recordRequest to avoid double-recording
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			s.logger.Error("proxy error",
 				"subdomain", subdomain,
 				"target", target.String(),
 				"error", err,
 			)
-			rw.statusCode = http.StatusBadGateway
+			if crw != nil {
+				crw.WriteHeader(http.StatusBadGateway)
+			} else if basicRw, ok := rw.(*responseWriter); ok {
+				basicRw.statusCode = http.StatusBadGateway
+			}
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
 		}
 
 		// Serve the request
 		proxy.ServeHTTP(rw, r)
 
+		// Build request details if capture is enabled
+		var details *RequestDetails
+		var statusCode int
+		if crw != nil {
+			statusCode = crw.StatusCode()
+			resBody, resHeaders := s.captureManager.CaptureResponse(requestID, crw)
+			details = &RequestDetails{
+				RequestHeaders:  reqHeaders,
+				ResponseHeaders: resHeaders,
+				RequestBody:     reqBody,
+				ResponseBody:    resBody,
+			}
+		} else if basicRw, ok := rw.(*responseWriter); ok {
+			statusCode = basicRw.statusCode
+		} else {
+			statusCode = http.StatusOK
+		}
+
 		// Record the request (single recording point for all cases)
-		s.recordRequest(r, subdomain, rw.statusCode, startTime)
+		s.recordRequest(r, subdomain, statusCode, startTime, requestID, details)
 	})
 }
 
@@ -258,8 +332,9 @@ func (s *Service) extractSubdomain(host string) string {
 }
 
 // recordRequest records a request in the request manager.
-func (s *Service) recordRequest(r *http.Request, subdomain string, statusCode int, startTime time.Time) {
+func (s *Service) recordRequest(r *http.Request, subdomain string, statusCode int, startTime time.Time, requestID string, details *RequestDetails) {
 	record := RequestRecord{
+		ID:         requestID,
 		Timestamp:  startTime,
 		Method:     r.Method,
 		URL:        r.URL.String(),
@@ -267,6 +342,7 @@ func (s *Service) recordRequest(r *http.Request, subdomain string, statusCode in
 		StatusCode: statusCode,
 		Duration:   time.Since(startTime),
 		RemoteAddr: getClientIP(r),
+		Details:    details,
 	}
 	s.requestManager.Record(record)
 }

@@ -58,6 +58,12 @@ type BaseModel struct {
 	lastRestartProcess string
 	lastRestartError   error
 
+	// Request detail view
+	selectedRequestID string
+	requestDetail     *RequestDetailData
+	detailLoading     bool
+	detailError       error
+
 	// Dimensions
 	width  int
 	height int
@@ -254,12 +260,13 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "tab":
-		// Toggle between Logs and Requests views
+		// Toggle between Logs and Requests views (only if not in detail view)
 		if b.viewMode == ViewModeLogs {
 			b.viewMode = ViewModeRequests
-		} else {
+		} else if b.viewMode == ViewModeRequests {
 			b.viewMode = ViewModeLogs
 		}
+		// In detail view, tab does nothing
 		b.updateViewport()
 		return true
 
@@ -268,20 +275,26 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		return true
 
 	case "f":
-		b.mode = ModeFilter
-		b.textInput.Focus()
+		if b.viewMode != ViewModeRequestDetail {
+			b.mode = ModeFilter
+			b.textInput.Focus()
+		}
 		return true
 
 	case "/":
-		b.mode = ModeSearch
-		b.textInput.SetValue("")
-		b.textInput.Focus()
+		if b.viewMode != ViewModeRequestDetail {
+			b.mode = ModeSearch
+			b.textInput.SetValue("")
+			b.textInput.Focus()
+		}
 		return true
 
 	case "s":
-		b.mode = ModeStringFilter
-		b.textInput.SetValue("")
-		b.textInput.Focus()
+		if b.viewMode != ViewModeRequestDetail {
+			b.mode = ModeStringFilter
+			b.textInput.SetValue("")
+			b.textInput.Focus()
+		}
 		return true
 
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
@@ -302,6 +315,15 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		return true
 
 	case "esc":
+		// In detail view, go back to requests list
+		if b.viewMode == ViewModeRequestDetail {
+			b.viewMode = ViewModeRequests
+			b.selectedRequestID = ""
+			b.requestDetail = nil
+			b.detailError = nil
+			b.updateViewport()
+			return true
+		}
 		// Clear filters
 		b.soloProcess = ""
 		b.searchPattern = ""
@@ -375,13 +397,16 @@ func (b *BaseModel) isNearBottom() bool {
 func (b *BaseModel) updateViewport() {
 	var lines []string
 
-	if b.viewMode == ViewModeRequests {
+	switch b.viewMode {
+	case ViewModeRequestDetail:
+		lines = b.formatRequestDetail()
+	case ViewModeRequests:
 		requests := b.filteredProxyRequests()
 		for _, req := range requests {
 			line := b.formatProxyRequest(req)
 			lines = append(lines, line)
 		}
-	} else {
+	default: // ViewModeLogs
 		entries := b.filteredEntries()
 		for _, entry := range entries {
 			line := b.formatLogEntry(entry)
@@ -391,6 +416,110 @@ func (b *BaseModel) updateViewport() {
 
 	content := strings.Join(lines, "\n")
 	b.viewport.SetContent(content)
+}
+
+// formatRequestDetail formats the request detail view
+func (b *BaseModel) formatRequestDetail() []string {
+	var lines []string
+
+	if b.detailLoading {
+		lines = append(lines, "Loading request details...")
+		return lines
+	}
+
+	if b.detailError != nil {
+		lines = append(lines, errorStyle.Render("Error: "+b.detailError.Error()))
+		return lines
+	}
+
+	if b.requestDetail == nil {
+		lines = append(lines, "No request selected")
+		return lines
+	}
+
+	d := b.requestDetail
+
+	// Header info
+	lines = append(lines, headerStyle.Render(fmt.Sprintf("Request: %s", d.ID)))
+	lines = append(lines, "")
+	lines = append(lines, fmt.Sprintf("  Time:     %s", d.Timestamp))
+	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
+	lines = append(lines, fmt.Sprintf("  URL:      %s", d.URL))
+	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
+	lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
+	lines = append(lines, fmt.Sprintf("  Remote:   %s", d.RemoteAddr))
+
+	// Request headers
+	if len(d.RequestHeaders) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, headerStyle.Render("Request Headers"))
+		for name, values := range d.RequestHeaders {
+			for _, value := range values {
+				lines = append(lines, fmt.Sprintf("  %s: %s", dimStyle.Render(name), value))
+			}
+		}
+	}
+
+	// Response headers
+	if len(d.ResponseHeaders) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, headerStyle.Render("Response Headers"))
+		for name, values := range d.ResponseHeaders {
+			for _, value := range values {
+				lines = append(lines, fmt.Sprintf("  %s: %s", dimStyle.Render(name), value))
+			}
+		}
+	}
+
+	// Request body
+	if d.RequestBody != nil && d.RequestBody.Size > 0 {
+		lines = append(lines, "")
+		bodyTitle := fmt.Sprintf("Request Body (%d bytes", d.RequestBody.Size)
+		if d.RequestBody.Truncated {
+			bodyTitle += ", truncated"
+		}
+		bodyTitle += ")"
+		lines = append(lines, headerStyle.Render(bodyTitle))
+		if d.RequestBody.Data != "" {
+			if d.RequestBody.IsBinary {
+				lines = append(lines, dimStyle.Render("[binary data]"))
+			} else {
+				// Split body into lines
+				bodyLines := strings.Split(d.RequestBody.Data, "\n")
+				for _, line := range bodyLines {
+					lines = append(lines, "  "+line)
+				}
+			}
+		}
+	}
+
+	// Response body
+	if d.ResponseBody != nil && d.ResponseBody.Size > 0 {
+		lines = append(lines, "")
+		bodyTitle := fmt.Sprintf("Response Body (%d bytes", d.ResponseBody.Size)
+		if d.ResponseBody.Truncated {
+			bodyTitle += ", truncated"
+		}
+		bodyTitle += ")"
+		lines = append(lines, headerStyle.Render(bodyTitle))
+		if d.ResponseBody.Data != "" {
+			if d.ResponseBody.IsBinary {
+				lines = append(lines, dimStyle.Render("[binary data]"))
+			} else {
+				// Split body into lines
+				bodyLines := strings.Split(d.ResponseBody.Data, "\n")
+				for _, line := range bodyLines {
+					lines = append(lines, "  "+line)
+				}
+			}
+		}
+	}
+
+	// Footer hint
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("Press ESC to go back"))
+
+	return lines
 }
 
 // filteredEntries returns log entries after applying filters
@@ -440,6 +569,27 @@ func (b *BaseModel) filteredProxyRequests() []proxy.RequestRecord {
 	}
 
 	return result
+}
+
+// getSelectedRequest returns the request ID at the current viewport line in requests view.
+// Returns empty string if not in requests view or no request is selected.
+func (b *BaseModel) getSelectedRequest() string {
+	if b.viewMode != ViewModeRequests {
+		return ""
+	}
+
+	requests := b.filteredProxyRequests()
+	if len(requests) == 0 {
+		return ""
+	}
+
+	// Get the line index from viewport position
+	lineIdx := b.viewport.YOffset
+	if lineIdx >= 0 && lineIdx < len(requests) {
+		return requests[lineIdx].ID
+	}
+
+	return ""
 }
 
 // formatProxyRequest formats a single proxy request for display
@@ -545,8 +695,11 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 
 	// View mode indicator
 	viewIndicator := "[Logs]"
-	if b.viewMode == ViewModeRequests {
+	switch b.viewMode {
+	case ViewModeRequests:
 		viewIndicator = "[Requests]"
+	case ViewModeRequestDetail:
+		viewIndicator = "[Request Detail]"
 	}
 
 	// Left side: mode/filter info
@@ -698,6 +851,10 @@ Navigation:
   PgUp/PgDn  Page up/down
   F          Toggle auto-follow mode
 
+Request Details:
+  Enter      View details for selected request
+  ESC        Return to request list (or clear filters)
+
 Filtering:
   s          String filter (URL/method/subdomain)
   ESC        Clear filters
@@ -727,4 +884,46 @@ func truncateError(err error, maxLen int) string {
 		return msg[:maxLen-3] + "..."
 	}
 	return msg
+}
+
+// convertRequestRecordToDetail converts a proxy.RequestRecord to RequestDetailData.
+// This is shared between Model (local mode) and ClientModel (API mode).
+func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
+	detail := &RequestDetailData{
+		ID:         req.ID,
+		Timestamp:  req.Timestamp.Format("2006-01-02 15:04:05.000"),
+		Method:     req.Method,
+		URL:        req.URL,
+		Subdomain:  req.Subdomain,
+		StatusCode: req.StatusCode,
+		DurationMs: req.Duration.Milliseconds(),
+		RemoteAddr: req.RemoteAddr,
+	}
+
+	if req.Details != nil {
+		detail.RequestHeaders = req.Details.RequestHeaders
+		detail.ResponseHeaders = req.Details.ResponseHeaders
+
+		if req.Details.RequestBody != nil {
+			detail.RequestBody = &BodyData{
+				Size:        req.Details.RequestBody.Size,
+				Truncated:   req.Details.RequestBody.Truncated,
+				ContentType: req.Details.RequestBody.ContentType,
+				IsBinary:    req.Details.RequestBody.IsBinary,
+				Data:        string(req.Details.RequestBody.Data),
+			}
+		}
+
+		if req.Details.ResponseBody != nil {
+			detail.ResponseBody = &BodyData{
+				Size:        req.Details.ResponseBody.Size,
+				Truncated:   req.Details.ResponseBody.Truncated,
+				ContentType: req.Details.ResponseBody.ContentType,
+				IsBinary:    req.Details.ResponseBody.IsBinary,
+				Data:        string(req.Details.ResponseBody.Data),
+			}
+		}
+	}
+
+	return detail
 }
