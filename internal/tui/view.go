@@ -14,7 +14,7 @@ func (m Model) View() string {
 
 	switch m.mode {
 	case ModeHelp:
-		return m.BaseModel.helpView()
+		return m.helpView()
 	default:
 		statusInfo := ""
 		if m.lastRestartProcess != "" {
@@ -24,7 +24,7 @@ func (m Model) View() string {
 				statusInfo = "Restarted: " + m.lastRestartProcess
 			}
 		}
-		return m.BaseModel.mainView(statusInfo)
+		return m.mainView(statusInfo)
 	}
 }
 

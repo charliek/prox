@@ -261,9 +261,10 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "tab":
 		// Toggle between Logs and Requests views (only if not in detail view)
-		if b.viewMode == ViewModeLogs {
+		switch b.viewMode {
+		case ViewModeLogs:
 			b.viewMode = ViewModeRequests
-		} else if b.viewMode == ViewModeRequests {
+		case ViewModeRequests:
 			b.viewMode = ViewModeLogs
 		}
 		// In detail view, tab does nothing

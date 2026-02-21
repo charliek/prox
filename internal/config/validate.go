@@ -113,7 +113,7 @@ func validateServiceName(name string) error {
 		return fmt.Errorf("service name cannot start or end with hyphen")
 	}
 	for _, c := range name {
-		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 			return fmt.Errorf("service name can only contain lowercase letters, numbers, and hyphens")
 		}
 	}

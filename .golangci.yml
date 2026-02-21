@@ -1,33 +1,36 @@
+version: "2"
+
 linters:
+  default: none
   enable:
     - errcheck
     - staticcheck
     - unused
     - govet
     - ineffassign
+    - misspell
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*os/exec.Cmd).Wait
+        - (*os/exec.Cmd).Process.Kill
+        - io.Copy
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: _test\.go
+        linters:
+          - unused
+      - linters:
+          - staticcheck
+        text: "SA1019:.*viewport\\.(LineUp|LineDown|HalfViewUp|HalfViewDown)"
+
+formatters:
+  enable:
     - gofmt
     - goimports
-    - gosimple
-    - misspell
-
-linters-settings:
-  errcheck:
-    exclude-functions:
-      - (*os/exec.Cmd).Wait
-      - (*os/exec.Cmd).Process.Kill
-      - io.Copy
-
-issues:
-  exclude-rules:
-    # Exclude errcheck in test files - common practice
-    - path: _test\.go
-      linters:
-        - errcheck
-    # Exclude unused in test files - test helpers are often unused
-    - path: _test\.go
-      linters:
-        - unused
-    # Exclude deprecated warnings for viewport methods - will update separately
-    - linters:
-        - staticcheck
-      text: "SA1019:.*viewport\\.(LineUp|LineDown|HalfViewUp|HalfViewDown)"

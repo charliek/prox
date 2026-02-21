@@ -151,16 +151,16 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Handle mode-specific keys first
 	switch m.mode {
 	case ModeFilter:
-		_, cmd := m.BaseModel.handleFilterKey(msg)
+		_, cmd := m.handleFilterKey(msg)
 		return m, cmd
 	case ModeSearch:
-		_, cmd := m.BaseModel.handleSearchKey(msg)
+		_, cmd := m.handleSearchKey(msg)
 		return m, cmd
 	case ModeStringFilter:
-		_, cmd := m.BaseModel.handleStringFilterKey(msg)
+		_, cmd := m.handleStringFilterKey(msg)
 		return m, cmd
 	case ModeHelp:
-		m.BaseModel.handleHelpKey(msg)
+		m.handleHelpKey(msg)
 		return m, nil
 	}
 
@@ -198,7 +198,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Handle common navigation keys
-	if m.BaseModel.handleNavigationKey(msg) {
+	if m.handleNavigationKey(msg) {
 		return m, nil
 	}
 
@@ -262,7 +262,7 @@ func (m ClientModel) View() string {
 
 	switch m.mode {
 	case ModeHelp:
-		return m.BaseModel.helpView()
+		return m.helpView()
 	default:
 		statusInfo := "Connected via API"
 		if m.connectionError != nil {
@@ -274,6 +274,6 @@ func (m ClientModel) View() string {
 				statusInfo = "Restarted: " + m.lastRestartProcess
 			}
 		}
-		return m.BaseModel.mainView(statusInfo)
+		return m.mainView(statusInfo)
 	}
 }
