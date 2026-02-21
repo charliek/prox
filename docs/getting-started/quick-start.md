@@ -120,13 +120,31 @@ Background mode features:
 - CLI commands auto-discover the running daemon
 - Daemon logs are written to `.prox/prox.log`
 
-## HTTPS Proxy (Optional)
+## Proxy (Optional)
 
-prox can provide friendly HTTPS URLs for your services via subdomain routing.
+prox can provide friendly subdomain URLs for your services via HTTP and/or HTTPS reverse proxying.
 
-### Prerequisites
+### HTTP Proxy (simplest)
 
-Install mkcert for local certificate generation:
+No certificate setup required:
+
+```yaml
+processes:
+  frontend: npm run dev
+  backend: go run ./cmd/server
+
+proxy:
+  http_port: 6788
+  domain: local.myapp.dev
+
+services:
+  app: 3000
+  api: 8000
+```
+
+### HTTPS Proxy
+
+For locally-trusted HTTPS, install mkcert first:
 
 ```bash
 # macOS
@@ -136,9 +154,7 @@ brew install mkcert
 mkcert -install
 ```
 
-### Configuration
-
-Add proxy settings to your `prox.yaml`:
+Then configure HTTPS:
 
 ```yaml
 processes:
@@ -146,7 +162,6 @@ processes:
   backend: go run ./cmd/server
 
 proxy:
-  enabled: true
   https_port: 6789
   domain: local.myapp.dev
 
@@ -173,10 +188,10 @@ prox up
 
 Access your services:
 
-- `https://app.local.myapp.dev:6789` → `http://localhost:3000`
-- `https://api.local.myapp.dev:6789` → `http://localhost:8000`
+- `http://app.local.myapp.dev:6788` → `http://localhost:3000` (HTTP mode)
+- `https://app.local.myapp.dev:6789` → `http://localhost:3000` (HTTPS mode)
 
-See the [Configuration Reference](../reference/configuration.md#https-proxy-configuration) for full details.
+See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full details.
 
 ## HTTP API
 

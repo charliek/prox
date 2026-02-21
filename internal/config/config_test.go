@@ -236,9 +236,143 @@ services:
 		cfg, err := Parse([]byte(yaml))
 		require.NoError(t, err)
 
-		// Certs config should be auto-created when proxy is enabled
+		// Certs config should be auto-created when proxy is enabled with HTTPS
 		require.NotNil(t, cfg.Certs)
 		assert.Equal(t, "~/.prox/certs", cfg.Certs.Dir)
+		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+
+	t.Run("parses HTTP port config", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// Check proxy auto-enabled and HTTP port set
+		require.NotNil(t, cfg.Proxy)
+		assert.True(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 6788, cfg.Proxy.HTTPPort)
+		assert.Equal(t, 0, cfg.Proxy.HTTPSPort) // No HTTPS
+
+		// No certs config for HTTP only
+		assert.Nil(t, cfg.Certs)
+	})
+
+	t.Run("parses dual stack proxy config", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  https_port: 6789
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// Check both ports set and proxy enabled
+		require.NotNil(t, cfg.Proxy)
+		assert.True(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 6788, cfg.Proxy.HTTPPort)
+		assert.Equal(t, 6789, cfg.Proxy.HTTPSPort)
+
+		// Certs config should be created for HTTPS
+		require.NotNil(t, cfg.Certs)
+		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+
+	t.Run("proxy auto-enables when http_port set", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// Proxy should be auto-enabled
+		require.NotNil(t, cfg.Proxy)
+		assert.True(t, cfg.Proxy.Enabled)
+	})
+
+	t.Run("explicit enabled false is respected when port is set", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: false
+  http_port: 6788
+  domain: local.test.dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy)
+		assert.False(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 6788, cfg.Proxy.HTTPPort)
+		assert.Equal(t, 0, cfg.Proxy.HTTPSPort)
+		assert.Nil(t, cfg.Certs)
+	})
+
+	t.Run("HTTP only does not auto-create certs", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  domain: local.test.dev
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		// No certs should be auto-created for HTTP only
+		assert.Nil(t, cfg.Certs)
+	})
+
+	t.Run("loads HTTP only config from file", func(t *testing.T) {
+		cfg, err := Load(filepath.Join("..", "..", "testdata", "configs", "http_only.yaml"))
+		require.NoError(t, err)
+
+		assert.True(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 6788, cfg.Proxy.HTTPPort)
+		assert.Equal(t, 0, cfg.Proxy.HTTPSPort)
+		assert.Equal(t, "local.test.dev", cfg.Proxy.Domain)
+		assert.Nil(t, cfg.Certs) // No certs for HTTP only
+	})
+
+	t.Run("loads dual stack config from file", func(t *testing.T) {
+		cfg, err := Load(filepath.Join("..", "..", "testdata", "configs", "dual_stack.yaml"))
+		require.NoError(t, err)
+
+		assert.True(t, cfg.Proxy.Enabled)
+		assert.Equal(t, 6788, cfg.Proxy.HTTPPort)
+		assert.Equal(t, 6789, cfg.Proxy.HTTPSPort)
+		assert.Equal(t, "local.test.dev", cfg.Proxy.Domain)
+		require.NotNil(t, cfg.Certs) // Certs auto-created for HTTPS
 		assert.True(t, cfg.Certs.AutoGenerate)
 	})
 }

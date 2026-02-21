@@ -254,12 +254,20 @@ func TestCleanupStaleFiles(t *testing.T) {
 func TestSetupLogging(t *testing.T) {
 	t.Run("creates log file", func(t *testing.T) {
 		tmpDir := t.TempDir()
+		originalStdout := os.Stdout
+		originalStderr := os.Stderr
 
 		logFile, err := SetupLogging(tmpDir)
 		if err != nil {
 			t.Fatalf("SetupLogging failed: %v", err)
 		}
-		defer logFile.Close()
+		t.Cleanup(func() {
+			_ = logFile.Close()
+		})
+		t.Cleanup(func() {
+			os.Stdout = originalStdout
+			os.Stderr = originalStderr
+		})
 
 		// Check log file exists
 		logPath := LogPath(tmpDir)

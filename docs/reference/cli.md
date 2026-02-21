@@ -28,8 +28,10 @@ prox up [processes...]
 |------|-------------|
 | `--detach, -d` | Run in background (daemon mode) |
 | `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`) |
-| `--port, -p` | Override API port (otherwise dynamic) |
-| `--no-proxy` | Disable HTTPS proxy even if configured |
+| `--api-port, -p` | Override API server port (otherwise dynamic) |
+| `--http-port` | Override proxy HTTP port |
+| `--https-port` | Override proxy HTTPS port |
+| `--no-proxy` | Disable proxy even if configured |
 
 **Examples:**
 
@@ -50,15 +52,21 @@ prox up --tui
 prox up --tui web api
 
 # Override API port
-prox up --port 6000
+prox up --api-port 6000
 
 # Daemon mode with specific port
-prox up -d --port 6000
+prox up -d --api-port 6000
+
+# Start with HTTP proxy only
+prox up --http-port 6788
+
+# Start with dual-stack proxy
+prox up --http-port 6788 --https-port 6789
 ```
 
 **Dynamic Port Allocation:**
 
-When no port is specified (via `--port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
+When no port is specified (via `--api-port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
 
 ### status
 

@@ -134,11 +134,13 @@ The `.prox/` directory is project-local, so add it to your `.gitignore`:
 .prox/
 ```
 
-## HTTPS Proxy Configuration
+## Proxy Configuration
 
-prox can act as an HTTPS reverse proxy, providing friendly subdomain URLs for your services.
+prox can act as an HTTP and/or HTTPS reverse proxy, providing friendly subdomain URLs for your services. HTTP-only mode requires no certificate setup. HTTPS mode uses locally-trusted certificates via mkcert.
 
-### Proxy Example
+### HTTP-Only Example
+
+The simplest proxy setup — no certificates required:
 
 ```yaml
 processes:
@@ -146,7 +148,53 @@ processes:
   backend: go run ./cmd/server
 
 proxy:
-  enabled: true
+  http_port: 6788
+  domain: local.myapp.dev
+
+services:
+  app: 3000
+  api: 8000
+```
+
+With this configuration:
+- `http://app.local.myapp.dev:6788` → `http://localhost:3000`
+- `http://api.local.myapp.dev:6788` → `http://localhost:8000`
+
+### HTTPS Example
+
+```yaml
+processes:
+  frontend: npm run dev
+  backend: go run ./cmd/server
+
+proxy:
+  https_port: 6789
+  domain: local.myapp.dev
+
+services:
+  app: 3000
+  api: 8000
+
+certs:
+  dir: ~/.prox/certs
+  auto_generate: true
+```
+
+With this configuration:
+- `https://app.local.myapp.dev:6789` → `http://localhost:3000`
+- `https://api.local.myapp.dev:6789` → `http://localhost:8000`
+
+### Dual-Stack Example
+
+Run both HTTP and HTTPS simultaneously:
+
+```yaml
+processes:
+  frontend: npm run dev
+  backend: go run ./cmd/server
+
+proxy:
+  http_port: 6788
   https_port: 6789
   domain: local.myapp.dev
 
@@ -161,16 +209,13 @@ certs:
   auto_generate: true
 ```
 
-With this configuration:
-- `https://app.local.myapp.dev:6789` → `http://localhost:3000`
-- `https://api.local.myapp.dev:6789` → `http://localhost:8000`
-
 ### Proxy Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `proxy.enabled` | bool | `false` | Enable HTTPS reverse proxy |
-| `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server |
+| `proxy.enabled` | bool | auto | Enable reverse proxy (auto-enabled when a port is set) |
+| `proxy.http_port` | int | — | Port for the HTTP proxy server |
+| `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
 | `proxy.domain` | string | required | Base domain for subdomain routing |
 
 ### Service Fields
@@ -198,9 +243,9 @@ services:
 | `certs.dir` | string | `~/.prox/certs` | Directory for storing certificates |
 | `certs.auto_generate` | bool | `true` | Automatically generate certificates using mkcert |
 
-### Prerequisites
+### Prerequisites (HTTPS only)
 
-The proxy requires [mkcert](https://github.com/FiloSottile/mkcert) for certificate generation:
+HTTPS mode requires [mkcert](https://github.com/FiloSottile/mkcert) for certificate generation. HTTP-only mode has no prerequisites.
 
 ```bash
 # macOS

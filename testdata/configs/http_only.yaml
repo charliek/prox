@@ -1,0 +1,13 @@
+api:
+  port: 5555
+  host: 127.0.0.1
+
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  domain: local.test.dev
+
+services:
+  app: 3000

@@ -1,10 +1,17 @@
 package proxy
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/charliek/prox/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -115,6 +122,36 @@ func TestNewService(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, svc)
 	})
+
+	t.Run("HTTP only proxy with domain succeeds", func(t *testing.T) {
+		cfg := &config.ProxyConfig{
+			Enabled:  true,
+			HTTPPort: 6788,
+			Domain:   "local.myapp.dev",
+		}
+		services := map[string]config.ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		// No certs needed for HTTP only
+		svc, err := NewService(cfg, services, nil, logger, workDir)
+		require.NoError(t, err)
+		assert.NotNil(t, svc)
+	})
+
+	t.Run("dual stack proxy with domain succeeds", func(t *testing.T) {
+		cfg := &config.ProxyConfig{
+			Enabled:   true,
+			HTTPPort:  6788,
+			HTTPSPort: 6789,
+			Domain:    "local.myapp.dev",
+		}
+		services := map[string]config.ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		svc, err := NewService(cfg, services, nil, logger, workDir)
+		require.NoError(t, err)
+		assert.NotNil(t, svc)
+	})
 }
 
 func TestRequestManagerSubscriptionID(t *testing.T) {
@@ -130,5 +167,107 @@ func TestRequestManagerSubscriptionID(t *testing.T) {
 		defer rm.Unsubscribe(sub2.ID)
 
 		assert.Equal(t, "sub-2", sub2.ID)
+	})
+}
+
+func TestStart_RollbackHTTPOnHTTPSFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	workDir := t.TempDir()
+
+	hp := findFreePort(t)
+	hsp := findFreePort(t)
+	if hp == hsp {
+		t.Skip("OS returned identical ephemeral ports; skipping to avoid spurious bind error")
+	}
+	cfg := &config.ProxyConfig{
+		Enabled:   true,
+		HTTPPort:  hp,
+		HTTPSPort: hsp,
+		Domain:    "local.myapp.dev",
+	}
+	services := map[string]config.ServiceConfig{
+		"app": {Port: 3000, Host: "localhost"},
+	}
+
+	svc, err := NewService(cfg, services, nil, logger, workDir)
+	require.NoError(t, err)
+
+	err = svc.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "certificates not configured")
+
+	require.Eventually(t, func() bool {
+		return !isPortListening(cfg.HTTPPort)
+	}, time.Second, 20*time.Millisecond, "expected HTTP port to be closed after startup rollback")
+}
+
+func findFreePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func isPortListening(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func TestCreateRouter_XForwardedProto(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	workDir := t.TempDir()
+
+	// Create a backend that captures the X-Forwarded-Proto header
+	var receivedProto atomic.Value
+	receivedProto.Store("")
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedProto.Store(r.Header.Get("X-Forwarded-Proto"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	// Parse backend port
+	backendPort := backend.Listener.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.ProxyConfig{
+		Enabled:  true,
+		HTTPPort: 6788,
+		Domain:   "local.myapp.dev",
+	}
+	services := map[string]config.ServiceConfig{
+		"app": {Port: backendPort, Host: "localhost"},
+	}
+
+	svc, err := NewService(cfg, services, nil, logger, workDir)
+	require.NoError(t, err)
+
+	router := svc.createRouter()
+
+	t.Run("HTTP request sets X-Forwarded-Proto to http", func(t *testing.T) {
+		receivedProto.Store("")
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Host = "app.local.myapp.dev:6788"
+		w := httptest.NewRecorder()
+
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, "http", receivedProto.Load())
+	})
+
+	t.Run("HTTPS request sets X-Forwarded-Proto to https", func(t *testing.T) {
+		receivedProto.Store("")
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Host = "app.local.myapp.dev:6789"
+		req.TLS = &tls.ConnectionState{} // Simulate TLS connection
+		w := httptest.NewRecorder()
+
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, "https", receivedProto.Load())
 	})
 }

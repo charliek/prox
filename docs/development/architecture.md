@@ -85,18 +85,18 @@ This document describes the internal design of prox for contributors.
 - Mark healthy after one success
 - Health state exposed via API and TUI
 
-## HTTPS Reverse Proxy
+## HTTP/HTTPS Reverse Proxy
 
-The optional HTTPS reverse proxy provides subdomain-based routing to local services.
+The optional reverse proxy provides subdomain-based routing to local services over HTTP and/or HTTPS.
 
 ### Proxy Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    HTTPS Reverse Proxy                            │
+│                   HTTP/HTTPS Reverse Proxy                        │
 │                                                                    │
 │  Browser Request                                                   │
-│  https://app.local.dev:6789/api/users                             │
+│  http(s)://app.local.dev:port/api/users                           │
 │         │                                                          │
 │         ▼                                                          │
 │  ┌─────────────────────┐                                          │
@@ -133,12 +133,13 @@ internal/proxy/
 
 ### Request Flow
 
-1. Incoming HTTPS request to `*.domain:port`
+1. Incoming HTTP or HTTPS request to `*.domain:port`
 2. Extract subdomain from Host header
 3. Look up service in route table
 4. Forward request via `httputil.ReverseProxy`
-5. Record request in RequestManager
-6. Return response to client
+5. Set `X-Forwarded-Proto` based on connection type (HTTP or HTTPS)
+6. Record request in RequestManager
+7. Return response to client
 
 ## Technologies
 

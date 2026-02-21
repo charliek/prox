@@ -7,7 +7,7 @@ A modern process manager for development with an API-first design, enabling both
 - **Simple by default** - Procfile-like experience with minimal YAML configuration
 - **API-first** - Full process control and log access via HTTP, always available
 - **Interactive TUI** - Real-time log viewing with filtering and search
-- **HTTPS Proxy** - Subdomain routing with locally-trusted certificates
+- **HTTP/HTTPS Proxy** - Subdomain routing with optional locally-trusted certificates
 - **Health checks** - Optional health monitoring for processes
 - **LLM-friendly** - Structured output and filtering to support AI-assisted debugging
 
