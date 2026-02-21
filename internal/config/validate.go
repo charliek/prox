@@ -54,9 +54,21 @@ func Validate(config *Config) error {
 
 	// Validate proxy config if present
 	if config.Proxy != nil {
-		if config.Proxy.HTTPSPort <= 0 || config.Proxy.HTTPSPort > 65535 {
-			errs = append(errs, fmt.Sprintf("proxy.https_port: must be between 1 and 65535, got %d", config.Proxy.HTTPSPort))
+		// Validate HTTP port if set
+		if config.Proxy.HTTPPort < 0 || config.Proxy.HTTPPort > 65535 {
+			errs = append(errs, fmt.Sprintf("proxy.http_port: must be between 0 and 65535, got %d", config.Proxy.HTTPPort))
 		}
+
+		// Validate HTTPS port if set
+		if config.Proxy.HTTPSPort < 0 || config.Proxy.HTTPSPort > 65535 {
+			errs = append(errs, fmt.Sprintf("proxy.https_port: must be between 0 and 65535, got %d", config.Proxy.HTTPSPort))
+		}
+
+		// Require at least one port when proxy is enabled
+		if config.Proxy.Enabled && config.Proxy.HTTPPort == 0 && config.Proxy.HTTPSPort == 0 {
+			errs = append(errs, "proxy: at least one of http_port or https_port must be set when proxy is enabled")
+		}
+
 		if config.Proxy.Enabled && config.Proxy.Domain == "" {
 			errs = append(errs, "proxy.domain: required when proxy is enabled")
 		}
@@ -69,6 +81,13 @@ func Validate(config *Config) error {
 	if config.Certs != nil {
 		if config.Certs.Dir == "" {
 			errs = append(errs, "certs.dir: directory path is required")
+		}
+	}
+
+	// Validate that HTTPS requires certs when enabled
+	if config.Proxy != nil && config.Proxy.Enabled && config.Proxy.HTTPSPort > 0 {
+		if config.Certs == nil {
+			errs = append(errs, "certs: certificate configuration required when HTTPS proxy is enabled")
 		}
 	}
 

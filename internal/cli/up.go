@@ -38,7 +38,9 @@ const (
 var (
 	useTUI        bool
 	noProxy       bool
-	port          int
+	apiPort       int
+	httpPort      int
+	httpsPort     int
 	enableCapture bool
 )
 
@@ -56,7 +58,7 @@ Examples:
   prox up -d                  # Start in background (daemon mode)
   prox up --tui               # Start with interactive TUI
   prox up web api             # Start specific processes
-  prox up --no-proxy          # Start without HTTPS proxy
+  prox up --no-proxy          # Start without proxy
   prox up --capture           # Enable request/response capture`,
 	Args:              cobra.ArbitraryArgs,
 	RunE:              runUp,
@@ -67,8 +69,10 @@ func init() {
 	rootCmd.AddCommand(upCmd)
 
 	upCmd.Flags().BoolVar(&useTUI, "tui", false, "Enable interactive TUI mode")
-	upCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "Disable HTTPS proxy even if configured")
-	upCmd.Flags().IntVarP(&port, "port", "p", 0, "Override API port (otherwise dynamic)")
+	upCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "Disable proxy even if configured")
+	upCmd.Flags().IntVarP(&apiPort, "api-port", "p", 0, "Override API server port (otherwise dynamic)")
+	upCmd.Flags().IntVar(&httpPort, "http-port", 0, "Override proxy HTTP port")
+	upCmd.Flags().IntVar(&httpsPort, "https-port", 0, "Override proxy HTTPS port")
 	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Enable request/response body capture")
 }
 
@@ -122,9 +126,20 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Determine port: CLI flag > config > dynamic
-	if port > 0 {
-		cfg.API.Port = port
+	// Validate port flags
+	if apiPort < 0 {
+		return fmt.Errorf("--api-port cannot be negative, got %d", apiPort)
+	}
+	if httpPort < 0 {
+		return fmt.Errorf("--http-port cannot be negative, got %d", httpPort)
+	}
+	if httpsPort < 0 {
+		return fmt.Errorf("--https-port cannot be negative, got %d", httpsPort)
+	}
+
+	// Determine API port: CLI flag > config > dynamic
+	if apiPort > 0 {
+		cfg.API.Port = apiPort
 	} else if cfg.API.Port == 0 {
 		// Dynamic port allocation
 		host := cfg.API.Host
@@ -136,6 +151,36 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to find available port: %w", err)
 		}
 		cfg.API.Port = dynamicPort
+	}
+
+	// Override proxy ports if CLI flags are set
+	if cfg.Proxy != nil {
+		if httpPort > 0 {
+			cfg.Proxy.HTTPPort = httpPort
+		}
+		if httpsPort > 0 {
+			cfg.Proxy.HTTPSPort = httpsPort
+		}
+
+		// Auto-enable proxy if CLI port flags provided
+		if !cfg.Proxy.Enabled && (httpPort > 0 || httpsPort > 0) {
+			cfg.Proxy.Enabled = true
+		}
+
+		// Apply cert defaults for HTTPS if CLI overrides enabled it.
+		if cfg.Proxy.Enabled && cfg.Proxy.HTTPSPort > 0 && cfg.Certs == nil {
+			cfg.Certs = &config.CertsConfig{AutoGenerate: true}
+		}
+	} else if httpPort > 0 || httpsPort > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: --http-port/--https-port flags ignored (no proxy section in config)\n")
+	}
+	if cfg.Certs != nil && cfg.Certs.Dir == "" {
+		cfg.Certs.Dir = constants.DefaultCertsDir
+	}
+
+	// Re-validate after applying CLI overrides.
+	if err := config.Validate(cfg); err != nil {
+		return fmt.Errorf("invalid runtime configuration after CLI overrides: %w", err)
 	}
 
 	// Enable capture if --capture flag is set
@@ -342,7 +387,17 @@ func runUp(cmd *cobra.Command, args []string) error {
 			proxyService = nil
 			// Continue without proxy - this is not fatal
 		} else {
-			fmt.Printf("Proxy server: https://*.%s:%d\n", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort)
+			// Build proxy server display message
+			var proxyAddrs []string
+			if cfg.Proxy.HTTPPort > 0 {
+				proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
+			}
+			if cfg.Proxy.HTTPSPort > 0 {
+				proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
+			}
+			if len(proxyAddrs) > 0 {
+				fmt.Printf("Proxy server: %s\n", strings.Join(proxyAddrs, ", "))
+			}
 			// Wire up request manager and capture manager to API handlers
 			handlers.SetRequestManager(proxyService.RequestManager())
 			handlers.SetCaptureManager(proxyService.CaptureManager())

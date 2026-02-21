@@ -22,9 +22,10 @@ type Config struct {
 	Certs     *CertsConfig             `yaml:"certs,omitempty"`
 }
 
-// ProxyConfig defines the HTTPS reverse proxy configuration
+// ProxyConfig defines the HTTP/HTTPS reverse proxy configuration
 type ProxyConfig struct {
 	Enabled   bool           `yaml:"enabled"`
+	HTTPPort  int            `yaml:"http_port"`
 	HTTPSPort int            `yaml:"https_port"`
 	Domain    string         `yaml:"domain"`
 	Capture   *CaptureConfig `yaml:"capture,omitempty"`
@@ -74,12 +75,20 @@ type HealthcheckConfig struct {
 	StartPeriod string `yaml:"start_period"`
 }
 
+type rawProxyConfig struct {
+	Enabled   *bool          `yaml:"enabled,omitempty"`
+	HTTPPort  int            `yaml:"http_port"`
+	HTTPSPort int            `yaml:"https_port"`
+	Domain    string         `yaml:"domain"`
+	Capture   *CaptureConfig `yaml:"capture,omitempty"`
+}
+
 // rawConfig is used for initial YAML parsing to handle the flexible process/service format
 type rawConfig struct {
 	API       APIConfig              `yaml:"api"`
 	EnvFile   string                 `yaml:"env_file"`
 	Processes map[string]interface{} `yaml:"processes"`
-	Proxy     *ProxyConfig           `yaml:"proxy,omitempty"`
+	Proxy     *rawProxyConfig        `yaml:"proxy,omitempty"`
 	Services  map[string]interface{} `yaml:"services,omitempty"`
 	Certs     *CertsConfig           `yaml:"certs,omitempty"`
 }
@@ -118,9 +127,19 @@ func Parse(data []byte) (*Config, error) {
 		API:       raw.API,
 		EnvFile:   raw.EnvFile,
 		Processes: make(map[string]ProcessConfig),
-		Proxy:     raw.Proxy,
 		Services:  make(map[string]ServiceConfig),
 		Certs:     raw.Certs,
+	}
+	if raw.Proxy != nil {
+		config.Proxy = &ProxyConfig{
+			HTTPPort:  raw.Proxy.HTTPPort,
+			HTTPSPort: raw.Proxy.HTTPSPort,
+			Domain:    raw.Proxy.Domain,
+			Capture:   raw.Proxy.Capture,
+		}
+		if raw.Proxy.Enabled != nil {
+			config.Proxy.Enabled = *raw.Proxy.Enabled
+		}
 	}
 
 	// Apply defaults
@@ -149,15 +168,22 @@ func Parse(data []byte) (*Config, error) {
 		config.Services[name] = svc
 	}
 
-	// Apply proxy defaults
+	// Apply proxy defaults and auto-enable logic
 	if config.Proxy != nil {
-		if config.Proxy.HTTPSPort == 0 {
+		// Auto-enable proxy if either port is set and enabled was not explicitly set.
+		if raw.Proxy.Enabled == nil && (config.Proxy.HTTPPort > 0 || config.Proxy.HTTPSPort > 0) {
+			config.Proxy.Enabled = true
+		}
+
+		// For backwards compatibility: if proxy is enabled but no ports set,
+		// default to HTTPS only (original behavior)
+		if config.Proxy.Enabled && config.Proxy.HTTPPort == 0 && config.Proxy.HTTPSPort == 0 {
 			config.Proxy.HTTPSPort = constants.DefaultProxyPort
 		}
 	}
 
-	// Apply certs defaults
-	if config.Certs == nil && config.Proxy != nil {
+	// Apply certs defaults only if HTTPS is being used
+	if config.Certs == nil && config.Proxy != nil && config.Proxy.Enabled && config.Proxy.HTTPSPort > 0 {
 		config.Certs = &CertsConfig{
 			AutoGenerate: true, // Default to auto-generating certs
 		}

@@ -1,4 +1,4 @@
-// Package proxy provides an HTTPS reverse proxy with subdomain-based routing.
+// Package proxy provides HTTP/HTTPS reverse proxy with subdomain-based routing.
 // It allows mapping subdomains to local ports (e.g., app.local.dev:6789 → localhost:3000).
 package proxy
 
@@ -22,16 +22,17 @@ import (
 	"github.com/charliek/prox/internal/proxy/certs"
 )
 
-// Service manages the HTTPS reverse proxy server.
+// Service manages the HTTP/HTTPS reverse proxy servers.
 type Service struct {
 	cfg      *config.ProxyConfig
 	services map[string]config.ServiceConfig
 	certs    *certs.Manager
 	logger   *slog.Logger
 
-	server    *http.Server
-	transport *http.Transport
-	mu        sync.RWMutex
+	httpServer  *http.Server
+	httpsServer *http.Server
+	transport   *http.Transport
+	mu          sync.RWMutex
 
 	// Request tracking
 	requestManager *RequestManager
@@ -50,7 +51,8 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 	}
 
 	var certsMgr *certs.Manager
-	if certsCfg != nil && cfg != nil {
+	// Only create cert manager if HTTPS is enabled and certs are configured
+	if certsCfg != nil && cfg != nil && cfg.HTTPSPort > 0 {
 		certsMgr = certs.NewManager(certsCfg.Dir, cfg.Domain)
 	}
 
@@ -93,15 +95,81 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 	}, nil
 }
 
-// Start starts the HTTPS reverse proxy server.
+// Start starts the HTTP and/or HTTPS reverse proxy servers.
 func (s *Service) Start(ctx context.Context) error {
 	if s.cfg == nil || !s.cfg.Enabled {
 		return nil
 	}
 
+	router := s.createRouter()
+	httpStarted := false
+
+	// Start HTTP server if configured
+	if s.cfg.HTTPPort > 0 {
+		if err := s.startHTTP(router); err != nil {
+			return err
+		}
+		httpStarted = true
+	}
+
+	// Start HTTPS server if configured
+	if s.cfg.HTTPSPort > 0 {
+		if err := s.startHTTPS(router); err != nil {
+			// Roll back HTTP start if HTTPS fails so startup is atomic.
+			if httpStarted {
+				rollbackCtx, cancel := context.WithTimeout(context.Background(), constants.DefaultShutdownTimeout)
+				defer cancel()
+				for _, shutdownErr := range s.stopServers(rollbackCtx) {
+					s.logger.Error("failed to rollback proxy startup", "error", shutdownErr)
+				}
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
+// startHTTP starts the HTTP proxy server.
+func (s *Service) startHTTP(router http.Handler) error {
+	addr := fmt.Sprintf(":%d", s.cfg.HTTPPort)
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      router,
+		ReadTimeout:  constants.DefaultProxyReadTimeout,
+		WriteTimeout: constants.DefaultProxyWriteTimeout,
+		IdleTimeout:  constants.DefaultProxyIdleTimeout,
+	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+
+	s.mu.Lock()
+	s.httpServer = server
+	s.mu.Unlock()
+
+	s.logger.Info("HTTP proxy server started",
+		"addr", addr,
+		"domain", s.cfg.Domain,
+		"services", len(s.services),
+	)
+
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			s.logger.Error("HTTP proxy server error", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// startHTTPS starts the HTTPS proxy server.
+func (s *Service) startHTTPS(router http.Handler) error {
 	// Check that certs manager is configured
 	if s.certs == nil {
-		return fmt.Errorf("certificates not configured for proxy")
+		return fmt.Errorf("certificates not configured for HTTPS proxy")
 	}
 
 	// Ensure certificates exist
@@ -122,10 +190,6 @@ func (s *Service) Start(ctx context.Context) error {
 		MinVersion:   tls.VersionTLS12,
 	}
 
-	// Create the router
-	router := s.createRouter()
-
-	// Create HTTP server
 	addr := fmt.Sprintf(":%d", s.cfg.HTTPSPort)
 	server := &http.Server{
 		Addr:         addr,
@@ -136,46 +200,37 @@ func (s *Service) Start(ctx context.Context) error {
 		IdleTimeout:  constants.DefaultProxyIdleTimeout,
 	}
 
-	// Assign server with lock to avoid race condition with Shutdown
-	s.mu.Lock()
-	s.server = server
-	s.mu.Unlock()
-
-	// Start listening
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
 
+	s.mu.Lock()
+	s.httpsServer = server
+	s.mu.Unlock()
+
 	tlsListener := tls.NewListener(listener, tlsConfig)
 
-	s.logger.Info("proxy server started",
+	s.logger.Info("HTTPS proxy server started",
 		"addr", addr,
 		"domain", s.cfg.Domain,
 		"services", len(s.services),
 	)
 
-	// Start server in goroutine
 	go func() {
-		if err := s.server.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
-			s.logger.Error("proxy server error", "error", err)
+		if err := server.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
+			s.logger.Error("HTTPS proxy server error", "error", err)
 		}
 	}()
 
 	return nil
 }
 
-// Shutdown gracefully stops the proxy server.
+// Shutdown gracefully stops the proxy servers.
 func (s *Service) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-	server := s.server
-	s.mu.Unlock()
+	s.logger.Info("shutting down proxy servers")
 
-	if server == nil {
-		return nil
-	}
-
-	s.logger.Info("shutting down proxy server")
+	shutdownErrs := s.stopServers(ctx)
 
 	// Close the request manager to clean up subscriptions
 	s.requestManager.Close()
@@ -187,7 +242,44 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	return server.Shutdown(ctx)
+	if len(shutdownErrs) > 0 {
+		return errors.Join(shutdownErrs...)
+	}
+
+	return nil
+}
+
+func (s *Service) stopServers(ctx context.Context) []error {
+	s.mu.Lock()
+	httpServer := s.httpServer
+	httpsServer := s.httpsServer
+	s.httpServer = nil
+	s.httpsServer = nil
+	s.mu.Unlock()
+
+	var (
+		wg           sync.WaitGroup
+		mu           sync.Mutex
+		shutdownErrs []error
+	)
+	shutdownOne := func(srv *http.Server, name string) {
+		defer wg.Done()
+		if err := srv.Shutdown(ctx); err != nil {
+			mu.Lock()
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("%s server shutdown: %w", name, err))
+			mu.Unlock()
+		}
+	}
+	if httpServer != nil {
+		wg.Add(1)
+		go shutdownOne(httpServer, "HTTP")
+	}
+	if httpsServer != nil {
+		wg.Add(1)
+		go shutdownOne(httpsServer, "HTTPS")
+	}
+	wg.Wait()
+	return shutdownErrs
 }
 
 // RequestManager returns the request manager for tracking proxy requests.
@@ -244,13 +336,19 @@ func (s *Service) createRouter() http.Handler {
 			reqHeaders = cloneHeaders(r.Header)
 		}
 
+		// Determine if request came via HTTPS
+		proto := "http"
+		if r.TLS != nil {
+			proto = "https"
+		}
+
 		// Customize the director to preserve the original request info
 		originalDirector := proxy.Director
 		proxy.Director = func(req *http.Request) {
 			originalDirector(req)
 			// Preserve the original host header for applications that need it
 			req.Header.Set("X-Forwarded-Host", r.Host)
-			req.Header.Set("X-Forwarded-Proto", "https")
+			req.Header.Set("X-Forwarded-Proto", proto)
 			req.Header.Set("X-Real-IP", getClientIP(r))
 		}
 

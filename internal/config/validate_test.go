@@ -117,6 +117,10 @@ func TestValidateProxy(t *testing.T) {
 			Processes: map[string]ProcessConfig{
 				"web": {Cmd: "npm run dev"},
 			},
+			Certs: &CertsConfig{
+				Dir:          "/tmp/certs",
+				AutoGenerate: true,
+			},
 		}
 	}
 
@@ -179,7 +183,7 @@ func TestValidateProxy(t *testing.T) {
 		}
 		err := Validate(cfg)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "proxy.https_port")
+		assert.Contains(t, err.Error(), "at least one of http_port or https_port")
 	})
 
 	t.Run("proxy port -1 fails", func(t *testing.T) {
@@ -194,7 +198,7 @@ func TestValidateProxy(t *testing.T) {
 		}
 		err := Validate(cfg)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "proxy.https_port")
+		assert.Contains(t, err.Error(), "proxy.https_port: must be between 0 and 65535")
 	})
 
 	t.Run("proxy port 65536 fails", func(t *testing.T) {
@@ -209,7 +213,99 @@ func TestValidateProxy(t *testing.T) {
 		}
 		err := Validate(cfg)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "proxy.https_port")
+		assert.Contains(t, err.Error(), "proxy.https_port: must be between 0 and 65535")
+	})
+
+	t.Run("HTTP only proxy is valid", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:  true,
+			HTTPPort: 6788,
+			Domain:   "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		err := Validate(cfg)
+		assert.NoError(t, err)
+	})
+
+	t.Run("dual stack proxy is valid", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:   true,
+			HTTPPort:  6788,
+			HTTPSPort: 6789,
+			Domain:    "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		err := Validate(cfg)
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid HTTP port fails", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:  true,
+			HTTPPort: 70000,
+			Domain:   "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "proxy.http_port")
+	})
+
+	t.Run("negative HTTP port fails", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:  true,
+			HTTPPort: -1,
+			Domain:   "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "proxy.http_port")
+	})
+
+	t.Run("HTTP only requires no certs", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:  true,
+			HTTPPort: 6788,
+			Domain:   "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		// Explicitly remove certs - should be valid for HTTP only
+		cfg.Certs = nil
+		err := Validate(cfg)
+		assert.NoError(t, err)
+	})
+
+	t.Run("HTTPS requires certs", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled:   true,
+			HTTPSPort: 6789,
+			Domain:    "local.myapp.dev",
+		}
+		cfg.Services = map[string]ServiceConfig{
+			"app": {Port: 3000, Host: "localhost"},
+		}
+		// No certs config - should fail for HTTPS
+		cfg.Certs = nil
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "certs: certificate configuration required")
 	})
 
 	t.Run("services without proxy fails", func(t *testing.T) {
@@ -344,6 +440,10 @@ func TestValidateDomain(t *testing.T) {
 			Processes: map[string]ProcessConfig{
 				"web": {Cmd: "npm run dev"},
 			},
+			Certs: &CertsConfig{
+				Dir:          "/tmp/certs",
+				AutoGenerate: true,
+			},
 		}
 	}
 
@@ -402,6 +502,10 @@ func TestValidateCertsConfig(t *testing.T) {
 			Processes: map[string]ProcessConfig{
 				"web": {Cmd: "npm run dev"},
 			},
+			Certs: &CertsConfig{
+				Dir:          "/tmp/certs",
+				AutoGenerate: true,
+			},
 		}
 	}
 
@@ -433,6 +537,10 @@ func TestValidateServiceHost(t *testing.T) {
 			API: APIConfig{Port: 5555, Host: "127.0.0.1"},
 			Processes: map[string]ProcessConfig{
 				"web": {Cmd: "npm run dev"},
+			},
+			Certs: &CertsConfig{
+				Dir:          "/tmp/certs",
+				AutoGenerate: true,
 			},
 		}
 	}
