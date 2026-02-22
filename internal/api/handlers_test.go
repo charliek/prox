@@ -763,3 +763,253 @@ func TestStreamProxyRequests_ProxyNotEnabled(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.ErrCodeProxyNotEnabled, resp.Code)
 }
+
+func TestGetProxyRequest(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	rm := proxy.NewRequestManager(100)
+	handlers.SetRequestManager(rm)
+
+	// Create a capture manager for body loading
+	captureCfg := &config.CaptureConfig{Enabled: true}
+	cm, err := proxy.NewCaptureManager(captureCfg, t.TempDir())
+	require.NoError(t, err)
+	handlers.SetCaptureManager(cm)
+
+	// Record a request with details (text body)
+	rm.Record(proxy.RequestRecord{
+		ID:         "abc1234",
+		Timestamp:  time.Now(),
+		Method:     "POST",
+		URL:        "/api/users",
+		Subdomain:  "api",
+		StatusCode: 201,
+		Duration:   50 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+		Details: &proxy.RequestDetails{
+			RequestHeaders:  http.Header{"Content-Type": {"application/json"}},
+			ResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+			RequestBody: &proxy.CapturedBody{
+				Size:        13,
+				ContentType: "application/json",
+				Data:        []byte(`{"name":"Jo"}`),
+			},
+			ResponseBody: &proxy.CapturedBody{
+				Size:        15,
+				ContentType: "application/json",
+				Data:        []byte(`{"id":1,"ok":1}`),
+			},
+		},
+	})
+
+	// Record a request with binary body
+	binaryData := []byte{0xff, 0xfe, 0x00, 0x01}
+	rm.Record(proxy.RequestRecord{
+		ID:         "bin5678",
+		Timestamp:  time.Now(),
+		Method:     "POST",
+		URL:        "/upload",
+		Subdomain:  "app",
+		StatusCode: 200,
+		Duration:   100 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+		Details: &proxy.RequestDetails{
+			RequestHeaders: http.Header{"Content-Type": {"application/octet-stream"}},
+			RequestBody: &proxy.CapturedBody{
+				Size:        int64(len(binaryData)),
+				ContentType: "application/octet-stream",
+				IsBinary:    true,
+				Data:        binaryData,
+			},
+		},
+	})
+
+	// Record a request without details
+	rm.Record(proxy.RequestRecord{
+		ID:         "nod9999",
+		Timestamp:  time.Now(),
+		Method:     "GET",
+		URL:        "/health",
+		Subdomain:  "api",
+		StatusCode: 200,
+		Duration:   5 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+	})
+
+	t.Run("returns 503 when proxy not enabled", func(t *testing.T) {
+		h := NewHandlers(sup, logMgr, "prox.yaml", nil)
+		// Don't set request manager
+
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/abc1234", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "abc1234")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		h.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var resp ErrorResponse
+		json.NewDecoder(w.Body).Decode(&resp)
+		assert.Equal(t, domain.ErrCodeProxyNotEnabled, resp.Code)
+	})
+
+	t.Run("returns 400 for missing request ID", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var resp ErrorResponse
+		json.NewDecoder(w.Body).Decode(&resp)
+		assert.Equal(t, domain.ErrCodeMissingRequestID, resp.Code)
+	})
+
+	t.Run("returns 404 for unknown request ID", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/unknown", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "unknown")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+		var resp ErrorResponse
+		json.NewDecoder(w.Body).Decode(&resp)
+		assert.Equal(t, domain.ErrCodeRequestNotFound, resp.Code)
+	})
+
+	t.Run("returns basic response without body when include not set", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/abc1234", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "abc1234")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestDetailResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Equal(t, "abc1234", resp.ID)
+		assert.Equal(t, "POST", resp.Method)
+		assert.Equal(t, "/api/users", resp.URL)
+		assert.Equal(t, 201, resp.StatusCode)
+
+		// Details should be present but body data should not be included
+		require.NotNil(t, resp.Details)
+		assert.NotNil(t, resp.Details.RequestHeaders)
+		assert.NotNil(t, resp.Details.ResponseHeaders)
+		if resp.Details.RequestBody != nil {
+			assert.Empty(t, resp.Details.RequestBody.Data)
+		}
+		if resp.Details.ResponseBody != nil {
+			assert.Empty(t, resp.Details.ResponseBody.Data)
+		}
+	})
+
+	t.Run("returns text body data when include=body", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/abc1234?include=body", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "abc1234")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestDetailResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		require.NotNil(t, resp.Details)
+		require.NotNil(t, resp.Details.RequestBody)
+		assert.Equal(t, int64(13), resp.Details.RequestBody.Size)
+		assert.Equal(t, "application/json", resp.Details.RequestBody.ContentType)
+		assert.False(t, resp.Details.RequestBody.IsBinary)
+		assert.Equal(t, `{"name":"Jo"}`, resp.Details.RequestBody.Data)
+
+		require.NotNil(t, resp.Details.ResponseBody)
+		assert.Equal(t, `{"id":1,"ok":1}`, resp.Details.ResponseBody.Data)
+	})
+
+	t.Run("returns base64-encoded binary body when include=body", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/bin5678?include=body", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "bin5678")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestDetailResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		require.NotNil(t, resp.Details)
+		require.NotNil(t, resp.Details.RequestBody)
+		assert.True(t, resp.Details.RequestBody.IsBinary)
+
+		// Should be base64-encoded
+		expected := base64Encode(binaryData)
+		assert.Equal(t, expected, resp.Details.RequestBody.Data)
+	})
+
+	t.Run("handles request with nil details gracefully", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/nod9999?include=body", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "nod9999")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestDetailResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Equal(t, "nod9999", resp.ID)
+		assert.Nil(t, resp.Details)
+	})
+
+	t.Run("includes request and response headers", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/abc1234", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "abc1234")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequest(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestDetailResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		require.NotNil(t, resp.Details)
+		assert.Equal(t, []string{"application/json"}, resp.Details.RequestHeaders["Content-Type"])
+		assert.Equal(t, []string{"application/json"}, resp.Details.ResponseHeaders["Content-Type"])
+	})
+}
