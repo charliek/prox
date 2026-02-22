@@ -334,6 +334,30 @@ proxy:
 		assert.Nil(t, cfg.Certs)
 	})
 
+	t.Run("parses capture config", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  http_port: 6788
+  domain: local.test.dev
+  capture:
+    enabled: true
+    max_body_size: "2MB"
+
+services:
+  app: 3000
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy)
+		require.NotNil(t, cfg.Proxy.Capture)
+		assert.True(t, cfg.Proxy.Capture.Enabled)
+		assert.Equal(t, "2MB", cfg.Proxy.Capture.MaxBodySize)
+	})
+
 	t.Run("HTTP only does not auto-create certs", func(t *testing.T) {
 		yaml := `
 processes:
@@ -374,5 +398,84 @@ services:
 		assert.Equal(t, "local.test.dev", cfg.Proxy.Domain)
 		require.NotNil(t, cfg.Certs) // Certs auto-created for HTTPS
 		assert.True(t, cfg.Certs.AutoGenerate)
+	})
+}
+
+func TestParseSize(t *testing.T) {
+	t.Run("empty string returns zero", func(t *testing.T) {
+		size, err := ParseSize("")
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), size)
+	})
+
+	t.Run("plain bytes", func(t *testing.T) {
+		size, err := ParseSize("1024")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1024), size)
+	})
+
+	t.Run("B suffix", func(t *testing.T) {
+		size, err := ParseSize("512B")
+		require.NoError(t, err)
+		assert.Equal(t, int64(512), size)
+	})
+
+	t.Run("KB suffix", func(t *testing.T) {
+		size, err := ParseSize("512KB")
+		require.NoError(t, err)
+		assert.Equal(t, int64(512*1024), size)
+	})
+
+	t.Run("K suffix", func(t *testing.T) {
+		size, err := ParseSize("64K")
+		require.NoError(t, err)
+		assert.Equal(t, int64(64*1024), size)
+	})
+
+	t.Run("MB suffix", func(t *testing.T) {
+		size, err := ParseSize("1MB")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1024*1024), size)
+	})
+
+	t.Run("M suffix", func(t *testing.T) {
+		size, err := ParseSize("2M")
+		require.NoError(t, err)
+		assert.Equal(t, int64(2*1024*1024), size)
+	})
+
+	t.Run("GB suffix", func(t *testing.T) {
+		size, err := ParseSize("1GB")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1024*1024*1024), size)
+	})
+
+	t.Run("case insensitive", func(t *testing.T) {
+		size, err := ParseSize("1mb")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1024*1024), size)
+	})
+
+	t.Run("whitespace is trimmed", func(t *testing.T) {
+		size, err := ParseSize("  512KB  ")
+		require.NoError(t, err)
+		assert.Equal(t, int64(512*1024), size)
+	})
+
+	t.Run("invalid suffix returns error", func(t *testing.T) {
+		_, err := ParseSize("100XB")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid size suffix")
+	})
+
+	t.Run("non-numeric string returns error", func(t *testing.T) {
+		_, err := ParseSize("notanumber")
+		require.Error(t, err)
+	})
+
+	t.Run("zero is valid", func(t *testing.T) {
+		size, err := ParseSize("0")
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), size)
 	})
 }
