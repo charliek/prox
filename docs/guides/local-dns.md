@@ -36,7 +36,7 @@ With this configuration:
 
 If you prefer a custom domain like `local.myapp.dev`, add entries to `/etc/hosts` manually:
 
-```
+```text
 127.0.0.1 local.myapp.dev app.local.myapp.dev api.local.myapp.dev
 ```
 
