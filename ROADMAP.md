@@ -9,11 +9,6 @@ Features planned for future versions of prox.
 - `prox logs` works after supervisor exits
 - Auto-cleanup of old logs
 
-## Global Config
-
-- `~/.prox/config.yaml` for user defaults
-- Default API port, log retention, etc.
-
 ## Process Groups
 
 ```yaml
