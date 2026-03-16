@@ -268,55 +268,6 @@ Show version information.
 prox version
 ```
 
-### certs
-
-Manage HTTPS certificates for the proxy.
-
-```bash
-prox certs [options]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--regenerate` | Force regenerate certificates |
-
-**Examples:**
-
-```bash
-# Show certificate status
-prox certs
-
-# Regenerate certificates
-prox certs --regenerate
-```
-
-### hosts
-
-Manage /etc/hosts entries for proxy subdomains.
-
-```bash
-prox hosts [options]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--show` | Show entries that would be added (default) |
-| `--add` | Add entries to /etc/hosts (requires sudo) |
-| `--remove` | Remove entries from /etc/hosts (requires sudo) |
-
-**Examples:**
-
-```bash
-# Show required entries
-prox hosts --show
-
-# Add entries (requires sudo)
-prox hosts --add
-
-# Remove entries
-prox hosts --remove
-```
-
 ### help
 
 Show help for any command.

@@ -90,6 +90,8 @@ nav:
   - Home: index.md
   - Getting Started:
       - Quick Start: getting-started/quick-start.md
+  - Guides:
+      - Local DNS & Certificates: guides/local-dns.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md

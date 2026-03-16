@@ -36,7 +36,7 @@ func TestExpandPath(t *testing.T) {
 
 func TestGetCertPaths(t *testing.T) {
 	m := NewManager("/tmp/certs", "local.myapp.dev")
-	paths := m.GetCertPaths()
+	paths := m.getCertPaths()
 
 	assert.Equal(t, "/tmp/certs/local_myapp_dev.pem", paths.CertFile)
 	assert.Equal(t, "/tmp/certs/local_myapp_dev-key.pem", paths.KeyFile)
