@@ -23,5 +23,6 @@ site-build/
 # Prox runtime data
 .prox/
 
-# Claude Code local settings (user-specific)
+# Claude Code local/user-specific files
 .claude/settings.local.json
+.claude/projects/
