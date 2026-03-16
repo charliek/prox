@@ -126,7 +126,7 @@ prox can provide friendly subdomain URLs for your services via HTTP and/or HTTPS
 
 ### HTTP Proxy (simplest)
 
-No certificate setup required:
+No certificate or DNS setup required when using `lvh.me` (resolves to `127.0.0.1` automatically):
 
 ```yaml
 processes:
@@ -135,7 +135,7 @@ processes:
 
 proxy:
   http_port: 6788
-  domain: local.myapp.dev
+  domain: lvh.me
 
 services:
   app: 3000
@@ -163,19 +163,11 @@ processes:
 
 proxy:
   https_port: 6789
-  domain: local.myapp.dev
+  domain: lvh.me
 
 services:
   app: 3000
   api: 8000
-```
-
-### DNS Setup
-
-Add entries to `/etc/hosts`:
-
-```bash
-prox hosts --add
 ```
 
 ### Usage
@@ -188,10 +180,10 @@ prox up
 
 Access your services:
 
-- `http://app.local.myapp.dev:6788` → `http://localhost:3000` (HTTP mode)
-- `https://app.local.myapp.dev:6789` → `http://localhost:3000` (HTTPS mode)
+- `http://app.lvh.me:6788` → `http://localhost:3000` (HTTP mode)
+- `https://app.lvh.me:6789` → `http://localhost:3000` (HTTPS mode)
 
-See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full details.
+See the [Local DNS & Certificates](../guides/local-dns.md) guide for custom domains, certificate management, and sharing CAs across machines. See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full proxy options.
 
 ## HTTP API
 

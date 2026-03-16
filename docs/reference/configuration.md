@@ -260,15 +260,7 @@ mkcert -install
 
 ### DNS Setup
 
-Add entries to `/etc/hosts` for your subdomains:
-
-```bash
-# View required entries
-prox hosts --show
-
-# Add entries (requires sudo)
-prox hosts --add
-```
+Custom domains require DNS entries pointing to `127.0.0.1`. See the [Local DNS & Certificates](../guides/local-dns.md) guide for options including localhost DNS services that work without `/etc/hosts` editing.
 
 ## Security Note
 

@@ -14,13 +14,6 @@ Features planned for future versions of prox.
 - `~/.prox/config.yaml` for user defaults
 - Default API port, log retention, etc.
 
-## Daemon Mode
-
-- `prox up -d` starts detached
-- `prox attach` connects to running instance
-- `prox attach --tui` attaches with TUI
-- PID file management
-
 ## Process Groups
 
 ```yaml
@@ -83,24 +76,3 @@ Track running prox instances and dynamically assign API ports.
 
 **Inspiration**: codelens project's ServerStateRepository pattern
 
-## Request Details & Body Inspection
-
-View detailed request/response information including bodies.
-
-**CLI:**
-- `prox requests <id>` - Show request details by short hash
-- `prox requests <id> --body` - Include request/response body
-
-**API:**
-- `GET /proxy/requests/{id}` - Get single request details
-- `GET /proxy/requests/{id}?include=body` - Include body content
-
-**Storage enhancements:**
-- Store request/response bodies (configurable max size)
-- Persist requests to disk for post-mortem debugging
-- Configurable retention policy
-
-**Use cases:**
-- Debug API payloads without external tools
-- Replay requests for testing
-- Post-mortem analysis of failed requests
