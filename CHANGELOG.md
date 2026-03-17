@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.0.3
+
+### Features
+
+- Add HTTP proxy support for dual-stack (HTTP + HTTPS) proxying
+- Add request/response body capture for proxy inspection
+
+### Improvements
+
+- Remove `hosts` and `certs` CLI commands, replaced with documentation
+- Upgrade golangci-lint to v2 with macOS support
+- Fix CI: upgrade golangci-lint-action to v7
+
+### Tests
+
+- Add comprehensive tests for request/response body capture
+
 ## v0.0.2
 
 ### Features
