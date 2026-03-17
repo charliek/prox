@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Remove `hosts` and `certs` CLI commands, replaced with documentation
 - Upgrade golangci-lint to v2 with macOS support
 - Fix CI: upgrade golangci-lint-action to v7
+- Fix release workflow: upgrade golangci-lint-action to v7 for v2 support
 
 ### Tests
 
