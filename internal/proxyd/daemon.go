@@ -50,8 +50,8 @@ func EnsureRunning() (*Client, error) {
 		// Daemon is running — check version
 		if daemonVersion != version.Version {
 			return nil, fmt.Errorf(
-				"proxy daemon is running version %s, but this process is version %s.\n"+
-					"Stop all projects and restart, or run 'prox proxy stop --force' to reset.",
+				"proxy daemon is running version %s, but this process is version %s; "+
+					"stop all projects and restart, or run 'prox proxy stop --force' to reset",
 				daemonVersion, version.Version,
 			)
 		}
@@ -101,7 +101,7 @@ func startDaemon() error {
 	}
 
 	// Detach — don't wait for the child
-	cmd.Process.Release()
+	_ = cmd.Process.Release()
 	return nil
 }
 
@@ -133,7 +133,7 @@ func RunDaemon(ctx context.Context) error {
 		}
 		return fmt.Errorf("creating daemon PID file: %w", err)
 	}
-	defer pidFile.Release()
+	defer func() { _ = pidFile.Release() }()
 
 	// Write state file
 	state := &DaemonState{

@@ -45,7 +45,7 @@ type ListenerInfo struct {
 // Registry tracks route registrations from multiple projects.
 type Registry struct {
 	mu        sync.RWMutex
-	routes    map[string]*Route              // key: "hostname:port"
+	routes    map[string]*Route               // key: "hostname:port"
 	projects  map[string]*ProjectRegistration // key: project dir
 	listeners map[int]*ListenerInfo           // key: port
 }

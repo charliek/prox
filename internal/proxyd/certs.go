@@ -15,8 +15,8 @@ import (
 type MultiDomainCertManager struct {
 	mu       sync.RWMutex
 	certsDir string
-	managers map[string]*certs.Manager    // base domain -> cert manager
-	loaded   map[string]*tls.Certificate  // base domain -> loaded cert
+	managers map[string]*certs.Manager   // base domain -> cert manager
+	loaded   map[string]*tls.Certificate // base domain -> loaded cert
 }
 
 // NewMultiDomainCertManager creates a new multi-domain cert manager.
