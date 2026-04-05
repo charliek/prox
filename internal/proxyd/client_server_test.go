@@ -11,8 +11,13 @@ import (
 func startTestServer(t *testing.T) (*Server, *Client, string) {
 	t.Helper()
 
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
+	// Use a short temp dir to stay under Unix socket 104-byte path limit on macOS
+	tmpDir, err := os.MkdirTemp("/tmp", "prox-ut-")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	socketPath := filepath.Join(tmpDir, "t.sock")
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 

@@ -279,6 +279,7 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 
 // PurgeByHostnames removes all records matching any of the given hostnames
 // from the ring buffer and calls the eviction callback for each.
+// It compacts the buffer to preserve the contiguous ring invariant.
 func (m *RequestManager) PurgeByHostnames(hostnames []string) {
 	if len(hostnames) == 0 {
 		return
@@ -294,8 +295,12 @@ func (m *RequestManager) PurgeByHostnames(hostnames []string) {
 
 	m.mu.Lock()
 	onEvict = m.onEvict
-	for i := 0; i < m.capacity; i++ {
-		rec := &m.buffer[i]
+
+	// Rebuild the buffer keeping only non-matching records in order.
+	kept := make([]RequestRecord, 0, m.count)
+	for i := 0; i < m.count; i++ {
+		idx := (m.head - m.count + i + m.capacity) % m.capacity
+		rec := m.buffer[idx]
 		if rec.ID == "" {
 			continue
 		}
@@ -303,12 +308,16 @@ func (m *RequestManager) PurgeByHostnames(hostnames []string) {
 			if rec.Details != nil {
 				evictIDs = append(evictIDs, rec.ID)
 			}
-			m.buffer[i] = RequestRecord{} // zero out
-			if m.count > 0 {
-				m.count--
-			}
+			continue
 		}
+		kept = append(kept, rec)
 	}
+
+	compacted := make([]RequestRecord, m.capacity)
+	copy(compacted, kept)
+	m.buffer = compacted
+	m.count = len(kept)
+	m.head = m.count % m.capacity
 	m.mu.Unlock()
 
 	// Call eviction callbacks outside of lock

@@ -75,6 +75,11 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		return nil, nil, fmt.Errorf("project %s is already registered; deregister first", req.ProjectDir)
 	}
 
+	// Reject same port for both HTTP and HTTPS
+	if req.HTTPPort > 0 && req.HTTPSPort > 0 && req.HTTPPort == req.HTTPSPort {
+		return nil, nil, fmt.Errorf("http_port and https_port cannot be the same (%d)", req.HTTPPort)
+	}
+
 	// Build the set of routes this project wants to register.
 	type pendingRoute struct {
 		hostname string

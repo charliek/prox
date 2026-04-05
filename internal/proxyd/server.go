@@ -152,11 +152,32 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ensure certs exist for HTTPS domains before starting listeners
+	if s.proxy != nil && s.proxy.certMgr != nil {
+		for _, ps := range newPorts {
+			if ps.Protocol == "https" {
+				if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
+					s.registry.Deregister(req.ProjectDir)
+					writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+						Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
+						Code:  "CERT_GENERATION_FAILED",
+					})
+					return
+				}
+				break // one EnsureDomain per domain is sufficient
+			}
+		}
+	}
+
 	// Start listeners for new ports
 	if s.proxy != nil {
+		var startedPorts []int
 		for _, ps := range newPorts {
 			if err := s.proxy.AddListener(ps.Port, ps.Protocol); err != nil {
-				// Rollback: deregister the routes we just added
+				// Rollback: stop listeners we already started, then deregister
+				for _, p := range startedPorts {
+					_ = s.proxy.RemoveListener(p)
+				}
 				s.registry.Deregister(req.ProjectDir)
 				writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 					Error: fmt.Sprintf("failed to bind port %d: %v", ps.Port, err),
@@ -164,6 +185,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
+			startedPorts = append(startedPorts, ps.Port)
 		}
 	}
 

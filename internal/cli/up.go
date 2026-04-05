@@ -323,7 +323,11 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var proxyService *proxy.Service
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
-		daemonClient, proxyService = startProxy(cfg, cwd, ctx, handlers)
+		var proxyErr error
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers)
+		if proxyErr != nil {
+			return proxyErr
+		}
 	}
 	// Ensure standalone proxy is cleaned up on any subsequent error
 	if proxyService != nil {
@@ -543,38 +547,37 @@ func proxyStartError(err error) error {
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, *proxy.Service) {
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
-	client, ok, fatal := tryDaemonProxy(cfg, cwd, ctx, handlers)
+	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers)
 	if ok {
-		return client, nil
+		return client, nil, nil
 	}
-	if fatal {
+	if fatalErr != nil {
 		// Daemon is running but registration failed (conflict, version mismatch, etc.)
-		// Don't fall back to standalone — it would just fail on port binding too.
-		return nil, nil
+		return nil, nil, fatalErr
 	}
 
 	// Fallback to standalone proxy (daemon unavailable or sandboxed)
-	return nil, startStandaloneProxy(cfg, cwd, ctx, handlers)
+	return nil, startStandaloneProxy(cfg, cwd, ctx, handlers), nil
 }
 
 // tryDaemonProxy attempts to register with the shared proxy daemon.
-// Returns (client, true, false) on success, (nil, false, false) when daemon is
-// unavailable (fall back to standalone), (nil, false, true) when daemon is running
-// but registration failed (don't fall back).
-func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, bool, bool) {
+// Returns (client, true, nil) on success, (nil, false, nil) when daemon is
+// unavailable (fall back to standalone), (nil, false, error) when daemon is
+// running but registration failed (don't fall back, fail the command).
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, bool, error) {
 	// Check if we can access the daemon directory
 	if err := proxyd.EnsureDaemonDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
-		return nil, false, false
+		return nil, false, nil
 	}
 
 	// Ensure daemon is running
 	client, err := proxyd.EnsureRunning()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
-		return nil, false, false
+		return nil, false, nil
 	}
 
 	// Build registration request
@@ -596,8 +599,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 
 	resp, err := client.Register(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return nil, false, true // fatal — daemon running but registration failed
+		return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", err)
 	}
 
 	// Print registered routes
@@ -621,7 +623,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	handlers.SetRequestManager(localRM)
 	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), resp.Registered, localRM)
 
-	return client, true, false
+	return client, true, nil
 }
 
 // startStandaloneProxy creates and starts a standalone proxy (current behavior).

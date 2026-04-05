@@ -31,10 +31,14 @@ type DaemonState struct {
 }
 
 // DaemonDir returns the path to the ~/.prox directory.
+// Falls back to a relative path only as a last resort; EnsureDaemonDir
+// should be called to validate the path is usable before relying on it.
 func DaemonDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return DaemonDirName
+		// This fallback is intentionally fragile — EnsureDaemonDir will
+		// fail and trigger standalone mode rather than silently using cwd.
+		return filepath.Join(os.TempDir(), DaemonDirName)
 	}
 	return filepath.Join(home, DaemonDirName)
 }

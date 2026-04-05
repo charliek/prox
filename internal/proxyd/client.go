@@ -41,6 +41,10 @@ func (c *Client) Health() (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("daemon health check returned %d", resp.StatusCode)
+	}
+
 	var result map[string]string
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("decoding health response: %w", err)
