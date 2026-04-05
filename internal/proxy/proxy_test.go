@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"syscall"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
