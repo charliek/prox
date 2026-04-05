@@ -23,7 +23,10 @@ func (e *PortConflictError) Error() string {
 }
 
 func (e *PortConflictError) Unwrap() []error {
-	return []error{ErrPortInUse, e.Cause}
+	if e.Cause != nil {
+		return []error{ErrPortInUse, e.Cause}
+	}
+	return []error{ErrPortInUse}
 }
 
 // isAddrInUse checks whether an error from net.Listen is caused by the address

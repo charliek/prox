@@ -443,11 +443,12 @@ func runUp(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Stop proxy server
+	// Stop proxy server and disarm the deferred shutdown
 	if proxyService != nil {
 		if err := proxyService.Shutdown(shutdownCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
 		}
+		proxyService = nil
 	}
 
 	// Stop API server
