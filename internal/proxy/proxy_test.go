@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"syscall"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -270,4 +272,97 @@ func TestCreateRouter_XForwardedProto(t *testing.T) {
 
 		assert.Equal(t, "https", receivedProto.Load())
 	})
+}
+
+func TestPortConflictError_ErrorMessage(t *testing.T) {
+	tests := []struct {
+		port     int
+		protocol string
+		expected string
+	}{
+		{443, "HTTPS", "HTTPS proxy port 443 already in use"},
+		{80, "HTTP", "HTTP proxy port 80 already in use"},
+		{8080, "HTTP", "HTTP proxy port 8080 already in use"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			err := &PortConflictError{Port: tt.port, Protocol: tt.protocol}
+			assert.Equal(t, tt.expected, err.Error())
+		})
+	}
+}
+
+func TestPortConflictError_Unwrap(t *testing.T) {
+	cause := fmt.Errorf("listen tcp :443: bind: address already in use")
+	err := &PortConflictError{Port: 443, Protocol: "HTTPS", Cause: cause}
+
+	// Sentinel is reachable via multi-unwrap
+	assert.True(t, errors.Is(err, ErrPortInUse))
+	// Original cause is also reachable
+	assert.True(t, errors.Is(err, cause))
+	assert.False(t, errors.Is(err, errors.New("something else")))
+}
+
+func TestPortConflictError_Unwrap_NilCause(t *testing.T) {
+	err := &PortConflictError{Port: 80, Protocol: "HTTP"}
+	assert.True(t, errors.Is(err, ErrPortInUse))
+}
+
+func TestIsAddrInUse(t *testing.T) {
+	t.Run("returns true for EADDRINUSE", func(t *testing.T) {
+		// Bind a port and try to bind it again
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer listener.Close()
+
+		addr := listener.Addr().String()
+		_, err = net.Listen("tcp", addr)
+		require.Error(t, err)
+		assert.True(t, isAddrInUse(err))
+	})
+
+	t.Run("returns false for nil", func(t *testing.T) {
+		assert.False(t, isAddrInUse(nil))
+	})
+
+	t.Run("returns false for other errors", func(t *testing.T) {
+		assert.False(t, isAddrInUse(errors.New("something else")))
+	})
+}
+
+func TestStart_PortConflict_HTTP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	workDir := t.TempDir()
+
+	// Hold a port open on all interfaces to match how the proxy binds (":port")
+	listener, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.ProxyConfig{
+		Enabled:  true,
+		HTTPPort: port,
+		Domain:   "local.myapp.dev",
+	}
+	services := map[string]config.ServiceConfig{
+		"app": {Port: 3000, Host: "localhost"},
+	}
+
+	svc, err := NewService(cfg, services, nil, logger, workDir)
+	require.NoError(t, err)
+
+	err = svc.Start(context.Background())
+	require.Error(t, err)
+
+	// Verify it's a PortConflictError with correct metadata
+	assert.True(t, errors.Is(err, ErrPortInUse))
+
+	var portErr *PortConflictError
+	require.True(t, errors.As(err, &portErr))
+	assert.Equal(t, port, portErr.Port)
+	assert.Equal(t, "HTTP", portErr.Protocol)
+	// Original OS error is preserved via multi-unwrap
+	assert.NotNil(t, portErr.Cause)
+	assert.True(t, errors.Is(err, syscall.EADDRINUSE))
 }

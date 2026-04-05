@@ -317,6 +317,48 @@ func runUp(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start proxy server first if configured — fail fast on port conflicts
+	// before spawning child processes.
+	var proxyService *proxy.Service
+	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
+		level := slog.LevelInfo
+		if verbose {
+			level = slog.LevelDebug
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+		var err error
+		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
+		if err != nil {
+			return fmt.Errorf("failed to create proxy: %w", err)
+		}
+		if err := proxyService.Start(ctx); err != nil {
+			return proxyStartError(err)
+		}
+		// Ensure proxy is cleaned up on any subsequent error (e.g., supervisor
+		// fails to start). The normal shutdown path also calls Shutdown, but
+		// a double-call is safe since stopServers nil-checks server pointers.
+		defer func() {
+			if proxyService != nil {
+				sCtx, sCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer sCancel()
+				_ = proxyService.Shutdown(sCtx)
+			}
+		}()
+
+		var proxyAddrs []string
+		if cfg.Proxy.HTTPPort > 0 {
+			proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
+		}
+		if cfg.Proxy.HTTPSPort > 0 {
+			proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
+		}
+		if len(proxyAddrs) > 0 {
+			fmt.Printf("Proxy server: %s\n", strings.Join(proxyAddrs, ", "))
+		}
+		handlers.SetRequestManager(proxyService.RequestManager())
+		handlers.SetCaptureManager(proxyService.CaptureManager())
+	}
+
 	// Start supervisor
 	fmt.Printf("Starting prox with config: %s\n", configPath)
 	if isLocalhost(cfg.API.Host) {
@@ -368,41 +410,6 @@ func runUp(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}()
-
-	// Start proxy server if configured and not disabled
-	var proxyService *proxy.Service
-	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
-		level := slog.LevelInfo
-		if verbose {
-			level = slog.LevelDebug
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-		var err error
-		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating proxy service: %v\n", err)
-			// Continue without proxy - this is not fatal
-		} else if err := proxyService.Start(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting proxy: %v\n", err)
-			proxyService = nil
-			// Continue without proxy - this is not fatal
-		} else {
-			// Build proxy server display message
-			var proxyAddrs []string
-			if cfg.Proxy.HTTPPort > 0 {
-				proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
-			}
-			if cfg.Proxy.HTTPSPort > 0 {
-				proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
-			}
-			if len(proxyAddrs) > 0 {
-				fmt.Printf("Proxy server: %s\n", strings.Join(proxyAddrs, ", "))
-			}
-			// Wire up request manager and capture manager to API handlers
-			handlers.SetRequestManager(proxyService.RequestManager())
-			handlers.SetCaptureManager(proxyService.CaptureManager())
-		}
-	}
 
 	// Handle TUI vs terminal output
 	if useTUI {
@@ -537,6 +544,16 @@ func ensureNotAlreadyRunning(cwd string) error {
 	}
 
 	return nil
+}
+
+// proxyStartError formats an actionable error message for proxy startup failures.
+// For port conflicts it includes the port number and a hint to identify the process.
+func proxyStartError(err error) error {
+	var portErr *proxy.PortConflictError
+	if errors.As(err, &portErr) {
+		return fmt.Errorf("%w\n\nAnother process is listening on this port. To identify it:\n  lsof -i :%d\n\nTo start without the proxy:\n  prox up --no-proxy", portErr, portErr.Port)
+	}
+	return fmt.Errorf("proxy failed to start: %w", err)
 }
 
 // printLogs subscribes to logs and prints them to terminal

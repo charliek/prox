@@ -143,6 +143,9 @@ func (s *Service) startHTTP(router http.Handler) error {
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		if isAddrInUse(err) {
+			return &PortConflictError{Port: s.cfg.HTTPPort, Protocol: "HTTP", Cause: err}
+		}
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
 
@@ -202,6 +205,9 @@ func (s *Service) startHTTPS(router http.Handler) error {
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		if isAddrInUse(err) {
+			return &PortConflictError{Port: s.cfg.HTTPSPort, Protocol: "HTTPS", Cause: err}
+		}
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
 
