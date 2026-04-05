@@ -16,6 +16,7 @@ type RequestRecord struct {
 	Method     string        `json:"method"`
 	URL        string        `json:"url"`
 	Subdomain  string        `json:"subdomain"`
+	Hostname   string        `json:"hostname,omitempty"` // full hostname (e.g., api.local.dev)
 	StatusCode int           `json:"status_code"`
 	Duration   time.Duration `json:"duration"`
 	RemoteAddr string        `json:"remote_addr"`
@@ -52,6 +53,7 @@ func generateRequestID(timestamp time.Time, method, url string) string {
 // RequestFilter specifies criteria for filtering requests.
 type RequestFilter struct {
 	Subdomain string
+	Hostnames []string // match if record.Hostname is in this list (empty = match all)
 	Method    string
 	MinStatus int
 	MaxStatus int
@@ -248,6 +250,18 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 	if filter.Subdomain != "" && record.Subdomain != filter.Subdomain {
 		return false
 	}
+	if len(filter.Hostnames) > 0 {
+		matched := false
+		for _, h := range filter.Hostnames {
+			if record.Hostname == h {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
 	if filter.Method != "" && record.Method != filter.Method {
 		return false
 	}
@@ -261,4 +275,46 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 		return false
 	}
 	return true
+}
+
+// PurgeByHostnames removes all records matching any of the given hostnames
+// from the ring buffer and calls the eviction callback for each.
+func (m *RequestManager) PurgeByHostnames(hostnames []string) {
+	if len(hostnames) == 0 {
+		return
+	}
+
+	hostSet := make(map[string]struct{}, len(hostnames))
+	for _, h := range hostnames {
+		hostSet[h] = struct{}{}
+	}
+
+	var evictIDs []string
+	var onEvict EvictionCallback
+
+	m.mu.Lock()
+	onEvict = m.onEvict
+	for i := 0; i < m.capacity; i++ {
+		rec := &m.buffer[i]
+		if rec.ID == "" {
+			continue
+		}
+		if _, match := hostSet[rec.Hostname]; match {
+			if rec.Details != nil {
+				evictIDs = append(evictIDs, rec.ID)
+			}
+			m.buffer[i] = RequestRecord{} // zero out
+			if m.count > 0 {
+				m.count--
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	// Call eviction callbacks outside of lock
+	if onEvict != nil {
+		for _, id := range evictIDs {
+			onEvict(id)
+		}
+	}
 }

@@ -49,6 +49,11 @@ func (h *Handlers) SetRequestManager(rm *proxy.RequestManager) {
 	h.requestManager = rm
 }
 
+// GetRequestManager returns the proxy request manager, or nil if not set.
+func (h *Handlers) GetRequestManager() *proxy.RequestManager {
+	return h.requestManager
+}
+
 // SetCaptureManager sets the capture manager for loading captured body data.
 func (h *Handlers) SetCaptureManager(cm *proxy.CaptureManager) {
 	h.captureManager = cm

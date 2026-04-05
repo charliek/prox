@@ -22,8 +22,10 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/proxyd"
 	"github.com/charliek/prox/internal/supervisor"
 	"github.com/charliek/prox/internal/tui"
+	"github.com/charliek/prox/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -317,26 +319,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start proxy server first if configured — fail fast on port conflicts
-	// before spawning child processes.
+	// Start proxy — either via shared daemon or standalone fallback.
 	var proxyService *proxy.Service
+	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
-		level := slog.LevelInfo
-		if verbose {
-			level = slog.LevelDebug
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-		var err error
-		proxyService, err = proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
-		if err != nil {
-			return fmt.Errorf("failed to create proxy: %w", err)
-		}
-		if err := proxyService.Start(ctx); err != nil {
-			return proxyStartError(err)
-		}
-		// Ensure proxy is cleaned up on any subsequent error (e.g., supervisor
-		// fails to start). The normal shutdown path also calls Shutdown, but
-		// a double-call is safe since stopServers nil-checks server pointers.
+		daemonClient, proxyService = startProxy(cfg, cwd, ctx, handlers)
+	}
+	// Ensure standalone proxy is cleaned up on any subsequent error
+	if proxyService != nil {
 		defer func() {
 			if proxyService != nil {
 				sCtx, sCancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -344,19 +334,6 @@ func runUp(cmd *cobra.Command, args []string) error {
 				_ = proxyService.Shutdown(sCtx)
 			}
 		}()
-
-		var proxyAddrs []string
-		if cfg.Proxy.HTTPPort > 0 {
-			proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
-		}
-		if cfg.Proxy.HTTPSPort > 0 {
-			proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
-		}
-		if len(proxyAddrs) > 0 {
-			fmt.Printf("Proxy server: %s\n", strings.Join(proxyAddrs, ", "))
-		}
-		handlers.SetRequestManager(proxyService.RequestManager())
-		handlers.SetCaptureManager(proxyService.CaptureManager())
 	}
 
 	// Start supervisor
@@ -414,10 +391,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Handle TUI vs terminal output
 	if useTUI {
 		// Run TUI - it blocks until quit
-		var reqMgr *proxy.RequestManager
-		if proxyService != nil {
-			reqMgr = proxyService.RequestManager()
-		}
+		reqMgr := localRequestManager(proxyService, handlers)
 		if err := tui.Run(sup, logMgr, reqMgr); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
@@ -443,7 +417,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Stop proxy server and disarm the deferred shutdown
+	// Deregister from shared daemon or stop standalone proxy
+	if daemonClient != nil {
+		if err := daemonClient.Deregister(proxyd.DeregisterRequest{
+			ProjectDir: cwd,
+			PID:        os.Getpid(),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to deregister from proxy daemon: %v\n", err)
+		}
+	}
 	if proxyService != nil {
 		if err := proxyService.Shutdown(shutdownCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
@@ -555,6 +537,137 @@ func proxyStartError(err error) error {
 		return fmt.Errorf("%w\n\nAnother process is listening on this port. To identify it:\n  lsof -i :%d\n\nTo start without the proxy:\n  prox up --no-proxy", portErr, portErr.Port)
 	}
 	return fmt.Errorf("proxy failed to start: %w", err)
+}
+
+// startProxy attempts to register with the shared proxy daemon. If the daemon
+// cannot be reached (e.g., sandboxed environment), it falls back to starting a
+// standalone proxy. Returns the daemon client (if using daemon) and/or the
+// standalone proxy service (if using fallback).
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, *proxy.Service) {
+	// Try shared daemon first
+	client, ok, fatal := tryDaemonProxy(cfg, cwd, ctx, handlers)
+	if ok {
+		return client, nil
+	}
+	if fatal {
+		// Daemon is running but registration failed (conflict, version mismatch, etc.)
+		// Don't fall back to standalone — it would just fail on port binding too.
+		return nil, nil
+	}
+
+	// Fallback to standalone proxy (daemon unavailable or sandboxed)
+	return nil, startStandaloneProxy(cfg, cwd, ctx, handlers)
+}
+
+// tryDaemonProxy attempts to register with the shared proxy daemon.
+// Returns (client, true, false) on success, (nil, false, false) when daemon is
+// unavailable (fall back to standalone), (nil, false, true) when daemon is running
+// but registration failed (don't fall back).
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, bool, bool) {
+	// Check if we can access the daemon directory
+	if err := proxyd.EnsureDaemonDir(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
+		return nil, false, false
+	}
+
+	// Ensure daemon is running
+	client, err := proxyd.EnsureRunning()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
+		return nil, false, false
+	}
+
+	// Build registration request
+	services := make(map[string]proxyd.ServiceTarget, len(cfg.Services))
+	for name, svc := range cfg.Services {
+		services[name] = proxyd.ServiceTarget{Host: svc.Host, Port: svc.Port}
+	}
+
+	req := proxyd.RegisterRequest{
+		ProjectDir:     cwd,
+		PID:            os.Getpid(),
+		Version:        version.Version,
+		Domain:         cfg.Proxy.Domain,
+		Services:       services,
+		HTTPPort:       cfg.Proxy.HTTPPort,
+		HTTPSPort:      cfg.Proxy.HTTPSPort,
+		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
+	}
+
+	resp, err := client.Register(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return nil, false, true // fatal — daemon running but registration failed
+	}
+
+	// Print registered routes
+	var proxyAddrs []string
+	if cfg.Proxy.HTTPPort > 0 {
+		proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
+	}
+	if cfg.Proxy.HTTPSPort > 0 {
+		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
+	}
+	if len(proxyAddrs) > 0 {
+		fmt.Printf("Proxy (shared daemon): %s\n", strings.Join(proxyAddrs, ", "))
+	}
+	if len(resp.Registered) > 0 {
+		fmt.Printf("Registered domains: %s\n", strings.Join(resp.Registered, ", "))
+	}
+
+	// Create a local RequestManager and start the SSE forwarder to bridge
+	// daemon proxy requests into this project's TUI and API.
+	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
+	handlers.SetRequestManager(localRM)
+	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), resp.Registered, localRM)
+
+	return client, true, false
+}
+
+// startStandaloneProxy creates and starts a standalone proxy (current behavior).
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) *proxy.Service {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+
+	proxyService, err := proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to create proxy: %v\n", err)
+		return nil
+	}
+	if err := proxyService.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", proxyStartError(err))
+		return nil
+	}
+
+	var proxyAddrs []string
+	if cfg.Proxy.HTTPPort > 0 {
+		proxyAddrs = append(proxyAddrs, fmt.Sprintf("http://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPPort))
+	}
+	if cfg.Proxy.HTTPSPort > 0 {
+		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
+	}
+	if len(proxyAddrs) > 0 {
+		fmt.Printf("Proxy (standalone): %s\n", strings.Join(proxyAddrs, ", "))
+	}
+	handlers.SetRequestManager(proxyService.RequestManager())
+	handlers.SetCaptureManager(proxyService.CaptureManager())
+
+	return proxyService
+}
+
+// localRequestManager returns the RequestManager for use by the TUI.
+// In daemon mode, a local request manager is created (will be fed via SSE in Phase 5).
+// In standalone mode, the proxy service's request manager is returned.
+func localRequestManager(proxyService *proxy.Service, handlers *api.Handlers) *proxy.RequestManager {
+	if proxyService != nil {
+		return proxyService.RequestManager()
+	}
+	// In daemon mode, we return the request manager from the handlers
+	// (which may be nil if no proxy is configured, which is fine for TUI)
+	return handlers.GetRequestManager()
 }
 
 // printLogs subscribes to logs and prints them to terminal

@@ -1,17 +1,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/proxyd"
+	"github.com/charliek/prox/internal/version"
 	"github.com/spf13/cobra"
 )
-
-// Version is set during build
-var Version = "dev"
 
 // Global flags
 var (
@@ -33,7 +33,7 @@ processes for local development. It supports:
   - HTTPS reverse proxy with subdomain routing
   - Interactive TUI for monitoring
   - Background daemon mode`,
-	Version:       Version,
+	Version:       version.Version,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
@@ -57,8 +57,18 @@ processes for local development. It supports:
 	},
 }
 
-// Execute runs the root command
+// Execute runs the root command.
+// If the process is the proxy daemon child, it runs the daemon instead of
+// normal CLI dispatch.
 func Execute() {
+	if proxyd.IsDaemonProcess() {
+		if err := proxyd.RunDaemon(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "Proxy daemon error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -70,7 +80,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Show version",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("prox version %s\n", Version)
+		fmt.Printf("prox version %s\n", version.Version)
 	},
 }
 
@@ -102,7 +112,7 @@ func loadAPIAddrFromConfig() string {
 	}
 	port := cfg.API.Port
 	if port == 0 {
-		port = constants.DefaultAPIPort
+		return "" // Port is dynamic, must discover from state file
 	}
 
 	return fmt.Sprintf("http://%s:%d", host, port)

@@ -1,0 +1,10 @@
+# Test config: Project C - HTTP on different port 18080
+processes:
+  web: bash -c 'while true; do echo "project-c tick"; sleep 2; done'
+
+proxy:
+  http_port: 18080
+  domain: local.gamma.dev
+
+services:
+  app: 15000
