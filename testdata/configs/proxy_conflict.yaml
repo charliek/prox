@@ -1,0 +1,10 @@
+# Test config: Conflict - same domain+port as Project A
+processes:
+  web: echo "conflict test"
+
+proxy:
+  https_port: 16443
+  domain: local.alpha.dev
+
+services:
+  app: 16000

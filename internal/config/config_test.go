@@ -12,7 +12,7 @@ func TestLoad_SimpleForm(t *testing.T) {
 	cfg, err := Load(filepath.Join("..", "..", "testdata", "configs", "simple.yaml"))
 	require.NoError(t, err)
 
-	assert.Equal(t, 5555, cfg.API.Port)
+	assert.Equal(t, 0, cfg.API.Port) // 0 means dynamic assignment
 	assert.Equal(t, "127.0.0.1", cfg.API.Host)
 	assert.Len(t, cfg.Processes, 3)
 

@@ -34,7 +34,7 @@ processes:
 		}
 	})
 
-	t.Run("returns address with default port when not specified", func(t *testing.T) {
+	t.Run("returns empty when port not specified (dynamic)", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
 		err := os.WriteFile(testConfigPath, []byte(`
@@ -48,8 +48,8 @@ processes:
 		configPath = testConfigPath
 		addr := loadAPIAddrFromConfig()
 
-		if addr != "http://127.0.0.1:5555" {
-			t.Errorf("expected http://127.0.0.1:5555, got %s", addr)
+		if addr != "" {
+			t.Errorf("expected empty string for dynamic port, got %s", addr)
 		}
 	})
 

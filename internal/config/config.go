@@ -143,9 +143,8 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	// Apply defaults
-	if config.API.Port == 0 {
-		config.API.Port = constants.DefaultAPIPort
-	}
+	// Note: API.Port == 0 means dynamic assignment (handled by cli/up.go).
+	// Users can still set api.port explicitly in their config if needed.
 	if config.API.Host == "" {
 		config.API.Host = constants.DefaultAPIHost
 	}
