@@ -30,6 +30,23 @@ archives:
     files:
       - none*
 
+brews:
+  - name: prox
+    ids:
+      - default
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/prox"
+    description: "Modern process manager for development with API-first design"
+    license: "MIT"
+    install: |
+      bin.install "prox"
+    test: |
+      system bin/"prox", "version"
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
