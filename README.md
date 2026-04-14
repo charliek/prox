@@ -11,13 +11,19 @@ A modern process manager for development with an API-first design.
 
 ## Installation
 
+### Homebrew (macOS)
+
 ```bash
-go install github.com/charliek/prox/cmd/prox@latest
+brew install charliek/tap/prox
 ```
 
-Or build from source:
+### Other Methods
 
 ```bash
+# Install via Go
+go install github.com/charliek/prox/cmd/prox@latest
+
+# Or build from source
 git clone https://github.com/charliek/prox.git
 cd prox
 make build
