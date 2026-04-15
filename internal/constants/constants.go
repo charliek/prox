@@ -89,11 +89,11 @@ const (
 	// DefaultProxyBackendTimeout is the timeout for backend connections
 	DefaultProxyBackendTimeout = 30 * time.Second
 
-	// DefaultProxyReadTimeout is the timeout for reading the entire request
-	DefaultProxyReadTimeout = 30 * time.Second
-
-	// DefaultProxyWriteTimeout is the timeout for writing the response
-	DefaultProxyWriteTimeout = 30 * time.Second
+	// DefaultProxyReadHeaderTimeout is the timeout for reading request headers only.
+	// Unlike ReadTimeout/WriteTimeout, this does not set a deadline on the full
+	// connection lifetime, allowing long-lived connections (WebSocket, SSE) to
+	// remain open indefinitely.
+	DefaultProxyReadHeaderTimeout = 10 * time.Second
 
 	// DefaultProxyIdleTimeout is the timeout for idle connections
 	DefaultProxyIdleTimeout = 120 * time.Second

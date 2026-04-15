@@ -134,11 +134,10 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) startHTTP(router http.Handler) error {
 	addr := fmt.Sprintf(":%d", s.cfg.HTTPPort)
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      router,
-		ReadTimeout:  constants.DefaultProxyReadTimeout,
-		WriteTimeout: constants.DefaultProxyWriteTimeout,
-		IdleTimeout:  constants.DefaultProxyIdleTimeout,
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: constants.DefaultProxyReadHeaderTimeout,
+		IdleTimeout:       constants.DefaultProxyIdleTimeout,
 	}
 
 	listener, err := net.Listen("tcp", addr)
@@ -195,12 +194,11 @@ func (s *Service) startHTTPS(router http.Handler) error {
 
 	addr := fmt.Sprintf(":%d", s.cfg.HTTPSPort)
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      router,
-		TLSConfig:    tlsConfig,
-		ReadTimeout:  constants.DefaultProxyReadTimeout,
-		WriteTimeout: constants.DefaultProxyWriteTimeout,
-		IdleTimeout:  constants.DefaultProxyIdleTimeout,
+		Addr:              addr,
+		Handler:           router,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: constants.DefaultProxyReadHeaderTimeout,
+		IdleTimeout:       constants.DefaultProxyIdleTimeout,
 	}
 
 	listener, err := net.Listen("tcp", addr)
