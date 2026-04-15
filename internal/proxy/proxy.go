@@ -56,15 +56,18 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 		certsMgr = certs.NewManager(certsCfg.Dir, cfg.Domain)
 	}
 
-	// Create shared transport for connection pooling
+	// Create shared transport for connection pooling.
+	// Note: ResponseHeaderTimeout is intentionally omitted — it breaks
+	// long-lived streaming connections (SSE, chunked responses) by treating
+	// them as stalled after the timeout. Timeouts are handled at the
+	// HTTP server level (ReadHeaderTimeout) instead.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   constants.DefaultProxyDialTimeout,
 			KeepAlive: constants.DefaultProxyKeepAlive,
 		}).DialContext,
-		ResponseHeaderTimeout: constants.DefaultProxyBackendTimeout,
-		MaxIdleConns:          constants.DefaultProxyMaxIdleConns,
-		IdleConnTimeout:       constants.DefaultProxyIdleConnTimeout,
+		MaxIdleConns:    constants.DefaultProxyMaxIdleConns,
+		IdleConnTimeout: constants.DefaultProxyIdleConnTimeout,
 	}
 
 	// Create capture manager if capture is configured
@@ -330,6 +333,8 @@ func (s *Service) createRouter() http.Handler {
 
 		// Use shared transport for connection pooling
 		proxy.Transport = s.transport
+		// Flush immediately for streaming responses (SSE, chunked transfer)
+		proxy.FlushInterval = -1
 
 		// Capture request body and headers if capture is enabled
 		var reqBody *CapturedBody
