@@ -1,8 +1,10 @@
 package proxyd
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -90,10 +92,9 @@ func (dp *DynamicProxy) AddListener(port int, protocol string) error {
 	}
 
 	server := &http.Server{
-		Handler:      handler,
-		ReadTimeout:  constants.DefaultProxyReadTimeout,
-		WriteTimeout: constants.DefaultProxyWriteTimeout,
-		IdleTimeout:  constants.DefaultProxyIdleTimeout,
+		Handler:           handler,
+		ReadHeaderTimeout: constants.DefaultProxyReadHeaderTimeout,
+		IdleTimeout:       constants.DefaultProxyIdleTimeout,
 	}
 
 	ml := &managedListener{
@@ -233,6 +234,26 @@ func (w *statusResponseWriter) WriteHeader(code int) {
 		w.wroteHeader = true
 	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Flush implements http.Flusher for streaming responses (SSE).
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack implements http.Hijacker for WebSocket support.
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("hijacking not supported")
+}
+
+// Unwrap returns the underlying ResponseWriter for http.ResponseController compatibility.
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // extractHostname strips the port from a Host header value.
