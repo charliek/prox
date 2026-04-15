@@ -16,3 +16,4 @@ install: build
 	mkdir -p ~/.local/bin
 	cp prox ~/.local/bin/prox
 	@if [ "$$(uname)" = "Linux" ]; then sudo setcap 'cap_net_bind_service=+ep' ~/.local/bin/prox; fi
+	@if [ "$$(uname)" = "Darwin" ]; then codesign --force --sign - ~/.local/bin/prox; fi
