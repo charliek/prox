@@ -173,6 +173,8 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 
 		rp := httputil.NewSingleHostReverseProxy(target)
 		rp.Transport = dp.transport
+		// Flush immediately for streaming responses (SSE, chunked transfer)
+		rp.FlushInterval = -1
 
 		// Determine protocol from the listener
 		proto := route.Protocol

@@ -56,7 +56,10 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 		certsMgr = certs.NewManager(certsCfg.Dir, cfg.Domain)
 	}
 
-	// Create shared transport for connection pooling
+	// Create shared transport for connection pooling.
+	// ResponseHeaderTimeout bounds only the time waiting for backend response
+	// headers — it does not affect body streaming (SSE, chunked, WebSocket)
+	// once headers have been received.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   constants.DefaultProxyDialTimeout,
@@ -330,6 +333,8 @@ func (s *Service) createRouter() http.Handler {
 
 		// Use shared transport for connection pooling
 		proxy.Transport = s.transport
+		// Flush immediately for streaming responses (SSE, chunked transfer)
+		proxy.FlushInterval = -1
 
 		// Capture request body and headers if capture is enabled
 		var reqBody *CapturedBody
