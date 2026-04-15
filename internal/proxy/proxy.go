@@ -57,17 +57,17 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 	}
 
 	// Create shared transport for connection pooling.
-	// Note: ResponseHeaderTimeout is intentionally omitted — it breaks
-	// long-lived streaming connections (SSE, chunked responses) by treating
-	// them as stalled after the timeout. Timeouts are handled at the
-	// HTTP server level (ReadHeaderTimeout) instead.
+	// ResponseHeaderTimeout bounds only the time waiting for backend response
+	// headers — it does not affect body streaming (SSE, chunked, WebSocket)
+	// once headers have been received.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   constants.DefaultProxyDialTimeout,
 			KeepAlive: constants.DefaultProxyKeepAlive,
 		}).DialContext,
-		MaxIdleConns:    constants.DefaultProxyMaxIdleConns,
-		IdleConnTimeout: constants.DefaultProxyIdleConnTimeout,
+		ResponseHeaderTimeout: constants.DefaultProxyBackendTimeout,
+		MaxIdleConns:          constants.DefaultProxyMaxIdleConns,
+		IdleConnTimeout:       constants.DefaultProxyIdleConnTimeout,
 	}
 
 	// Create capture manager if capture is configured
