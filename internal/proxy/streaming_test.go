@@ -67,28 +67,43 @@ func TestSSEThroughProxy(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
 
-	// Read events for 3 seconds — well beyond any short timeout
-	scanner := bufio.NewScanner(resp.Body)
+	// Read events in a goroutine so the deadline timer can interrupt a blocked scan
+	type scanResult struct {
+		line string
+		err  error
+	}
+	lines := make(chan scanResult, 16)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lines <- scanResult{line: scanner.Text()}
+		}
+		if err := scanner.Err(); err != nil {
+			lines <- scanResult{err: err}
+		}
+	}()
+
 	var events []string
 	deadline := time.After(3 * time.Second)
-
+loop:
 	for {
 		select {
 		case <-deadline:
-			goto done
-		default:
-			// Set a per-read deadline so we don't block forever
-			if scanner.Scan() {
-				line := scanner.Text()
-				if strings.HasPrefix(line, "data: ") {
-					events = append(events, line)
-				}
-			} else {
-				t.Fatalf("SSE stream ended unexpectedly after %d events: %v", len(events), scanner.Err())
+			break loop
+		case res, ok := <-lines:
+			if !ok {
+				t.Fatalf("SSE stream ended unexpectedly after %d events", len(events))
+			}
+			if res.err != nil {
+				t.Fatalf("SSE scan error after %d events: %v", len(events), res.err)
+			}
+			if strings.HasPrefix(res.line, "data: ") {
+				events = append(events, res.line)
 			}
 		}
 	}
-done:
+
 	// With 500ms interval over 3s, we expect at least 4 events
 	assert.GreaterOrEqual(t, len(events), 4,
 		"expected at least 4 SSE events over 3 seconds, got %d", len(events))
@@ -165,6 +180,9 @@ func TestWebSocketUpgradeThroughProxy(t *testing.T) {
 
 	_, err = conn.Write([]byte(upgradeReq))
 	require.NoError(t, err)
+
+	// Set a read deadline for the handshake to avoid hanging CI
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	// Read the 101 response
 	reader := bufio.NewReader(conn)
