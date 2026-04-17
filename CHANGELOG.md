@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.1.0
+
+### Features
+
+- Add shared proxy daemon for multi-project port sharing
+- Add Homebrew tap automation via GoReleaser
+- Add Homebrew as recommended install method in README
+
+### Fixes
+
+- Fix WebSocket and SSE connections dying after 30s through proxy
+- Fix SSE/streaming support in reverse proxy
+- Make proxy port binding failures fatal with actionable errors
+
+### Maintenance
+
+- Upgrade deploy-pages to v5 for Node.js 24 support
+- Upgrade GitHub Actions to Node.js 24-compatible versions
+- Remove legacy plans and replaced watch-pr command
+- Remove release command, moved to cc-plugins
+
 ## v0.0.3
 
 ### Features
