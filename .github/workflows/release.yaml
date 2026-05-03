@@ -41,3 +41,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Trigger apt-charliek publish
+        if: success()
+        run: |
+          # Retry the dispatch a few times — a transient network/API blip
+          # shouldn't fail the release after GoReleaser already succeeded.
+          # apt-charliek's publish workflow is idempotent so a missed dispatch
+          # also self-heals on the next release, but we still want to flag
+          # genuinely persistent failures.
+          for attempt in 1 2 3; do
+            if gh api repos/charliek/apt-charliek/dispatches \
+              --method POST \
+              -f event_type=publish \
+              -F "client_payload[package]=prox" \
+              -F "client_payload[tag]=${{ github.ref_name }}"; then
+              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+              exit 0
+            fi
+            echo "dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            [ "$attempt" -eq 3 ] && exit 1
+            sleep $((attempt * 5))
+          done
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
