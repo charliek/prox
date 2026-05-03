@@ -39,8 +39,10 @@ For one-off installs without configuring the apt repo (CI runners, locked-down h
 ARCH=$(dpkg --print-architecture)        # amd64 or arm64
 VERSION=0.1.1                            # check https://github.com/charliek/prox/releases for the latest
 curl -fLO "https://github.com/charliek/prox/releases/download/v${VERSION}/prox_${VERSION}_${ARCH}.deb"
-sudo dpkg -i "prox_${VERSION}_${ARCH}.deb"
+sudo apt install -y "./prox_${VERSION}_${ARCH}.deb"
 ```
+
+The `apt install ./...deb` form resolves dependencies; plain `dpkg -i` would skip that step.
 
 ### Other Methods
 
