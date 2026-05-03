@@ -17,6 +17,31 @@ A modern process manager for development with an API-first design.
 brew install charliek/tap/prox
 ```
 
+### Linux (apt)
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | \
+  sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | \
+  sudo tee /etc/apt/sources.list.d/apt-charliek.list
+sudo apt update
+sudo apt install prox
+```
+
+Tested on Pop!_OS 24.04 and Ubuntu 24.04+. Architectures: `amd64`, `arm64`. See [apt-charliek](https://github.com/charliek/apt-charliek) for the full repo.
+
+### Linux (`.deb` download, no apt repo)
+
+For one-off installs without configuring the apt repo (CI runners, locked-down hosts, etc.):
+
+```bash
+ARCH=$(dpkg --print-architecture)        # amd64 or arm64
+VERSION=0.1.1                            # check https://github.com/charliek/prox/releases for the latest
+curl -fLO "https://github.com/charliek/prox/releases/download/v${VERSION}/prox_${VERSION}_${ARCH}.deb"
+sudo dpkg -i "prox_${VERSION}_${ARCH}.deb"
+```
+
 ### Other Methods
 
 ```bash
