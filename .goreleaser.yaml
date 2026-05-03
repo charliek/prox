@@ -30,6 +30,21 @@ archives:
     files:
       - none*
 
+nfpms:
+  - id: prox-deb
+    package_name: prox
+    file_name_template: "prox_{{ .Version }}_{{ .Arch }}"
+    vendor: charliek
+    homepage: "https://github.com/charliek/prox"
+    maintainer: "Charlie Knudsen <charlie.knudsen@gmail.com>"
+    description: "Modern process manager for development with API-first design"
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    ids:
+      - prox
+
 brews:
   - name: prox
     ids:

@@ -41,3 +41,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Trigger apt-charliek publish
+        if: success()
+        run: |
+          gh api repos/charliek/apt-charliek/dispatches \
+            --method POST \
+            -f event_type=publish \
+            -F "client_payload[package]=prox" \
+            -F "client_payload[tag]=${{ github.ref_name }}"
+          echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
