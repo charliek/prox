@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.1.1
+
+### Features
+
+- Publish `.deb` packages for `amd64` and `arm64` on every release via GoReleaser's `nfpms:` block. Install on Pop!_OS / Ubuntu 24.04+ via `apt install prox` once the [`apt-charliek`](https://github.com/charliek/apt-charliek) repository is added.
+- Fire `repository_dispatch` at `charliek/apt-charliek` after a successful release so `apt update` picks up the new version automatically. Bounded retries on the dispatch call to ride out transient API blips.
+
+### Maintenance
+
+- Add `release-snapshot` CI job that runs `goreleaser release --snapshot` on every PR and validates both the `amd64` and `arm64` `.deb` artifacts (`Package: prox`, payload at `/usr/local/bin/prox`).
+
 ## v0.1.0
 
 ### Features
