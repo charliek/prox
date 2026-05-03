@@ -42,13 +42,16 @@ jobs:
         with:
           version: latest
           args: release --snapshot --clean --skip=publish,announce,sign
-      - name: Validate the deb artifact
+      - name: Validate the deb artifacts
         run: |
           set -e
-          deb=$(ls dist/prox_*_amd64.deb | head -1)
-          [ -n "$deb" ] || { echo "no deb produced"; ls -la dist/; exit 1; }
-          dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb"
-          dpkg-deb --field "$deb" Package | grep -qx 'prox'
-          dpkg-deb --field "$deb" Architecture | grep -qx 'amd64'
-          dpkg-deb --contents "$deb" | grep -q ' \./usr/local/bin/prox$'
+          for arch in amd64 arm64; do
+            deb=$(ls dist/prox_*_${arch}.deb 2>/dev/null | head -1)
+            [ -n "$deb" ] || { echo "no $arch deb produced"; ls -la dist/; exit 1; }
+            echo "=== validating $deb ==="
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+            dpkg-deb --field "$deb" Package | grep -qx 'prox'
+            dpkg-deb --field "$deb" Architecture | grep -qx "$arch"
+            dpkg-deb --contents "$deb" | grep -q ' \./usr/local/bin/prox$'
+          done
