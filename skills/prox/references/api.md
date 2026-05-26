@@ -2,7 +2,7 @@
 
 ## Base URL
 
-```
+```text
 http://{host}:{port}/api/v1
 ```
 
@@ -189,11 +189,11 @@ If both `lines` and `bytes` are specified, whichever limit hits first applies.
 
 Stream logs via Server-Sent Events (SSE).
 
-**Query Parameters:** Same as `GET /logs` (except `lines` and `bytes`)
+**Query Parameters:** Same as `GET /logs`, excluding `lines` and `bytes` (not applicable to streaming)
 
 **Response:** SSE stream
 
-```
+```text
 data: {"timestamp":"2025-01-19T10:32:01.123Z","process":"web","stream":"stdout","line":"GET /api/users 200 12ms"}
 
 data: {"timestamp":"2025-01-19T10:32:01.456Z","process":"api","stream":"stderr","line":"WARN: connection pool low"}
@@ -259,11 +259,11 @@ curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
 
 Stream proxy requests via Server-Sent Events (SSE).
 
-**Query Parameters:** Same as `GET /proxy/requests` (except `limit`)
+**Query Parameters:** Same as `GET /proxy/requests`, excluding `limit` (not applicable to streaming)
 
 **Response:** SSE stream
 
-```
+```text
 event: connected
 data: {}
 

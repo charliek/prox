@@ -75,7 +75,7 @@ How to reach services depends on whether the proxy is configured in prox.yaml.
 
 Read the `proxy` and `services` sections of prox.yaml. Services are accessible via subdomain routing:
 
-```
+```text
 http://<service>.<domain>:<http_port>/path
 ```
 
