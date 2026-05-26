@@ -1,0 +1,13 @@
+{
+  "name": "prox",
+  "version": "0.1.1",
+  "description": "Guidance for driving the prox process manager: prox.yaml config, CLI, proxy/subdomain routing, logs, and request inspection.",
+  "author": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "homepage": "https://github.com/charliek/prox",
+  "repository": "https://github.com/charliek/prox",
+  "license": "MIT",
+  "keywords": ["prox", "skills", "process-manager", "development"]
+}

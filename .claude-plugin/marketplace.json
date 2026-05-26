@@ -1,0 +1,15 @@
+{
+  "name": "prox",
+  "description": "prox skills for driving the prox process manager from your agent.",
+  "owner": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "plugins": [
+    {
+      "name": "prox",
+      "source": "./",
+      "description": "Guidance for driving the prox process manager: prox.yaml config, CLI, proxy/subdomain routing, logs, and request inspection."
+    }
+  ]
+}
