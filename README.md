@@ -56,6 +56,23 @@ cd prox
 make build
 ```
 
+### Claude Code / agent skills
+
+prox ships a skill that teaches your coding agent to drive the prox CLI (read `prox.yaml`, start/stop processes, tail logs, reach services through the proxy, inspect requests). Install the CLI (above) first, since the skill drives it.
+
+The general route ([`skills`](https://skills.sh)) installs into Claude Code, GitHub Copilot, OpenCode, and other agents:
+
+```bash
+npx skills add charliek/prox
+```
+
+For Claude Code, a native plugin is also available (it namespaces the skill as `prox:prox`):
+
+```text
+/plugin marketplace add charliek/prox
+/plugin install prox@prox
+```
+
 ## Quick Start
 
 Create a `prox.yaml` in your project directory:
@@ -147,7 +164,7 @@ The API runs at `http://127.0.0.1:5555/api/v1` by default.
 
 Configuration files are executed as code (via shell). Only use configuration from trusted sources, similar to Makefiles or Procfiles.
 
-When binding to non-localhost interfaces, authentication is automatically enabled. A bearer token is generated and stored in `~/.config/prox/`.
+When binding to non-localhost interfaces, authentication is automatically enabled. A bearer token is generated and stored in `~/.prox/token`.
 
 ## Documentation
 

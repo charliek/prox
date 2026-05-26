@@ -1,5 +1,5 @@
-# Binary
-prox
+# Binary (root build output only; do not match skills/prox/ or cmd/prox/)
+/prox
 
 # IDE
 .idea/
