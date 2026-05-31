@@ -51,17 +51,16 @@ jobs:
           gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
           echo "::endgroup::"
 
-          echo "::group::Installation repository count (must be ≥3 — prox + homebrew-tap + apt-charliek)"
-          # Count only — the App also installs on private repos and printing
-          # names in this public workflow log would leak them. The release
-          # flow needs the App installed on all three repos; a count below
-          # 3 means at least one cross-repo target is missing.
-          count="$(gh api /installation/repositories --jq '.total_count')"
-          echo "installation repository count: ${count}"
-          if [ "${count}" -lt 3 ]; then
-            echo "::error::App is missing at least one installation; expected ≥3 (prox + homebrew-tap + apt-charliek)"
-            exit 1
-          fi
+          echo "::group::Installation repository count"
+          # Per-repo selective installs (the typical pattern) show count=1
+          # from each repo's own installation perspective — the App's
+          # installation on charliek/prox sees just prox. Cross-repo
+          # minting (the per-target blocks below) reaches OTHER
+          # installations via the App's private key + owner+repositories
+          # inputs. So this count is informational only; the per-target
+          # reach checks below are the actual verification of whether
+          # the App can reach homebrew-tap and apt-charliek.
+          gh api /installation/repositories --jq '.total_count'
           echo "::endgroup::"
 
           # Installation tokens can't call /user (403 "Resource not accessible
