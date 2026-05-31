@@ -49,10 +49,13 @@ jobs:
         run: |
           set -euo pipefail
           expect="${GITHUB_REF_NAME#v}"
-          got="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
-                   .claude-plugin/plugin.json | sed -E 's/.*"([^"]+)"$/\1/')"
+          # Use jq to anchor to the top-level .version field; a regex would
+          # also (incorrectly) match a future nested "version" field
+          # (e.g. in a future "dependencies" block). jq is preinstalled
+          # on ubuntu-latest and fails loudly on malformed JSON.
+          got="$(jq -r '.version' .claude-plugin/plugin.json)"
           if [ "${got}" != "${expect}" ]; then
-            echo "::error::plugin.json version=${got} != tag=${expect}. Re-run /release-workflows:release after correcting."
+            echo "::error::plugin.json .version=${got} != tag=${expect}. Re-run /release-workflows:release after correcting."
             exit 1
           fi
 
