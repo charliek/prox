@@ -67,7 +67,7 @@ jobs:
       # env for git authentication.
       - name: Mint a homebrew-tap App token
         id: tap
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
@@ -98,7 +98,7 @@ jobs:
       - name: Mint an apt-charliek App token
         if: success()
         id: apt
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
