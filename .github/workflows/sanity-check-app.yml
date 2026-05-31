@@ -51,10 +51,17 @@ jobs:
           gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
           echo "::endgroup::"
 
-          echo "::group::Installation repository count (must be ≥1)"
+          echo "::group::Installation repository count (must be ≥3 — prox + homebrew-tap + apt-charliek)"
           # Count only — the App also installs on private repos and printing
-          # names in this public workflow log would leak them.
-          gh api /installation/repositories --jq '.total_count'
+          # names in this public workflow log would leak them. The release
+          # flow needs the App installed on all three repos; a count below
+          # 3 means at least one cross-repo target is missing.
+          count="$(gh api /installation/repositories --jq '.total_count')"
+          echo "installation repository count: ${count}"
+          if [ "${count}" -lt 3 ]; then
+            echo "::error::App is missing at least one installation; expected ≥3 (prox + homebrew-tap + apt-charliek)"
+            exit 1
+          fi
           echo "::endgroup::"
 
           # Installation tokens can't call /user (403 "Resource not accessible
@@ -71,6 +78,11 @@ jobs:
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner:        charliek
           repositories: homebrew-tap
+          # The reach check (gh api GET /repos/...) only needs metadata read;
+          # real release uses contents:write to push the formula. We mint the
+          # broader scope here so the verification matches what release.yaml
+          # actually mints, catching scope-related misconfigurations early.
+          permission-contents: write
 
       - name: Token can reach charliek/homebrew-tap
         env:
@@ -89,6 +101,8 @@ jobs:
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner:        charliek
           repositories: apt-charliek
+          # Matches what release.yaml mints; surfaces scope mismatches early.
+          permission-contents: write
 
       - name: Token can reach charliek/apt-charliek
         env:

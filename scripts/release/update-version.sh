@@ -22,7 +22,9 @@
 #   - one arg: semver string, no `v` prefix
 #   - idempotent
 #   - no network
-#   - verifies its own work (scripts/set-version.sh does)
+#   - verifies its own work — explicit grep-back on plugin.json after
+#     delegating, because set-version.sh's sed substitution silently
+#     no-ops if the version field is missing or malformed
 #   - doesn't `git add` (release skill stages + commits)
 
 set -euo pipefail
@@ -38,5 +40,16 @@ if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
   exit 2
 fi
 
+PLUGIN_JSON="$(dirname "$0")/../../.claude-plugin/plugin.json"
+
 # Delegate to the existing plugin.json bumper.
 "$(dirname "$0")/../set-version.sh" "$V"
+
+# Verify the bump actually landed. set-version.sh's sed silently no-ops
+# if the `"version"` field is missing or formatted differently than
+# expected, then exits 0 — which would let the release skill commit a
+# stale plugin.json and tag it. Grep-back is the safety net.
+if ! grep -qE "\"version\"[[:space:]]*:[[:space:]]*\"${V}\"" "${PLUGIN_JSON}"; then
+  echo "error: plugin.json did not bump to ${V} — check the \"version\" field's shape in ${PLUGIN_JSON}" >&2
+  exit 1
+fi

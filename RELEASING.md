@@ -73,14 +73,20 @@ add `-X .../version.Commit={{.Commit}}` to `.goreleaser.yaml`'s
 | `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID | required — minted at workflow time for both the homebrew-tap push (via GoReleaser) and the apt-charliek dispatch |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required — same |
 
-Retired (deleted during the convention adoption):
+Retired (deleted from `gh secret list -R charliek/prox` during the
+convention adoption — confirm with `gh secret list -R charliek/prox`
+returns only the `RELEASE_BOT_APP_*` pair, not just removed from the
+workflow):
 
 - `APT_DISPATCH_TOKEN` — replaced by the App-minted apt-charliek token
 - `HOMEBREW_TAP_TOKEN` — replaced by the App-minted homebrew-tap token
 
 GoReleaser still reads the env var named `HOMEBREW_TAP_TOKEN`; the
 workflow sets it from `steps.tap.outputs.token` instead of from
-`secrets`.
+`secrets`. If someone reintroduces `secrets.HOMEBREW_TAP_TOKEN` later
+without realizing the migration happened, it would silently re-shadow
+the App-minted value — that's why the secret itself needs to be gone
+from the secret store, not just unwired from the workflow.
 
 ## Branch protection
 
@@ -90,8 +96,10 @@ multiple separate jobs `test` / `lint` / `release-snapshot` and there's
 no single aggregator check). Bypass actors:
 
 - `charliek-release-bot` (App, type `Integration`) — lets the App push
-  to the homebrew-tap, dispatch to apt-charliek, and any future
-  post-build push back to prox's main
+  to the homebrew-tap and dispatch to apt-charliek (bypass needed only
+  when those targets' branches are themselves protected). The App is
+  also bypass-listed here in case a future post-build job needs to
+  push back to prox's main; no such step exists today.
 - Admin role (id `5`, type `RepositoryRole`) — lets
   `/release-workflows:release`'s push of the changelog + version commits
   + tag land
@@ -118,20 +126,27 @@ workflow). Each block must print the expected repo name.
 | `Trigger apt-charliek publish` step fails | App not installed on `apt-charliek` OR rate-limited | Confirm via `sanity-check-app.yml`'s apt-charliek block; install the App if missing. The dispatch step retries 3× internally; persistent failures usually mean install state, not network |
 | `release` job's `go test` fails on the tagged commit | Real test failure | Fix on a branch, merge, cut a fresh patch tag (don't force-update the failed tag) |
 | Formula push succeeded but `brew install` finds old version | Homebrew tap cache | `brew untap charliek/tap && brew tap charliek/tap` |
-| Claude Code installs old plugin version after the release | `plugin.json` wasn't bumped before the tag | `/release-workflows:release` should have bumped it via `update-version.sh`; if not, bump manually with `scripts/set-version.sh <ver>` + commit + push to main, then redirect Claude Code users to reinstall |
+| `release` job fails at `Verify plugin.json matches tag` | The tagged commit's plugin.json doesn't match the tag — either `update-version.sh` didn't run, or it ran but the bump didn't land (silent sed no-op on a malformed manifest) | Re-bump locally with `./scripts/release/update-version.sh <ver>` (it now grep-verifies the bump), commit, push to main, cut a fresh patch tag. The buggy tag stays as an audit trail; don't force-update it. |
+| Claude Code installs old plugin version after the release | `plugin.json` wasn't bumped before the tag (and the Verify step missed it, or the Verify step was bypassed) | `/release-workflows:release` should have bumped it via `update-version.sh`; if not, bump manually with `scripts/release/update-version.sh <ver>` + commit + push to main, then redirect Claude Code users to reinstall |
 
 ## Break-glass recovery
 
 ### Homebrew formula push failed
 
-If GoReleaser failed at the `brews` step but everything else uploaded:
+If GoReleaser failed at the `brews` step but everything else uploaded,
+the cleanest recovery is to re-run the failed GitHub Actions workflow
+run from the UI. GoReleaser's `mode: replace` in `.goreleaser.yaml`
+reuses the existing Release without re-uploading the tarballs/debs/
+checksums — only the formula push gets retried.
+
+Alternative: trigger via CLI on the same tag (use the gh CLI's run
+re-run, NOT a new dispatch — `release.yaml` triggers on tag-push, not
+workflow_dispatch):
 
 ```bash
-# Re-run just GoReleaser locally with the App token. Export the token
-# via gh's App-token flow (requires gh's app-token plugin or local mint).
-# Easiest path: re-run the GitHub Actions workflow run from the UI —
-# GoReleaser's `mode: replace` in .goreleaser.yaml reuses the existing
-# Release without re-uploading.
+RUN_ID=$(gh run list -R charliek/prox --workflow release.yaml \
+                     --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run rerun "${RUN_ID}" -R charliek/prox --failed
 ```
 
 ### apt-charliek dispatch failed

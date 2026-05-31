@@ -39,6 +39,23 @@ jobs:
         with:
           version: v2.10.1
 
+      # Tag/manifest invariant check — the local-bump flow's safety net.
+      # Replaces the deleted sync-version job's contract: instead of fixing
+      # plugin.json drift after the fact in CI, fail the release if the
+      # tagged commit's plugin.json doesn't match the tag. Cheap server-
+      # side check; the maintainer reruns /release-workflows:release
+      # against a corrected tag rather than shipping mismatched bytes.
+      - name: Verify plugin.json matches tag
+        run: |
+          set -euo pipefail
+          expect="${GITHUB_REF_NAME#v}"
+          got="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
+                   .claude-plugin/plugin.json | sed -E 's/.*"([^"]+)"$/\1/')"
+          if [ "${got}" != "${expect}" ]; then
+            echo "::error::plugin.json version=${got} != tag=${expect}. Re-run /release-workflows:release after correcting."
+            exit 1
+          fi
+
       # Mint a release-bot App token scoped to charliek/homebrew-tap for
       # GoReleaser's `brews:` step (formula push). The App must be
       # installed on homebrew-tap (verify via sanity-check-app.yml).
@@ -53,6 +70,11 @@ jobs:
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner:        charliek
           repositories: homebrew-tap
+          # Defense-in-depth: explicit permission floor on the minted
+          # token so a future widening of the App's installation perms
+          # doesn't silently broaden what this token can do. GoReleaser
+          # only needs contents:write on the tap repo (to push the formula).
+          permission-contents: write
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
@@ -79,6 +101,8 @@ jobs:
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner:        charliek
           repositories: apt-charliek
+          # POST /repos/.../dispatches requires contents:write.
+          permission-contents: write
 
       - name: Trigger apt-charliek publish
         if: success()
@@ -91,16 +115,22 @@ jobs:
           # dispatch self-heals on the next release, but we still want to
           # flag genuinely persistent failures.
           for attempt in 1 2 3; do
+            # Capture stderr so a real install-state failure (App not
+            # installed on apt-charliek, scoped-perms mismatch, etc.) is
+            # diagnosable from the workflow log without re-running.
             if gh api repos/charliek/apt-charliek/dispatches \
               --method POST \
               -f event_type=publish \
               -F "client_payload[package]=prox" \
-              -F "client_payload[tag]=${{ github.ref_name }}"; then
+              -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
               echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
               exit 0
             fi
-            echo "dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
-            [ "$attempt" -eq 3 ] && exit 1
+            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
+              exit 1
+            fi
             sleep $((attempt * 5))
           done
 
