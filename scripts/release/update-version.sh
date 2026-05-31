@@ -22,7 +22,7 @@
 #   - one arg: semver string, no `v` prefix
 #   - idempotent
 #   - no network
-#   - verifies its own work — explicit grep-back on plugin.json after
+#   - verifies its own work — explicit jq-back on plugin.json after
 #     delegating, because set-version.sh's sed substitution silently
 #     no-ops if the version field is missing or malformed
 #   - doesn't `git add` (release skill stages + commits)
@@ -48,8 +48,10 @@ PLUGIN_JSON="$(dirname "$0")/../../.claude-plugin/plugin.json"
 # Verify the bump actually landed. set-version.sh's sed silently no-ops
 # if the `"version"` field is missing or formatted differently than
 # expected, then exits 0 — which would let the release skill commit a
-# stale plugin.json and tag it. Grep-back is the safety net.
-if ! grep -qE "\"version\"[[:space:]]*:[[:space:]]*\"${V}\"" "${PLUGIN_JSON}"; then
-  echo "error: plugin.json did not bump to ${V} — check the \"version\" field's shape in ${PLUGIN_JSON}" >&2
+# stale plugin.json and tag it. Use jq to anchor to the TOP-LEVEL
+# .version field; a regex would also (incorrectly) match a future
+# nested "version" field (e.g. in a future "dependencies" block).
+if [ "$(jq -r '.version' "${PLUGIN_JSON}")" != "${V}" ]; then
+  echo "error: plugin.json top-level .version did not bump to ${V}" >&2
   exit 1
 fi
