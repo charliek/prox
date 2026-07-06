@@ -34,6 +34,8 @@ With this configuration:
 - `http://app.lvh.me:6788` → `http://localhost:3000`
 - `http://api.lvh.me:6788` → `http://localhost:8000`
 
+For multiple projects on the same port, keep DNS pointed at `127.0.0.1` and give each project distinct service hostnames. prox registers those hostnames with the shared proxy daemon automatically. See [Shared Proxy Across Projects](shared-proxy.md).
+
 If you prefer a custom domain like `local.myapp.dev`, add entries to `/etc/hosts` manually:
 
 ```text

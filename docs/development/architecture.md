@@ -4,7 +4,7 @@ This document describes the internal design of prox for contributors.
 
 ## Design Principles
 
-1. **Subscriber-based log output** — Terminal output is a subscriber to the log buffer, not a special case. This enables TUI, API streaming, and future daemon mode without architectural changes.
+1. **Subscriber-based log output** — Terminal output is a subscriber to the log buffer, not a special case. This enables TUI, API streaming, and daemon mode without architectural changes.
 
 2. **API always available** — Even in foreground mode, the HTTP API runs and accepts connections.
 
@@ -87,28 +87,28 @@ This document describes the internal design of prox for contributors.
 
 ## HTTP/HTTPS Reverse Proxy
 
-The optional reverse proxy provides subdomain-based routing to local services over HTTP and/or HTTPS.
+The optional reverse proxy provides hostname-based routing to local services over HTTP and/or HTTPS. In normal operation, projects register their routes with a per-user shared proxy daemon so several projects can use the same port.
 
 ### Proxy Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                   HTTP/HTTPS Reverse Proxy                        │
+│                   Shared HTTP/HTTPS Proxy                         │
 │                                                                    │
 │  Browser Request                                                   │
 │  http(s)://app.local.dev:port/api/users                           │
 │         │                                                          │
 │         ▼                                                          │
 │  ┌─────────────────────┐                                          │
-│  │  Subdomain Router   │  Extract "app" from host                 │
+│  │  Hostname Router    │  Match full hostname                     │
 │  │  (extract + lookup) │                                          │
 │  └──────────┬──────────┘                                          │
 │             │                                                      │
 │             ▼                                                      │
 │  ┌─────────────────────┐     ┌─────────────────────┐              │
 │  │   Route Table       │────▶│   Request Manager   │              │
-│  │   app → :3000       │     │   (ring buffer)     │              │
-│  │   api → :8000       │     └─────────────────────┘              │
+│  │ app.local → :3000   │     │   (ring buffer)     │              │
+│  │ api.local → :8000   │     └─────────────────────┘              │
 │  └──────────┬──────────┘                                          │
 │             │                                                      │
 │             ▼                                                      │
@@ -123,19 +123,26 @@ The optional reverse proxy provides subdomain-based routing to local services ov
 
 ```
 internal/proxy/
-├── proxy.go          # Main proxy service, router, request handling
+├── proxy.go          # Standalone proxy service and request handling
 ├── requests.go       # Request manager (ring buffer, subscriptions)
+├── capture.go        # Optional request/response body capture
 ├── certs/
 │   └── certs.go      # mkcert integration for certificate management
-└── hosts/
-    └── hosts.go      # /etc/hosts management
+
+internal/proxyd/
+├── daemon.go         # Shared daemon lifecycle and auto-start
+├── dynamic_proxy.go  # Runtime listener and route management
+├── registry.go       # Project route registry and conflict checks
+├── server.go         # Unix-socket HTTP API for registration/control
+├── client.go         # Client used by project supervisors
+└── certs.go          # Multi-domain certificate management
 ```
 
 ### Request Flow
 
-1. Incoming HTTP or HTTPS request to `*.domain:port`
-2. Extract subdomain from Host header
-3. Look up service in route table
+1. Incoming HTTP or HTTPS request to `hostname:port`
+2. Use the Host header for HTTP or SNI for HTTPS routing
+3. Look up the full hostname in the route table
 4. Forward request via `httputil.ReverseProxy`
 5. Set `X-Forwarded-Proto` based on connection type (HTTP or HTTPS)
 6. Record request in RequestManager
@@ -145,7 +152,7 @@ internal/proxy/
 
 | Component | Technology | Notes |
 |-----------|------------|-------|
-| Language | Go 1.23+ | Concurrency, single binary |
+| Language | Go 1.24+ | Concurrency, single binary |
 | TUI | [bubbletea](https://github.com/charmbracelet/bubbletea) | Elm-architecture TUI framework |
 | TUI styling | [lipgloss](https://github.com/charmbracelet/lipgloss) | Styling for bubbletea |
 | HTTP router | [chi](https://github.com/go-chi/chi) or stdlib | Lightweight, idiomatic |

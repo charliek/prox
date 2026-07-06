@@ -183,7 +183,13 @@ Access your services:
 - `http://app.lvh.me:6788` → `http://localhost:3000` (HTTP mode)
 - `https://app.lvh.me:6789` → `http://localhost:3000` (HTTPS mode)
 
-See the [Local DNS & Certificates](../guides/local-dns.md) guide for custom domains, certificate management, and sharing CAs across machines. See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full proxy options.
+When several projects configure the same proxy port, prox uses a shared proxy daemon automatically. Each project can register its own hostnames on the same port, including `443`, and keep an independent `prox up` / `prox down` lifecycle.
+
+```bash
+prox proxy routes
+```
+
+See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for multi-project routing. See the [Local DNS & Certificates](../guides/local-dns.md) guide for custom domains, certificate management, and sharing CAs across machines. See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full proxy options.
 
 ## HTTP API
 

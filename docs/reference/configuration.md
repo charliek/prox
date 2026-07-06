@@ -216,7 +216,22 @@ certs:
 | `proxy.enabled` | bool | auto | Enable reverse proxy (auto-enabled when a port is set) |
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
-| `proxy.domain` | string | required | Base domain for subdomain routing |
+| `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
+| `proxy.capture.enabled` | bool | `false` | Capture request and response body metadata for proxied requests |
+| `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
+
+### Shared Proxy Daemon
+
+When a proxy is configured, prox registers routes with a per-user shared proxy daemon under `~/.prox/`. This lets multiple projects use the same proxy port, including HTTPS on `443`, as long as each project owns distinct hostnames.
+
+The behavior is automatic:
+
+- `prox up` starts the daemon if needed and registers this project's services.
+- `prox down` deregisters only this project.
+- The daemon stops after the last project deregisters.
+- `prox proxy status` and `prox proxy routes` show daemon state.
+
+See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for examples and constraints.
 
 ### Service Fields
 
@@ -242,6 +257,21 @@ services:
 |-------|------|---------|-------------|
 | `certs.dir` | string | `~/.prox/certs` | Directory for storing certificates |
 | `certs.auto_generate` | bool | `true` | Automatically generate certificates using mkcert |
+
+### Request Capture
+
+Request capture records request and response body metadata for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated.
+
+```yaml
+proxy:
+  https_port: 6789
+  domain: local.myapp.dev
+  capture:
+    enabled: true
+    max_body_size: 1MB
+```
+
+Captured body files are stored under `.prox/capture/` and cleaned up as request records age out of the in-memory request buffer.
 
 ### Prerequisites (HTTPS only)
 

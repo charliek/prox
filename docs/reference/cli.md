@@ -13,6 +13,8 @@ prox <command> [options]
 | `--config, -c` | Config file path (default: `prox.yaml`) |
 | `--addr` | API address for client commands (auto-discovered from `.prox/prox.state`) |
 | `--detach, -d` | Run in background (daemon mode) |
+| `--verbose, -v` | Enable verbose output |
+| `--version` | Show version information |
 
 ## Commands
 
@@ -32,6 +34,7 @@ prox up [processes...]
 | `--http-port` | Override proxy HTTP port |
 | `--https-port` | Override proxy HTTPS port |
 | `--no-proxy` | Disable proxy even if configured |
+| `--capture` | Enable request/response body capture for proxied requests |
 
 **Examples:**
 
@@ -62,6 +65,9 @@ prox up --http-port 6788
 
 # Start with dual-stack proxy
 prox up --http-port 6788 --https-port 6789
+
+# Enable request/response body capture
+prox up --capture
 ```
 
 **Dynamic Port Allocation:**
@@ -219,10 +225,10 @@ prox restart worker
 
 ### requests
 
-Show or stream proxy requests.
+Show, stream, or inspect proxy requests.
 
 ```bash
-prox requests [options]
+prox requests [id] [options]
 ```
 
 | Flag | Description |
@@ -233,6 +239,7 @@ prox requests [options]
 | `--method` | Filter by HTTP method (GET, POST, etc.) |
 | `--min-status` | Filter by minimum status code (e.g., 400 for errors) |
 | `--json` | Output as JSON |
+| `--body` | Include captured request/response bodies when showing one request by ID |
 
 **Examples:**
 
@@ -254,11 +261,56 @@ prox requests --min-status 400
 
 # JSON output for piping
 prox requests --json | jq .
+
+# Show details for one request
+prox requests abc1234
+
+# Include captured bodies for one request
+prox requests abc1234 --body
 ```
 
 **Request IDs:**
 
 Each request is assigned a short hash ID (7 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
+
+Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`.
+
+### proxy
+
+Inspect and control the shared proxy daemon.
+
+The proxy daemon is normally started and stopped automatically by `prox up` and `prox down`. These commands are for debugging route ownership, checking shared ports, and resetting a stale daemon.
+
+```bash
+prox proxy <command>
+```
+
+| Command | Description |
+|---------|-------------|
+| `prox proxy status` | Show daemon version, PID, uptime, projects, routes, and listener ports |
+| `prox proxy status --json` | Output daemon status as JSON |
+| `prox proxy routes` | List registered routes |
+| `prox proxy routes --json` | Output registered routes as JSON |
+| `prox proxy stop` | Stop the daemon when no active routes are registered |
+| `prox proxy stop --force` | Stop the daemon even with active routes |
+
+**Examples:**
+
+```bash
+# Show daemon status and routes
+prox proxy status
+
+# List route ownership
+prox proxy routes
+
+# Stop only when no projects are registered
+prox proxy stop
+
+# Reset a stale daemon after upgrading prox
+prox proxy stop --force
+```
+
+See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for multi-project behavior and constraints.
 
 ### version
 
@@ -276,4 +328,12 @@ Show help for any command.
 prox help
 prox help up
 prox help logs
+```
+
+### completion
+
+Generate shell completion scripts.
+
+```bash
+prox completion [bash|zsh|fish|powershell]
 ```

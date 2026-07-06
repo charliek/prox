@@ -38,6 +38,8 @@ prox/
 │   ├── supervisor/           # Process orchestration
 │   ├── logs/                 # Log buffer, subscriptions
 │   ├── api/                  # HTTP server and handlers
+│   ├── proxy/                # Standalone proxy, request tracking, capture
+│   ├── proxyd/               # Shared proxy daemon
 │   ├── tui/                  # Bubbletea TUI
 │   └── cli/                  # CLI command definitions
 ├── docs/                     # Documentation
