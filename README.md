@@ -7,6 +7,7 @@ A modern process manager for development with an API-first design.
 - **Simple by default** - Procfile-like experience with minimal configuration
 - **API-first** - Full process control and log access via HTTP
 - **Interactive TUI** - Real-time log viewing with filtering and search
+- **HTTP/HTTPS proxy** - Friendly local hostnames with shared multi-project port support
 - **Health checks** - Optional health monitoring for processes
 
 ## Installation
@@ -142,6 +143,29 @@ prox restart <process>           # Restart a process
 prox status                      # Show process status
 prox logs [process]              # Show recent logs
 prox logs -f [process]           # Stream logs
+prox requests                     # Show recent proxy requests
+prox proxy routes                 # Show shared proxy route ownership
+```
+
+## Proxy
+
+Configure `proxy` and `services` to expose local processes through HTTP or HTTPS hostnames. When more than one project uses the same proxy port, prox automatically uses a shared per-user daemon so each project can own distinct hostnames on one port.
+
+```yaml
+proxy:
+  enabled: true
+  https_port: 443
+  domain: local.example.dev
+
+services:
+  app: 3000
+  api: 8000
+```
+
+With another project using the same `https_port`, both can participate on `443` as long as the service hostnames differ. Inspect ownership with:
+
+```bash
+prox proxy routes
 ```
 
 ## HTTP API
@@ -170,7 +194,7 @@ When binding to non-localhost interfaces, authentication is automatically enable
 
 Full documentation is available at [charliek.github.io/prox](https://charliek.github.io/prox/).
 
-See [docs/spec.md](docs/spec.md) for the complete specification including TUI keybindings, API details, and architecture.
+Local docs live under [docs](docs/), including the [CLI reference](docs/reference/cli.md), [configuration reference](docs/reference/configuration.md), [HTTP API reference](docs/reference/api.md), and [architecture notes](docs/development/architecture.md).
 
 ## Development
 

@@ -5,7 +5,7 @@ description: "Use when a prox.yaml file exists in the project root, or the user 
 
 # Prox Process Manager
 
-prox is a process manager for local development written in Go. It provides process supervision with automatic restarts, real-time log aggregation, an HTTP/HTTPS reverse proxy with subdomain routing, an interactive TUI, and a background daemon mode with a REST API. A shared proxy daemon lets multiple projects serve their domains through the same proxy port.
+prox is a process manager for local development written in Go. It provides process supervision with automatic restarts, real-time log aggregation, an HTTP/HTTPS reverse proxy with local hostname routing, an interactive TUI, and a background daemon mode with a REST API. A shared proxy daemon lets multiple projects serve their domains through the same proxy port.
 
 ## First Step: Read prox.yaml
 
@@ -73,7 +73,7 @@ How to reach services depends on whether the proxy is configured in prox.yaml.
 
 ### With proxy enabled
 
-Read the `proxy` and `services` sections of prox.yaml. Services are accessible via subdomain routing:
+Read the `proxy` and `services` sections of prox.yaml. Services are accessible via local hostname routing:
 
 ```text
 http://<service>.<domain>:<http_port>/path

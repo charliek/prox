@@ -38,6 +38,10 @@ All errors return JSON:
 | `PROCESS_NOT_RUNNING` | Process is not running |
 | `INVALID_PATTERN` | Invalid regex pattern |
 | `SHUTDOWN_IN_PROGRESS` | Supervisor is shutting down |
+| `PROXY_NOT_ENABLED` | Proxy request inspection is unavailable because the proxy is disabled |
+| `STREAMING_NOT_SUPPORTED` | The server cannot provide an SSE stream for this request |
+| `REQUEST_NOT_FOUND` | Proxy request ID does not exist in the request buffer |
+| `MISSING_REQUEST_ID` | Request detail endpoint was called without an ID |
 
 ## Endpoints
 
@@ -162,11 +166,10 @@ Retrieve logs from buffer.
 |-------|------|---------|-------------|
 | `process` | string | all | Comma-separated process names |
 | `lines` | int | 100 | Max lines to return |
-| `bytes` | int | — | Max bytes to return |
 | `pattern` | string | — | Filter pattern |
 | `regex` | bool | false | Treat pattern as regex |
 
-If both `lines` and `bytes` are specified, whichever limit hits first applies.
+The `lines` parameter is capped at 10000.
 
 **Response:**
 
@@ -189,7 +192,7 @@ If both `lines` and `bytes` are specified, whichever limit hits first applies.
 
 Stream logs via Server-Sent Events (SSE).
 
-**Query Parameters:** Same as `GET /logs` (except `lines` and `bytes`)
+**Query Parameters:** Same as `GET /logs` (except `lines`)
 
 **Response:** SSE stream
 
@@ -255,6 +258,50 @@ curl "http://localhost:5555/api/v1/proxy/requests?subdomain=api"
 curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
 ```
 
+### GET /proxy/requests/{id}
+
+Retrieve details for one proxied request.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `include` | string | — | Set to `body` to include captured request and response body data |
+
+Body data is available only when capture was enabled with `prox up --capture` or `proxy.capture.enabled: true`.
+
+**Response:**
+
+```json
+{
+  "id": "a1b2c3d",
+  "timestamp": "2025-01-19T10:32:01.123Z",
+  "method": "POST",
+  "url": "/api/users",
+  "subdomain": "api",
+  "status_code": 201,
+  "duration_ms": 45,
+  "remote_addr": "127.0.0.1",
+  "details": {
+    "request_headers": {
+      "Content-Type": ["application/json"]
+    },
+    "request_body": {
+      "size": 27,
+      "truncated": false,
+      "content_type": "application/json",
+      "is_binary": false,
+      "data": "{\"name\":\"Ada\"}"
+    }
+  }
+}
+```
+
+**Examples:**
+
+```bash
+curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d
+curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d?include=body"
+```
+
 ### GET /proxy/requests/stream
 
 Stream proxy requests via Server-Sent Events (SSE).
@@ -264,8 +311,7 @@ Stream proxy requests via Server-Sent Events (SSE).
 **Response:** SSE stream
 
 ```
-event: connected
-data: {}
+: connected
 
 data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```

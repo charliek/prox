@@ -1,5 +1,9 @@
 # Shared Proxy Across Projects
 
+## Status
+
+Implemented in #12 on 2026-04-06 as an auto-started shared proxy daemon. The user-facing guide is [Shared Proxy Across Projects](../guides/shared-proxy.md).
+
 ## Problem Statement
 
 A common usage pattern for prox is running the proxy on well-known ports (443 for HTTPS, 80 for HTTP). Users often have multiple projects on the same machine that each define their own `prox.yaml`, and ideally each project's domains would be served through the same proxy port.
@@ -8,9 +12,22 @@ For example:
 - **Project A** (`~/projects/auth-service/prox.yaml`): `auth.local.stridelabs.ai` on port 443
 - **Project B** (`~/projects/audit-service/prox.yaml`): `audit.local.stridelabs.ai` on port 443
 
-Today, each `prox up` invocation starts its own independent proxy listener. If Project A already owns port 443, Project B's proxy silently fails to bind (see Issue 1: port conflict detection), and its domains are unreachable.
+Before the shared proxy daemon, each `prox up` invocation started its own independent proxy listener. If Project A already owned port 443, Project B could not bind the same port.
 
-## Current Architecture
+## Decision
+
+prox uses Option C: an auto-started daemon on demand.
+
+- `prox up` starts the shared daemon when a proxy is configured and no daemon is running.
+- Each project registers its own service hostnames with the daemon.
+- HTTP routes by Host header. HTTPS routes by SNI.
+- `prox down` deregisters only the current project.
+- The daemon stops automatically when the last project deregisters.
+- `prox proxy status`, `prox proxy routes`, and `prox proxy stop` provide explicit inspection and control.
+
+The daemon is per-user and per-machine. It stores state in `~/.prox/`, while each project's supervisor state remains in that project's `.prox/` directory.
+
+## Previous Architecture
 
 - All state is **per-project scoped**: `.prox/prox.state`, `.prox/prox.pid`, and `.prox/prox.log` live in each project's working directory.
 - Each `prox up` creates its own `proxy.Service` that binds its own HTTP/HTTPS ports.
@@ -29,7 +46,7 @@ Today, each `prox up` invocation starts its own independent proxy listener. If P
 
 A standalone, long-lived proxy process that multiple projects register with.
 
-- `prox proxy start` starts a background proxy daemon that owns port 443/80, stores state in `~/.prox/`.
+- An explicit command such as `prox proxy start` could start a background proxy daemon that owns port 443/80 and stores state in `~/.prox/`.
 - `prox up` in a project detects the running proxy daemon, registers its domains/services via API, deregisters on shutdown.
 - The proxy daemon has its own route table that projects dynamically add to and remove from.
 
@@ -39,7 +56,7 @@ A standalone, long-lived proxy process that multiple projects register with.
 - No "first project owns the port" ambiguity.
 
 **Cons:**
-- Extra thing to manage -- user needs to run `prox proxy start` (or it auto-starts).
+- Extra thing to manage if startup is explicit.
 - Requires a registration API/protocol between project instances and the daemon.
 - Daemon needs its own logging, status, and management commands.
 
@@ -66,7 +83,7 @@ Like Option A, but the daemon auto-starts when the first `prox up` needs a proxy
 - `prox up` checks `~/.prox/proxy.state` -- if no proxy daemon is running, it forks one off as a separate background process.
 - The proxy daemon has its own PID, independent of any project.
 - `prox proxy stop` (or stopping all registered projects) brings it down.
-- `prox proxy start` also available for explicit control.
+- An explicit start command was considered for manual control, but the shipped CLI relies on automatic startup.
 
 **Pros:**
 - No extra manual step for users -- seamless experience.
@@ -78,22 +95,22 @@ Like Option A, but the daemon auto-starts when the first `prox up` needs a proxy
 - Need clear status/stop commands (`prox proxy status`, `prox proxy stop`).
 - Auto-start logic adds complexity.
 
-## Open Design Questions
+## Resolved Design Questions
 
-1. **Opt-in vs default**: Should port sharing be the default behavior, or should projects explicitly opt in (e.g., `proxy: shared: true` in `prox.yaml`)? The default behavior change could surprise existing users.
+| Question | Resolution |
+|----------|------------|
+| Opt-in vs default | Shared proxy behavior is automatic for any project with a configured proxy. There is no `shared` config field. |
+| Domain conflicts | Duplicate `hostname:port` registrations fail. |
+| Certificate management | HTTPS certificates are managed by the shared daemon as routes are registered. |
+| Stale route cleanup | The daemon tracks project PIDs and removes stale registrations for dead processes. |
+| Visibility and debugging | `prox proxy status` and `prox proxy routes` expose daemon state. |
+| Registration protocol | Projects communicate with the daemon over the Unix socket at `~/.prox/proxy.sock`. |
 
-2. **Domain conflicts**: What happens if two projects both try to register the same domain (e.g., both claim `api.local.stridelabs.ai`)? Options: first-come-first-served, error on the second, or last-write-wins.
+## Caveats
 
-3. **Certificate management**: The shared proxy needs certs for all registered domains. Currently certs are per-project. A shared proxy would likely need wildcard certs or dynamic cert generation as routes are added.
-
-4. **Stale route cleanup**: If a project crashes without deregistering, the proxy has a stale route pointing at a dead backend. Options: heartbeat-based expiry, health checking registered backends, or relying on the project's PID liveness.
-
-5. **Visibility and debugging**: How does the user inspect the shared proxy's state? Something like `prox proxy routes` to list all registered domains and which project owns them.
-
-6. **Registration protocol**: Should project instances communicate with the proxy daemon via HTTP API, Unix socket, or filesystem-based coordination (e.g., writing route files to `~/.prox/routes.d/`)?
-
-## Current Recommendation
-
-Option C (auto-start daemon) likely provides the best user experience, but Option A (explicit daemon) is simpler and more predictable. Option B should be avoided due to the fragile ownership model.
-
-Before designing this in detail, Issue 1 (port conflict detection) should be resolved first, as it is a prerequisite -- clear error messages when ports conflict will be needed regardless of which shared-proxy approach is chosen.
+| Caveat | Behavior |
+|--------|----------|
+| Same hostname | A second project cannot take over an existing `hostname:port`; registration fails. |
+| Mixed protocol | A port can be HTTP or HTTPS, not both. |
+| Version mismatch | A project with a different `prox` version cannot join the running daemon. Reset with `prox proxy stop --force`. |
+| Sandboxed state | If `~/.prox/` is unavailable, prox falls back to a standalone per-project proxy without port sharing. |
