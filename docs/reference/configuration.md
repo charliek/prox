@@ -216,7 +216,7 @@ certs:
 | `proxy.enabled` | bool | auto | Enable reverse proxy (auto-enabled when a port is set) |
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
-| `proxy.domain` | string | required | Base domain for subdomain routing |
+| `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
 | `proxy.capture.enabled` | bool | `false` | Capture request and response body metadata for proxied requests |
 | `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
 
