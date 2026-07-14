@@ -11,6 +11,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +31,12 @@ type Process interface {
 	PID() int
 	Wait() error
 	Signal(sig os.Signal) error
+	// GroupAlive reports whether any member of the process group is still
+	// alive, using a signal-0 liveness probe. It returns (false, nil) once the
+	// group is gone (ESRCH). Any surfaced error is returned alongside a
+	// conservative "alive" verdict so callers never treat an ambiguous probe
+	// as a confirmed reap.
+	GroupAlive() (bool, error)
 	Stdout() io.Reader
 	Stderr() io.Reader
 }
@@ -101,8 +108,15 @@ func (r *ExecRunner) Start(ctx context.Context, config domain.ProcessConfig, env
 	stdoutW.Close()
 	stderrW.Close()
 
+	// Capture the process group ID (PGID) at launch. Because SysProcAttr sets
+	// Setpgid without an explicit Pgid, the child starts a brand-new process
+	// group whose PGID equals the child's own PID (the child is the group
+	// leader). We record the leader PID directly rather than calling
+	// syscall.Getpgid: the leader PID is authoritative and this avoids a race
+	// where the leader has already exited by the time we'd query it.
 	return &execProcess{
 		cmd:    cmd,
+		pgid:   cmd.Process.Pid,
 		stdout: stdoutR,
 		stderr: stderrR,
 	}, nil
@@ -111,6 +125,7 @@ func (r *ExecRunner) Start(ctx context.Context, config domain.ProcessConfig, env
 // execProcess wraps exec.Cmd to implement Process interface
 type execProcess struct {
 	cmd    *exec.Cmd
+	pgid   int // process group ID captured at launch (== leader PID); <= 0 means unknown
 	stdout io.Reader
 	stderr io.Reader
 }
@@ -127,18 +142,66 @@ func (p *execProcess) Wait() error {
 }
 
 func (p *execProcess) Signal(sig os.Signal) error {
-	if p.cmd.Process == nil {
-		return nil
+	// Signal the entire process group using the PGID captured at launch. We
+	// hard-guard pgid > 0: syscall.Kill(-pgid, ...) with pgid <= 0 would signal
+	// prox's own process group (pgid 0 means "my group"), which is exactly the
+	// orphan/self-signal bug this replaces. We intentionally do NOT re-derive
+	// the pgid via syscall.Getpgid at signal time, since after the leader exits
+	// that lookup fails and we'd silently fall back to signaling nothing.
+	if p.pgid > 0 {
+		return syscall.Kill(-p.pgid, sig.(syscall.Signal))
 	}
 
-	// Kill entire process group
-	pgid, err := syscall.Getpgid(p.cmd.Process.Pid)
-	if err != nil {
-		// Fall back to killing just the process
+	// Fallback: no known group, signal the leader only if it exists.
+	if p.cmd.Process != nil {
 		return p.cmd.Process.Signal(sig)
 	}
 
-	return syscall.Kill(-pgid, sig.(syscall.Signal))
+	return nil
+}
+
+// GroupAlive reports whether any member of the process group is still alive
+// using a signal-0 liveness probe.
+//
+// When pgid > 0 it probes the whole group via syscall.Kill(-pgid, 0). When
+// pgid <= 0 it never touches a group (that would hit prox's own process group)
+// and falls back to a leader-only probe.
+//
+// Result mapping:
+//   - err == nil                   -> (true, nil)   process/group exists
+//   - errors.Is(err, ESRCH)        -> (false, nil)  process/group is gone
+//   - errors.Is(err, EPERM)        -> (true, nil)   exists, not permitted to signal
+//   - any other error              -> (true, err)   conservatively alive, surface err
+//
+// Note: a zombie leader remains a group member until it is reaped, so a probe
+// can report the group as alive until monitor()'s Wait() reaps the leader.
+func (p *execProcess) GroupAlive() (bool, error) {
+	var err error
+	if p.pgid > 0 {
+		err = syscall.Kill(-p.pgid, syscall.Signal(0))
+	} else {
+		// No known group: probe the leader only, never a group.
+		if p.cmd.Process == nil {
+			return false, nil
+		}
+		err = p.cmd.Process.Signal(syscall.Signal(0))
+	}
+
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	case errors.Is(err, os.ErrProcessDone):
+		// Reached only via the pgid<=0 leader-only fallback: os.Process.Signal
+		// reports a reaped process as os.ErrProcessDone (and normalizes raw
+		// ESRCH to it), not syscall.ESRCH. Treat it as gone.
+		return false, nil
+	case errors.Is(err, syscall.EPERM):
+		return true, nil
+	default:
+		return true, err
+	}
 }
 
 func (p *execProcess) Stdout() io.Reader {
