@@ -269,9 +269,17 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Restart restarts the process
-func (p *ManagedProcess) Restart(ctx context.Context) error {
-	if err := p.Stop(ctx); err != nil && err != domain.ErrProcessNotRunning {
+// Restart restarts the process.
+//
+// stopCtx and startCtx are intentionally distinct: stopCtx bounds the graceful
+// stop of the current instance (typically a short-lived, request/timeout
+// context), while startCtx becomes the lifecycle context for the replacement
+// instance's process/health-checker and must be long-lived (e.g. a
+// supervisor's own context). Using a request-scoped context for startCtx
+// would cancel the replacement's health checker and lifecycle context as
+// soon as the request context is cancelled/expires (see RestartProcess).
+func (p *ManagedProcess) Restart(stopCtx, startCtx context.Context) error {
+	if err := p.Stop(stopCtx); err != nil && err != domain.ErrProcessNotRunning {
 		return err
 	}
 
@@ -279,7 +287,7 @@ func (p *ManagedProcess) Restart(ctx context.Context) error {
 	p.restartCount++
 	p.mu.Unlock()
 
-	return p.Start(ctx)
+	return p.Start(startCtx)
 }
 
 // monitor watches for process exit

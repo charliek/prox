@@ -369,17 +369,22 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 	s.mu.RLock()
 	mp, ok := s.processes[name]
+	supCtx := s.ctx // Use supervisor context for the replacement's lifecycle, not request context
 	s.mu.RUnlock()
 
 	if !ok {
 		return domain.ErrProcessNotFound
 	}
 
-	// Create timeout context
+	// Create timeout context to bound the stop half of the restart.
 	restartCtx, cancel := context.WithTimeout(ctx, s.supConfig.ShutdownTimeout)
 	defer cancel()
 
-	err := mp.Restart(restartCtx)
+	// Stop uses restartCtx (bounded by the request/shutdown timeout); Start
+	// uses supCtx so the replacement's process lifecycle and health checker
+	// survive after this request's context is cancelled/expires (mirrors
+	// StartProcess).
+	err := mp.Restart(restartCtx, supCtx)
 	if err == nil {
 		s.emit(SupervisorEvent{
 			Type:      EventTypeProcessStarted,
