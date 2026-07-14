@@ -331,6 +331,14 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 		return domain.ErrProcessNotFound
 	}
 
+	// s.ctx is nil until Supervisor.Start() runs. Passing a nil context into
+	// mp.Start -> context.WithCancel would panic; guard against being called
+	// before the supervisor has started (unreachable via the normal API wiring,
+	// which serves requests only after Start, but defensive).
+	if supCtx == nil {
+		return domain.ErrShutdownInProgress
+	}
+
 	// Use supervisor context for the process lifecycle.
 	// The passed ctx is only used for the API request timeout, but the process
 	// should continue running after the request completes.
@@ -381,6 +389,13 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 
 	if !ok {
 		return domain.ErrProcessNotFound
+	}
+
+	// s.ctx is nil until Supervisor.Start() runs; the replacement is started on
+	// it, so guard against a pre-start call that would panic in
+	// context.WithCancel (defensive; unreachable via the normal API wiring).
+	if supCtx == nil {
+		return domain.ErrShutdownInProgress
 	}
 
 	// Create timeout context to bound the stop half of the restart.

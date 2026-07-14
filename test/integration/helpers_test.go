@@ -139,8 +139,8 @@ func stopProx(t *testing.T, addr string) error {
 }
 
 // restartProcess sends a POST /api/v1/processes/{name}/restart request and
-// returns the parsed error response (Code/Error) when the request did not
-// return 200, or a zero-value response and nil error on success.
+// returns the HTTP status code and the parsed error response (empty Code/Error
+// on success).
 func restartProcess(t *testing.T, addr, name string) (int, ErrorResponse) {
 	t.Helper()
 	return postProcessAction(t, addr, name, "restart")

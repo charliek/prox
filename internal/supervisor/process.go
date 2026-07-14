@@ -452,11 +452,12 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 		close(outputDone)
 	}()
 
+	drainTimedOut := false
 	select {
 	case <-outputDone:
 		// Output readers finished normally
 	case <-time.After(outputDrainTimeout):
-		p.logf(domain.StreamStderr, "output capture timed out (some logs may be missing)")
+		drainTimedOut = true
 	}
 
 	exitCode := exitCodeFromWaitErr(err)
@@ -464,8 +465,12 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 	p.mu.Lock()
 	// Generation guard: a stale monitor -- one whose instance has already been
 	// replaced by a newer Start -- must touch nothing shared and emit no
-	// (misleading) exit log. It only closes its own done below.
+	// (misleading) logs (drain-timeout notice or exit code) attributed to a run
+	// that is no longer current. It only closes its own done below.
 	if p.current == inst {
+		if drainTimedOut {
+			p.logf(domain.StreamStderr, "output capture timed out (some logs may be missing)")
+		}
 		switch p.state {
 		case domain.ProcessStateStopping:
 			// Stop owns the transition to stopped; here we only record the exit
