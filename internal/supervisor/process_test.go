@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -183,6 +184,85 @@ func TestManagedProcess_StopLogsExitCode(t *testing.T) {
 	}
 
 	assert.True(t, foundStoppedMessage, "should log 'stopped (rc=-15)' message when process is terminated by SIGTERM")
+}
+
+// TestManagedProcess_LoadEnvReloadsOnEveryStart verifies D1/A1c: a loadEnv
+// closure is invoked at the top of every Start, so an edited env source
+// (here a mutable closure over a variable, standing in for a rewritten
+// env_file) is reflected on the very next Start after a Stop - not just
+// once at process creation.
+func TestManagedProcess_LoadEnvReloadsOnEveryStart(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	runner := NewExecRunner()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name: "test",
+		Cmd:  "sleep 5",
+	}, nil, runner, logMgr)
+
+	current := "v1"
+	mp.loadEnv = func() (map[string]string, error) {
+		return map[string]string{"RELOAD_VAL": current}, nil
+	}
+
+	ctx := context.Background()
+	require.NoError(t, mp.Start(ctx))
+	assert.Equal(t, "v1", mp.Info().Env["RELOAD_VAL"])
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	require.NoError(t, mp.Stop(stopCtx))
+	cancel()
+
+	// Mutate the source the loader reads from, simulating an edited env_file.
+	current = "v2"
+
+	require.NoError(t, mp.Start(ctx))
+	assert.Equal(t, "v2", mp.Info().Env["RELOAD_VAL"])
+
+	// Cleanup
+	stopCtx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	require.NoError(t, mp.Stop(stopCtx2))
+}
+
+// TestManagedProcess_LoadEnvFailureCrashesProcess verifies A2: when loadEnv
+// fails, Start returns a typed error wrapping domain.ErrEnvReloadFailed, the
+// state becomes crashed, no process is launched, and a subsequent Stop
+// behaves sanely (ErrProcessNotRunning) rather than hanging or panicking on
+// a dangling done channel.
+func TestManagedProcess_LoadEnvFailureCrashesProcess(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	runner := NewExecRunner()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name: "test",
+		Cmd:  "sleep 5",
+	}, nil, runner, logMgr)
+
+	loadErr := errors.New("env file missing")
+	mp.loadEnv = func() (map[string]string, error) {
+		return nil, loadErr
+	}
+
+	ctx := context.Background()
+	err := mp.Start(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrEnvReloadFailed)
+	assert.Contains(t, err.Error(), "env file missing")
+
+	assert.Equal(t, domain.ProcessStateCrashed, mp.State())
+	assert.Equal(t, 0, mp.Info().PID, "no process should have been launched")
+
+	// A subsequent Stop should behave sanely rather than hang on a dangling
+	// done channel or panic on a double-close.
+	stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = mp.Stop(stopCtx)
+	assert.ErrorIs(t, err, domain.ErrProcessNotRunning)
 }
 
 func TestManagedProcess_CrashLogsExitCode(t *testing.T) {

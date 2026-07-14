@@ -18,6 +18,7 @@ func TestErrorCode(t *testing.T) {
 		{"process not running", ErrProcessNotRunning, ErrCodeProcessNotRunning},
 		{"invalid pattern", ErrInvalidPattern, ErrCodeInvalidPattern},
 		{"shutdown in progress", ErrShutdownInProgress, ErrCodeShutdownInProgress},
+		{"env reload failed", ErrEnvReloadFailed, ErrCodeEnvReloadFailed},
 		{"unknown error", errors.New("some error"), "INTERNAL_ERROR"},
 	}
 	for _, tt := range tests {

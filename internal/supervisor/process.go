@@ -28,6 +28,12 @@ type ManagedProcess struct {
 	runner     ProcessRunner
 	logManager *logs.Manager
 
+	// loadEnv, if set, is called at the top of every Start to (re)load the
+	// process's environment from disk (env_file(s)) merged with inline env.
+	// When nil, Start uses the stored env as-is (back-compat for tests that
+	// construct ManagedProcess directly via NewManagedProcess).
+	loadEnv func() (map[string]string, error)
+
 	state        domain.ProcessState
 	process      Process
 	startedAt    time.Time
@@ -115,6 +121,25 @@ func (p *ManagedProcess) Start(ctx context.Context) error {
 
 	if p.state == domain.ProcessStateRunning || p.state == domain.ProcessStateStarting {
 		return domain.ErrProcessAlreadyRunning
+	}
+
+	// Reload the environment from disk on every Start (covers both `start`
+	// after `stop` and the replacement half of `restart`). This must happen
+	// before any of the done/doneOnce/cancel state is mutated so a failure
+	// here leaves no dangling channel behind.
+	if p.loadEnv != nil {
+		env, err := p.loadEnv()
+		if err != nil {
+			p.state = domain.ProcessStateCrashed
+			p.logManager.Write(domain.LogEntry{
+				Timestamp: time.Now(),
+				Process:   p.config.Name,
+				Stream:    domain.StreamStderr,
+				Line:      fmt.Sprintf("failed to reload environment: %v", err),
+			})
+			return fmt.Errorf("%w: %v", domain.ErrEnvReloadFailed, err)
+		}
+		p.env = env
 	}
 
 	p.state = domain.ProcessStateStarting
