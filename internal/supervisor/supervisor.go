@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -256,6 +257,12 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 					Stream:    domain.StreamStderr,
 					Line:      fmt.Sprintf("Error stopping: %v", err),
 				})
+				// Full-instance stop is best-effort, but surface an
+				// un-reapable group prominently so operators can see which
+				// process leaked (D4). We do not abort the rest of shutdown.
+				if errors.Is(err, domain.ErrProcessGroupNotReaped) {
+					s.SystemLog("could not reap process group for %s", mp.Name())
+				}
 			}
 			s.emit(SupervisorEvent{
 				Type:      EventTypeProcessStopped,

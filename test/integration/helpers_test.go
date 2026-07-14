@@ -138,6 +138,49 @@ func stopProx(t *testing.T, addr string) error {
 	return nil
 }
 
+// restartProcess sends a POST /api/v1/processes/{name}/restart request and
+// returns the parsed error response (Code/Error) when the request did not
+// return 200, or a zero-value response and nil error on success.
+func restartProcess(t *testing.T, addr, name string) (int, ErrorResponse) {
+	t.Helper()
+	return postProcessAction(t, addr, name, "restart")
+}
+
+// stopProcess sends a POST /api/v1/processes/{name}/stop request and returns
+// the HTTP status code and parsed error response (empty Code/Error on
+// success).
+func stopProcess(t *testing.T, addr, name string) (int, ErrorResponse) {
+	t.Helper()
+	return postProcessAction(t, addr, name, "stop")
+}
+
+// postProcessAction posts to /api/v1/processes/{name}/{action} (start, stop,
+// restart) and returns the status code plus a decoded error body (zero value
+// if the response wasn't an error payload).
+func postProcessAction(t *testing.T, addr, name, action string) (int, ErrorResponse) {
+	t.Helper()
+
+	url := fmt.Sprintf("%s/api/v1/processes/%s/%s", addr, name, action)
+	resp, err := http.Post(url, "application/json", nil)
+	if err != nil {
+		t.Fatalf("failed to POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	var errResp ErrorResponse
+	if resp.StatusCode != http.StatusOK {
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	}
+	return resp.StatusCode, errResp
+}
+
+// ErrorResponse mirrors internal/api.ErrorResponse for decoding error bodies
+// in integration tests without importing the internal/api package.
+type ErrorResponse struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+}
+
 // killProx forcefully kills the prox process
 func killProx(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {

@@ -12,6 +12,7 @@ var (
 	ErrConfigNotFound        = errors.New("config file not found")
 	ErrInvalidConfig         = errors.New("invalid configuration")
 	ErrEnvReloadFailed       = errors.New("environment reload failed")
+	ErrProcessGroupNotReaped = errors.New("process group could not be terminated")
 )
 
 // Error codes for API responses
@@ -22,6 +23,7 @@ const (
 	ErrCodeInvalidPattern        = "INVALID_PATTERN"
 	ErrCodeShutdownInProgress    = "SHUTDOWN_IN_PROGRESS"
 	ErrCodeEnvReloadFailed       = "ENV_RELOAD_FAILED"
+	ErrCodeProcessGroupNotReaped = "PROCESS_GROUP_NOT_REAPED"
 
 	// Proxy-related error codes (API-only, no sentinel errors as they
 	// are only used for HTTP response formatting in the API layer)
@@ -46,6 +48,8 @@ func ErrorCode(err error) string {
 		return ErrCodeShutdownInProgress
 	case errors.Is(err, ErrEnvReloadFailed):
 		return ErrCodeEnvReloadFailed
+	case errors.Is(err, ErrProcessGroupNotReaped):
+		return ErrCodeProcessGroupNotReaped
 	default:
 		return "INTERNAL_ERROR"
 	}

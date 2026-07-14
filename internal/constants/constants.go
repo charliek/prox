@@ -31,6 +31,14 @@ const (
 
 	// DefaultShutdownTimeout is the default timeout for graceful shutdown
 	DefaultShutdownTimeout = 10 * time.Second
+
+	// KillGrace is the window reserved at the tail of a process's shutdown
+	// budget for the SIGKILL escalation and post-kill group-liveness
+	// verification. It is carved out of ShutdownTimeout: the graceful (SIGTERM)
+	// phase runs until (deadline - KillGrace), after which the group is
+	// SIGKILLed and given up to KillGrace more to disappear before Stop reports
+	// the group could not be reaped.
+	KillGrace = 2 * time.Second
 )
 
 // Log configuration

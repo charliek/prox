@@ -264,6 +264,13 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusInternalServerError
 		code = domain.ErrCodeEnvReloadFailed
 		message = err.Error()
+	case errors.Is(err, domain.ErrProcessGroupNotReaped):
+		// Surface the process name/detail so `prox stop`/`restart` report which
+		// process's group could not be terminated (systemd/docker-style loud
+		// failure). Non-sensitive: it's the user's own process name.
+		status = http.StatusInternalServerError
+		code = domain.ErrCodeProcessGroupNotReaped
+		message = err.Error()
 	default:
 		// For unknown errors, log the actual error but return a sanitized message
 		// to avoid leaking internal paths or sensitive information

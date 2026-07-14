@@ -1,0 +1,9 @@
+api:
+  port: 15560  # Dedicated port for the orphan-grandchild integration tests
+  host: 127.0.0.1
+
+processes:
+  worker:
+    cmd: ./testdata/scripts/stubborn_grandchild.sh
+    env:
+      STUBBORN_PORT: "15561"
