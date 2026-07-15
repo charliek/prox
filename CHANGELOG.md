@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.1.3
+
+Bug-fix release for the `prox restart`/`stop` process lifecycle (#29):
+a restart now reloads the process's `env_file`, and neither `stop` nor
+`restart` leaves orphaned grandchild processes holding their ports.
+
+### Fixes
+
+- **`restart` reloads `env_file`; `stop`/`restart` no longer orphan
+  grandchildren** (#29, #30). Previously `prox restart` could report
+  success while running the replacement with a stale environment and
+  leaving the old process's grandchildren alive — holding the listening
+  port, so the replacement failed with `EADDRINUSE` — and `prox stop`
+  could leave the same orphan behind. Now:
+  - `env_file` (global + per-process) and inline `env` are re-read from
+    disk on every start, so `start`/`restart` pick up edited values; a
+    failed reload fails loudly instead of launching with a stale env.
+  - `stop`/`restart` gate on the whole process group — SIGTERM, a
+    time-based graceful wait, then SIGKILL of the group with reap
+    verification — so a grandchild that ignores SIGTERM is still cleaned
+    up and its port freed.
+  - `prox stop <name>` / `prox restart <name>` now return a non-zero
+    exit and a typed `PROCESS_GROUP_NOT_REAPED` error when a group can't
+    be reaped, instead of always reporting success.
+  - `restart` starts the replacement on the supervisor's context, so its
+    health checker survives past the request that triggered it.
+
+### Documentation
+
+- Document the shared proxy daemon.
+
 ## v0.1.2
 
 Release-pipeline + plugin distribution release. Prox is now a
