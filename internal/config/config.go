@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -296,37 +295,6 @@ func (hc *HealthcheckConfig) ToDomain() (*domain.HealthConfig, error) {
 		Retries:     hc.Retries,
 		StartPeriod: startPeriod,
 	}, nil
-}
-
-// ToDomainProcesses converts config processes to domain ProcessConfig slice.
-// Process names are iterated in sorted order so that a conversion error for a
-// multi-process config is deterministic.
-func (c *Config) ToDomainProcesses() ([]domain.ProcessConfig, error) {
-	names := make([]string, 0, len(c.Processes))
-	for name := range c.Processes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	processes := make([]domain.ProcessConfig, 0, len(c.Processes))
-	for _, name := range names {
-		proc := c.Processes[name]
-		domainProc := domain.ProcessConfig{
-			Name:    name,
-			Cmd:     proc.Cmd,
-			Env:     proc.Env,
-			EnvFile: proc.EnvFile,
-		}
-		if proc.Healthcheck != nil {
-			hc, err := proc.Healthcheck.ToDomain()
-			if err != nil {
-				return nil, fmt.Errorf("process %q: %w", name, err)
-			}
-			domainProc.Healthcheck = hc
-		}
-		processes = append(processes, domainProc)
-	}
-	return processes, nil
 }
 
 // ParseSize parses a human-readable size string (e.g., "1MB", "512KB", "1024")
