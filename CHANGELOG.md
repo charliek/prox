@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixes
+
+- **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**
+  (#31). Previously only `healthcheck.cmd` took effect; the timing/retry fields
+  were silently dropped and replaced by the built-in defaults (`10s`/`5s`/`3`/
+  `30s`), so a tuned healthcheck ran at the wrong cadence and a slow starter got
+  no `start_period` grace. Configured values now reach the health checker. An
+  invalid or negative duration fails `prox up` at load with a clear,
+  process-named error (e.g. `processes.api.healthcheck.interval: invalid
+  duration "3x"`) instead of being silently ignored; `0`/omitted still means
+  "use the default".
+
 ## v0.1.3
 
 Bug-fix release for the `prox restart`/`stop` process lifecycle (#29):
