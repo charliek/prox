@@ -272,6 +272,85 @@ func TestSupervisor_StopLogsSIGTERM(t *testing.T) {
 	assert.True(t, foundSIGTERMMessage, "Stop should log 'sending SIGTERM to test (pid X)' message")
 }
 
+// TestSupervisor_CreateManagedProcess_HealthcheckTiming is the regression test
+// for issue #31: createManagedProcess must propagate the full healthcheck
+// timing (interval/timeout/retries/start_period), not just cmd, so configured
+// timing takes effect instead of being silently replaced by WithDefaults.
+func TestSupervisor_CreateManagedProcess_HealthcheckTiming(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := makeTestConfig(map[string]string{})
+	sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+	t.Run("non-default timing is honored, not WithDefaults", func(t *testing.T) {
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{
+			Cmd: "true",
+			Healthcheck: &config.HealthcheckConfig{
+				Cmd:         "true",
+				Interval:    "7s",
+				Timeout:     "3s",
+				Retries:     5,
+				StartPeriod: "11s",
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, mp)
+		require.NotNil(t, mp.config.Healthcheck)
+
+		assert.Equal(t, "true", mp.config.Healthcheck.Cmd)
+		assert.Equal(t, 7*time.Second, mp.config.Healthcheck.Interval)
+		assert.Equal(t, 3*time.Second, mp.config.Healthcheck.Timeout)
+		assert.Equal(t, 5, mp.config.Healthcheck.Retries)
+		assert.Equal(t, 11*time.Second, mp.config.Healthcheck.StartPeriod)
+
+		// Explicitly NOT the WithDefaults values (10s/5s/3/30s).
+		assert.NotEqual(t, 10*time.Second, mp.config.Healthcheck.Interval)
+		assert.NotEqual(t, 5*time.Second, mp.config.Healthcheck.Timeout)
+		assert.NotEqual(t, 3, mp.config.Healthcheck.Retries)
+		assert.NotEqual(t, 30*time.Second, mp.config.Healthcheck.StartPeriod)
+	})
+
+	t.Run("cmd-only healthcheck creates with zero timing", func(t *testing.T) {
+		mp, err := sup.createManagedProcess("svc2", config.ProcessConfig{
+			Cmd:         "true",
+			Healthcheck: &config.HealthcheckConfig{Cmd: "true"},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, mp)
+		require.NotNil(t, mp.config.Healthcheck)
+
+		assert.Equal(t, "true", mp.config.Healthcheck.Cmd)
+		assert.Equal(t, time.Duration(0), mp.config.Healthcheck.Interval)
+		assert.Equal(t, time.Duration(0), mp.config.Healthcheck.Timeout)
+		assert.Equal(t, 0, mp.config.Healthcheck.Retries)
+		assert.Equal(t, time.Duration(0), mp.config.Healthcheck.StartPeriod)
+	})
+}
+
+// TestSupervisor_CreateManagedProcess_InvalidHealthcheckDuration verifies the
+// defensive error path: a malformed duration surfaces a process-named error and
+// no ManagedProcess (rather than silently defaulting).
+func TestSupervisor_CreateManagedProcess_InvalidHealthcheckDuration(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := makeTestConfig(map[string]string{})
+	sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+	mp, err := sup.createManagedProcess("svc", config.ProcessConfig{
+		Cmd: "true",
+		Healthcheck: &config.HealthcheckConfig{
+			Cmd:      "true",
+			Interval: "3x",
+		},
+	})
+	require.Error(t, err)
+	assert.Nil(t, mp)
+	assert.Contains(t, err.Error(), "svc")
+	assert.Contains(t, err.Error(), "interval")
+}
+
 // TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext is the
 // regression test for the C2 restart-context bug: RestartProcess must start
 // the replacement process on the supervisor's long-lived context, not on a
@@ -299,13 +378,12 @@ func TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext(t *testin
 
 	runner := NewExecRunner()
 
-	// Supervisor.createManagedProcess currently only propagates
-	// Healthcheck.Cmd from config.ProcessConfig into domain.HealthConfig --
-	// Interval/Timeout/StartPeriod are dropped (a separate, pre-existing gap
-	// unrelated to this fix). To get a fast, deterministic health check we
-	// build the ManagedProcess directly with a full domain.HealthConfig and
-	// register it on the supervisor, then drive everything else through the
-	// real Supervisor.StartProcess/RestartProcess API used in production.
+	// Fast, deterministic health-check timing is driven through the real
+	// config -> domain conversion path (Supervisor.createManagedProcess) -- the
+	// same path production uses -- so the test exercises the actual wiring. We
+	// register the resulting ManagedProcess on the supervisor, then drive
+	// everything else through the real Supervisor.StartProcess/RestartProcess
+	// API used in production.
 	cfg := makeTestConfig(map[string]string{})
 	sup := New(cfg, logMgr, runner, DefaultSupervisorConfig())
 
@@ -318,17 +396,17 @@ func TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext(t *testin
 		sup.Stop(stopCtx)
 	}()
 
-	mp := NewManagedProcess(domain.ProcessConfig{
-		Name: "test",
-		Cmd:  "sleep 30",
-		Healthcheck: &domain.HealthConfig{
+	mp, err := sup.createManagedProcess("test", config.ProcessConfig{
+		Cmd: "sleep 30",
+		Healthcheck: &config.HealthcheckConfig{
 			Cmd:         "true", // always succeeds, cheap
-			Interval:    50 * time.Millisecond,
-			Timeout:     1 * time.Second,
+			Interval:    "50ms",
+			Timeout:     "1s",
 			Retries:     1,
-			StartPeriod: 50 * time.Millisecond,
+			StartPeriod: "50ms",
 		},
-	}, nil, runner, logMgr)
+	})
+	require.NoError(t, err)
 
 	sup.mu.Lock()
 	sup.processes["test"] = mp

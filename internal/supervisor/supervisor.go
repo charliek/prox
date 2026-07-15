@@ -177,9 +177,11 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 		EnvFile: procConfig.EnvFile,
 	}
 	if procConfig.Healthcheck != nil {
-		domainConfig.Healthcheck = &domain.HealthConfig{
-			Cmd: procConfig.Healthcheck.Cmd,
+		hc, err := procConfig.Healthcheck.ToDomain()
+		if err != nil {
+			return nil, fmt.Errorf("process %q healthcheck: %w", name, err)
 		}
+		domainConfig.Healthcheck = hc
 	}
 
 	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +81,181 @@ func TestValidate(t *testing.T) {
 		err := Validate(cfg)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "healthcheck.cmd")
+	})
+
+	t.Run("healthcheck malformed interval fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", Interval: "3x"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.interval")
+		assert.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("healthcheck malformed timeout fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", Timeout: "3x"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.timeout")
+		assert.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("healthcheck malformed start_period fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", StartPeriod: "3x"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.start_period")
+		assert.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("healthcheck negative interval fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", Interval: "-5s"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.interval")
+		assert.Contains(t, err.Error(), "negative")
+	})
+
+	t.Run("healthcheck negative timeout fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", Timeout: "-5s"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.timeout")
+		assert.Contains(t, err.Error(), "negative")
+	})
+
+	t.Run("healthcheck negative start_period fails", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true", StartPeriod: "-5s"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.start_period")
+		assert.Contains(t, err.Error(), "negative")
+	})
+
+	t.Run("healthcheck multiple bad durations all reported", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd: "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{
+						Cmd:      "true",
+						Interval: "3x",
+						Timeout:  "-5s",
+					},
+				},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.interval")
+		assert.Contains(t, err.Error(), "processes.api.healthcheck.timeout")
+	})
+
+	t.Run("healthcheck valid durations pass", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd: "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{
+						Cmd:         "true",
+						Interval:    "10s",
+						Timeout:     "5s",
+						StartPeriod: "30s",
+					},
+				},
+			},
+		}
+		err := Validate(cfg)
+		assert.NoError(t, err)
+	})
+
+	t.Run("healthcheck absent durations pass", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd:         "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{Cmd: "true"},
+				},
+			},
+		}
+		err := Validate(cfg)
+		assert.NoError(t, err)
+	})
+
+	t.Run("healthcheck explicit zero durations pass", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"api": {
+					Cmd: "go run ./cmd/server",
+					Healthcheck: &HealthcheckConfig{
+						Cmd:         "true",
+						Interval:    "0s",
+						Timeout:     "0s",
+						StartPeriod: "0s",
+					},
+				},
+			},
+		}
+		err := Validate(cfg)
+		assert.NoError(t, err)
 	})
 }
 

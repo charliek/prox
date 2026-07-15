@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,55 +82,106 @@ func TestParse_InvalidYAML(t *testing.T) {
 	assert.Contains(t, err.Error(), "parsing yaml")
 }
 
-func TestConfig_ToDomainProcesses(t *testing.T) {
-	cfg := &Config{
-		Processes: map[string]ProcessConfig{
-			"web": {Cmd: "npm run dev"},
-			"api": {
-				Cmd: "go run ./cmd/server",
-				Env: map[string]string{"PORT": "8080"},
-				Healthcheck: &HealthcheckConfig{
-					Cmd:      "curl -f http://localhost:8080/health",
-					Interval: "10s",
-					Timeout:  "5s",
-					Retries:  3,
-				},
-			},
-		},
-	}
+func TestParse_HealthcheckInvalidDuration(t *testing.T) {
+	yamlData := []byte(`
+api:
+  port: 5555
+processes:
+  api:
+    cmd: go run ./cmd/server
+    healthcheck:
+      cmd: curl -f http://localhost:8080/health
+      interval: 3x
+`)
+	cfg, err := Parse(yamlData)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+	assert.Contains(t, err.Error(), "processes.api.healthcheck.interval")
+}
 
-	procs := cfg.ToDomainProcesses()
-	assert.Len(t, procs, 2)
-
-	// Find api process
-	var apiProc *struct {
-		found bool
-		cmd   string
-		env   map[string]string
-		hc    bool
-	}
-	for _, p := range procs {
-		if p.Name == "api" {
-			apiProc = &struct {
-				found bool
-				cmd   string
-				env   map[string]string
-				hc    bool
-			}{
-				found: true,
-				cmd:   p.Cmd,
-				env:   p.Env,
-				hc:    p.Healthcheck != nil,
-			}
-			break
+func TestHealthcheckConfig_ToDomain(t *testing.T) {
+	t.Run("valid non-default durations populate all fields", func(t *testing.T) {
+		hc := &HealthcheckConfig{
+			Cmd:         "curl -f http://localhost/health",
+			Interval:    "7s",
+			Timeout:     "3s",
+			Retries:     5,
+			StartPeriod: "11s",
 		}
-	}
+		got, err := hc.ToDomain()
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, "curl -f http://localhost/health", got.Cmd)
+		assert.Equal(t, 7*time.Second, got.Interval)
+		assert.Equal(t, 3*time.Second, got.Timeout)
+		assert.Equal(t, 5, got.Retries)
+		assert.Equal(t, 11*time.Second, got.StartPeriod)
+	})
 
-	require.NotNil(t, apiProc)
-	assert.True(t, apiProc.found)
-	assert.Equal(t, "go run ./cmd/server", apiProc.cmd)
-	assert.Equal(t, "8080", apiProc.env["PORT"])
-	assert.True(t, apiProc.hc)
+	t.Run("empty durations convert to zero", func(t *testing.T) {
+		hc := &HealthcheckConfig{Cmd: "true"}
+		got, err := hc.ToDomain()
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, "true", got.Cmd)
+		assert.Equal(t, time.Duration(0), got.Interval)
+		assert.Equal(t, time.Duration(0), got.Timeout)
+		assert.Equal(t, 0, got.Retries)
+		assert.Equal(t, time.Duration(0), got.StartPeriod)
+	})
+
+	t.Run("explicit zero values convert to zero and default via WithDefaults", func(t *testing.T) {
+		hc := &HealthcheckConfig{
+			Cmd:         "true",
+			Interval:    "0s",
+			Timeout:     "0s",
+			Retries:     0,
+			StartPeriod: "0s",
+		}
+		got, err := hc.ToDomain()
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, time.Duration(0), got.Interval)
+		assert.Equal(t, time.Duration(0), got.Timeout)
+		assert.Equal(t, 0, got.Retries)
+		assert.Equal(t, time.Duration(0), got.StartPeriod)
+
+		// Zero means "use the documented default" (D5).
+		withDefaults := got.WithDefaults()
+		assert.Equal(t, 10*time.Second, withDefaults.Interval)
+		assert.Equal(t, 5*time.Second, withDefaults.Timeout)
+		assert.Equal(t, 3, withDefaults.Retries)
+		assert.Equal(t, 30*time.Second, withDefaults.StartPeriod)
+	})
+
+	t.Run("malformed duration returns error", func(t *testing.T) {
+		hc := &HealthcheckConfig{Cmd: "true", Interval: "3x"}
+		got, err := hc.ToDomain()
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.Contains(t, err.Error(), "interval")
+	})
+
+	t.Run("negative duration returns error", func(t *testing.T) {
+		hc := &HealthcheckConfig{Cmd: "true", Timeout: "-5s"}
+		got, err := hc.ToDomain()
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.Contains(t, err.Error(), "timeout")
+		assert.Contains(t, err.Error(), "negative")
+	})
+
+	t.Run("tiny negative duration truncating to zero still returns error", func(t *testing.T) {
+		// time.ParseDuration("-0.1ns") truncates to 0; the sign check must
+		// still reject it rather than let WithDefaults silently substitute.
+		hc := &HealthcheckConfig{Cmd: "true", Interval: "-0.1ns"}
+		got, err := hc.ToDomain()
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.Contains(t, err.Error(), "interval")
+		assert.Contains(t, err.Error(), "negative")
+	})
 }
 
 func TestParse_ProxyConfig(t *testing.T) {

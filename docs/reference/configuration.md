@@ -81,6 +81,8 @@ processes:
 | `retries` | int | `3` | Consecutive failures before marking unhealthy |
 | `start_period` | duration | `30s` | Grace period after startup before checks begin |
 
+Duration fields use Go's duration syntax (e.g. `500ms`, `30s`, `1m30s`). An invalid or negative duration makes `prox up` fail at startup with a clear error naming the field (e.g. `processes.api.healthcheck.interval: invalid duration "3x"`). Omitting a field — or setting it to `0` — uses the default shown above.
+
 ## Environment Variable Precedence
 
 Environment variables are loaded in this order (later values override earlier):
