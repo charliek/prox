@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,6 +80,24 @@ func TestParse_InvalidYAML(t *testing.T) {
 	_, err := Parse([]byte("invalid: yaml: content:"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parsing yaml")
+}
+
+func TestParse_HealthcheckInvalidDuration(t *testing.T) {
+	yamlData := []byte(`
+api:
+  port: 5555
+processes:
+  api:
+    cmd: go run ./cmd/server
+    healthcheck:
+      cmd: curl -f http://localhost:8080/health
+      interval: 3x
+`)
+	cfg, err := Parse(yamlData)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+	assert.Contains(t, err.Error(), "processes.api.healthcheck.interval")
 }
 
 func TestConfig_ToDomainProcesses(t *testing.T) {

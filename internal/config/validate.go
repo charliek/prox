@@ -49,6 +49,15 @@ func Validate(config *Config) error {
 			if proc.Healthcheck.Retries < 0 {
 				errs = append(errs, fmt.Sprintf("processes.%s.healthcheck.retries: must be non-negative", name))
 			}
+			for _, d := range []struct{ field, value string }{
+				{"interval", proc.Healthcheck.Interval},
+				{"timeout", proc.Healthcheck.Timeout},
+				{"start_period", proc.Healthcheck.StartPeriod},
+			} {
+				if _, err := parseHealthDuration(d.field, d.value); err != nil {
+					errs = append(errs, fmt.Sprintf("processes.%s.healthcheck.%s", name, err))
+				}
+			}
 		}
 	}
 
