@@ -1,6 +1,6 @@
 {
   "name": "prox",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Guidance for driving the prox process manager: prox.yaml config, CLI, proxy/subdomain routing, logs, and request inspection.",
   "author": {
     "name": "Charlie Knudsen",
