@@ -271,3 +271,132 @@ func TestSupervisor_StopLogsSIGTERM(t *testing.T) {
 
 	assert.True(t, foundSIGTERMMessage, "Stop should log 'sending SIGTERM to test (pid X)' message")
 }
+
+// TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext is the
+// regression test for the C2 restart-context bug: RestartProcess must start
+// the replacement process on the supervisor's long-lived context, not on a
+// context derived from the (request-scoped) ctx the caller passed in.
+//
+// Before the fix, Supervisor.RestartProcess built a single timeout context
+// from the caller's ctx and threaded it through ManagedProcess.Restart into
+// both Stop and Start. Start derives processCtx (and the health checker's
+// context) from whatever context it's given, so once an HTTP handler
+// returns and its request context is cancelled, the replacement's
+// processCtx -- and therefore its health checker -- was torn down even
+// though the process itself kept running. This test simulates exactly that:
+// a cancelable "request" context that is cancelled the instant
+// RestartProcess returns, then asserts the replacement's health checker
+// keeps ticking (status becomes and remains "healthy") well past that
+// cancellation.
+//
+// Health-check ticking is used as the observable here (rather than a new
+// production accessor into the process's internal context) because it is
+// the most direct symptom described by the bug report and is fully exposed
+// via Supervisor.Process already.
+func TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	runner := NewExecRunner()
+
+	// Supervisor.createManagedProcess currently only propagates
+	// Healthcheck.Cmd from config.ProcessConfig into domain.HealthConfig --
+	// Interval/Timeout/StartPeriod are dropped (a separate, pre-existing gap
+	// unrelated to this fix). To get a fast, deterministic health check we
+	// build the ManagedProcess directly with a full domain.HealthConfig and
+	// register it on the supervisor, then drive everything else through the
+	// real Supervisor.StartProcess/RestartProcess API used in production.
+	cfg := makeTestConfig(map[string]string{})
+	sup := New(cfg, logMgr, runner, DefaultSupervisorConfig())
+
+	ctx := context.Background()
+	_, err := sup.Start(ctx)
+	require.NoError(t, err)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		sup.Stop(stopCtx)
+	}()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name: "test",
+		Cmd:  "sleep 30",
+		Healthcheck: &domain.HealthConfig{
+			Cmd:         "true", // always succeeds, cheap
+			Interval:    50 * time.Millisecond,
+			Timeout:     1 * time.Second,
+			Retries:     1,
+			StartPeriod: 50 * time.Millisecond,
+		},
+	}, nil, runner, logMgr)
+
+	sup.mu.Lock()
+	sup.processes["test"] = mp
+	sup.mu.Unlock()
+
+	require.NoError(t, sup.StartProcess(ctx, "test"))
+
+	// Establish the checker is healthy before restarting.
+	waitForHealthCheckerHealthy(t, sup, "test", 2*time.Second)
+
+	firstInfo, err := sup.Process("test")
+	require.NoError(t, err)
+	firstPID := firstInfo.PID
+
+	// Simulate an HTTP handler: a cancelable request context that is
+	// cancelled the instant the handler (RestartProcess) returns -- this is
+	// exactly what net/http does once a response has been written.
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	err = sup.RestartProcess(requestCtx, "test")
+	cancelRequest()
+	require.NoError(t, err)
+
+	info, err := sup.Process("test")
+	require.NoError(t, err)
+	assert.Equal(t, domain.ProcessStateRunning, info.State)
+	assert.NotEqual(t, firstPID, info.PID, "restart should replace the process with a new PID")
+	assert.Equal(t, 1, info.RestartCount)
+
+	// The replacement's health checker must keep ticking even though the
+	// request context that initiated the restart is now cancelled. Without
+	// the C2 fix this never becomes healthy (status stays "unknown" forever
+	// because the health checker's context was cancelled along with the
+	// request context).
+	waitForHealthCheckerHealthy(t, sup, "test", 2*time.Second)
+
+	postCancelInfo, err := sup.Process("test")
+	require.NoError(t, err)
+	require.NotNil(t, postCancelInfo.HealthDetails)
+	lastCheck1 := postCancelInfo.HealthDetails.LastCheck
+	require.False(t, lastCheck1.IsZero())
+
+	// Confirm the checker is still actively ticking rather than frozen on a
+	// single successful check that happened to sneak in before teardown.
+	time.Sleep(300 * time.Millisecond)
+	laterInfo, err := sup.Process("test")
+	require.NoError(t, err)
+	require.NotNil(t, laterInfo.HealthDetails)
+	assert.True(t, laterInfo.HealthDetails.LastCheck.After(lastCheck1),
+		"health checker should still be ticking after the request context is cancelled")
+	assert.Equal(t, domain.ProcessStateRunning, laterInfo.State)
+}
+
+// waitForHealthCheckerHealthy polls the supervisor until the named process
+// reports domain.HealthStatusHealthy, failing the test if timeout elapses
+// first.
+func waitForHealthCheckerHealthy(t *testing.T, sup *Supervisor, name string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastStatus domain.HealthStatus
+	for time.Now().Before(deadline) {
+		info, err := sup.Process(name)
+		require.NoError(t, err)
+		lastStatus = info.Health
+		if info.Health == domain.HealthStatusHealthy {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("process %s did not become/remain healthy within %v (last health status: %q)", name, timeout, lastStatus)
+}

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -155,23 +156,24 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 }
 
 // createManagedProcess creates a new managed process from configuration.
+//
+// Environment loading is deferred to a closure invoked at the top of every
+// Start (see ManagedProcess.loadEnv / D1): this avoids an eager load here
+// that would (a) double-read the env files on the very first start and
+// (b) prevent process creation entirely if the env file is transiently
+// unreadable. A bad env file now fails loudly at Start instead.
 func (s *Supervisor) createManagedProcess(name string, procConfig config.ProcessConfig) (*ManagedProcess, error) {
-	// Load environment for this process
-	env, err := config.LoadProcessEnv(s.config.EnvFile, procConfig.EnvFile, procConfig.Env, s.supConfig.ConfigDir)
-	if err != nil {
-		s.logManager.Write(domain.LogEntry{
-			Timestamp: time.Now(),
-			Process:   name,
-			Stream:    domain.StreamStderr,
-			Line:      fmt.Sprintf("Failed to load environment: %v", err),
-		})
-		return nil, fmt.Errorf("failed to load environment: %w", err)
+	globalEnvFile := s.config.EnvFile
+	procEnvFile := procConfig.EnvFile
+	inlineEnv := procConfig.Env
+	configDir := s.supConfig.ConfigDir
+	loadEnv := func() (map[string]string, error) {
+		return config.LoadProcessEnv(globalEnvFile, procEnvFile, inlineEnv, configDir)
 	}
 
 	domainConfig := domain.ProcessConfig{
 		Name:    name,
 		Cmd:     procConfig.Cmd,
-		Env:     env,
 		EnvFile: procConfig.EnvFile,
 	}
 	if procConfig.Healthcheck != nil {
@@ -180,7 +182,9 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 		}
 	}
 
-	return NewManagedProcess(domainConfig, env, s.runner, s.logManager), nil
+	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)
+	mp.loadEnv = loadEnv
+	return mp, nil
 }
 
 // startProcessesConcurrently starts all managed processes concurrently and updates the result.
@@ -253,6 +257,12 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 					Stream:    domain.StreamStderr,
 					Line:      fmt.Sprintf("Error stopping: %v", err),
 				})
+				// Full-instance stop is best-effort, but surface an
+				// un-reapable group prominently so operators can see which
+				// process leaked (D4). We do not abort the rest of shutdown.
+				if errors.Is(err, domain.ErrProcessGroupNotReaped) {
+					s.SystemLog("could not reap process group for %s", mp.Name())
+				}
 			}
 			s.emit(SupervisorEvent{
 				Type:      EventTypeProcessStopped,
@@ -321,6 +331,14 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 		return domain.ErrProcessNotFound
 	}
 
+	// s.ctx is nil until Supervisor.Start() runs. Passing a nil context into
+	// mp.Start -> context.WithCancel would panic; guard against being called
+	// before the supervisor has started (unreachable via the normal API wiring,
+	// which serves requests only after Start, but defensive).
+	if supCtx == nil {
+		return domain.ErrShutdownInProgress
+	}
+
 	// Use supervisor context for the process lifecycle.
 	// The passed ctx is only used for the API request timeout, but the process
 	// should continue running after the request completes.
@@ -366,17 +384,29 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 	s.mu.RLock()
 	mp, ok := s.processes[name]
+	supCtx := s.ctx // Use supervisor context for the replacement's lifecycle, not request context
 	s.mu.RUnlock()
 
 	if !ok {
 		return domain.ErrProcessNotFound
 	}
 
-	// Create timeout context
+	// s.ctx is nil until Supervisor.Start() runs; the replacement is started on
+	// it, so guard against a pre-start call that would panic in
+	// context.WithCancel (defensive; unreachable via the normal API wiring).
+	if supCtx == nil {
+		return domain.ErrShutdownInProgress
+	}
+
+	// Create timeout context to bound the stop half of the restart.
 	restartCtx, cancel := context.WithTimeout(ctx, s.supConfig.ShutdownTimeout)
 	defer cancel()
 
-	err := mp.Restart(restartCtx)
+	// Stop uses restartCtx (bounded by the request/shutdown timeout); Start
+	// uses supCtx so the replacement's process lifecycle and health checker
+	// survive after this request's context is cancelled/expires (mirrors
+	// StartProcess).
+	err := mp.Restart(restartCtx, supCtx)
 	if err == nil {
 		s.emit(SupervisorEvent{
 			Type:      EventTypeProcessStarted,
