@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -251,10 +252,65 @@ func parseServiceConfig(name string, value interface{}) (ServiceConfig, error) {
 	}
 }
 
-// ToDomainProcesses converts config processes to domain ProcessConfig slice
-func (c *Config) ToDomainProcesses() []domain.ProcessConfig {
+// parseHealthDuration parses one healthcheck duration field. An empty string
+// leaves the value zero so domain.HealthConfig.WithDefaults applies the
+// documented default. A malformed or negative value returns a clear,
+// field-named error (a negative would survive WithDefaults and panic NewTicker).
+func parseHealthDuration(field, s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid duration %q", field, s)
+	}
+	// ParseDuration truncates a tiny negative (e.g. "-0.1ns") to 0, which would
+	// otherwise slip past d < 0 and be silently defaulted by WithDefaults. Check
+	// the input's sign too so any negative value is rejected, not just defaulted.
+	if d < 0 || strings.HasPrefix(s, "-") {
+		return 0, fmt.Errorf("%s: duration must not be negative (%q)", field, s)
+	}
+	return d, nil
+}
+
+// ToDomain converts the YAML healthcheck config to the domain type, parsing the
+// duration strings. Returns the first field error (parse or negative). Empty
+// fields stay zero so WithDefaults applies the default.
+func (hc *HealthcheckConfig) ToDomain() (*domain.HealthConfig, error) {
+	interval, err := parseHealthDuration("interval", hc.Interval)
+	if err != nil {
+		return nil, err
+	}
+	timeout, err := parseHealthDuration("timeout", hc.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	startPeriod, err := parseHealthDuration("start_period", hc.StartPeriod)
+	if err != nil {
+		return nil, err
+	}
+	return &domain.HealthConfig{
+		Cmd:         hc.Cmd,
+		Interval:    interval,
+		Timeout:     timeout,
+		Retries:     hc.Retries,
+		StartPeriod: startPeriod,
+	}, nil
+}
+
+// ToDomainProcesses converts config processes to domain ProcessConfig slice.
+// Process names are iterated in sorted order so that a conversion error for a
+// multi-process config is deterministic.
+func (c *Config) ToDomainProcesses() ([]domain.ProcessConfig, error) {
+	names := make([]string, 0, len(c.Processes))
+	for name := range c.Processes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	processes := make([]domain.ProcessConfig, 0, len(c.Processes))
-	for name, proc := range c.Processes {
+	for _, name := range names {
+		proc := c.Processes[name]
 		domainProc := domain.ProcessConfig{
 			Name:    name,
 			Cmd:     proc.Cmd,
@@ -262,30 +318,15 @@ func (c *Config) ToDomainProcesses() []domain.ProcessConfig {
 			EnvFile: proc.EnvFile,
 		}
 		if proc.Healthcheck != nil {
-			hc := &domain.HealthConfig{
-				Cmd:     proc.Healthcheck.Cmd,
-				Retries: proc.Healthcheck.Retries,
-			}
-			if proc.Healthcheck.Interval != "" {
-				if d, err := time.ParseDuration(proc.Healthcheck.Interval); err == nil {
-					hc.Interval = d
-				}
-			}
-			if proc.Healthcheck.Timeout != "" {
-				if d, err := time.ParseDuration(proc.Healthcheck.Timeout); err == nil {
-					hc.Timeout = d
-				}
-			}
-			if proc.Healthcheck.StartPeriod != "" {
-				if d, err := time.ParseDuration(proc.Healthcheck.StartPeriod); err == nil {
-					hc.StartPeriod = d
-				}
+			hc, err := proc.Healthcheck.ToDomain()
+			if err != nil {
+				return nil, fmt.Errorf("process %q: %w", name, err)
 			}
 			domainProc.Healthcheck = hc
 		}
 		processes = append(processes, domainProc)
 	}
-	return processes
+	return processes, nil
 }
 
 // ParseSize parses a human-readable size string (e.g., "1MB", "512KB", "1024")
