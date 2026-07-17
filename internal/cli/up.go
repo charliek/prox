@@ -279,6 +279,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create supervisor
 	supConfig := supervisor.DefaultSupervisorConfig()
 	supConfig.ConfigDir = configDir
+	// The absolute config path lets an API-driven (re)start re-read prox.yaml and
+	// apply the target process's current config (#33, D3).
+	supConfig.ConfigPath = absConfigPath
 	// cfg.ShutdownTimeout was already validated by config.Load above, so this
 	// only errors for a hand-built Config bypassing Load/Validate.
 	// ShutdownTimeoutDuration's error is already field-prefixed
@@ -317,8 +320,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "         Any network client can control this supervisor.\n")
 	}
 
-	// Create API handlers and server
-	handlers := api.NewHandlers(sup, logMgr, configPath, shutdownFn)
+	// Create API handlers and server. The handlers get the absolute config path
+	// so GET /status reports the same file the reload path re-reads (#33, D3).
+	handlers := api.NewHandlers(sup, logMgr, absConfigPath, shutdownFn)
 	apiServer := api.NewServer(api.ServerConfig{
 		Host:        cfg.API.Host,
 		Port:        cfg.API.Port,

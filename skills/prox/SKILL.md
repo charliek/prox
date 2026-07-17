@@ -28,6 +28,8 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 | Check what's running | `prox status` |
 | Attach interactive TUI | `prox attach` |
 
+**Editing `prox.yaml`?** `prox restart <name>` (and `prox start <name>` after a `prox stop <name>`) re-reads the file and applies that process's current config — changed `cmd`, `healthcheck`, `stop_timeout`, and `env`/`env_file`. So the edit → restart loop needs no full `prox stop` + `prox up`. Adding/removing/renaming processes or changing `services`/`proxy` still requires `prox up`.
+
 **Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block.
 
 **Never kill processes directly** (e.g., `kill <pid>`). Use prox commands so it can track state and handle restarts correctly.

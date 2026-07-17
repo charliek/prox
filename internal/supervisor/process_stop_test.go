@@ -158,7 +158,7 @@ func TestManagedProcess_RestartClobberSafety(t *testing.T) {
 	const restarts = 10
 	for i := 0; i < restarts; i++ {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := mp.Restart(stopCtx, context.Background())
+		err := mp.Restart(stopCtx, context.Background(), nil)
 		cancel()
 		require.NoErrorf(t, err, "restart %d", i)
 		require.Equalf(t, domain.ProcessStateRunning, mp.State(), "restart %d should leave the process running", i)

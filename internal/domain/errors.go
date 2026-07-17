@@ -13,6 +13,14 @@ var (
 	ErrInvalidConfig         = errors.New("invalid configuration")
 	ErrEnvReloadFailed       = errors.New("environment reload failed")
 	ErrProcessGroupNotReaped = errors.New("process group could not be terminated")
+	// ErrConfigReloadFailed wraps any failure to re-read/validate prox.yaml on an
+	// API-driven (re)start (missing/unreadable file, YAML syntax, validation
+	// failure). The wrapping detail carries the underlying loader message (#33, D3).
+	ErrConfigReloadFailed = errors.New("config reload failed")
+	// ErrProcessNotInConfig is returned when an API-driven (re)start reloads the
+	// config and the target process is no longer present in it (#33, D3). The
+	// caller must run `prox up` to reconcile added/removed processes.
+	ErrProcessNotInConfig = errors.New("no longer in config")
 )
 
 // Error codes for API responses
@@ -24,6 +32,8 @@ const (
 	ErrCodeShutdownInProgress    = "SHUTDOWN_IN_PROGRESS"
 	ErrCodeEnvReloadFailed       = "ENV_RELOAD_FAILED"
 	ErrCodeProcessGroupNotReaped = "PROCESS_GROUP_NOT_REAPED"
+	ErrCodeConfigReloadFailed    = "CONFIG_RELOAD_FAILED"
+	ErrCodeProcessNotInConfig    = "PROCESS_NOT_IN_CONFIG"
 
 	// Proxy-related error codes (API-only, no sentinel errors as they
 	// are only used for HTTP response formatting in the API layer)
@@ -50,6 +60,10 @@ func ErrorCode(err error) string {
 		return ErrCodeEnvReloadFailed
 	case errors.Is(err, ErrProcessGroupNotReaped):
 		return ErrCodeProcessGroupNotReaped
+	case errors.Is(err, ErrConfigReloadFailed):
+		return ErrCodeConfigReloadFailed
+	case errors.Is(err, ErrProcessNotInConfig):
+		return ErrCodeProcessNotInConfig
 	default:
 		return "INTERNAL_ERROR"
 	}

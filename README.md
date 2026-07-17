@@ -139,7 +139,7 @@ processes:
 prox up [processes...]           # Start processes (foreground)
 prox up --tui [processes...]     # Start with interactive TUI
 prox stop                        # Stop running instance
-prox restart <process>           # Restart a process
+prox restart <process>           # Restart a process (re-reads prox.yaml, applies its current config)
 prox status                      # Show process status
 prox logs [process]              # Show recent logs
 prox logs -f [process]           # Stream logs

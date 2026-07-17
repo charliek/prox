@@ -192,6 +192,108 @@ processes:
 	waitForLogContains(t, addr, "echoenv", "MYVAL=v2", 5*time.Second)
 }
 
+// printerConfig renders a config whose single `printer` process echoes
+// "MARKER=<marker>" in a loop, on the given API port. Used by the
+// changed-cmd reload test to edit the launched command out from under a
+// running process.
+func printerConfig(port int, marker string) string {
+	return fmt.Sprintf(`api:
+  port: %d
+  host: 127.0.0.1
+
+processes:
+  printer:
+    cmd: 'while :; do echo "MARKER=%s"; sleep 0.3; done'
+`, port, marker)
+}
+
+// TestRestart_ReloadsChangedCmd (#33): edit the launched command in prox.yaml
+// and restart via the API; the replacement must run the NEW command. A second
+// edit->restart cycle proves reload is per-request (consecutive reloads each
+// pick up the latest file), exercising the real `prox up` + API path end to end.
+func TestRestart_ReloadsChangedCmd(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	const port = 15563
+	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "prox.yaml")
+	requireNoError(t, os.WriteFile(cfgPath, []byte(printerConfig(port, "v1")), 0644), "writing initial config")
+
+	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
+	defer killProx(prox.cmd)
+
+	waitForAPI(t, addr, 10*time.Second)
+	waitForLogContains(t, addr, "printer", "MARKER=v1", 5*time.Second)
+
+	// Two consecutive edit->restart cycles, each picking up the latest file.
+	for _, marker := range []string{"v2", "v3"} {
+		requireNoError(t, os.WriteFile(cfgPath, []byte(printerConfig(port, marker)), 0644), "rewriting config")
+
+		status, errResp := restartProcess(t, addr, "printer")
+		if status != http.StatusOK {
+			t.Fatalf("restart (%s) failed: status=%d code=%s error=%s", marker, status, errResp.Code, errResp.Error)
+		}
+		waitForLogContains(t, addr, "printer", "MARKER="+marker, 5*time.Second)
+	}
+}
+
+// TestRestart_RemovedProcessReturns409 (#33): removing the restart target from
+// the config (while another process remains, so validation passes) must make a
+// restart of the removed process fail with PROCESS_NOT_IN_CONFIG (HTTP 409) and
+// leave the still-configured process running untouched.
+func TestRestart_RemovedProcessReturns409(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	const port = 15564
+	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "prox.yaml")
+	twoProcs := fmt.Sprintf(`api:
+  port: %d
+  host: 127.0.0.1
+
+processes:
+  alpha:
+    cmd: 'while :; do echo "ALPHA"; sleep 0.3; done'
+  beta:
+    cmd: 'while :; do echo "BETA"; sleep 0.3; done'
+`, port)
+	requireNoError(t, os.WriteFile(cfgPath, []byte(twoProcs), 0644), "writing initial config")
+
+	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
+	defer killProx(prox.cmd)
+
+	waitForAPI(t, addr, 10*time.Second)
+	waitForLogContains(t, addr, "alpha", "ALPHA", 5*time.Second)
+
+	// Remove alpha from the file (beta remains so the file still validates).
+	onlyBeta := fmt.Sprintf(`api:
+  port: %d
+  host: 127.0.0.1
+
+processes:
+  beta:
+    cmd: 'while :; do echo "BETA"; sleep 0.3; done'
+`, port)
+	requireNoError(t, os.WriteFile(cfgPath, []byte(onlyBeta), 0644), "rewriting config without alpha")
+
+	status, errResp := restartProcess(t, addr, "alpha")
+	if status != http.StatusConflict {
+		t.Fatalf("expected 409 restarting a removed process, got status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
+	}
+	if errResp.Code != "PROCESS_NOT_IN_CONFIG" {
+		t.Fatalf("expected code PROCESS_NOT_IN_CONFIG, got %q (error=%q)", errResp.Code, errResp.Error)
+	}
+
+	// alpha must still be running with its original command untouched.
+	waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+}
+
 // TestStop_KillsStubbornGrandchild (A3): the leader exits gracefully on
 // SIGTERM but a backgrounded grandchild ignores it and holds a real TCP port.
 // `stop` must return only once the grandchild is verified gone (escalating to

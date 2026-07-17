@@ -106,6 +106,27 @@ controls that escalation:
   [process detail API](api.md#get-processesname), so you can see the budget
   governing a long stop.
 
+## Config Reload on Restart
+
+Whenever a process is (re)started through the API — `prox restart <name>`, or
+`prox start <name>` after a `prox stop <name>` — prox re-reads `prox.yaml` and
+runs the process with the config the file **now** contains. So editing a
+process and restarting it is enough; a full `prox stop` + `prox up` is not
+needed for the fields below.
+
+- Applied on (re)start: `cmd`, `healthcheck`, `stop_timeout`, and environment
+  inputs (inline `env`, per-process and global `env_file`, including changed
+  file paths). A changed `stop_timeout` governs the **next** stop — the
+  restart's own stop half still uses the pre-edit budget.
+- NOT applied (these require `prox up`): process renames, added or removed
+  processes, and `services` / `proxy` / port changes.
+- The reload is **fail-closed**: the whole file is re-validated, so an invalid
+  edit anywhere in it — even in an unrelated process or the proxy section — or a
+  missing referenced env file aborts the (re)start and the existing process keeps
+  running unchanged. See the [restart API](api.md#post-processesnamerestart)
+  reference for the exact error codes (`CONFIG_RELOAD_FAILED`,
+  `PROCESS_NOT_IN_CONFIG`).
+
 ## Health Check Fields
 
 | Field | Type | Default | Description |

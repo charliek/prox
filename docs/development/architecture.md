@@ -89,10 +89,13 @@ into the supervisor's process-stop budget:
 
 ### Process Restart
 
-1. Stop the process: SIGTERM to its process group, graceful liveness polling, SIGKILL escalation to the group at the graceful deadline, then a post-kill liveness check. If the group could not be reaped, restart aborts before starting a replacement and reports `PROCESS_GROUP_NOT_REAPED` (a surviving group is never shadowed by a new one)
-2. Increment the restart counter
-3. Start the process again — `env_file` files are re-read from disk on every start (including this restart's start half) and merged with the inline `env` values captured at `up` time
-4. Reset health check state
+Every API-driven (re)start (`restart`, and `start` after a `stop`) re-reads `prox.yaml` and applies the target process's current config, so an edit → restart loop works without a full `prox stop` + `prox up`.
+
+1. **Reload + validate + preflight (before any stop):** re-read the whole config file from its absolute path and validate it, look up the target process in the fresh config, build its new runtime (`cmd`, `healthcheck`, `stop_timeout`, and a rebuilt env-loader closure over the fresh global/per-process `env_file` and inline `env`), and preflight that env load. Any failure here leaves the running process **completely untouched** and returns a typed error: `CONFIG_RELOAD_FAILED` (invalid/unreadable file, or a missing referenced env file — whole-file validation means an invalid *unrelated* section also blocks the restart) or `PROCESS_NOT_IN_CONFIG` (target removed from the file). Renames, added/removed processes, and `services`/`proxy`/port changes are out of scope and require `prox up`
+2. Stop the process: SIGTERM to its process group, graceful liveness polling, SIGKILL escalation to the group at the graceful deadline, then a post-kill liveness check. This stop half uses the process's **pre-edit** stop budget; a raised `stop_timeout` governs the next stop. If the group could not be reaped, restart aborts before starting a replacement and reports `PROCESS_GROUP_NOT_REAPED` (a surviving group is never shadowed by a new one)
+3. Increment the restart counter
+4. Start the process again, **swapping the reloaded config in atomically**: the swap happens inside the start's locked critical section, after the already-running / surviving-group guards pass and before the process launches, so a concurrent start that wins the race launches the old config and the loser is refused (`PROCESS_ALREADY_RUNNING`) without applying its swap — the running process and the stored config never mismatch. `env_file` files are re-read from disk on this start half. If the launch fails after the swap, the new config stays active for the next start ("the file is the truth")
+5. Reset health check state
 
 ### Health Checks
 

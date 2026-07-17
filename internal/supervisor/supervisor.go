@@ -18,6 +18,12 @@ import (
 type SupervisorConfig struct {
 	ShutdownTimeout time.Duration
 	ConfigDir       string // Directory containing the config file (for resolving relative paths)
+	// ConfigPath is the absolute path to prox.yaml. When set, an API-driven
+	// (re)start re-reads and validates the file and applies the target
+	// process's current config before launching it (#33, D3). Empty disables
+	// reload entirely (tests that construct a Supervisor directly), preserving
+	// back-compat: the up-time config is used as-is.
+	ConfigPath string
 }
 
 // DefaultSupervisorConfig returns default configuration
@@ -32,7 +38,13 @@ func DefaultSupervisorConfig() SupervisorConfig {
 type Supervisor struct {
 	mu sync.RWMutex
 
-	// config holds the loaded process configuration
+	// config holds the process configuration as loaded at `up` time. It is an
+	// immutable snapshot: per-process API-driven reloads (#33, D3) re-read the
+	// file into a fresh config used only for that process's swap and deliberately
+	// do NOT update this field. Consequently a whole-supervisor Stop-then-Start
+	// rebuilds every process from the ORIGINAL up-time config, not the latest
+	// file (only reachable in tests today; a full-config hot reload is future
+	// work).
 	config *config.Config
 	// supConfig holds supervisor-specific settings like shutdown timeout
 	supConfig SupervisorConfig
@@ -164,7 +176,32 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 // (b) prevent process creation entirely if the env file is transiently
 // unreadable. A bad env file now fails loudly at Start instead.
 func (s *Supervisor) createManagedProcess(name string, procConfig config.ProcessConfig) (*ManagedProcess, error) {
-	globalEnvFile := s.config.EnvFile
+	domainConfig, loadEnv, effective, err := s.buildProcessRuntime(name, s.config, procConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)
+	// mp is not yet published to s.processes / any other goroutine, so these
+	// direct field sets need no lock; production reads go through the locked
+	// StopTimeout() accessor and the lock-held loadEnv read in Start.
+	mp.loadEnv = loadEnv
+	mp.shutdownTimeout = effective
+
+	return mp, nil
+}
+
+// buildProcessRuntime resolves the domain process config, the env-loader
+// closure, and the effective stop budget for a process from the given config
+// (the up-time config at creation, or a freshly reloaded one on an API-driven
+// (re)start -- see prepareReload). The env closure captures cfg's global
+// env_file plus the process's own env_file/inline env, so a path change in a
+// reloaded file takes effect when it is invoked at the top of Start.
+//
+// Effective stop budget: the process's own stop_timeout, else cfg's global
+// shutdown_timeout, else constants.DefaultShutdownTimeout (#35, D1).
+func (s *Supervisor) buildProcessRuntime(name string, cfg *config.Config, procConfig config.ProcessConfig) (domain.ProcessConfig, func() (map[string]string, error), time.Duration, error) {
+	globalEnvFile := cfg.EnvFile
 	procEnvFile := procConfig.EnvFile
 	inlineEnv := procConfig.Env
 	configDir := s.supConfig.ConfigDir
@@ -174,7 +211,7 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 
 	stopTimeout, err := procConfig.StopTimeoutDuration()
 	if err != nil {
-		return nil, fmt.Errorf("process %q: %w", name, err)
+		return domain.ProcessConfig{}, nil, 0, fmt.Errorf("process %q: %w", name, err)
 	}
 
 	domainConfig := domain.ProcessConfig{
@@ -186,33 +223,76 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 	if procConfig.Healthcheck != nil {
 		hc, err := procConfig.Healthcheck.ToDomain()
 		if err != nil {
-			return nil, fmt.Errorf("process %q healthcheck: %w", name, err)
+			return domain.ProcessConfig{}, nil, 0, fmt.Errorf("process %q healthcheck: %w", name, err)
 		}
 		domainConfig.Healthcheck = hc
 	}
 
-	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)
-	mp.loadEnv = loadEnv
-
-	// Resolve the effective stop budget: this process's own stop_timeout,
-	// else the global shutdown_timeout, else the constant default (#35, D1).
-	// mp is not yet published to s.processes / any other goroutine, so this
-	// direct field set (mirroring the mp.loadEnv assignment above) needs no
-	// lock; production reads go through the locked StopTimeout() accessor.
 	effective := stopTimeout
 	if effective == 0 {
-		global, err := s.config.ShutdownTimeoutDuration()
+		global, err := cfg.ShutdownTimeoutDuration()
 		if err != nil {
-			return nil, fmt.Errorf("process %q: %w", name, err)
+			return domain.ProcessConfig{}, nil, 0, fmt.Errorf("process %q: %w", name, err)
 		}
 		effective = global
 	}
 	if effective == 0 {
 		effective = constants.DefaultShutdownTimeout
 	}
-	mp.shutdownTimeout = effective
 
-	return mp, nil
+	return domainConfig, loadEnv, effective, nil
+}
+
+// prepareReload re-reads and validates the whole config file and resolves the
+// pending runtime (domain config + env loader + effective stop budget) for the
+// named process, to be swapped in atomically inside startWithConfig (#33, D3).
+//
+// It returns:
+//   - (nil, nil) when ConfigPath is unset -- reload is disabled and the caller
+//     (re)starts with the existing stored config (back-compat for tests that
+//     construct a Supervisor directly);
+//   - (nil, ErrConfigReloadFailed) for a missing/unreadable file, YAML syntax
+//     error, validation failure (including an invalid UNRELATED section --
+//     whole-file validation is intentional, fail-closed), or a preflight env
+//     failure;
+//   - (nil, ErrProcessNotInConfig) when the target was removed from the file;
+//   - (pending, nil) otherwise.
+//
+// It touches no ManagedProcess state and performs no stop, so any error here
+// leaves the running process completely untouched. The env loader is preflighted
+// once (result discarded) so a missing new env_file fails before any stop.
+func (s *Supervisor) prepareReload(name string) (*pendingConfig, error) {
+	cfgPath := s.supConfig.ConfigPath
+	if cfgPath == "" {
+		return nil, nil
+	}
+
+	fresh, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	procConfig, ok := fresh.Processes[name]
+	if !ok {
+		return nil, fmt.Errorf("process %q %w; run 'prox up' to reconcile", name, domain.ErrProcessNotInConfig)
+	}
+
+	domainConfig, loadEnv, effective, err := s.buildProcessRuntime(name, fresh, procConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	// Preflight the env load so a missing/unreadable new env_file fails here,
+	// before any stop -- the running process stays untouched. The resulting map
+	// is carried on the pending config and applied verbatim at launch (see
+	// pendingConfig.env), so the same validated snapshot is used and no re-read
+	// window is reopened after the stop.
+	env, err := loadEnv()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	return &pendingConfig{config: domainConfig, loadEnv: loadEnv, env: env, stopTimeout: effective}, nil
 }
 
 // startProcessesConcurrently starts all managed processes concurrently and updates the result.
@@ -373,10 +453,22 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
+	// Re-read the config and prepare the fresh runtime BEFORE launching, so a
+	// `stop`+`start` picks up a changed cmd/env/healthcheck/stop_timeout exactly
+	// like `restart` does (#33, D3). Any reload failure leaves the process
+	// untouched. pending is nil when ConfigPath is unset (reload disabled).
+	pending, err := s.prepareReload(name)
+	if err != nil {
+		return err
+	}
+
 	// Use supervisor context for the process lifecycle.
 	// The passed ctx is only used for the API request timeout, but the process
-	// should continue running after the request completes.
-	err := mp.Start(supCtx)
+	// should continue running after the request completes. The pending config is
+	// swapped in atomically inside the locked critical section (see
+	// startWithConfig), so a concurrent Start that wins the race never leaves the
+	// running process and stored config mismatched.
+	err = mp.startWithConfig(supCtx, pending)
 	if err == nil {
 		s.emit(SupervisorEvent{
 			Type:      EventTypeProcessStarted,
@@ -434,17 +526,28 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
+	// Re-read + validate the whole file and preflight the target's fresh env
+	// BEFORE the stop, so an invalid file, a removed process, or a missing new
+	// env_file fails with the running process untouched (#33, D3). pending is nil
+	// when ConfigPath is unset (reload disabled).
+	pending, err := s.prepareReload(name)
+	if err != nil {
+		return err
+	}
+
 	// Bound the stop half of the restart by this process's own effective budget
-	// (snapshot of the currently-effective per-process value). See mp.StopTimeout
-	// (#35, D2).
+	// (snapshot of the currently-effective, pre-swap value: a raised stop_timeout
+	// only governs from the next stop). Computed here, before mp.Restart runs the
+	// stop, so the stop half observes the OLD budget (#35, D2 / #33, D3).
 	restartCtx, cancel := context.WithTimeout(ctx, mp.StopTimeout())
 	defer cancel()
 
-	// Stop uses restartCtx (bounded by the request/shutdown timeout); Start
-	// uses supCtx so the replacement's process lifecycle and health checker
+	// Stop uses restartCtx (bounded by the request/shutdown timeout); the
+	// replacement's Start uses supCtx so its process lifecycle and health checker
 	// survive after this request's context is cancelled/expires (mirrors
-	// StartProcess).
-	err := mp.Restart(restartCtx, supCtx)
+	// StartProcess). The pending config is swapped in atomically inside the
+	// replacement's locked critical section (see startWithConfig).
+	err = mp.Restart(restartCtx, supCtx, pending)
 	if err == nil {
 		s.emit(SupervisorEvent{
 			Type:      EventTypeProcessStarted,

@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- **`restart` and `start` apply the current `prox.yaml`** (#33). An API-driven
+  (re)start — `prox restart <name>`, and `prox start <name>` after a
+  `prox stop <name>` — now re-reads and validates the whole config file and runs
+  the process with its **current** config, so the edit → restart → observe loop
+  no longer needs a full `prox stop` + `prox up`. Applied on (re)start: `cmd`,
+  `healthcheck`, `stop_timeout` (the new value governs the next stop; the
+  restart's own stop half keeps the pre-edit budget), and environment inputs
+  (inline `env`, per-process and global `env_file`, including changed file
+  paths). Renames, added/removed processes, and `services`/`proxy`/port changes
+  still require `prox up`. The reload is **fail-closed**: an invalid file (even an
+  unrelated process or the proxy section), a missing referenced env file, or a
+  removed target aborts the (re)start with the existing process left running
+  unchanged, via two new error codes — `CONFIG_RELOAD_FAILED` (HTTP 422) and
+  `PROCESS_NOT_IN_CONFIG` (HTTP 409). The config swap is applied atomically inside
+  the start's locked critical section, so a start racing a restart never leaves
+  the running process and stored config mismatched.
 - **Configurable stop timeout** (#35). Two new duration fields control the
   SIGTERM→SIGKILL escalation budget: global `shutdown_timeout` (top-level) and
   per-process `stop_timeout` (overrides the global). The effective budget for a

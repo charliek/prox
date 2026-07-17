@@ -272,6 +272,19 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusInternalServerError
 		code = domain.ErrCodeProcessGroupNotReaped
 		message = err.Error()
+	case errors.Is(err, domain.ErrConfigReloadFailed):
+		// The config was re-read on an API-driven (re)start and could not be
+		// loaded/validated. The detail is the user's own config path/validation
+		// message, not sensitive, so it is surfaced directly (#33, D3).
+		status = http.StatusUnprocessableEntity
+		code = domain.ErrCodeConfigReloadFailed
+		message = err.Error()
+	case errors.Is(err, domain.ErrProcessNotInConfig):
+		// Target process was removed from the config since `prox up`. The old
+		// process keeps running; the user must run `prox up` to reconcile (#33, D3).
+		status = http.StatusConflict
+		code = domain.ErrCodeProcessNotInConfig
+		message = err.Error()
 	default:
 		// For unknown errors, log the actual error but return a sanitized message
 		// to avoid leaking internal paths or sensitive information
