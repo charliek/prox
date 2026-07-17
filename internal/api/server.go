@@ -11,7 +11,20 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/charliek/prox/internal/constants"
 )
+
+// defaultRequestTimeout bounds all non-lifecycle API requests. The lifecycle
+// routes (start/stop/restart) are exempt because the supervisor bounds them
+// internally per-process; they use lifecycleRequestTimeout instead.
+const defaultRequestTimeout = constants.DefaultRequestTimeout
+
+// lifecycleRequestTimeout is the router-level hang-protection ceiling for the
+// start/stop/restart routes. It sits safely above the configured stop-budget
+// cap (constants.MaxStopTimeout) so a legitimately long stop is never cut off
+// by the router; the supervisor is the authoritative bound (#35, D2).
+const lifecycleRequestTimeout = constants.LifecycleTimeoutCeiling
 
 // ServerConfig holds configuration for the API server
 type ServerConfig struct {
@@ -39,7 +52,11 @@ func NewServer(config ServerConfig, handlers *Handlers) *Server {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	// NOTE: the request timeout is applied per route group in registerRoutes,
+	// not globally here. Most routes get defaultRequestTimeout (30s); the
+	// lifecycle routes (start/stop/restart) get a much larger ceiling because
+	// the supervisor bounds those operations internally by each process's
+	// configured stop budget (#35, D2).
 
 	// CORS - restricted to localhost only for security
 	r.Use(corsMiddleware())
@@ -148,41 +165,65 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 	}
 }
 
-// registerRoutes sets up all API routes
+// registerRoutes sets up all API routes.
+//
+// The request-timeout middleware is applied per route group, not globally, so
+// the lifecycle routes can carry a larger ceiling than everything else:
+//   - Lifecycle group (start/stop/restart): lifecycleRequestTimeout (11m). The
+//     supervisor bounds these operations internally per-process by the
+//     configured stop budget; this router ceiling is hang protection only.
+//   - Default group (everything else, including the SSE streams and /shutdown):
+//     defaultRequestTimeout (30s), preserving the prior behavior exactly. The
+//     SSE streams (/logs/stream, /proxy/requests/stream) watch r.Context() and
+//     were 30s-capped before this restructure; they remain so.
 func (s *Server) registerRoutes() {
-	// Health check at root (no auth required)
-	s.router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	// Health check at root (no auth required). Kept under the default 30s
+	// ceiling to preserve prior behavior (it returns immediately regardless).
+	s.router.With(middleware.Timeout(defaultRequestTimeout)).
+		Get("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
 
 	s.router.Route("/api/v1", func(r chi.Router) {
 		// Apply auth middleware to all API routes (only if auth is enabled)
 		r.Use(authMiddleware(s.config.AuthEnabled, s.config.Token))
 
-		// Supervisor status
-		r.Get("/status", s.handlers.GetStatus)
+		// Lifecycle routes: bounded internally by the supervisor per-process, so
+		// they get the large hang-protection ceiling rather than the 30s default.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(lifecycleRequestTimeout))
 
-		// Processes
-		r.Get("/processes", s.handlers.GetProcesses)
-		r.Get("/processes/{name}", s.handlers.GetProcess)
-		r.Post("/processes/{name}/start", s.handlers.StartProcess)
-		r.Post("/processes/{name}/stop", s.handlers.StopProcess)
-		r.Post("/processes/{name}/restart", s.handlers.RestartProcess)
+			r.Post("/processes/{name}/start", s.handlers.StartProcess)
+			r.Post("/processes/{name}/stop", s.handlers.StopProcess)
+			r.Post("/processes/{name}/restart", s.handlers.RestartProcess)
+		})
 
-		// Logs
-		r.Get("/logs", s.handlers.GetLogs)
-		r.Get("/logs/stream", s.handlers.StreamLogs)
+		// Everything else keeps the default 30s ceiling.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(defaultRequestTimeout))
 
-		// Proxy requests
-		// Note: /proxy/requests/stream must come before /proxy/requests/{id}
-		// to prevent the parameterized route from matching "stream" as an ID
-		r.Get("/proxy/requests", s.handlers.GetProxyRequests)
-		r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
-		r.Get("/proxy/requests/{id}", s.handlers.GetProxyRequest)
+			// Supervisor status
+			r.Get("/status", s.handlers.GetStatus)
 
-		// Shutdown
-		r.Post("/shutdown", s.handlers.Shutdown)
+			// Processes (read-only)
+			r.Get("/processes", s.handlers.GetProcesses)
+			r.Get("/processes/{name}", s.handlers.GetProcess)
+
+			// Logs
+			r.Get("/logs", s.handlers.GetLogs)
+			r.Get("/logs/stream", s.handlers.StreamLogs)
+
+			// Proxy requests
+			// Note: /proxy/requests/stream must come before /proxy/requests/{id}
+			// to prevent the parameterized route from matching "stream" as an ID
+			r.Get("/proxy/requests", s.handlers.GetProxyRequests)
+			r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
+			r.Get("/proxy/requests/{id}", s.handlers.GetProxyRequest)
+
+			// Shutdown (responds immediately, then triggers async teardown)
+			r.Post("/shutdown", s.handlers.Shutdown)
+		})
 	})
 }
 

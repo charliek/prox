@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Features
+
+- **Configurable stop timeout** (#35). Two new duration fields control the
+  SIGTERM→SIGKILL escalation budget: global `shutdown_timeout` (top-level) and
+  per-process `stop_timeout` (overrides the global). The effective budget for a
+  process is its own `stop_timeout`, else the global `shutdown_timeout`, else the
+  built-in `10s` default. The value is the escalation window — a fixed `2s` is
+  reserved for the SIGKILL phase, so the graceful drain window is `budget − 2s`.
+  Values must be greater than `2s` and at most `10m`; anything outside that range
+  (including `0s`/negatives) is rejected at load with a field-named error. The
+  budget is honored end-to-end — `prox stop`, `prox restart` (the stop half), and
+  full daemon shutdown — and the effective value is surfaced as `stop_timeout` in
+  the `GET /processes/{name}` response.
+
+### Changed
+
+- **Daemon shutdown now uses per-stage deadlines instead of one shared 10s
+  budget** (#35). Full `prox stop` / Ctrl-C previously wrapped proxy teardown,
+  API-server shutdown, and *all* process stops in a single 10-second context, so
+  slow proxy/API teardown silently ate into the time available to stop processes
+  — truncating an otherwise-valid graceful drain. Teardown now runs in stages,
+  each with its own deadline computed at shutdown time: the proxy and API server
+  get short fixed deadlines, then every process is stopped concurrently, each on
+  its **own** configured stop budget (read live, so a per-process budget raised at
+  runtime is respected). With nothing configured, per-process escalation timing is
+  unchanged (10s/2s); the daemon's outer window simply no longer truncates a stop.
+
 ### Fixes
 
 - **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**

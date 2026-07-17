@@ -165,6 +165,8 @@ Without arguments, sends a shutdown signal to the daemon. All processes receive 
 
 With a process name, stops only that process while keeping prox and other processes running.
 
+The SIGTERM→SIGKILL timeout is configurable per process via `stop_timeout` (or globally via `shutdown_timeout`; default `10s`) — see [Stop Timeout](configuration.md#stop-timeout). A process with a large budget may make `prox stop` wait a while before returning: the server is authoritative and holds the request open until the process actually stops (up to the configured budget), so a long silent wait is expected rather than a hang. Pressing Ctrl-C on the CLI is safe — it only detaches the client; the daemon keeps stopping the process on its configured budget.
+
 **Examples:**
 
 ```bash
@@ -222,6 +224,8 @@ prox restart <process>
 prox restart api
 prox restart worker
 ```
+
+The stop half of a restart uses the process's **pre-edit** stop budget (see [Stop Timeout](configuration.md#stop-timeout)); a changed `stop_timeout` takes effect on the next stop after the restart.
 
 ### requests
 

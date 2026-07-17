@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -106,10 +105,11 @@ func (h *Handlers) GetProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) StartProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.StartProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the operation internally by
+	// the process's configured stop budget, and the lifecycle route group caps
+	// the request at lifecycleRequestTimeout for hang protection. r.Context()
+	// still propagates client disconnect (#35, D2).
+	if err := h.supervisor.StartProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -121,10 +121,10 @@ func (h *Handlers) StartProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) StopProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.StopProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the stop internally by the
+	// process's configured stop budget; the lifecycle route group provides the
+	// hang-protection ceiling. r.Context() still propagates client disconnect.
+	if err := h.supervisor.StopProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -136,10 +136,11 @@ func (h *Handlers) StopProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) RestartProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.RestartProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the stop half internally by
+	// the process's configured stop budget; the lifecycle route group provides
+	// the hang-protection ceiling. r.Context() still propagates client
+	// disconnect.
+	if err := h.supervisor.RestartProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}

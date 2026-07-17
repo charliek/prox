@@ -134,9 +134,12 @@ Get detailed process info.
   "cmd": "go run ./cmd/server",
   "env": {
     "PORT": "8080"
-  }
+  },
+  "stop_timeout": "30s"
 }
 ```
+
+`stop_timeout` is the effective SIGTERM→SIGKILL escalation budget in force for this process (its own `stop_timeout`, else the global `shutdown_timeout`, else the `10s` default), as a duration string. It is the budget governing a `POST /processes/{name}/stop` or `POST /processes/{name}/restart`. See [Stop Timeout](configuration.md#stop-timeout).
 
 ### POST /processes/{name}/start
 
@@ -354,3 +357,5 @@ Gracefully shut down supervisor and all processes.
 ```
 
 Connection closes after response as supervisor terminates.
+
+The daemon then tears down in stages, each with its own deadline: the proxy and API server are stopped on short fixed deadlines, then every process is stopped concurrently, each on its own configured stop budget (see [Stop Timeout](configuration.md#stop-timeout)). Graceful timing therefore derives from the configured `shutdown_timeout` / `stop_timeout` values, not a single fixed window.

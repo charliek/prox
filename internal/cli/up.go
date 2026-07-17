@@ -30,8 +30,12 @@ import (
 )
 
 const (
-	// shutdownTimeout is the maximum time to wait for graceful shutdown
-	shutdownTimeout = 10 * time.Second
+	// teardownStageTimeout bounds each fixed daemon-shutdown teardown stage
+	// (proxy deregister/shutdown, API-server shutdown) independently. The
+	// supervisor stage is bounded separately by MaxStopBudget (see the shutdown
+	// path below) so a large configured stop budget is never truncated by proxy
+	// or API teardown time (#35, D2).
+	teardownStageTimeout = 5 * time.Second
 	// logFlushDelay is the time to wait for logs to be printed before closing
 	logFlushDelay = 50 * time.Millisecond
 )
@@ -340,16 +344,18 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return proxyErr
 		}
 	}
-	// Ensure standalone proxy is cleaned up on any subsequent error
-	if proxyService != nil {
-		defer func() {
-			if proxyService != nil {
-				sCtx, sCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-				defer sCancel()
-				_ = proxyService.Shutdown(sCtx)
-			}
-		}()
-	}
+	// Ensure standalone proxy is cleaned up on any subsequent error. This defer
+	// only tears down the proxy listeners (never processes), so it gets the
+	// short proxy stage budget, matching the normal shutdown path. On the
+	// normal shutdown path proxyService is set to nil first, so this becomes a
+	// no-op there.
+	defer func() {
+		if proxyService != nil {
+			sCtx, sCancel := context.WithTimeout(context.Background(), teardownStageTimeout)
+			defer sCancel()
+			_ = proxyService.Shutdown(sCtx)
+		}
+	}()
 
 	// Start supervisor
 	fmt.Printf("Starting prox with config: %s\n", configPath)
@@ -428,9 +434,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Stop signal handler to prevent additional signals during shutdown
 	signal.Stop(sigCh)
 
-	// Graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer shutdownCancel()
+	// Graceful shutdown. Each stage gets its own deadline computed at shutdown
+	// time, rather than one shared deadline, so proxy/API teardown time can
+	// never eat into the supervisor's process-stop budget (#35, D2):
+	//   - proxy deregister/shutdown: teardownStageTimeout (fixed, short)
+	//   - API-server shutdown:       teardownStageTimeout (fixed, short;
+	//     force-closes any in-flight lifecycle request, whose process is then
+	//     stopped by sup.Stop immediately below)
+	//   - supervisor stop: MaxStopBudget()+margin, read live so hot-reloaded
+	//     per-process budgets are honored.
 
 	// Deregister from shared daemon or stop standalone proxy
 	if daemonClient != nil {
@@ -442,21 +454,28 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if proxyService != nil {
-		if err := proxyService.Shutdown(shutdownCtx); err != nil {
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), teardownStageTimeout)
+		if err := proxyService.Shutdown(proxyCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
 		}
+		proxyCancel()
 		proxyService = nil
 	}
 
 	// Stop API server
-	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+	apiCtx, apiCancel := context.WithTimeout(context.Background(), teardownStageTimeout)
+	if err := apiServer.Shutdown(apiCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
+	apiCancel()
 
-	// Stop supervisor
-	if err := sup.Stop(shutdownCtx); err != nil {
+	// Stop supervisor with a deadline sized from the live per-process stop
+	// budgets, plus a small margin for the SIGKILL escalation and finalization.
+	supCtx, supCancel := context.WithTimeout(context.Background(), sup.MaxStopBudget()+teardownStageTimeout)
+	if err := sup.Stop(supCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
+	supCancel()
 
 	// Log shutdown complete before closing the log manager
 	sup.SystemLog("shutdown complete")

@@ -62,12 +62,30 @@ This document describes the internal design of prox for contributors.
 
 ### Shutdown (Ctrl+C or API)
 
-1. Stop accepting new API requests
-2. For each process, send SIGTERM to its entire process group (not just the leader), so descendants spawned by the command are included
-3. Poll the group's liveness until it exits or the graceful deadline passes (by default ~8 seconds: a 10-second total shutdown budget minus a 2-second reserve for the SIGKILL/verify phase)
-4. If the group is still alive at the graceful deadline, send SIGKILL to the group and poll again until the kill deadline passes
-5. Verify the group is actually gone; if it survived SIGKILL, the stop reports `PROCESS_GROUP_NOT_REAPED` instead of succeeding
-6. Exit
+The daemon tears down in stages, each with its own deadline computed at shutdown
+time rather than one shared budget, so proxy/API teardown time can never eat
+into the supervisor's process-stop budget:
+
+1. Deregister from (or stop) the proxy — a short fixed stage deadline
+2. Stop the API server — a short fixed stage deadline. The server stops
+   accepting new connections and waits up to the stage deadline for in-flight
+   requests; a still-running lifecycle request is not force-closed, and the
+   supervisor stage below stops its process regardless
+3. Stop all processes (the supervisor stage), bounded by the maximum per-process
+   stop budget currently in force plus a small margin. Each process is stopped
+   concurrently on its **own** effective stop budget:
+   1. Send SIGTERM to its entire process group (not just the leader), so
+      descendants spawned by the command are included
+   2. Poll the group's liveness until it exits or the graceful deadline passes.
+      The graceful window is the process's configured stop budget minus a 2-second
+      reserve for the SIGKILL/verify phase — by default ~8 seconds (a 10-second
+      budget minus the 2-second reserve), but tunable via `shutdown_timeout` /
+      `stop_timeout`
+   3. If the group is still alive at the graceful deadline, send SIGKILL to the
+      group and poll again until the kill deadline passes
+   4. Verify the group is actually gone; if it survived SIGKILL, the stop reports
+      `PROCESS_GROUP_NOT_REAPED` instead of succeeding
+4. Exit
 
 ### Process Restart
 

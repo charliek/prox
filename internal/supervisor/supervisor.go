@@ -264,21 +264,27 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	// Create timeout context for shutdown
-	shutdownCtx, cancel := context.WithTimeout(ctx, s.supConfig.ShutdownTimeout)
-	defer cancel()
-
-	// Stop all processes concurrently
+	// Stop all processes concurrently. Each process gets its own timeout context
+	// sized from its effective stop budget (StopTimeout), so a per-process
+	// stop_timeout is honored individually. This replaces the single shared
+	// shutdownCtx that previously truncated every process to one common deadline
+	// (#35, D2). The daemon's outer deadline is sized by up.go from
+	// MaxStopBudget() so ctx here rarely bounds anything.
 	var wg sync.WaitGroup
 	for _, mp := range processes {
 		wg.Add(1)
 		go func(mp *ManagedProcess) {
 			defer wg.Done()
+			// Info() already snapshots the effective stop budget (StopTimeout),
+			// so read it once here rather than taking the process lock a second
+			// time via mp.StopTimeout().
 			info := mp.Info()
+			stopCtx, cancel := context.WithTimeout(ctx, info.StopTimeout)
+			defer cancel()
 			if info.PID > 0 {
-				s.SystemLog("sending SIGTERM to %s (pid %d)", mp.Name(), info.PID)
+				s.SystemLog("sending SIGTERM to %s (pid %d)", info.Name, info.PID)
 			}
-			if err := mp.Stop(shutdownCtx); err != nil && err != domain.ErrProcessNotRunning {
+			if err := mp.Stop(stopCtx); err != nil && err != domain.ErrProcessNotRunning {
 				s.logManager.Write(domain.LogEntry{
 					Timestamp: time.Now(),
 					Process:   mp.Name(),
@@ -392,8 +398,10 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 		return domain.ErrProcessNotFound
 	}
 
-	// Create timeout context
-	stopCtx, cancel := context.WithTimeout(ctx, s.supConfig.ShutdownTimeout)
+	// Bound the stop by this process's own effective budget (a snapshot of the
+	// currently-effective per-process value; a budget raised concurrently takes
+	// effect from the next request). See mp.StopTimeout (#35, D2).
+	stopCtx, cancel := context.WithTimeout(ctx, mp.StopTimeout())
 	defer cancel()
 
 	err := mp.Stop(stopCtx)
@@ -426,8 +434,10 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
-	// Create timeout context to bound the stop half of the restart.
-	restartCtx, cancel := context.WithTimeout(ctx, s.supConfig.ShutdownTimeout)
+	// Bound the stop half of the restart by this process's own effective budget
+	// (snapshot of the currently-effective per-process value). See mp.StopTimeout
+	// (#35, D2).
+	restartCtx, cancel := context.WithTimeout(ctx, mp.StopTimeout())
 	defer cancel()
 
 	// Stop uses restartCtx (bounded by the request/shutdown timeout); Start
@@ -444,6 +454,27 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 		})
 	}
 	return err
+}
+
+// MaxStopBudget returns the maximum effective stop budget (StopTimeout) over
+// all current processes, or constants.DefaultShutdownTimeout when there are no
+// processes. It is used at shutdown time to size the daemon's outer shutdown
+// deadline so that hot-reloaded per-process budgets (plan D3, future work) are
+// respected -- it reads live values rather than a snapshot taken at startup.
+func (s *Supervisor) MaxStopBudget() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	maxBudget := time.Duration(0)
+	for _, mp := range s.processes {
+		if b := mp.StopTimeout(); b > maxBudget {
+			maxBudget = b
+		}
+	}
+	if maxBudget <= 0 {
+		return constants.DefaultShutdownTimeout
+	}
+	return maxBudget
 }
 
 // Status returns supervisor status

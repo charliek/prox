@@ -57,6 +57,11 @@ type ProcessDetailResponse struct {
 	Healthcheck   *HealthcheckInfo  `json:"healthcheck,omitempty"`
 	Cmd           string            `json:"cmd"`
 	Env           map[string]string `json:"env,omitempty"`
+	// StopTimeout is the effective SIGTERM->SIGKILL escalation budget as a
+	// duration string (e.g. "10s"), so users can see the budget governing a
+	// stop/restart. Omitted only when unset (process built outside the
+	// supervisor's normal resolution path).
+	StopTimeout string `json:"stop_timeout,omitempty"`
 }
 
 // HealthcheckInfo represents health check details
@@ -116,6 +121,10 @@ func ToProcessDetailResponse(info domain.ProcessInfo) ProcessDetailResponse {
 		Health:        string(info.Health),
 		Cmd:           info.Cmd,
 		Env:           filterSensitiveEnv(info.Env),
+	}
+
+	if info.StopTimeout > 0 {
+		resp.StopTimeout = info.StopTimeout.String()
 	}
 
 	if info.HealthDetails != nil {

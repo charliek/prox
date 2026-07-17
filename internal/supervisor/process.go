@@ -117,6 +117,7 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		Health:       domain.HealthStatusUnknown,
 		Cmd:          p.config.Cmd,
 		Env:          p.env,
+		StopTimeout:  p.shutdownTimeout,
 	}
 
 	// PID is only meaningful while the process is active. Once stopped or

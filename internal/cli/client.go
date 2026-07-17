@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 )
 
@@ -44,6 +45,12 @@ type Client struct {
 	baseURL    string
 	token      string
 	httpClient *http.Client
+	// lifecycleClient is used for the start/stop/restart calls, which the
+	// daemon may legitimately hold open for up to a configured stop budget
+	// (capped at constants.MaxStopTimeout). Its timeout sits above that cap so
+	// the client never aborts a valid long stop; the server is authoritative
+	// and Ctrl-C on the CLI is safe (#35, D2).
+	lifecycleClient *http.Client
 }
 
 // NewClient creates a new API client
@@ -56,6 +63,9 @@ func NewClient(baseURL string) *Client {
 		token:   token,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+		},
+		lifecycleClient: &http.Client{
+			Timeout: constants.LifecycleTimeoutCeiling,
 		},
 	}
 }
@@ -90,19 +100,19 @@ func (c *Client) GetProcess(name string) (*api.ProcessDetailResponse, error) {
 // StartProcess starts a process
 func (c *Client) StartProcess(name string) error {
 	var resp api.SuccessResponse
-	return c.post("/api/v1/processes/"+url.PathEscape(name)+"/start", &resp)
+	return c.postLifecycle("/api/v1/processes/"+url.PathEscape(name)+"/start", &resp)
 }
 
 // StopProcess stops a process
 func (c *Client) StopProcess(name string) error {
 	var resp api.SuccessResponse
-	return c.post("/api/v1/processes/"+url.PathEscape(name)+"/stop", &resp)
+	return c.postLifecycle("/api/v1/processes/"+url.PathEscape(name)+"/stop", &resp)
 }
 
 // RestartProcess restarts a process
 func (c *Client) RestartProcess(name string) error {
 	var resp api.SuccessResponse
-	return c.post("/api/v1/processes/"+url.PathEscape(name)+"/restart", &resp)
+	return c.postLifecycle("/api/v1/processes/"+url.PathEscape(name)+"/restart", &resp)
 }
 
 // Shutdown shuts down the supervisor
@@ -219,6 +229,10 @@ func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
 }
 
 func (c *Client) doRequest(method, path string, v interface{}) error {
+	return c.doRequestWith(c.httpClient, method, path, v)
+}
+
+func (c *Client) doRequestWith(client *http.Client, method, path string, v interface{}) error {
 	req, err := http.NewRequest(method, c.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
@@ -228,7 +242,7 @@ func (c *Client) doRequest(method, path string, v interface{}) error {
 	}
 	c.addAuthHeader(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -254,6 +268,13 @@ func (c *Client) get(path string, v interface{}) error {
 
 func (c *Client) post(path string, v interface{}) error {
 	return c.doRequest("POST", path, v)
+}
+
+// postLifecycle issues a POST using the lifecycle client, whose longer timeout
+// tolerates a stop/restart that the daemon holds open up to a configured stop
+// budget (#35, D2).
+func (c *Client) postLifecycle(path string, v interface{}) error {
+	return c.doRequestWith(c.lifecycleClient, "POST", path, v)
 }
 
 // addAuthHeader adds the Authorization header if a token is available

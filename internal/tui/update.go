@@ -2,16 +2,19 @@ package tui
 
 import (
 	"context"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
 
-// restartTimeout is the maximum time to wait for a restart operation
-const restartTimeout = 30 * time.Second
+// restartTimeout is the maximum time to wait for a foreground restart from the
+// TUI. It sits above the configured stop-budget cap (constants.MaxStopTimeout)
+// so a legitimately long stop half of a restart is never cut off here; this
+// ceiling is hang protection only, matching the CLI lifecycle client (#35, D2).
+const restartTimeout = constants.LifecycleTimeoutCeiling
 
 // Update handles messages
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
