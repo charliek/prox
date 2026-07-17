@@ -271,6 +271,11 @@ processes:
 	waitForAPI(t, addr, 10*time.Second)
 	waitForLogContains(t, addr, "alpha", "ALPHA", 5*time.Second)
 
+	// Snapshot alpha's identity so we can prove the failed restart didn't
+	// stop-and-relaunch it (same PID, same restart count), not merely that
+	// something named alpha ended up running.
+	before := waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+
 	// Remove alpha from the file (beta remains so the file still validates).
 	onlyBeta := fmt.Sprintf(`api:
   port: %d
@@ -290,8 +295,13 @@ processes:
 		t.Fatalf("expected code PROCESS_NOT_IN_CONFIG, got %q (error=%q)", errResp.Code, errResp.Error)
 	}
 
-	// alpha must still be running with its original command untouched.
-	waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+	// alpha must still be running, and it must be the SAME instance: identical
+	// PID and restart count, not a stop-and-relaunch.
+	after := waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+	if after.PID != before.PID || after.Restarts != before.Restarts {
+		t.Fatalf("alpha was disturbed by the failed restart: pid %d->%d restarts %d->%d",
+			before.PID, after.PID, before.Restarts, after.Restarts)
+	}
 }
 
 // TestStop_KillsStubbornGrandchild (A3): the leader exits gracefully on

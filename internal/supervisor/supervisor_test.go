@@ -393,6 +393,18 @@ func TestSupervisor_CreateManagedProcess_StopTimeoutResolution(t *testing.T) {
 		assert.Equal(t, constants.DefaultShutdownTimeout, mp.StopTimeout())
 	})
 
+	t.Run("SupervisorConfig.ShutdownTimeout is honored before the constant", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		supConfig := DefaultSupervisorConfig()
+		supConfig.ShutdownTimeout = 25 * time.Second
+		sup := New(cfg, logMgr, nil, supConfig)
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true"})
+		require.NoError(t, err)
+		assert.Equal(t, 25*time.Second, mp.StopTimeout(),
+			"a directly-configured SupervisorConfig timeout must not be inert")
+	})
+
 	t.Run("malformed global shutdown_timeout surfaces a process-named error", func(t *testing.T) {
 		cfg := makeTestConfig(map[string]string{})
 		cfg.ShutdownTimeout = "3x"

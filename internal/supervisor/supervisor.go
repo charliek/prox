@@ -236,7 +236,14 @@ func (s *Supervisor) buildProcessRuntime(name string, cfg *config.Config, procCo
 		}
 		effective = global
 	}
+	// Honor a SupervisorConfig-level default before the constant so directly
+	// constructed supervisors (no shutdown_timeout in the file) get the timeout
+	// they configured; up.go sets it from the same parsed config, so this is a
+	// no-op on the normal path.
 	if effective == 0 {
+		effective = s.supConfig.ShutdownTimeout
+	}
+	if effective <= 0 {
 		effective = constants.DefaultShutdownTimeout
 	}
 
@@ -439,10 +446,20 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 	s.mu.RLock()
 	mp, ok := s.processes[name]
 	supCtx := s.ctx // Use supervisor context for process lifecycle, not request context
+	state := s.state
 	s.mu.RUnlock()
 
 	if !ok {
 		return domain.ErrProcessNotFound
+	}
+
+	// Refuse to launch once shutdown has begun. An in-flight lifecycle request
+	// can outlive the API server's shutdown window (Shutdown never force-closes
+	// active connections), so without this gate a start could re-launch a child
+	// after Supervisor.Stop finished reaping. Not a complete lease (a stop can
+	// still begin after this check); full serialization is tracked with #32/#36.
+	if state != "running" {
+		return domain.ErrShutdownInProgress
 	}
 
 	// s.ctx is nil until Supervisor.Start() runs. Passing a nil context into
@@ -513,10 +530,17 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 	s.mu.RLock()
 	mp, ok := s.processes[name]
 	supCtx := s.ctx // Use supervisor context for the replacement's lifecycle, not request context
+	state := s.state
 	s.mu.RUnlock()
 
 	if !ok {
 		return domain.ErrProcessNotFound
+	}
+
+	// Refuse to launch a replacement once shutdown has begun (same gate and
+	// caveat as StartProcess).
+	if state != "running" {
+		return domain.ErrShutdownInProgress
 	}
 
 	// s.ctx is nil until Supervisor.Start() runs; the replacement is started on
