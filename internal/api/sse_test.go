@@ -238,3 +238,63 @@ func TestStreamLogs_InvalidPattern(t *testing.T) {
 		t.Errorf("expected code %q, got %q", domain.ErrCodeInvalidPattern, errResp.Code)
 	}
 }
+
+// noFlushWriter is a minimal http.ResponseWriter that deliberately does NOT
+// implement http.Flusher, so it exercises StreamLogs' no-flusher branch.
+// (httptest.ResponseRecorder implements Flusher, so it cannot.)
+type noFlushWriter struct {
+	headers http.Header
+	status  int
+	body    []byte
+}
+
+func (w *noFlushWriter) Header() http.Header {
+	if w.headers == nil {
+		w.headers = make(http.Header)
+	}
+	return w.headers
+}
+
+func (w *noFlushWriter) Write(p []byte) (int, error) {
+	w.body = append(w.body, p...)
+	return len(p), nil
+}
+
+func (w *noFlushWriter) WriteHeader(status int) { w.status = status }
+
+func TestStreamLogs_NoFlusher_ReturnsJSONError(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{
+		BufferSize:         100,
+		SubscriptionBuffer: 10,
+	})
+	defer logMgr.Close()
+
+	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/logs/stream", nil)
+	w := &noFlushWriter{}
+
+	handlers.StreamLogs(w, req)
+
+	if w.status != http.StatusInternalServerError {
+		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, w.status)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type 'application/json', got %q", ct)
+	}
+	// The error path must run before any SSE headers are written; assert none
+	// leaked (Content-Type alone is insufficient, since writeJSON overwrites it).
+	for _, header := range []string{"Cache-Control", "Connection", "X-Accel-Buffering"} {
+		if got := w.Header().Get(header); got != "" {
+			t.Errorf("expected %s to be unset on the error path, got %q", header, got)
+		}
+	}
+
+	var errResp ErrorResponse
+	if err := json.Unmarshal(w.body, &errResp); err != nil {
+		t.Fatalf("response body is not JSON: %v (body=%q)", err, w.body)
+	}
+	if errResp.Code != domain.ErrCodeStreamingNotSupported {
+		t.Errorf("expected code %q, got %q", domain.ErrCodeStreamingNotSupported, errResp.Code)
+	}
+}
