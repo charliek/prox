@@ -282,6 +282,13 @@ func TestStreamLogs_NoFlusher_ReturnsJSONError(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("expected Content-Type 'application/json', got %q", ct)
 	}
+	// The error path must run before any SSE headers are written; assert none
+	// leaked (Content-Type alone is insufficient, since writeJSON overwrites it).
+	for _, header := range []string{"Cache-Control", "Connection", "X-Accel-Buffering"} {
+		if got := w.Header().Get(header); got != "" {
+			t.Errorf("expected %s to be unset on the error path, got %q", header, got)
+		}
+	}
 
 	var errResp ErrorResponse
 	if err := json.Unmarshal(w.body, &errResp); err != nil {
