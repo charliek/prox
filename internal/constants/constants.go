@@ -38,7 +38,17 @@ const (
 	// phase runs until (deadline - KillGrace), after which the group is
 	// SIGKILLed and given up to KillGrace more to disappear before Stop reports
 	// the group could not be reaped.
+	//
+	// It also doubles as the configuration-time minimum for shutdown_timeout /
+	// stop_timeout: a configured budget must leave more than KillGrace on the
+	// table for the escalation to mean anything.
 	KillGrace = 2 * time.Second
+
+	// MaxStopTimeout is the configuration-time maximum for shutdown_timeout /
+	// stop_timeout. It keeps the static ceilings that wrap the configured
+	// value (API route timeout, CLI client timeout, TUI restart timeout)
+	// boundable.
+	MaxStopTimeout = 10 * time.Minute
 )
 
 // Log configuration

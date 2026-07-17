@@ -275,6 +275,17 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create supervisor
 	supConfig := supervisor.DefaultSupervisorConfig()
 	supConfig.ConfigDir = configDir
+	// cfg.ShutdownTimeout was already validated by config.Load above, so this
+	// only errors for a hand-built Config bypassing Load/Validate.
+	// ShutdownTimeoutDuration's error is already field-prefixed
+	// ("shutdown_timeout: ..."), so it's returned as-is rather than wrapped again.
+	globalShutdownTimeout, err := cfg.ShutdownTimeoutDuration()
+	if err != nil {
+		return err
+	}
+	if globalShutdownTimeout > 0 {
+		supConfig.ShutdownTimeout = globalShutdownTimeout
+	}
 	sup := supervisor.New(cfg, logMgr, nil, supConfig)
 
 	// Create shutdown channel

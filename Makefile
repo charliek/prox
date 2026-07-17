@@ -1,10 +1,13 @@
-.PHONY: build test lint clean install
+.PHONY: build test test-race lint clean install
 
 build:
 	go build -o prox ./cmd/prox
 
 test:
 	go test -v ./...
+
+test-race:
+	go test -race ./...
 
 lint:
 	golangci-lint run

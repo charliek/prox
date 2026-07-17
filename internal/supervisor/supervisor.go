@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/config"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 )
@@ -22,7 +23,7 @@ type SupervisorConfig struct {
 // DefaultSupervisorConfig returns default configuration
 func DefaultSupervisorConfig() SupervisorConfig {
 	return SupervisorConfig{
-		ShutdownTimeout: 10 * time.Second,
+		ShutdownTimeout: constants.DefaultShutdownTimeout,
 	}
 }
 
@@ -171,10 +172,16 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 		return config.LoadProcessEnv(globalEnvFile, procEnvFile, inlineEnv, configDir)
 	}
 
+	stopTimeout, err := procConfig.StopTimeoutDuration()
+	if err != nil {
+		return nil, fmt.Errorf("process %q: %w", name, err)
+	}
+
 	domainConfig := domain.ProcessConfig{
-		Name:    name,
-		Cmd:     procConfig.Cmd,
-		EnvFile: procConfig.EnvFile,
+		Name:        name,
+		Cmd:         procConfig.Cmd,
+		EnvFile:     procConfig.EnvFile,
+		StopTimeout: stopTimeout,
 	}
 	if procConfig.Healthcheck != nil {
 		hc, err := procConfig.Healthcheck.ToDomain()
@@ -186,6 +193,25 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 
 	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)
 	mp.loadEnv = loadEnv
+
+	// Resolve the effective stop budget: this process's own stop_timeout,
+	// else the global shutdown_timeout, else the constant default (#35, D1).
+	// mp is not yet published to s.processes / any other goroutine, so this
+	// direct field set (mirroring the mp.loadEnv assignment above) needs no
+	// lock; production reads go through the locked StopTimeout() accessor.
+	effective := stopTimeout
+	if effective == 0 {
+		global, err := s.config.ShutdownTimeoutDuration()
+		if err != nil {
+			return nil, fmt.Errorf("process %q: %w", name, err)
+		}
+		effective = global
+	}
+	if effective == 0 {
+		effective = constants.DefaultShutdownTimeout
+	}
+	mp.shutdownTimeout = effective
+
 	return mp, nil
 }
 

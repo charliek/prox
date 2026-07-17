@@ -72,10 +72,15 @@ type ManagedProcess struct {
 	// Health checker for the current run.
 	healthChecker *HealthChecker
 
-	// shutdownTimeout overrides constants.DefaultShutdownTimeout for the
-	// no-context-deadline fallback in computeDeadlines. It is a test seam only
-	// (kept small so the no-deadline escalation path runs fast); production
-	// code leaves it zero, which means "use constants.DefaultShutdownTimeout".
+	// shutdownTimeout is this process's effective stop budget: the
+	// no-context-deadline fallback in computeDeadlines. supervisor.
+	// createManagedProcess resolves and sets it (per-process stop_timeout,
+	// else global shutdown_timeout, else constants.DefaultShutdownTimeout)
+	// before the ManagedProcess is published, so production code never sees
+	// zero here. Tests that construct a ManagedProcess directly (bypassing
+	// createManagedProcess) may still set it directly as a seam to shrink the
+	// fallback window; production code and computeDeadlines both go through
+	// the locked StopTimeout() accessor.
 	shutdownTimeout time.Duration
 }
 
@@ -139,6 +144,14 @@ func (p *ManagedProcess) State() domain.ProcessState {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.state
+}
+
+// StopTimeout returns the effective per-process stop budget used as the
+// no-context-deadline fallback in computeDeadlines.
+func (p *ManagedProcess) StopTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.shutdownTimeout
 }
 
 // Start starts the process
@@ -243,7 +256,7 @@ func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline
 
 	dl, ok := ctx.Deadline()
 	if !ok {
-		timeout := p.shutdownTimeout
+		timeout := p.StopTimeout()
 		if timeout <= 0 {
 			timeout = constants.DefaultShutdownTimeout
 		}

@@ -184,6 +184,156 @@ func TestHealthcheckConfig_ToDomain(t *testing.T) {
 	})
 }
 
+// TestShutdownTimeoutDuration_Matrix covers the #35/D1 validation policy for
+// the top-level shutdown_timeout field: empty is unset (zero, no error);
+// malformed/negative/zero/sub-KillGrace values are rejected uniformly; values
+// in (KillGrace, MaxStopTimeout] are accepted, including the boundaries.
+func TestShutdownTimeoutDuration_Matrix(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		wantDur   time.Duration
+		wantErr   bool
+		errSubstr string
+	}{
+		{name: "omitted is unset", value: "", wantDur: 0},
+		{name: "valid value parses", value: "30s", wantDur: 30 * time.Second},
+		{name: "malformed is rejected", value: "3x", wantErr: true, errSubstr: "invalid duration"},
+		{name: "negative is rejected", value: "-5s", wantErr: true, errSubstr: "negative"},
+		{name: "explicit zero is rejected", value: "0s", wantErr: true, errSubstr: "greater than 2s"},
+		{name: "exactly KillGrace (2s) is rejected", value: "2s", wantErr: true, errSubstr: "greater than 2s"},
+		{name: "just above KillGrace (2.5s) is accepted", value: "2.5s", wantDur: 2500 * time.Millisecond},
+		{name: "exactly MaxStopTimeout (10m) is accepted", value: "10m", wantDur: 10 * time.Minute},
+		{name: "above MaxStopTimeout is rejected", value: "10m1s", wantErr: true, errSubstr: "must not exceed 10m"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{ShutdownTimeout: tt.value}
+			got, err := cfg.ShutdownTimeoutDuration()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "shutdown_timeout")
+				assert.Contains(t, err.Error(), tt.errSubstr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDur, got)
+		})
+	}
+}
+
+// TestStopTimeoutDuration_Matrix mirrors TestShutdownTimeoutDuration_Matrix
+// for the per-process stop_timeout field; same policy, different field name
+// in the error.
+func TestStopTimeoutDuration_Matrix(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		wantDur   time.Duration
+		wantErr   bool
+		errSubstr string
+	}{
+		{name: "omitted is unset", value: "", wantDur: 0},
+		{name: "valid value parses", value: "45s", wantDur: 45 * time.Second},
+		{name: "malformed is rejected", value: "bogus", wantErr: true, errSubstr: "invalid duration"},
+		{name: "negative is rejected", value: "-1s", wantErr: true, errSubstr: "negative"},
+		{name: "explicit zero is rejected", value: "0s", wantErr: true, errSubstr: "greater than 2s"},
+		{name: "exactly KillGrace (2s) is rejected", value: "2s", wantErr: true, errSubstr: "greater than 2s"},
+		{name: "just above KillGrace (2.5s) is accepted", value: "2.5s", wantDur: 2500 * time.Millisecond},
+		{name: "exactly MaxStopTimeout (10m) is accepted", value: "10m", wantDur: 10 * time.Minute},
+		{name: "above MaxStopTimeout is rejected", value: "10m1s", wantErr: true, errSubstr: "must not exceed 10m"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proc := &ProcessConfig{Cmd: "true", StopTimeout: tt.value}
+			got, err := proc.StopTimeoutDuration()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "stop_timeout")
+				assert.Contains(t, err.Error(), tt.errSubstr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDur, got)
+		})
+	}
+}
+
+// TestShutdownTimeoutDuration_ErrorMessageFormat pins the exact error text
+// from the plan (D1): field-named, and states the KillGrace rationale.
+func TestShutdownTimeoutDuration_ErrorMessageFormat(t *testing.T) {
+	cfg := &Config{ShutdownTimeout: "1s"}
+	_, err := cfg.ShutdownTimeoutDuration()
+	require.Error(t, err)
+	assert.Equal(t, `shutdown_timeout: must be greater than 2s (2s is reserved for the SIGKILL escalation): "1s"`, err.Error())
+}
+
+// TestParse_ShutdownAndStopTimeout verifies the new YAML fields round-trip
+// through Parse (both top-level and per-process, expanded form).
+func TestParse_ShutdownAndStopTimeout(t *testing.T) {
+	yamlData := []byte(`
+shutdown_timeout: 30s
+processes:
+  web:
+    cmd: npm run dev
+    stop_timeout: 45s
+  worker: python worker.py
+`)
+	cfg, err := Parse(yamlData)
+	require.NoError(t, err)
+	assert.Equal(t, "30s", cfg.ShutdownTimeout)
+	assert.Equal(t, "45s", cfg.Processes["web"].StopTimeout)
+	assert.Equal(t, "", cfg.Processes["worker"].StopTimeout)
+}
+
+// TestLoad_ValidationError_ShutdownTimeout and its stop_timeout counterpart
+// verify the bad values surface through the full Load path (Parse+Validate),
+// field-named per the #31 pattern.
+func TestLoad_ValidationError_ShutdownTimeout(t *testing.T) {
+	yamlData := []byte(`
+shutdown_timeout: 1s
+processes:
+  web: npm run dev
+`)
+	_, err := Parse(yamlData)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shutdown_timeout")
+	assert.Contains(t, err.Error(), "greater than 2s")
+}
+
+func TestLoad_ValidationError_StopTimeout(t *testing.T) {
+	yamlData := []byte(`
+processes:
+  web:
+    cmd: npm run dev
+    stop_timeout: 15m
+`)
+	_, err := Parse(yamlData)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "processes.web.stop_timeout")
+	assert.Contains(t, err.Error(), "must not exceed 10m")
+}
+
+// TestHealthcheckConfig_ToDomain_RegressionAfterStopBudgetParser: the parser
+// generalization for #35 must not change healthcheck semantics (non-goal).
+// Explicit zero stays accepted (use-default) and durations well past
+// MaxStopTimeout are still accepted -- healthcheck fields have no cap.
+func TestHealthcheckConfig_ToDomain_RegressionAfterStopBudgetParser(t *testing.T) {
+	t.Run("explicit zero interval still accepted", func(t *testing.T) {
+		hc := &HealthcheckConfig{Cmd: "true", Interval: "0s"}
+		got, err := hc.ToDomain()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), got.Interval)
+	})
+
+	t.Run("duration beyond MaxStopTimeout still accepted (no cap leak)", func(t *testing.T) {
+		hc := &HealthcheckConfig{Cmd: "true", StartPeriod: "15m"}
+		got, err := hc.ToDomain()
+		require.NoError(t, err)
+		assert.Equal(t, 15*time.Minute, got.StartPeriod)
+	})
+}
+
 func TestParse_ProxyConfig(t *testing.T) {
 	t.Run("parses full proxy config", func(t *testing.T) {
 		yaml := `

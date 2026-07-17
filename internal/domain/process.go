@@ -41,6 +41,11 @@ type ProcessConfig struct {
 	Env         map[string]string
 	EnvFile     string
 	Healthcheck *HealthConfig
+	// StopTimeout is this process's own configured SIGTERM->SIGKILL
+	// escalation budget (config.ProcessConfig.StopTimeout, parsed). Zero
+	// means unset: the effective budget resolution (proc > global > default)
+	// happens in supervisor.createManagedProcess, not here.
+	StopTimeout time.Duration
 }
 
 // ProcessInfo represents the runtime state of a process

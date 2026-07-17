@@ -239,6 +239,85 @@ func TestValidate(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("shutdown_timeout malformed fails field-named", func(t *testing.T) {
+		cfg := &Config{
+			API:             APIConfig{Port: 5555},
+			ShutdownTimeout: "3x",
+			Processes: map[string]ProcessConfig{
+				"web": {Cmd: "npm run dev"},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, domain.ErrInvalidConfig))
+		assert.Contains(t, err.Error(), "shutdown_timeout")
+		assert.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("shutdown_timeout at or below KillGrace fails", func(t *testing.T) {
+		cfg := &Config{
+			API:             APIConfig{Port: 5555},
+			ShutdownTimeout: "2s",
+			Processes: map[string]ProcessConfig{
+				"web": {Cmd: "npm run dev"},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "shutdown_timeout: must be greater than 2s")
+	})
+
+	t.Run("shutdown_timeout above MaxStopTimeout fails", func(t *testing.T) {
+		cfg := &Config{
+			API:             APIConfig{Port: 5555},
+			ShutdownTimeout: "11m",
+			Processes: map[string]ProcessConfig{
+				"web": {Cmd: "npm run dev"},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "shutdown_timeout: must not exceed 10m")
+	})
+
+	t.Run("shutdown_timeout omitted and exactly MaxStopTimeout both pass", func(t *testing.T) {
+		cfg := &Config{
+			API:             APIConfig{Port: 5555},
+			ShutdownTimeout: "10m",
+			Processes: map[string]ProcessConfig{
+				"web": {Cmd: "npm run dev"},
+			},
+		}
+		assert.NoError(t, Validate(cfg))
+
+		cfg.ShutdownTimeout = ""
+		assert.NoError(t, Validate(cfg))
+	})
+
+	t.Run("per-process stop_timeout fails field-named with process prefix", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"web": {Cmd: "npm run dev", StopTimeout: "1s"},
+			},
+		}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "processes.web.stop_timeout: must be greater than 2s")
+	})
+
+	t.Run("per-process stop_timeout omitted and valid values pass", func(t *testing.T) {
+		cfg := &Config{
+			API: APIConfig{Port: 5555},
+			Processes: map[string]ProcessConfig{
+				"web":    {Cmd: "npm run dev"},
+				"api":    {Cmd: "go run ./cmd/server", StopTimeout: "2.5s"},
+				"worker": {Cmd: "python worker.py", StopTimeout: "10m"},
+			},
+		}
+		assert.NoError(t, Validate(cfg))
+	})
+
 	t.Run("healthcheck explicit zero durations pass", func(t *testing.T) {
 		cfg := &Config{
 			API: APIConfig{Port: 5555},
