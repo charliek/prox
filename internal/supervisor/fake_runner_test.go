@@ -178,12 +178,22 @@ func newUnreapableFake(pid int) *fakeProcess {
 
 // fakeRunner is a ProcessRunner that hands out fakeProcess instances produced
 // by factory, one per Start call (call index passed in). It records every
-// process it produced.
+// process it produced along with the config and env it was launched with, so a
+// reload test can assert what the runner was actually handed (#33, D3).
 type fakeRunner struct {
 	mu      sync.Mutex
 	factory func(call int) *fakeProcess
 	procs   []*fakeProcess
+	configs []domain.ProcessConfig
+	envs    []map[string]string
 	calls   int
+
+	// onStart, when set, is invoked (call index passed in) after the launch is
+	// recorded but before Start returns, while the ManagedProcess still holds
+	// its lock (runner.Start runs inside startWithConfig's critical section).
+	// It lets an interleaving test use the runner as a barrier to force a
+	// deterministic ordering between a winning and a losing (re)start.
+	onStart func(call int)
 }
 
 func newFakeRunner(factory func(call int) *fakeProcess) *fakeRunner {
@@ -192,12 +202,39 @@ func newFakeRunner(factory func(call int) *fakeProcess) *fakeRunner {
 
 func (r *fakeRunner) Start(ctx context.Context, config domain.ProcessConfig, env map[string]string) (Process, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	call := r.calls
 	r.calls++
 	fp := r.factory(call)
 	r.procs = append(r.procs, fp)
+	r.configs = append(r.configs, config)
+	r.envs = append(r.envs, env)
+	hook := r.onStart
+	r.mu.Unlock()
+
+	if hook != nil {
+		hook(call)
+	}
 	return fp, nil
+}
+
+// lastConfig returns the config the most recent Start was launched with.
+func (r *fakeRunner) lastConfig() domain.ProcessConfig {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.configs) == 0 {
+		return domain.ProcessConfig{}
+	}
+	return r.configs[len(r.configs)-1]
+}
+
+// lastEnv returns the env map the most recent Start was launched with.
+func (r *fakeRunner) lastEnv() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.envs) == 0 {
+		return nil
+	}
+	return r.envs[len(r.envs)-1]
 }
 
 // last returns the most recently produced fake process.

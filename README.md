@@ -38,7 +38,7 @@ For one-off installs without configuring the apt repo (CI runners, locked-down h
 
 ```bash
 ARCH=$(dpkg --print-architecture)        # amd64 or arm64
-VERSION=0.1.1                            # check https://github.com/charliek/prox/releases for the latest
+VERSION=0.1.3                            # check https://github.com/charliek/prox/releases for the latest
 curl -fLO "https://github.com/charliek/prox/releases/download/v${VERSION}/prox_${VERSION}_${ARCH}.deb"
 sudo apt install -y "./prox_${VERSION}_${ARCH}.deb"
 ```
@@ -139,7 +139,7 @@ processes:
 prox up [processes...]           # Start processes (foreground)
 prox up --tui [processes...]     # Start with interactive TUI
 prox stop                        # Stop running instance
-prox restart <process>           # Restart a process
+prox restart <process>           # Restart a process (re-reads prox.yaml, applies its current config)
 prox status                      # Show process status
 prox logs [process]              # Show recent logs
 prox logs -f [process]           # Stream logs
@@ -170,7 +170,7 @@ prox proxy routes
 
 ## HTTP API
 
-The API runs at `http://127.0.0.1:5555/api/v1` by default.
+By default, the API binds to a dynamic (auto-assigned) localhost port. Discover the address with `prox status`, or pin a fixed port by setting `api.port` in `prox.yaml` (e.g. `api.port: 5555`).
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|

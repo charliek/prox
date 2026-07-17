@@ -41,6 +41,11 @@ type ProcessConfig struct {
 	Env         map[string]string
 	EnvFile     string
 	Healthcheck *HealthConfig
+	// StopTimeout is this process's own configured SIGTERM->SIGKILL
+	// escalation budget (config.ProcessConfig.StopTimeout, parsed). Zero
+	// means unset: the effective budget resolution (proc > global > default)
+	// happens in supervisor.createManagedProcess, not here.
+	StopTimeout time.Duration
 }
 
 // ProcessInfo represents the runtime state of a process
@@ -54,6 +59,11 @@ type ProcessInfo struct {
 	HealthDetails *HealthState      `json:"healthcheck,omitempty"`
 	Cmd           string            `json:"cmd,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
+	// StopTimeout is the effective SIGTERM->SIGKILL escalation budget in force
+	// for this process (per-process stop_timeout, else global shutdown_timeout,
+	// else the default). Surfaced so operators can see the budget governing a
+	// stop/restart. Zero only for a process built outside createManagedProcess.
+	StopTimeout time.Duration `json:"-"`
 }
 
 // UptimeSeconds returns the number of seconds the process has been running

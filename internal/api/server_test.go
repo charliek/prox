@@ -7,10 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charliek/prox/internal/config"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/supervisor"
 )
@@ -354,6 +357,102 @@ func TestServerShutdown_NilServer(t *testing.T) {
 
 	err := server.Shutdown(ctx)
 	assert.NoError(t, err)
+}
+
+// TestRequestTimeoutConstants pins the two router-level ceilings: the default
+// 30s for ordinary routes and the much larger lifecycle ceiling, which must sit
+// above the configured stop-budget cap so a legitimately long stop/restart is
+// never truncated by the router (the supervisor is authoritative). (#35, D2)
+func TestRequestTimeoutConstants(t *testing.T) {
+	assert.Equal(t, 30*time.Second, defaultRequestTimeout)
+	assert.Equal(t, constants.MaxStopTimeout+time.Minute, lifecycleRequestTimeout)
+	assert.Greater(t, lifecycleRequestTimeout, defaultRequestTimeout)
+	assert.GreaterOrEqual(t, lifecycleRequestTimeout, constants.MaxStopTimeout,
+		"lifecycle ceiling must cover the maximum configurable stop budget")
+}
+
+// TestRouteGroupTimeoutWiring verifies the per-group timeout mechanism that
+// registerRoutes relies on: a route placed in a group with
+// middleware.Timeout(lifecycleRequestTimeout) sees a context deadline of ~11m,
+// while a route under defaultRequestTimeout sees ~30s. It mirrors the exact
+// group structure of registerRoutes with probe handlers (the real lifecycle
+// handlers cannot report their own deadline), keeping the test instant -- no
+// >30s sleep. Together with TestRequestTimeoutConstants and the routing smoke
+// test, this establishes that lifecycle requests are not cut at the old 30s
+// boundary.
+func TestRouteGroupTimeoutWiring(t *testing.T) {
+	var lifecycleBudget, defaultBudget time.Duration
+
+	probe := func(dst *time.Duration) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if dl, ok := r.Context().Deadline(); ok {
+				*dst = time.Until(dl)
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}
+
+	r := chi.NewRouter()
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(lifecycleRequestTimeout))
+		r.Post("/processes/{name}/stop", probe(&lifecycleBudget))
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(defaultRequestTimeout))
+		r.Get("/status", probe(&defaultBudget))
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("POST", "/processes/web/stop", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Lifecycle route must carry the large ceiling, well past the old 30s.
+	assert.Greater(t, lifecycleBudget, 30*time.Second, "lifecycle route deadline must exceed the old 30s boundary")
+	assert.WithinDuration(t, time.Now().Add(lifecycleRequestTimeout), time.Now().Add(lifecycleBudget), 5*time.Second)
+	// Default route keeps the 30s ceiling.
+	assert.LessOrEqual(t, defaultBudget, 30*time.Second)
+	assert.Greater(t, defaultBudget, 25*time.Second)
+}
+
+// TestRegisterRoutes_RoutingSmoke exercises the restructured router end-to-end to
+// confirm the subgroup split did not break routing: lifecycle POSTs, read-only
+// GETs, the SSE routes, /health and /shutdown all resolve to their handlers.
+func TestRegisterRoutes_RoutingSmoke(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0, Host: "127.0.0.1"},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
+
+	cases := []struct {
+		method, path string
+		wantStatus   int
+	}{
+		{"GET", "/health", http.StatusOK},
+		{"GET", "/api/v1/status", http.StatusOK},
+		{"GET", "/api/v1/processes", http.StatusOK},
+		// Lifecycle routes resolve to their handlers; a missing process yields a
+		// 404 from the handler (not a routing miss), proving the subgroup wiring.
+		{"POST", "/api/v1/processes/missing/start", http.StatusNotFound},
+		{"POST", "/api/v1/processes/missing/stop", http.StatusNotFound},
+		{"POST", "/api/v1/processes/missing/restart", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			server.router.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			assert.Equal(t, tc.wantStatus, rec.Code)
+		})
+	}
 }
 
 func TestIsLocalhostOrigin(t *testing.T) {

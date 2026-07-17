@@ -158,7 +158,7 @@ func TestManagedProcess_RestartClobberSafety(t *testing.T) {
 	const restarts = 10
 	for i := 0; i < restarts; i++ {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := mp.Restart(stopCtx, context.Background())
+		err := mp.Restart(stopCtx, context.Background(), nil)
 		cancel()
 		require.NoErrorf(t, err, "restart %d", i)
 		require.Equalf(t, domain.ProcessStateRunning, mp.State(), "restart %d should leave the process running", i)
@@ -279,4 +279,29 @@ func TestManagedProcess_Stop_NoDeadlineFallbackEscalates(t *testing.T) {
 	assert.Equal(t, domain.ProcessStateStopped, mp.State())
 	assert.True(t, fp.sawSignal(sigkill), "stubborn group should be SIGKILLed after the graceful window")
 	assert.Less(t, elapsed, 3*time.Second, "escalation must use the ~1s fallback window, not the 10s default")
+}
+
+// TestManagedProcess_Stop_EscalationUpperBound is the plan §7 escalation-timing
+// bound: a SIGTERM-ignoring process with a 3s stop budget must be SIGKILLed no
+// earlier than ~1s (the graceful window = budget - KillGrace(2s)) and no later
+// than ~3s+ε (the full budget) after the stop begins. It asserts the actual
+// SIGKILL timestamp, not just that a SIGKILL happened.
+func TestManagedProcess_Stop_EscalationUpperBound(t *testing.T) {
+	runner := newFakeRunner(func(call int) *fakeProcess { return newStubbornFake(6500 + call) })
+	mp := newFakeManagedProcess(t, runner)
+	mp.shutdownTimeout = 3 * time.Second // graceful window == 3s - KillGrace(2s) == 1s
+
+	require.NoError(t, mp.Start(context.Background()))
+	fp := runner.last()
+
+	start := time.Now()
+	require.NoError(t, mp.Stop(context.Background()))
+
+	sigs := fp.signalsReceived()
+	killIdx := firstIndexOf(sigs, sigkill)
+	require.GreaterOrEqual(t, killIdx, 0, "stubborn group must be SIGKILLed")
+	killAt := sigs[killIdx].at.Sub(start)
+
+	assert.GreaterOrEqual(t, killAt, 900*time.Millisecond, "SIGKILL must not fire before the ~1s graceful window elapses")
+	assert.LessOrEqual(t, killAt, 3*time.Second+500*time.Millisecond, "SIGKILL must fire within the ~3s budget (+ε)")
 }

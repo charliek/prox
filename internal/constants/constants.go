@@ -38,7 +38,27 @@ const (
 	// phase runs until (deadline - KillGrace), after which the group is
 	// SIGKILLed and given up to KillGrace more to disappear before Stop reports
 	// the group could not be reaped.
+	//
+	// It also doubles as the configuration-time minimum for shutdown_timeout /
+	// stop_timeout: a configured budget must leave more than KillGrace on the
+	// table for the escalation to mean anything.
 	KillGrace = 2 * time.Second
+
+	// MaxStopTimeout is the configuration-time maximum for shutdown_timeout /
+	// stop_timeout. It keeps the static ceilings that wrap the configured
+	// value (API route timeout, CLI client timeout, TUI restart timeout)
+	// boundable.
+	MaxStopTimeout = 10 * time.Minute
+
+	// LifecycleTimeoutCeiling is the static hang-protection ceiling for a
+	// lifecycle operation (process start/stop/restart) that the daemon may
+	// legitimately hold open for up to a configured stop budget. It sits one
+	// minute above MaxStopTimeout so a valid long stop is never cut off by the
+	// wrapping layer; the supervisor is the authoritative bound. Shared by the
+	// three consumers named in MaxStopTimeout's comment: the API lifecycle
+	// route timeout, the CLI lifecycle http.Client timeout, and the TUI restart
+	// timeout (#35, D2).
+	LifecycleTimeoutCeiling = MaxStopTimeout + time.Minute
 )
 
 // Log configuration

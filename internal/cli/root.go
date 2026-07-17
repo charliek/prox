@@ -47,6 +47,7 @@ processes for local development. It supports:
 			"status":  true,
 			"logs":    true,
 			"stop":    true,
+			"start":   true,
 			"restart": true,
 			"down":    true,
 			"attach":  true,

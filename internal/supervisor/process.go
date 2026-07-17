@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"maps"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -42,9 +43,35 @@ func (i *processInstance) closeDone() {
 	i.doneOnce.Do(func() { close(i.done) })
 }
 
+// pendingConfig carries a freshly-reloaded process runtime (domain config, env
+// loader closure, the env map that closure produced, and effective stop budget)
+// to be swapped into a ManagedProcess atomically inside startWithConfig's locked
+// critical section (#33, D3). The supervisor builds it via prepareReload before
+// any stop; a nil pending means "no reload -- keep the stored config".
+type pendingConfig struct {
+	config  domain.ProcessConfig
+	loadEnv func() (map[string]string, error)
+	// env is the exact map prepareReload's preflight already loaded and
+	// validated from disk, BEFORE the stop. startWithConfig applies it as-is for
+	// this run rather than re-invoking loadEnv, so an env file deleted between
+	// the preflight and the launch cannot cause downtime (the fail-before-stop
+	// promise) and the running process gets exactly what was validated. The
+	// loadEnv closure is still stored for any future non-reload start, preserving
+	// the #30 fresh-read-on-every-start semantics.
+	env         map[string]string
+	stopTimeout time.Duration
+}
+
 // ManagedProcess handles the lifecycle of a single process
 type ManagedProcess struct {
 	mu sync.RWMutex
+
+	// name is the process's identity, set once at construction and never
+	// mutated (a rename requires `prox up`, not a restart). It is read lock-free
+	// for log attribution (logf/readOutput) and error messages so a config swap
+	// under mu.Lock cannot race those reads, and so an old run's monitor stays
+	// correctly attributed across a swap (#33, D3).
+	name string
 
 	config     domain.ProcessConfig
 	env        map[string]string
@@ -72,16 +99,29 @@ type ManagedProcess struct {
 	// Health checker for the current run.
 	healthChecker *HealthChecker
 
-	// shutdownTimeout overrides constants.DefaultShutdownTimeout for the
-	// no-context-deadline fallback in computeDeadlines. It is a test seam only
-	// (kept small so the no-deadline escalation path runs fast); production
-	// code leaves it zero, which means "use constants.DefaultShutdownTimeout".
+	// restartStartBarrier is a test-only seam (nil in production). When set, it
+	// is invoked inside Restart after the stop half completes and before the
+	// replacement's start half runs, so an interleaving test can deterministically
+	// hold a restart open in the unlocked gap between its stop and start and race
+	// a concurrent StartProcess into it. Read once under the lock in Restart.
+	restartStartBarrier func()
+
+	// shutdownTimeout is this process's effective stop budget: the
+	// no-context-deadline fallback in computeDeadlines. supervisor.
+	// createManagedProcess resolves and sets it (per-process stop_timeout,
+	// else global shutdown_timeout, else constants.DefaultShutdownTimeout)
+	// before the ManagedProcess is published, so production code never sees
+	// zero here. Tests that construct a ManagedProcess directly (bypassing
+	// createManagedProcess) may still set it directly as a seam to shrink the
+	// fallback window; production code and computeDeadlines both go through
+	// the locked StopTimeout() accessor.
 	shutdownTimeout time.Duration
 }
 
 // NewManagedProcess creates a new managed process
 func NewManagedProcess(config domain.ProcessConfig, env map[string]string, runner ProcessRunner, logManager *logs.Manager) *ManagedProcess {
 	return &ManagedProcess{
+		name:       config.Name,
 		config:     config,
 		env:        env,
 		runner:     runner,
@@ -90,14 +130,27 @@ func NewManagedProcess(config domain.ProcessConfig, env map[string]string, runne
 	}
 }
 
-// Name returns the process name
+// Name returns the process name. Immutable, so no lock is taken.
 func (p *ManagedProcess) Name() string {
-	return p.config.Name
+	return p.name
 }
 
-// Config returns the process configuration
+// Config returns a deep copy of the process configuration. It takes the read
+// lock (config is swappable on a reload -- #33, D3) and clones the reference
+// fields (Healthcheck pointer, Env map) so callers cannot observe a torn value
+// or mutate the live config.
 func (p *ManagedProcess) Config() domain.ProcessConfig {
-	return p.config
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	cfg := p.config
+	if p.config.Healthcheck != nil {
+		hc := *p.config.Healthcheck
+		cfg.Healthcheck = &hc
+	}
+	// maps.Clone returns nil for a nil map, preserving the nil-vs-empty distinction.
+	cfg.Env = maps.Clone(p.config.Env)
+	return cfg
 }
 
 // Info returns the current process info
@@ -112,6 +165,7 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		Health:       domain.HealthStatusUnknown,
 		Cmd:          p.config.Cmd,
 		Env:          p.env,
+		StopTimeout:  p.shutdownTimeout,
 	}
 
 	// PID is only meaningful while the process is active. Once stopped or
@@ -141,25 +195,81 @@ func (p *ManagedProcess) State() domain.ProcessState {
 	return p.state
 }
 
-// Start starts the process
+// StopTimeout returns the effective per-process stop budget used as the
+// no-context-deadline fallback in computeDeadlines.
+func (p *ManagedProcess) StopTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.shutdownTimeout
+}
+
+// Start starts the process with its currently-stored config.
 func (p *ManagedProcess) Start(ctx context.Context) error {
+	return p.startWithConfig(ctx, nil)
+}
+
+// startWithConfig starts the process, optionally swapping in a freshly-reloaded
+// config first. When pending is non-nil the swap (config, env loader, effective
+// stop budget) happens inside this locked critical section, AFTER both
+// early-return guards (already-running state check, surviving-previous-group
+// check) pass and BEFORE the runner launches -- so a concurrent Start that wins
+// the race starts the old config and the loser returns ErrProcessAlreadyRunning
+// WITHOUT applying the swap. The stored config therefore always matches the
+// running process (#33, D3).
+//
+// If the runner (or the post-swap env reload) fails AFTER the swap was applied,
+// the new config stays in place (state Crashed; the next start uses it) -- "the
+// file is the truth".
+func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingConfig) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Reject starting over an active run. `stopping` is included so a Start
 	// racing an in-flight Stop is refused rather than launching a duplicate
-	// while the previous group is still being reaped.
+	// while the previous group is still being reaped. The loser exits here
+	// before any swap, keeping the stored config consistent with the winner.
 	if p.state == domain.ProcessStateRunning ||
 		p.state == domain.ProcessStateStarting ||
 		p.state == domain.ProcessStateStopping {
 		return domain.ErrProcessAlreadyRunning
 	}
 
-	// Reload the environment from disk on every Start (covers both `start`
-	// after `stop` and the replacement half of `restart`). This must happen
-	// before any per-instance state is created so a failure here leaves no
-	// dangling instance behind.
-	if p.loadEnv != nil {
+	// Never launch a duplicate over a surviving previous group. If the prior
+	// run's group is still alive (e.g. a prior Stop failed to reap it), refuse
+	// rather than orphan it -- the caller must stop it first. Checked before the
+	// swap so a refusal here also leaves the stored config untouched.
+	if p.current != nil && p.current.proc != nil {
+		if alive, _ := p.current.proc.GroupAlive(); alive {
+			return fmt.Errorf("%w: %s (previous instance still running; stop it first)",
+				domain.ErrProcessGroupNotReaped, p.name)
+		}
+	}
+
+	// Commit point: both guards passed, so this call is the one that launches.
+	// Swap in the reloaded runtime now (config, env loader, effective stop
+	// budget) -- from here on a failure keeps the new config active.
+	if pending != nil {
+		p.config = pending.config
+		p.loadEnv = pending.loadEnv
+		p.shutdownTimeout = pending.stopTimeout
+	}
+
+	// Apply the environment for this run.
+	//
+	//   - Reload path (pending != nil): use the snapshot prepareReload already
+	//     loaded AND validated from disk before the stop. Re-reading here would
+	//     reopen a window where an env file deleted between preflight and launch
+	//     causes downtime, breaking the fail-before-stop promise; it would also
+	//     risk applying something other than what was validated. No error path is
+	//     needed -- the load already succeeded.
+	//   - Non-reload path (up-time start, or ConfigPath unset): read from disk now
+	//     via the stored closure so a plain start still picks up current env-file
+	//     contents (#30 fresh-read-on-every-start). This must happen before any
+	//     per-instance state is created so a failure here leaves no dangling
+	//     instance behind.
+	if pending != nil {
+		p.env = pending.env
+	} else if p.loadEnv != nil {
 		env, err := p.loadEnv()
 		if err != nil {
 			p.state = domain.ProcessStateCrashed
@@ -167,16 +277,6 @@ func (p *ManagedProcess) Start(ctx context.Context) error {
 			return fmt.Errorf("%w: %v", domain.ErrEnvReloadFailed, err)
 		}
 		p.env = env
-	}
-
-	// Never launch a duplicate over a surviving previous group. If the prior
-	// run's group is still alive (e.g. a prior Stop failed to reap it), refuse
-	// rather than orphan it -- the caller must stop it first.
-	if p.current != nil && p.current.proc != nil {
-		if alive, _ := p.current.proc.GroupAlive(); alive {
-			return fmt.Errorf("%w: %s (previous instance still running; stop it first)",
-				domain.ErrProcessGroupNotReaped, p.config.Name)
-		}
 	}
 
 	p.state = domain.ProcessStateStarting
@@ -243,7 +343,7 @@ func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline
 
 	dl, ok := ctx.Deadline()
 	if !ok {
-		timeout := p.shutdownTimeout
+		timeout := p.StopTimeout()
 		if timeout <= 0 {
 			timeout = constants.DefaultShutdownTimeout
 		}
@@ -346,7 +446,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 			Timestamp: time.Now(),
 			Process:   "system",
 			Stream:    domain.StreamStdout,
-			Line:      fmt.Sprintf("sending SIGKILL to %s (graceful shutdown timed out)", p.config.Name),
+			Line:      fmt.Sprintf("sending SIGKILL to %s (graceful shutdown timed out)", p.name),
 		})
 		if err := inst.proc.Signal(sigkill); err != nil {
 			p.logf(domain.StreamStderr, "SIGKILL failed: %v", err)
@@ -387,7 +487,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 	p.mu.Unlock()
 
 	if alive {
-		return fmt.Errorf("%w: %s", domain.ErrProcessGroupNotReaped, p.config.Name)
+		return fmt.Errorf("%w: %s", domain.ErrProcessGroupNotReaped, p.name)
 	}
 	return nil
 }
@@ -423,16 +523,28 @@ func waitGroupGone(proc Process, deadline time.Time) bool {
 //
 // If Stop fails (e.g. the old group could not be reaped) Restart aborts before
 // Start, so a surviving group is never shadowed by a replacement.
-func (p *ManagedProcess) Restart(stopCtx, startCtx context.Context) error {
+//
+// pending, when non-nil, carries a freshly-reloaded config swapped in atomically
+// by the replacement's start half (see startWithConfig); nil restarts with the
+// stored config. The stop half runs before the swap, so it uses the OLD stored
+// stop budget -- a raised stop_timeout only governs the next stop (#33, D3).
+func (p *ManagedProcess) Restart(stopCtx, startCtx context.Context, pending *pendingConfig) error {
 	if err := p.Stop(stopCtx); err != nil && err != domain.ErrProcessNotRunning {
 		return err
 	}
 
 	p.mu.Lock()
 	p.restartCount++
+	barrier := p.restartStartBarrier
 	p.mu.Unlock()
 
-	return p.Start(startCtx)
+	// Test-only seam: hold the restart in the unlocked gap between its stop and
+	// its start half so an interleaving test can race a concurrent start in.
+	if barrier != nil {
+		barrier()
+	}
+
+	return p.startWithConfig(startCtx, pending)
 }
 
 // monitor watches a single instance for exit. It owns draining that instance's
@@ -518,7 +630,7 @@ func exitCodeFromWaitErr(err error) int {
 func (p *ManagedProcess) logf(stream domain.Stream, format string, args ...interface{}) {
 	p.logManager.Write(domain.LogEntry{
 		Timestamp: time.Now(),
-		Process:   p.config.Name,
+		Process:   p.name,
 		Stream:    stream,
 		Line:      fmt.Sprintf(format, args...),
 	})
@@ -539,7 +651,7 @@ func (p *ManagedProcess) readOutput(r interface{}, stream domain.Stream) {
 		line := scanner.Text()
 		p.logManager.Write(domain.LogEntry{
 			Timestamp: time.Now(),
-			Process:   p.config.Name,
+			Process:   p.name,
 			Stream:    stream,
 			Line:      line,
 		})

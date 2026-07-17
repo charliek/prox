@@ -115,7 +115,7 @@ func TestManagedProcess_Restart(t *testing.T) {
 	restartCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err = mp.Restart(restartCtx, context.Background())
+	err = mp.Restart(restartCtx, context.Background(), nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, domain.ProcessStateRunning, mp.State())

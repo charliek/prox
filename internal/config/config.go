@@ -20,6 +20,10 @@ type Config struct {
 	Proxy     *ProxyConfig             `yaml:"proxy,omitempty"`
 	Services  map[string]ServiceConfig `yaml:"services,omitempty"`
 	Certs     *CertsConfig             `yaml:"certs,omitempty"`
+	// ShutdownTimeout is the default SIGTERM->SIGKILL escalation budget for
+	// every process that does not set its own stop_timeout. Empty means
+	// "use constants.DefaultShutdownTimeout". See stopBudgetOptions.
+	ShutdownTimeout string `yaml:"shutdown_timeout"`
 }
 
 // ProxyConfig defines the HTTP/HTTPS reverse proxy configuration
@@ -64,6 +68,10 @@ type ProcessConfig struct {
 	Env         map[string]string  `yaml:"env"`
 	EnvFile     string             `yaml:"env_file"`
 	Healthcheck *HealthcheckConfig `yaml:"healthcheck"`
+	// StopTimeout overrides Config.ShutdownTimeout for this process. Empty
+	// means "use the global shutdown_timeout, else the constant default".
+	// See stopBudgetOptions.
+	StopTimeout string `yaml:"stop_timeout"`
 }
 
 // HealthcheckConfig defines health check configuration in YAML
@@ -85,12 +93,13 @@ type rawProxyConfig struct {
 
 // rawConfig is used for initial YAML parsing to handle the flexible process/service format
 type rawConfig struct {
-	API       APIConfig              `yaml:"api"`
-	EnvFile   string                 `yaml:"env_file"`
-	Processes map[string]interface{} `yaml:"processes"`
-	Proxy     *rawProxyConfig        `yaml:"proxy,omitempty"`
-	Services  map[string]interface{} `yaml:"services,omitempty"`
-	Certs     *CertsConfig           `yaml:"certs,omitempty"`
+	API             APIConfig              `yaml:"api"`
+	EnvFile         string                 `yaml:"env_file"`
+	Processes       map[string]interface{} `yaml:"processes"`
+	Proxy           *rawProxyConfig        `yaml:"proxy,omitempty"`
+	Services        map[string]interface{} `yaml:"services,omitempty"`
+	Certs           *CertsConfig           `yaml:"certs,omitempty"`
+	ShutdownTimeout string                 `yaml:"shutdown_timeout"`
 }
 
 // Load reads and parses a configuration file
@@ -124,11 +133,12 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	config := &Config{
-		API:       raw.API,
-		EnvFile:   raw.EnvFile,
-		Processes: make(map[string]ProcessConfig),
-		Services:  make(map[string]ServiceConfig),
-		Certs:     raw.Certs,
+		API:             raw.API,
+		EnvFile:         raw.EnvFile,
+		Processes:       make(map[string]ProcessConfig),
+		Services:        make(map[string]ServiceConfig),
+		Certs:           raw.Certs,
+		ShutdownTimeout: raw.ShutdownTimeout,
 	}
 	if raw.Proxy != nil {
 		config.Proxy = &ProxyConfig{
@@ -251,11 +261,28 @@ func parseServiceConfig(name string, value interface{}) (ServiceConfig, error) {
 	}
 }
 
-// parseHealthDuration parses one healthcheck duration field. An empty string
-// leaves the value zero so domain.HealthConfig.WithDefaults applies the
-// documented default. A malformed or negative value returns a clear,
-// field-named error (a negative would survive WithDefaults and panic NewTicker).
-func parseHealthDuration(field, s string) (time.Duration, error) {
+// durationFieldOptions configures parseFieldDuration's per-field validation
+// policy. The zero value (all fields false/zero) enforces only "well-formed,
+// non-negative" -- callers opt into the extra behaviors they need.
+type durationFieldOptions struct {
+	// allowZero treats an explicitly-parsed zero duration (e.g. "0s") as
+	// meaning "use the documented default" and returns it as zero without
+	// applying min/max below. Healthcheck fields set this; the stop-budget
+	// fields do not, so an explicit zero falls through to the min check and
+	// is rejected like any other too-small value.
+	allowZero bool
+	// min, when nonzero, rejects any duration <= min. Ignored when zero.
+	min time.Duration
+	// max, when nonzero, rejects any duration > max. Ignored when zero.
+	max time.Duration
+}
+
+// parseFieldDuration parses one duration field under the given policy. An
+// empty string always leaves the value zero (unset) with no error -- what
+// "zero" means (use a default, or absence) is up to the caller. A malformed
+// or negative value always returns a clear, field-named error; min/max are
+// enforced only when set in opts.
+func parseFieldDuration(field, s string, opts durationFieldOptions) (time.Duration, error) {
 	if s == "" {
 		return 0, nil
 	}
@@ -264,12 +291,80 @@ func parseHealthDuration(field, s string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: invalid duration %q", field, s)
 	}
 	// ParseDuration truncates a tiny negative (e.g. "-0.1ns") to 0, which would
-	// otherwise slip past d < 0 and be silently defaulted by WithDefaults. Check
-	// the input's sign too so any negative value is rejected, not just defaulted.
+	// otherwise slip past d < 0 and be silently accepted as zero. Check the
+	// input's sign too so any negative value is rejected outright.
 	if d < 0 || strings.HasPrefix(s, "-") {
 		return 0, fmt.Errorf("%s: duration must not be negative (%q)", field, s)
 	}
+	if opts.allowZero && d == 0 {
+		return 0, nil
+	}
+	if opts.min > 0 && d <= opts.min {
+		return 0, fmt.Errorf("%s: must be greater than %s (%s is reserved for the SIGKILL escalation): %q",
+			field, trimZeroDuration(opts.min), trimZeroDuration(opts.min), s)
+	}
+	if opts.max > 0 && d > opts.max {
+		return 0, fmt.Errorf("%s: must not exceed %s: %q", field, trimZeroDuration(opts.max), s)
+	}
 	return d, nil
+}
+
+// trimZeroDuration renders a duration without the trailing zero-valued units
+// time.Duration.String always includes (e.g. 10*time.Minute -> "10m0s", not
+// "10m"). Only exercised on the fixed constants used as min/max (KillGrace,
+// MaxStopTimeout) in error messages, so only whole hour/minute/second values
+// need the shorter form; anything else falls back to the standard format.
+func trimZeroDuration(d time.Duration) string {
+	switch {
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	case d >= time.Second && d%time.Second == 0:
+		return fmt.Sprintf("%ds", d/time.Second)
+	default:
+		return d.String()
+	}
+}
+
+// healthDurationOptions is the validation policy for healthcheck duration
+// fields (interval/timeout/start_period): zero means "use the documented
+// default" and there is no upper cap. This preserves the pre-#35 behavior
+// exactly (issue #31).
+var healthDurationOptions = durationFieldOptions{allowZero: true}
+
+// stopBudgetOptions is the validation policy shared by the top-level
+// shutdown_timeout and per-process stop_timeout fields (#35, D1): no
+// "zero means default" special case -- an explicit zero is just another
+// too-small value -- and a bounded range of (KillGrace, MaxStopTimeout] so
+// every static ceiling that wraps the configured value stays boundable.
+var stopBudgetOptions = durationFieldOptions{
+	min: constants.KillGrace,
+	max: constants.MaxStopTimeout,
+}
+
+// parseHealthDuration parses one healthcheck duration field under
+// healthDurationOptions. See parseFieldDuration.
+func parseHealthDuration(field, s string) (time.Duration, error) {
+	return parseFieldDuration(field, s, healthDurationOptions)
+}
+
+// ShutdownTimeoutDuration parses Config.ShutdownTimeout under
+// stopBudgetOptions. Zero (empty string) means unset -- callers fall back to
+// constants.DefaultShutdownTimeout. Validate has already confirmed the value
+// is well-formed and in range for any config that went through Load/Parse; a
+// parse error here is only reachable for a Config built directly (e.g. tests)
+// without going through Validate.
+func (c *Config) ShutdownTimeoutDuration() (time.Duration, error) {
+	return parseFieldDuration("shutdown_timeout", c.ShutdownTimeout, stopBudgetOptions)
+}
+
+// StopTimeoutDuration parses ProcessConfig.StopTimeout under
+// stopBudgetOptions. Zero (empty string) means unset -- callers fall back to
+// the global shutdown_timeout, then constants.DefaultShutdownTimeout. See
+// Config.ShutdownTimeoutDuration for the same Validate-already-checked note.
+func (p *ProcessConfig) StopTimeoutDuration() (time.Duration, error) {
+	return parseFieldDuration("stop_timeout", p.StopTimeout, stopBudgetOptions)
 }
 
 // ToDomain converts the YAML healthcheck config to the domain type, parsing the

@@ -285,6 +285,7 @@ func TestToProcessDetailResponse(t *testing.T) {
 		RestartCount: 2,
 		Health:       domain.HealthStatusHealthy,
 		Cmd:          "npm start",
+		StopTimeout:  15 * time.Second,
 		Env: map[string]string{
 			"NODE_ENV":    "production",
 			"DB_PASSWORD": "secret123",
@@ -305,6 +306,11 @@ func TestToProcessDetailResponse(t *testing.T) {
 	}
 	if resp.Cmd != "npm start" {
 		t.Errorf("expected Cmd 'npm start', got %q", resp.Cmd)
+	}
+
+	// The effective stop budget is surfaced as a duration string.
+	if resp.StopTimeout != "15s" {
+		t.Errorf("expected StopTimeout '15s', got %q", resp.StopTimeout)
 	}
 
 	// Check that sensitive env vars are redacted
@@ -330,6 +336,23 @@ func TestToProcessDetailResponse(t *testing.T) {
 	}
 	if resp.Healthcheck.ConsecutiveFailures != 0 {
 		t.Errorf("expected ConsecutiveFailures 0, got %d", resp.Healthcheck.ConsecutiveFailures)
+	}
+}
+
+// TestToProcessDetailResponse_StopTimeoutOmittedWhenUnset verifies the
+// stop_timeout field is omitted (omitempty) when the effective budget is zero
+// (a process built outside the supervisor's normal resolution path), rather
+// than serialized as "0s".
+func TestToProcessDetailResponse_StopTimeoutOmittedWhenUnset(t *testing.T) {
+	info := domain.ProcessInfo{
+		Name:  "no-budget",
+		State: domain.ProcessStateStopped,
+		Cmd:   "true",
+	}
+
+	resp := ToProcessDetailResponse(info)
+	if resp.StopTimeout != "" {
+		t.Errorf("expected StopTimeout to be omitted for an unset budget, got %q", resp.StopTimeout)
 	}
 }
 

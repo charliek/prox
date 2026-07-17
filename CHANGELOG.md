@@ -4,8 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Features
+
+- **`restart` and `start` apply the current `prox.yaml`** (#33). An API-driven
+  (re)start — `prox restart <name>`, and `prox start <name>` after a
+  `prox stop <name>` — now re-reads and validates the whole config file and runs
+  the process with its **current** config, so the edit → restart → observe loop
+  no longer needs a full `prox stop` + `prox up`. Applied on (re)start: `cmd`,
+  `healthcheck`, `stop_timeout` (the new value governs the next stop; the
+  restart's own stop half keeps the pre-edit budget), and environment inputs
+  (inline `env`, per-process and global `env_file`, including changed file
+  paths). Renames, added/removed processes, and `services`/`proxy`/port changes
+  still require `prox up`. The reload is **fail-closed**: an invalid file (even an
+  unrelated process or the proxy section), a missing referenced env file, or a
+  removed target aborts the (re)start with the existing process left running
+  unchanged, via two new error codes — `CONFIG_RELOAD_FAILED` (HTTP 422) and
+  `PROCESS_NOT_IN_CONFIG` (HTTP 409). The config swap is applied atomically inside
+  the start's locked critical section, so a start racing a restart never leaves
+  the running process and stored config mismatched.
+- **Configurable stop timeout** (#35). Two new duration fields control the
+  SIGTERM→SIGKILL escalation budget: global `shutdown_timeout` (top-level) and
+  per-process `stop_timeout` (overrides the global). The effective budget for a
+  process is its own `stop_timeout`, else the global `shutdown_timeout`, else the
+  built-in `10s` default. The value is the escalation window — a fixed `2s` is
+  reserved for the SIGKILL phase, so the graceful drain window is `budget − 2s`.
+  Values must be greater than `2s` and at most `10m`; anything outside that range
+  (including `0s`/negatives) is rejected at load with a field-named error. The
+  budget is honored end-to-end — `prox stop`, `prox restart` (the stop half), and
+  full daemon shutdown — and the effective value is surfaced as `stop_timeout` in
+  the `GET /processes/{name}` response.
+
+### Changed
+
+- **Daemon shutdown now uses per-stage deadlines instead of one shared 10s
+  budget** (#35). Full `prox stop` / Ctrl-C previously wrapped proxy teardown,
+  API-server shutdown, and *all* process stops in a single 10-second context, so
+  slow proxy/API teardown silently ate into the time available to stop processes
+  — truncating an otherwise-valid graceful drain. Teardown now runs in stages,
+  each with its own deadline computed at shutdown time: the proxy and API server
+  get short fixed deadlines, then every process is stopped concurrently, each on
+  its **own** configured stop budget (read live, so a per-process budget raised at
+  runtime is respected). With nothing configured, per-process escalation timing is
+  unchanged (10s/2s); the daemon's outer window simply no longer truncates a stop.
+
 ### Fixes
 
+- `prox start <name>` now discovers the daemon's API address from `.prox/prox.state`
+  like the other client commands; previously it always used the default `:5555`
+  address and failed against daemons on dynamic API ports (found during #33
+  verification).
 - **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**
   (#31). Previously only `healthcheck.cmd` took effect; the timing/retry fields
   were silently dropped and replaced by the built-in defaults (`10s`/`5s`/`3`/
@@ -179,3 +226,4 @@ Initial release of prox, a modern process manager for local development.
 - Background daemon mode with `--detach` flag
 - CLI built with Cobra framework with shell completions
 - REST API for programmatic control
+

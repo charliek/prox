@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/config"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/stretchr/testify/assert"
@@ -349,6 +350,90 @@ func TestSupervisor_CreateManagedProcess_InvalidHealthcheckDuration(t *testing.T
 	assert.Nil(t, mp)
 	assert.Contains(t, err.Error(), "svc")
 	assert.Contains(t, err.Error(), "interval")
+}
+
+// TestSupervisor_CreateManagedProcess_StopTimeoutResolution covers the
+// #35/D1 effective stop-budget precedence: per-process stop_timeout beats the
+// global shutdown_timeout, which beats constants.DefaultShutdownTimeout. The
+// resolved value lands in the ManagedProcess's promoted shutdownTimeout field
+// (read via StopTimeout()); domain.ProcessConfig.StopTimeout carries only the
+// raw per-process value (0 = unset), never the resolved one.
+func TestSupervisor_CreateManagedProcess_StopTimeoutResolution(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	t.Run("per-process stop_timeout overrides global shutdown_timeout", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		cfg.ShutdownTimeout = "20s"
+		sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true", StopTimeout: "45s"})
+		require.NoError(t, err)
+		assert.Equal(t, 45*time.Second, mp.StopTimeout())
+		assert.Equal(t, 45*time.Second, mp.config.StopTimeout)
+	})
+
+	t.Run("global shutdown_timeout used when process has none", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		cfg.ShutdownTimeout = "20s"
+		sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true"})
+		require.NoError(t, err)
+		assert.Equal(t, 20*time.Second, mp.StopTimeout())
+		assert.Equal(t, time.Duration(0), mp.config.StopTimeout, "raw per-process value stays unset")
+	})
+
+	t.Run("constant default used when neither is set", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true"})
+		require.NoError(t, err)
+		assert.Equal(t, constants.DefaultShutdownTimeout, mp.StopTimeout())
+	})
+
+	t.Run("SupervisorConfig.ShutdownTimeout is honored before the constant", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		supConfig := DefaultSupervisorConfig()
+		supConfig.ShutdownTimeout = 25 * time.Second
+		sup := New(cfg, logMgr, nil, supConfig)
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true"})
+		require.NoError(t, err)
+		assert.Equal(t, 25*time.Second, mp.StopTimeout(),
+			"a directly-configured SupervisorConfig timeout must not be inert")
+	})
+
+	t.Run("malformed global shutdown_timeout surfaces a process-named error", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		cfg.ShutdownTimeout = "3x"
+		sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true"})
+		require.Error(t, err)
+		assert.Nil(t, mp)
+		assert.Contains(t, err.Error(), "svc")
+		assert.Contains(t, err.Error(), "shutdown_timeout")
+	})
+
+	t.Run("malformed per-process stop_timeout surfaces a process-named error", func(t *testing.T) {
+		cfg := makeTestConfig(map[string]string{})
+		sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
+
+		mp, err := sup.createManagedProcess("svc", config.ProcessConfig{Cmd: "true", StopTimeout: "1s"})
+		require.Error(t, err)
+		assert.Nil(t, mp)
+		assert.Contains(t, err.Error(), "svc")
+		assert.Contains(t, err.Error(), "stop_timeout")
+	})
+}
+
+// TestDefaultSupervisorConfig_ShutdownTimeout pins DefaultSupervisorConfig's
+// default to constants.DefaultShutdownTimeout instead of its own literal
+// (#35).
+func TestDefaultSupervisorConfig_ShutdownTimeout(t *testing.T) {
+	assert.Equal(t, constants.DefaultShutdownTimeout, DefaultSupervisorConfig().ShutdownTimeout)
 }
 
 // TestSupervisor_RestartProcess_HealthCheckerSurvivesRequestContext is the

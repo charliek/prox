@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -106,10 +105,11 @@ func (h *Handlers) GetProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) StartProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.StartProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the operation internally by
+	// the process's configured stop budget, and the lifecycle route group caps
+	// the request at lifecycleRequestTimeout for hang protection. r.Context()
+	// still propagates client disconnect (#35, D2).
+	if err := h.supervisor.StartProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -121,10 +121,10 @@ func (h *Handlers) StartProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) StopProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.StopProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the stop internally by the
+	// process's configured stop budget; the lifecycle route group provides the
+	// hang-protection ceiling. r.Context() still propagates client disconnect.
+	if err := h.supervisor.StopProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -136,10 +136,11 @@ func (h *Handlers) StopProcess(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) RestartProcess(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	if err := h.supervisor.RestartProcess(ctx, name); err != nil {
+	// No per-handler timeout: the supervisor bounds the stop half internally by
+	// the process's configured stop budget; the lifecycle route group provides
+	// the hang-protection ceiling. r.Context() still propagates client
+	// disconnect.
+	if err := h.supervisor.RestartProcess(r.Context(), name); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -270,6 +271,19 @@ func writeError(w http.ResponseWriter, err error) {
 		// failure). Non-sensitive: it's the user's own process name.
 		status = http.StatusInternalServerError
 		code = domain.ErrCodeProcessGroupNotReaped
+		message = err.Error()
+	case errors.Is(err, domain.ErrConfigReloadFailed):
+		// The config was re-read on an API-driven (re)start and could not be
+		// loaded/validated. The detail is the user's own config path/validation
+		// message, not sensitive, so it is surfaced directly (#33, D3).
+		status = http.StatusUnprocessableEntity
+		code = domain.ErrCodeConfigReloadFailed
+		message = err.Error()
+	case errors.Is(err, domain.ErrProcessNotInConfig):
+		// Target process was removed from the config since `prox up`. The old
+		// process keeps running; the user must run `prox up` to reconcile (#33, D3).
+		status = http.StatusConflict
+		code = domain.ErrCodeProcessNotInConfig
 		message = err.Error()
 	default:
 		// For unknown errors, log the actual error but return a sanitized message

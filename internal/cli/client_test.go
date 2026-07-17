@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 )
 
@@ -28,6 +30,91 @@ func TestNewClient_TrimsTrailingSlash(t *testing.T) {
 	if client.baseURL != "http://localhost:5555" {
 		t.Errorf("expected baseURL without trailing slash, got %q", client.baseURL)
 	}
+}
+
+// TestNewClient_LifecycleClientTimeout verifies the two-client split: ordinary
+// calls use the 30s default client, while the lifecycle calls (start/stop/
+// restart) use a dedicated client whose timeout sits above the configured
+// stop-budget cap so a legitimately long stop is never aborted by the CLI
+// (#35, D2).
+func TestNewClient_LifecycleClientTimeout(t *testing.T) {
+	client := NewClient("http://localhost:5555")
+
+	if client.httpClient == nil || client.lifecycleClient == nil {
+		t.Fatal("expected both httpClient and lifecycleClient to be non-nil")
+	}
+	if client.httpClient.Timeout != 30*time.Second {
+		t.Errorf("expected default client timeout 30s, got %v", client.httpClient.Timeout)
+	}
+	wantLifecycle := constants.MaxStopTimeout + time.Minute
+	if client.lifecycleClient.Timeout != wantLifecycle {
+		t.Errorf("expected lifecycle client timeout %v, got %v", wantLifecycle, client.lifecycleClient.Timeout)
+	}
+	if client.lifecycleClient.Timeout <= client.httpClient.Timeout {
+		t.Error("lifecycle client timeout must exceed the default client timeout")
+	}
+}
+
+// TestClient_LifecycleCallsUseLifecycleClient confirms StartProcess/StopProcess/
+// RestartProcess route through the lifecycle client, not the default one, by
+// swapping in a marked client and asserting the ordinary calls do not use it.
+func TestClient_LifecycleCallsUseLifecycleClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+
+	// Distinguish the two clients by giving the lifecycle client a sentinel
+	// transport that records whether it was used.
+	used := false
+	client.lifecycleClient = &http.Client{
+		Timeout:   constants.MaxStopTimeout + time.Minute,
+		Transport: recordingTransport{used: &used},
+	}
+
+	if err := client.StopProcess("web"); err != nil {
+		t.Fatalf("StopProcess: %v", err)
+	}
+	if !used {
+		t.Error("StopProcess should use the lifecycle client")
+	}
+
+	used = false
+	if err := client.StartProcess("web"); err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	if !used {
+		t.Error("StartProcess should use the lifecycle client")
+	}
+
+	used = false
+	if err := client.RestartProcess("web"); err != nil {
+		t.Fatalf("RestartProcess: %v", err)
+	}
+	if !used {
+		t.Error("RestartProcess should use the lifecycle client")
+	}
+
+	// A non-lifecycle call must NOT use the lifecycle client.
+	used = false
+	if _, err := client.GetStatus(); err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if used {
+		t.Error("GetStatus should use the default client, not the lifecycle client")
+	}
+}
+
+// recordingTransport marks used=true on every round trip and delegates to the
+// default transport.
+type recordingTransport struct{ used *bool }
+
+func (rt recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	*rt.used = true
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 func TestClient_GetStatus(t *testing.T) {

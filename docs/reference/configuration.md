@@ -22,6 +22,9 @@ api:
 
 env_file: .env
 
+# Default stop budget for every process (SIGTERM->SIGKILL escalation window).
+shutdown_timeout: 10s
+
 processes:
   # Simple form - string command
   web: npm run dev
@@ -30,6 +33,8 @@ processes:
   # Expanded form - full configuration
   api:
     cmd: go run ./cmd/server
+    # Give this process a longer graceful-drain window than the global default.
+    stop_timeout: 30s
     env:
       PORT: "8080"
       DEBUG: "true"
@@ -46,9 +51,11 @@ processes:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api.port` | int | dynamic | HTTP API port (auto-assigned if not specified or port in use) |
+| `api.port` | int | dynamic | HTTP API port. When unset (or `0`), a free port is auto-assigned; an explicit port is used as-is — if it's already in use the API server fails to start (logged as an error) rather than picking another port |
 | `api.host` | string | `127.0.0.1` | API bind address |
+| `api.auth` | bool | auto | Force authentication on (`true`) or off (`false`). Omitted: auth is enabled automatically unless `api.host` is localhost-only |
 | `env_file` | string | — | Global .env file path, loaded for all processes |
+| `shutdown_timeout` | duration | `10s` | Default stop budget for every process (the SIGTERM→SIGKILL escalation window; see [Stop Timeout](#stop-timeout)). Overridable per process via `stop_timeout`. Must be greater than `2s` and at most `10m` |
 | `processes` | map | required | Process definitions |
 
 ## Process Fields
@@ -69,7 +76,56 @@ processes:
 | `cmd` | string | required | Command to run |
 | `env` | map | — | Environment variables for this process |
 | `env_file` | string | — | Process-specific .env file |
+| `stop_timeout` | duration | inherits `shutdown_timeout` | This process's stop budget, overriding the global `shutdown_timeout` (see [Stop Timeout](#stop-timeout)). Must be greater than `2s` and at most `10m` |
 | `healthcheck` | object | — | Health check configuration |
+
+## Stop Timeout
+
+When prox stops a process — via `prox stop <name>`, `prox restart <name>`, or a
+full `prox stop` / Ctrl-C of the daemon — it first sends `SIGTERM` and waits for
+the process to exit gracefully, then escalates to `SIGKILL`. The **stop budget**
+controls that escalation:
+
+- The effective budget for a process is its own `stop_timeout`, else the global
+  `shutdown_timeout`, else the built-in default of `10s`.
+- The budget is the **SIGTERM→SIGKILL escalation window**. A fixed `2s` at the
+  tail is reserved for the `SIGKILL` phase, so the graceful window is
+  **`budget − 2s`** (e.g. a `10s` budget gives ~8s of graceful drain before
+  `SIGKILL`). The reserve is not configurable.
+- Because of that reserve, the budget must be **greater than `2s`**; values of
+  `2s` or less (including `0s` and negatives) are rejected at load with a
+  field-named error. The upper bound is **`10m`**; `10m` exactly is accepted.
+- The configured value bounds **escalation timing**, not strict total
+  wall-clock — a process that is slow to flush its output can add a few seconds
+  of drain time on top.
+- The budget is honored on every stop path: `prox stop`, `prox restart` (the
+  stop half), and full daemon shutdown, where each process is stopped on its
+  **own** budget concurrently (a large budget on one process no longer forces a
+  shared shorter deadline on the others).
+- The effective budget is reported as `stop_timeout` in the
+  [process detail API](api.md#get-processesname), so you can see the budget
+  governing a long stop.
+
+## Config Reload on Restart
+
+Whenever a process is (re)started through the API — `prox restart <name>`, or
+`prox start <name>` after a `prox stop <name>` — prox re-reads `prox.yaml` and
+runs the process with the config the file **now** contains. So editing a
+process and restarting it is enough; a full `prox stop` + `prox up` is not
+needed for the fields below.
+
+- Applied on (re)start: `cmd`, `healthcheck`, `stop_timeout`, and environment
+  inputs (inline `env`, per-process and global `env_file`, including changed
+  file paths). A changed `stop_timeout` governs the **next** stop — the
+  restart's own stop half still uses the pre-edit budget.
+- NOT applied (these require `prox up`): process renames, added or removed
+  processes, and `services` / `proxy` / port changes.
+- The reload is **fail-closed**: the whole file is re-validated, so an invalid
+  edit anywhere in it — even in an unrelated process or the proxy section — or a
+  missing referenced env file aborts the (re)start and the existing process keeps
+  running unchanged. See the [restart API](api.md#post-processesnamerestart)
+  reference for the exact error codes (`CONFIG_RELOAD_FAILED`,
+  `PROCESS_NOT_IN_CONFIG`).
 
 ## Health Check Fields
 
@@ -99,6 +155,12 @@ Duration fields accept Go duration strings:
 - `5s` - 5 seconds
 - `10m` - 10 minutes
 - `1h30m` - 1 hour 30 minutes
+
+Different duration fields enforce different bounds. Health check durations accept
+any non-negative value (and treat `0` as "use the default"). The stop-budget
+fields `shutdown_timeout` and `stop_timeout` must be greater than `2s` and at
+most `10m` (see [Stop Timeout](#stop-timeout)); a value outside that range —
+including `0s` or a negative — is rejected at load with a field-named error.
 
 ## Runtime State
 

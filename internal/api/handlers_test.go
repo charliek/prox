@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -426,6 +427,46 @@ func TestProcessControl_Conflict(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.ErrCodeProcessAlreadyRunning, resp.Code)
 	})
+}
+
+// TestWriteError_ReloadSentinels covers the two config-reload error mappings
+// added for #33: ErrConfigReloadFailed -> 422 CONFIG_RELOAD_FAILED and
+// ErrProcessNotInConfig -> 409 PROCESS_NOT_IN_CONFIG, with the underlying detail
+// surfaced in the message.
+func TestWriteError_ReloadSentinels(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "config reload failed",
+			err:        fmt.Errorf("%w: parsing yaml: bad", domain.ErrConfigReloadFailed),
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   domain.ErrCodeConfigReloadFailed,
+		},
+		{
+			name:       "process not in config",
+			err:        fmt.Errorf("process %q %w; run 'prox up' to reconcile", "web", domain.ErrProcessNotInConfig),
+			wantStatus: http.StatusConflict,
+			wantCode:   domain.ErrCodeProcessNotInConfig,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeError(w, tc.err)
+
+			assert.Equal(t, tc.wantStatus, w.Code)
+
+			var resp ErrorResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+			assert.Equal(t, tc.wantCode, resp.Code)
+			assert.Equal(t, tc.err.Error(), resp.Error, "detail must be surfaced")
+		})
+	}
 }
 
 func TestGetProxyRequests(t *testing.T) {

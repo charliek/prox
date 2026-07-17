@@ -146,6 +146,8 @@ Start a stopped process.
 prox start <process>
 ```
 
+Like `restart`, `start` re-reads `prox.yaml` and launches the process with its **current** config (see [Config reload on (re)start](#config-reload-on-restart) below). Editing a process's `cmd` and running `prox stop <process>` + `prox start <process>` applies the change, just as `prox restart <process>` does.
+
 **Examples:**
 
 ```bash
@@ -164,6 +166,8 @@ prox stop [process]
 Without arguments, sends a shutdown signal to the daemon. All processes receive SIGTERM, then SIGKILL after a timeout.
 
 With a process name, stops only that process while keeping prox and other processes running.
+
+The SIGTERM→SIGKILL timeout is configurable per process via `stop_timeout` (or globally via `shutdown_timeout`; default `10s`) — see [Stop Timeout](configuration.md#stop-timeout). A process with a large budget may make `prox stop` wait a while before returning: the server is authoritative and holds the request open until the process actually stops (up to the configured budget), so a long silent wait is expected rather than a hang. Pressing Ctrl-C on the CLI is safe — it only detaches the client; the daemon keeps stopping the process on its configured budget.
 
 **Examples:**
 
@@ -222,6 +226,32 @@ prox restart <process>
 prox restart api
 prox restart worker
 ```
+
+The stop half of a restart uses the process's **pre-edit** stop budget (see [Stop Timeout](configuration.md#stop-timeout)); a changed `stop_timeout` takes effect on the next stop after the restart.
+
+#### Config reload on (re)start
+
+Every API-driven (re)start — `prox restart <process>`, and `prox start <process>` after a `prox stop <process>` — re-reads `prox.yaml` first and runs the process with **what the file now says**. This makes the edit → restart → observe loop work without a full `prox stop` + `prox up`.
+
+**Applied on (re)start:**
+
+- `cmd`
+- `healthcheck`
+- `stop_timeout` (the new value governs the *next* stop; the restart's own stop half uses the pre-edit budget)
+- environment inputs — inline `env`, per-process `env_file`, and the global `env_file`, including **changed file paths** (the values are re-read from disk)
+
+**NOT applied on (re)start (require `prox up`):**
+
+- process **renames** (a rename is a delete + add)
+- **added or removed** processes
+- `services`, `proxy`, ports, and other top-level daemon settings
+
+**Failure semantics (fail-closed):** the whole file is re-validated, so an invalid edit — even in an *unrelated* process or the proxy section — or a referenced env file that is missing aborts the (re)start with an error, and the existing process keeps running unchanged. Two cases have dedicated errors:
+
+- an invalid/unreadable/malformed file → `CONFIG_RELOAD_FAILED` (HTTP 422)
+- the target process no longer present in the file → `PROCESS_NOT_IN_CONFIG` (HTTP 409)
+
+Fix the file (or run `prox up` to reconcile added/removed/renamed processes) and try again.
 
 ### requests
 

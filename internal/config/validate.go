@@ -31,6 +31,13 @@ func Validate(config *Config) error {
 		errs = append(errs, fmt.Sprintf("api.port: must be between 0 and 65535, got %d", config.API.Port))
 	}
 
+	// Validate the default shutdown_timeout (#35, D1): empty is fine (falls
+	// back to constants.DefaultShutdownTimeout); anything else must parse and
+	// fall in (KillGrace, MaxStopTimeout].
+	if _, err := parseFieldDuration("shutdown_timeout", config.ShutdownTimeout, stopBudgetOptions); err != nil {
+		errs = append(errs, err.Error())
+	}
+
 	// Validate processes
 	if len(config.Processes) == 0 {
 		errs = append(errs, "processes: at least one process must be defined")
@@ -39,6 +46,12 @@ func Validate(config *Config) error {
 	for name, proc := range config.Processes {
 		if proc.Cmd == "" {
 			errs = append(errs, fmt.Sprintf("processes.%s.cmd: command is required", name))
+		}
+
+		// Validate stop_timeout under the same policy as shutdown_timeout
+		// (#35, D1); prefixed like the healthcheck field errors below.
+		if _, err := parseFieldDuration("stop_timeout", proc.StopTimeout, stopBudgetOptions); err != nil {
+			errs = append(errs, fmt.Sprintf("processes.%s.%s", name, err))
 		}
 
 		// Validate healthcheck if present

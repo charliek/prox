@@ -36,7 +36,7 @@ This document describes the internal design of prox for contributors.
 
 ## Log Manager
 
-- Ring buffer per process (configurable size, default 1000 lines or 1MB)
+- Ring buffer per process (configurable size, default 1000 lines)
 - Each entry: `{timestamp, process, stream (stdout|stderr), line}`
 - Supports multiple concurrent readers/subscribers
 - Filter primitives: by process, by pattern (substring or regex)
@@ -56,25 +56,45 @@ This document describes the internal design of prox for contributors.
 
 1. Parse config file
 2. Load environment (global .env, per-process env_file, per-process env)
-3. Start HTTP API server
-4. Start each process
-5. Begin health checks (if configured)
-6. Attach log subscribers (terminal or TUI)
+3. Start each process (and begin its health checks, if configured)
+4. Start HTTP API server
+5. Attach log subscribers (terminal or TUI)
 
 ### Shutdown (Ctrl+C or API)
 
-1. Stop accepting new API requests
-2. Send SIGTERM to all child processes
-3. Wait for graceful shutdown (default 10 seconds)
-4. Send SIGKILL to any remaining processes
-5. Exit
+The daemon tears down in stages, each with its own deadline computed at shutdown
+time rather than one shared budget, so proxy/API teardown time can never eat
+into the supervisor's process-stop budget:
+
+1. Deregister from (or stop) the proxy — a short fixed stage deadline
+2. Stop the API server — a short fixed stage deadline. The server stops
+   accepting new connections and waits up to the stage deadline for in-flight
+   requests; a still-running lifecycle request is not force-closed, and the
+   supervisor stage below stops its process regardless
+3. Stop all processes (the supervisor stage), bounded by the maximum per-process
+   stop budget currently in force plus a small margin. Each process is stopped
+   concurrently on its **own** effective stop budget:
+   1. Send SIGTERM to its entire process group (not just the leader), so
+      descendants spawned by the command are included
+   2. Poll the group's liveness until it exits or the graceful deadline passes.
+      The graceful window is the process's configured stop budget minus a 2-second
+      reserve for the SIGKILL/verify phase — by default ~8 seconds (a 10-second
+      budget minus the 2-second reserve), but tunable via `shutdown_timeout` /
+      `stop_timeout`
+   3. If the group is still alive at the graceful deadline, send SIGKILL to the
+      group and poll again until the kill deadline passes
+   4. Verify the group is actually gone; if it survived SIGKILL, the stop reports
+      `PROCESS_GROUP_NOT_REAPED` instead of succeeding
+4. Exit
 
 ### Process Restart
 
-1. Send SIGTERM to process
-2. Wait for shutdown (timeout → SIGKILL)
-3. Reset restart counter if appropriate
-4. Start process again
+Every API-driven (re)start (`restart`, and `start` after a `stop`) re-reads `prox.yaml` and applies the target process's current config, so an edit → restart loop works without a full `prox stop` + `prox up`.
+
+1. **Reload + validate + preflight (before any stop):** re-read the whole config file from its absolute path and validate it, look up the target process in the fresh config, build its new runtime (`cmd`, `healthcheck`, `stop_timeout`, and a rebuilt env-loader closure over the fresh global/per-process `env_file` and inline `env`), and preflight that env load. Any failure here leaves the running process **completely untouched** and returns a typed error: `CONFIG_RELOAD_FAILED` (invalid/unreadable file, or a missing referenced env file — whole-file validation means an invalid *unrelated* section also blocks the restart) or `PROCESS_NOT_IN_CONFIG` (target removed from the file). Renames, added/removed processes, and `services`/`proxy`/port changes are out of scope and require `prox up`
+2. Stop the process: SIGTERM to its process group, graceful liveness polling, SIGKILL escalation to the group at the graceful deadline, then a post-kill liveness check. This stop half uses the process's **pre-edit** stop budget; a raised `stop_timeout` governs the next stop. If the group could not be reaped, restart aborts before starting a replacement and reports `PROCESS_GROUP_NOT_REAPED` (a surviving group is never shadowed by a new one)
+3. Increment the restart counter
+4. Start the process again, **swapping the reloaded config in atomically**: the swap happens inside the start's locked critical section, after the already-running / surviving-group guards pass and before the process launches, so a concurrent start that wins the race launches the old config and the loser is refused (`PROCESS_ALREADY_RUNNING`) without applying its swap — the running process and the stored config never mismatch. `env_file` files are re-read from disk on this start half. If the launch fails after the swap, the new config stays active for the next start ("the file is the truth")
 5. Reset health check state
 
 ### Health Checks

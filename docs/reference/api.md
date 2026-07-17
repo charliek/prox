@@ -6,11 +6,17 @@
 http://{host}:{port}/api/v1
 ```
 
-Default: `http://127.0.0.1:5555/api/v1`
+By default, `{port}` is a dynamically assigned free localhost port chosen at startup — discover it with `prox status` (which reports the API address), or pin it by setting `api.port` in `prox.yaml`. The examples below assume `api.port: 5555` is set in `prox.yaml`.
 
 ## Authentication
 
-When prox binds to a non-localhost interface, authentication is required. A bearer token is generated and stored in `~/.prox/token`.
+By default, authentication is enabled automatically unless prox binds to a localhost-only address (`127.0.0.1`, `localhost`, or `::1`); binding to `0.0.0.0` or another non-localhost address turns auth on. When enabled, a bearer token is generated and stored in `~/.prox/token`.
+
+This can be overridden with the `api.auth` field in `prox.yaml`:
+
+- Omitted (default): auto-determine based on `api.host` as described above.
+- `true`: force authentication on, even when bound to localhost.
+- `false`: force authentication off, even when bound to a non-localhost address. prox prints a startup warning in this case, since any network client can then control the supervisor.
 
 Include the token in requests:
 
@@ -38,12 +44,26 @@ All errors return JSON:
 | `PROCESS_NOT_RUNNING` | Process is not running |
 | `INVALID_PATTERN` | Invalid regex pattern |
 | `SHUTDOWN_IN_PROGRESS` | Supervisor is shutting down |
+| `ENV_RELOAD_FAILED` | A process's `env_file` could not be re-read from disk on start |
+| `PROCESS_GROUP_NOT_REAPED` | A process's group survived SIGKILL and could not be confirmed terminated |
+| `CONFIG_RELOAD_FAILED` | `prox.yaml` could not be re-read/validated on an API-driven (re)start (missing/unreadable file, YAML syntax, or validation failure); the running process is left untouched |
+| `PROCESS_NOT_IN_CONFIG` | The target process is no longer present in `prox.yaml` on a (re)start; run `prox up` to reconcile |
 | `PROXY_NOT_ENABLED` | Proxy request inspection is unavailable because the proxy is disabled |
 | `STREAMING_NOT_SUPPORTED` | The server cannot provide an SSE stream for this request |
 | `REQUEST_NOT_FOUND` | Proxy request ID does not exist in the request buffer |
 | `MISSING_REQUEST_ID` | Request detail endpoint was called without an ID |
 
 ## Endpoints
+
+### GET /health
+
+Plain liveness check, served at the server root (not under `/api/v1`). No authentication required.
+
+**Response:** `200 OK` with plain-text body `ok` (not JSON).
+
+```bash
+curl http://localhost:5555/health
+```
 
 ### GET /status
 
@@ -116,13 +136,18 @@ Get detailed process info.
   "cmd": "go run ./cmd/server",
   "env": {
     "PORT": "8080"
-  }
+  },
+  "stop_timeout": "30s"
 }
 ```
+
+`stop_timeout` is the effective SIGTERM→SIGKILL escalation budget in force for this process (its own `stop_timeout`, else the global `shutdown_timeout`, else the `10s` default), as a duration string. It is the budget governing a `POST /processes/{name}/stop` or `POST /processes/{name}/restart`. See [Stop Timeout](configuration.md#stop-timeout).
 
 ### POST /processes/{name}/start
 
 Start a stopped process.
+
+`prox.yaml` is re-read first and the process is launched with its current config — see the reload behavior documented under [restart](#post-processesnamerestart) below (it applies identically to `start`).
 
 **Response:**
 
@@ -147,6 +172,13 @@ Stop a running process.
 ### POST /processes/{name}/restart
 
 Restart a process (stop then start).
+
+**Config reload:** before launching, prox re-reads and validates the whole `prox.yaml` and applies the target process's **current** config. Applied on (re)start: `cmd`, `healthcheck`, `stop_timeout` (the new value governs the next stop; the restart's own stop half uses the pre-edit budget), and environment inputs (inline `env`, per-process and global `env_file`, including changed file paths). NOT applied (require `prox up`): renames, added/removed processes, and `services`/`proxy`/port changes.
+
+The reload is **fail-closed**: an invalid file (even an unrelated process or the proxy section), a missing referenced env file, or a removed target aborts the (re)start with an error and leaves the existing process running unchanged:
+
+- `CONFIG_RELOAD_FAILED` (HTTP 422) — the file could not be read/parsed/validated.
+- `PROCESS_NOT_IN_CONFIG` (HTTP 409) — the target process is no longer in the file; run `prox up` to reconcile.
 
 **Response:**
 
@@ -336,3 +368,5 @@ Gracefully shut down supervisor and all processes.
 ```
 
 Connection closes after response as supervisor terminates.
+
+The daemon then tears down in stages, each with its own deadline: the proxy and API server are stopped on short fixed deadlines, then every process is stopped concurrently, each on its own configured stop budget (see [Stop Timeout](configuration.md#stop-timeout)). Graceful timing therefore derives from the configured `shutdown_timeout` / `stop_timeout` values, not a single fixed window.
