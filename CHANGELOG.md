@@ -49,6 +49,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixes
 
+- `prox start <name>` now discovers the daemon's API address from `.prox/prox.state`
+  like the other client commands; previously it always used the default `:5555`
+  address and failed against daemons on dynamic API ports (found during #33
+  verification).
 - **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**
   (#31). Previously only `healthcheck.cmd` took effect; the timing/retry fields
   were silently dropped and replaced by the built-in defaults (`10s`/`5s`/`3`/
@@ -222,3 +226,4 @@ Initial release of prox, a modern process manager for local development.
 - Background daemon mode with `--detach` flag
 - CLI built with Cobra framework with shell completions
 - REST API for programmatic control
+
