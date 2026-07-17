@@ -12,18 +12,22 @@ import (
 
 // StreamLogs handles GET /api/v1/logs/stream (SSE)
 func (h *Handlers) StreamLogs(w http.ResponseWriter, r *http.Request) {
+	// Check if flusher is available before writing any SSE headers, so the
+	// error path can return a clean JSON error (matching StreamProxyRequests).
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error: "streaming not supported",
+			Code:  domain.ErrCodeStreamingNotSupported,
+		})
+		return
+	}
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-
-	// Check if flusher is available
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return
-	}
 
 	// Parse filter parameters
 	filter := domain.LogFilter{}
