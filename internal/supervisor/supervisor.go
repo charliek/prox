@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charliek/prox/internal/config"
@@ -59,6 +60,17 @@ type Supervisor struct {
 	startedAt time.Time
 	// state is the current supervisor state: "stopped", "running", or "stopping"
 	state string
+
+	// launchable is the launch gate (#32/#36, D2): true while the supervisor is
+	// running, flipped false at the top of Stop (under s.mu, alongside
+	// state="stopping") before the per-process stop goroutines are created, and
+	// reset true on every entry into "running" so a stop->start cycle reopens the
+	// gate. createManagedProcess injects a launchGate closure that reads this flag
+	// (atomic read only -- see the closure comment) and refuses a launch with
+	// ErrShutdownInProgress once it is false. It is an atomic (not guarded by s.mu)
+	// so the gate can be read inside startWithConfig's p.mu critical section without
+	// taking s.mu, which would AB-BA against the verified s.mu -> p.mu order.
+	launchable atomic.Bool
 
 	// ctx and cancel are used for coordinating graceful shutdown
 	ctx    context.Context
@@ -136,6 +148,9 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.state = "running"
+	// Reopen the launch gate. This also covers a stop->start cycle (Stop flipped
+	// it false): the fresh run must accept launches again (#32/#36, D2).
+	s.launchable.Store(true)
 	s.startedAt = time.Now()
 	s.mu.Unlock()
 
@@ -187,6 +202,17 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 	// StopTimeout() accessor and the lock-held loadEnv read in Start.
 	mp.loadEnv = loadEnv
 	mp.shutdownTimeout = effective
+	// Inject the launch gate (#32/#36, D2). ATOMIC READ ONLY: startWithConfig
+	// calls this inside its p.mu critical section, so this closure must NOT take
+	// s.mu -- the verified s.mu -> p.mu order would make an s.mu acquisition here
+	// an AB-BA deadlock against callers already holding s.mu while reaching for
+	// p.mu (Processes/Process/MaxStopBudget). Reading the atomic is sufficient.
+	mp.launchGate = func() error {
+		if !s.launchable.Load() {
+			return domain.ErrShutdownInProgress
+		}
+		return nil
+	}
 
 	return mp, nil
 }
@@ -345,6 +371,11 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		return nil
 	}
 	s.state = "stopping"
+	// Close the launch gate before spawning the per-process stop goroutines, so a
+	// launcher that observes it closed never launches, and a launcher already past
+	// the gate (the check/use window) is reaped by this process's stop goroutine --
+	// which is queued on p.mu behind that very launch -- before Stop returns (D2).
+	s.launchable.Store(false)
 	processes := make([]*ManagedProcess, 0, len(s.processes))
 	for _, mp := range s.processes {
 		processes = append(processes, mp)

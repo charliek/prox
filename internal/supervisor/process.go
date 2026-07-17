@@ -139,6 +139,14 @@ type ManagedProcess struct {
 	// in flight.
 	episode *stopEpisode
 
+	// launchGate, when set, is the supervisor's launch gate closure (#32/#36, D2).
+	// startWithConfig invokes it inside its p.mu critical section, after the state
+	// and surviving-group guards and BEFORE the pending-config swap; a non-nil
+	// error (ErrShutdownInProgress) aborts the launch with no swap applied and the
+	// state unchanged. supervisor.createManagedProcess injects it; nil (direct
+	// NewManagedProcess construction in tests) means "always allow".
+	launchGate func() error
+
 	// stopBarrier is a test-only seam (nil in production). Stop invokes it,
 	// unlocked, at two interleaving-sensitive points identified by phase:
 	//
@@ -289,6 +297,29 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 		if alive, _ := p.current.proc.GroupAlive(); alive {
 			return fmt.Errorf("%w: %s (previous instance still running; stop it first)",
 				domain.ErrProcessGroupNotReaped, p.name)
+		}
+	}
+
+	// Launch gate (#32/#36, D2). Called here -- inside the p.mu critical section,
+	// after the state and surviving-group guards, before the pending-config swap
+	// and the runner launch -- so a refusal applies no swap, leaves the state
+	// unchanged, and returns the gate's error (ErrShutdownInProgress). The closure
+	// reads only an atomic (see createManagedProcess); it must NOT take s.mu, whose
+	// s.mu -> p.mu order would AB-BA here.
+	//
+	// Invariant (D2, deliberately weak): a launcher that OBSERVES the gate closed
+	// never launches. A launcher that read the gate open just before Supervisor.Stop
+	// flipped it may still launch while holding p.mu -- but that is harmless: Stop
+	// flips the gate under s.mu before it spawns the per-process stop goroutines, so
+	// this process's stop goroutine, queued on p.mu behind this very launch, reaps
+	// the replacement before Supervisor.Stop returns. No replacement outlives
+	// Supervisor.Stop. The stronger "cannot launch after Stop began" is NOT claimed;
+	// a full launch lease (RWMutex) was considered and rejected -- a new lock class
+	// and ordering rules to exclude a transient the invariant already renders
+	// harmless (no orphan survives daemon exit).
+	if p.launchGate != nil {
+		if err := p.launchGate(); err != nil {
+			return err
 		}
 	}
 
