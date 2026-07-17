@@ -6,11 +6,17 @@
 http://{host}:{port}/api/v1
 ```
 
-Default: `http://127.0.0.1:5555/api/v1`
+By default, `{port}` is a dynamically assigned free localhost port chosen at startup — discover it with `prox status` (which reports the API address), or pin it by setting `api.port` in `prox.yaml`. The examples below assume `api.port: 5555` is set in `prox.yaml`.
 
 ## Authentication
 
-When prox binds to a non-localhost interface, authentication is required. A bearer token is generated and stored in `~/.prox/token`.
+By default, authentication is enabled automatically unless prox binds to a localhost-only address (`127.0.0.1`, `localhost`, or `::1`); binding to `0.0.0.0` or another non-localhost address turns auth on. When enabled, a bearer token is generated and stored in `~/.prox/token`.
+
+This can be overridden with the `api.auth` field in `prox.yaml`:
+
+- Omitted (default): auto-determine based on `api.host` as described above.
+- `true`: force authentication on, even when bound to localhost.
+- `false`: force authentication off, even when bound to a non-localhost address. prox prints a startup warning in this case, since any network client can then control the supervisor.
 
 Include the token in requests:
 
@@ -38,12 +44,24 @@ All errors return JSON:
 | `PROCESS_NOT_RUNNING` | Process is not running |
 | `INVALID_PATTERN` | Invalid regex pattern |
 | `SHUTDOWN_IN_PROGRESS` | Supervisor is shutting down |
+| `ENV_RELOAD_FAILED` | A process's `env_file` could not be re-read from disk on start |
+| `PROCESS_GROUP_NOT_REAPED` | A process's group survived SIGKILL and could not be confirmed terminated |
 | `PROXY_NOT_ENABLED` | Proxy request inspection is unavailable because the proxy is disabled |
 | `STREAMING_NOT_SUPPORTED` | The server cannot provide an SSE stream for this request |
 | `REQUEST_NOT_FOUND` | Proxy request ID does not exist in the request buffer |
 | `MISSING_REQUEST_ID` | Request detail endpoint was called without an ID |
 
 ## Endpoints
+
+### GET /health
+
+Plain liveness check, served at the server root (not under `/api/v1`). No authentication required.
+
+**Response:** `200 OK` with plain-text body `ok` (not JSON).
+
+```bash
+curl http://localhost:5555/health
+```
 
 ### GET /status
 

@@ -193,9 +193,14 @@ See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for mult
 
 ## HTTP API
 
-The API runs at `http://127.0.0.1:5555/api/v1` by default.
+By default, the API binds to a dynamic (auto-assigned) localhost port chosen at startup. Run `prox status` to see the address currently in use, or pin a fixed port by adding this to `prox.yaml`:
 
-Check supervisor status:
+```yaml
+api:
+  port: 5555
+```
+
+With `api.port: 5555` set, check supervisor status:
 
 ```bash
 curl http://localhost:5555/api/v1/status

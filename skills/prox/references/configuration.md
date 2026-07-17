@@ -46,8 +46,9 @@ processes:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api.port` | int | dynamic | HTTP API port (auto-assigned if not specified or port in use) |
+| `api.port` | int | dynamic | HTTP API port. When unset (or `0`), a free port is auto-assigned; an explicit port is used as-is — if it's already in use the API server fails to start (logged as an error) rather than picking another port |
 | `api.host` | string | `127.0.0.1` | API bind address |
+| `api.auth` | bool | auto | Force authentication on (`true`) or off (`false`). Omitted: auth is enabled automatically unless `api.host` is localhost-only |
 | `env_file` | string | — | Global .env file path, loaded for all processes |
 | `processes` | map | required | Process definitions |
 

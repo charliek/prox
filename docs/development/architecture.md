@@ -36,7 +36,7 @@ This document describes the internal design of prox for contributors.
 
 ## Log Manager
 
-- Ring buffer per process (configurable size, default 1000 lines or 1MB)
+- Ring buffer per process (configurable size, default 1000 lines)
 - Each entry: `{timestamp, process, stream (stdout|stderr), line}`
 - Supports multiple concurrent readers/subscribers
 - Filter primitives: by process, by pattern (substring or regex)
@@ -56,26 +56,25 @@ This document describes the internal design of prox for contributors.
 
 1. Parse config file
 2. Load environment (global .env, per-process env_file, per-process env)
-3. Start HTTP API server
-4. Start each process
-5. Begin health checks (if configured)
-6. Attach log subscribers (terminal or TUI)
+3. Start each process (and begin its health checks, if configured)
+4. Start HTTP API server
+5. Attach log subscribers (terminal or TUI)
 
 ### Shutdown (Ctrl+C or API)
 
 1. Stop accepting new API requests
-2. Send SIGTERM to all child processes
-3. Wait for graceful shutdown (default 10 seconds)
-4. Send SIGKILL to any remaining processes
-5. Exit
+2. For each process, send SIGTERM to its entire process group (not just the leader), so descendants spawned by the command are included
+3. Poll the group's liveness until it exits or the graceful deadline passes (by default ~8 seconds: a 10-second total shutdown budget minus a 2-second reserve for the SIGKILL/verify phase)
+4. If the group is still alive at the graceful deadline, send SIGKILL to the group and poll again until the kill deadline passes
+5. Verify the group is actually gone; if it survived SIGKILL, the stop reports `PROCESS_GROUP_NOT_REAPED` instead of succeeding
+6. Exit
 
 ### Process Restart
 
-1. Send SIGTERM to process
-2. Wait for shutdown (timeout → SIGKILL)
-3. Reset restart counter if appropriate
-4. Start process again
-5. Reset health check state
+1. Stop the process: SIGTERM to its process group, graceful liveness polling, SIGKILL escalation to the group at the graceful deadline, then a post-kill liveness check. If the group could not be reaped, restart aborts before starting a replacement and reports `PROCESS_GROUP_NOT_REAPED` (a surviving group is never shadowed by a new one)
+2. Increment the restart counter
+3. Start the process again — `env_file` files are re-read from disk on every start (including this restart's start half) and merged with the inline `env` values captured at `up` time
+4. Reset health check state
 
 ### Health Checks
 

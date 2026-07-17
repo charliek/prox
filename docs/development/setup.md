@@ -34,14 +34,18 @@ prox/
 │   └── prox/
 │       └── main.go           # CLI entrypoint
 ├── internal/
-│   ├── config/               # YAML parsing, validation
-│   ├── supervisor/           # Process orchestration
-│   ├── logs/                 # Log buffer, subscriptions
 │   ├── api/                  # HTTP server and handlers
+│   ├── cli/                  # CLI command definitions
+│   ├── config/               # YAML parsing, validation
+│   ├── constants/            # Shared constants (timeouts, buffer sizes, defaults)
+│   ├── daemon/               # Background daemon lifecycle, PID file, state file
+│   ├── domain/               # Core domain types and error definitions
+│   ├── logs/                 # Log buffer, subscriptions
 │   ├── proxy/                # Standalone proxy, request tracking, capture
 │   ├── proxyd/               # Shared proxy daemon
+│   ├── supervisor/           # Process orchestration
 │   ├── tui/                  # Bubbletea TUI
-│   └── cli/                  # CLI command definitions
+│   └── version/              # Build/version metadata
 ├── docs/                     # Documentation
 ├── prox.yaml                 # Example config
 ├── go.mod

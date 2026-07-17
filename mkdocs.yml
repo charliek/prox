@@ -93,7 +93,8 @@ nav:
   - Guides:
       - Local DNS & Certificates: guides/local-dns.md
       - Shared Proxy Across Projects: guides/shared-proxy.md
-      - Discovery: discovery/shared-proxy-across-projects.md
+  - Design Notes:
+      - Shared Proxy Across Projects: discovery/shared-proxy-across-projects.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
