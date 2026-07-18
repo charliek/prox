@@ -217,6 +217,19 @@ func TestLoadDecodedBody(t *testing.T) {
 		assert.Nil(t, got.Data)
 	})
 
+	t.Run("allowlist violation surfaces error with unavailable reason", func(t *testing.T) {
+		allowed := t.TempDir()
+		outside := t.TempDir()
+		fp := filepath.Join(outside, "secret.bin")
+		require.NoError(t, os.WriteFile(fp, []byte("secret"), 0600))
+		body := &CapturedBody{FilePath: fp}
+		got, err := LoadDecodedBody(body, []string{allowed})
+		require.Error(t, err) // out-of-allowlist path is not benign
+		assert.False(t, got.Available)
+		assert.Equal(t, "unavailable", got.UnavailableReason)
+		assert.Nil(t, got.Data)
+	})
+
 	t.Run("disk-backed gzip body loads and decodes", func(t *testing.T) {
 		dir := t.TempDir()
 		payload := []byte(`{"disk":"gzip"}`)

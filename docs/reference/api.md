@@ -266,7 +266,7 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 {
   "requests": [
     {
-      "id": "a1b2c3d",
+      "id": "a1b2c3d4e5f6",
       "timestamp": "2025-01-19T10:32:01.123Z",
       "method": "GET",
       "url": "/api/users",
@@ -316,7 +316,7 @@ Body data is available only when capture was enabled with `prox up --capture` or
 
 ```json
 {
-  "id": "a1b2c3d",
+  "id": "a1b2c3d4e5f6",
   "timestamp": "2025-01-19T10:32:01.123Z",
   "method": "POST",
   "url": "/api/users",
@@ -359,8 +359,8 @@ Body data is available only when capture was enabled with `prox up --capture` or
 **Examples:**
 
 ```bash
-curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d
-curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d?include=body"
+curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6
+curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6?include=body"
 ```
 
 ### GET /proxy/requests/stream
@@ -376,7 +376,7 @@ The stream is long-lived: it is exempt from the 30s request-timeout class and en
 ```
 : connected
 
-data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","hostname":"api.local.dev","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
+data: {"id":"a1b2c3d4e5f6","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","hostname":"api.local.dev","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```
 
 **Example:**

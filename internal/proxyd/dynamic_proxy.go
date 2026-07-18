@@ -256,8 +256,16 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			case crw != nil && crw.Hijacked():
 				// After a WebSocket upgrade all traffic bypassed the capture
 				// writer; finalizing would record garbage (status 200, empty
-				// body). Record metadata only, like a non-capture route.
-				statusCode = crw.StatusCode()
+				// body). The successful upgrade writes the 101 raw to the
+				// hijacked conn, so record the protocol switch and keep
+				// metadata only, like a non-capture route.
+				statusCode = http.StatusSwitchingProtocols
+				// The metadata-only record carries no Details, so eviction
+				// would never clean a request-body file spilled to disk before
+				// the upgrade; finalize and clean it up here to avoid orphaning
+				// it.
+				proxy.FinalizeRequestBody(r.Body)
+				dp.captureManager.CleanupRequest(requestID)
 			case crw != nil:
 				statusCode = crw.StatusCode()
 				// Freeze the request-body capture before publishing the record:

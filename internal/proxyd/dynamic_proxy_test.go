@@ -1,6 +1,7 @@
 package proxyd
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
@@ -198,6 +200,70 @@ func TestDynamicProxy_CaptureDisk_EvictionDeletesFiles(t *testing.T) {
 
 	if _, err := os.Stat(resFile); !os.IsNotExist(err) {
 		t.Errorf("capture file %s should have been deleted on eviction, stat err = %v", resFile, err)
+	}
+}
+
+// hijackRecorder is an http.ResponseWriter that also implements http.Hijacker,
+// backed by an in-memory net.Pipe, so a reverse-proxy WebSocket upgrade can be
+// driven in a unit test (httptest.ResponseRecorder alone is not a Hijacker).
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	conn net.Conn
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	rw := bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn))
+	return h.conn, rw, nil
+}
+
+func TestDynamicProxy_Hijacked_RecordsSwitchingProtocols(t *testing.T) {
+	// Backend accepts the upgrade by hijacking and writing a raw 101.
+	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+	})
+
+	dp, rm, _ := newCaptureProxy(t, true, host, port, 10)
+
+	clientEnd, testEnd := net.Pipe()
+	defer clientEnd.Close()
+	defer testEnd.Close()
+	// Drain whatever the proxy writes to the hijacked client conn (the 101) so
+	// its flush does not block on the synchronous pipe.
+	go func() { _, _ = io.Copy(io.Discard, testEnd) }()
+
+	hr := &hijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: clientEnd}
+	req := httptest.NewRequest("GET", "http://api.local.dev/ws", nil)
+	req.Host = "api.local.dev"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+	go func() {
+		dp.handler(80).ServeHTTP(hr, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hijacked request did not complete within 5s")
+	}
+
+	records := rm.Recent(proxy.RequestFilter{ProjectDir: "/projects/a"})
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	rec0 := records[0]
+	if rec0.StatusCode != http.StatusSwitchingProtocols {
+		t.Errorf("StatusCode = %d, want %d (101 Switching Protocols)", rec0.StatusCode, http.StatusSwitchingProtocols)
+	}
+	if rec0.Details != nil {
+		t.Error("Details should be nil for a hijacked (metadata-only) record")
 	}
 }
 

@@ -520,6 +520,13 @@ func TestParseSinceFlag(t *testing.T) {
 			t.Error("expected error for malformed --since value")
 		}
 	})
+
+	t.Run("negative duration errors", func(t *testing.T) {
+		_, err := parseSinceFlag("-5m")
+		if err == nil {
+			t.Error("expected error for negative --since duration")
+		}
+	})
 }
 
 func TestRunRequests_SinceValidation(t *testing.T) {

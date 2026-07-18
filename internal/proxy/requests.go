@@ -12,7 +12,7 @@ import (
 
 // RequestRecord represents a single proxied request.
 type RequestRecord struct {
-	// ID is a 7-character hash generated from timestamp, method, and URL.
+	// ID is a 12-character hash generated from timestamp, method, and URL.
 	ID         string        `json:"id"`
 	Timestamp  time.Time     `json:"timestamp"`
 	Method     string        `json:"method"`
@@ -60,16 +60,17 @@ type CapturedBody struct {
 // and their capture files would overwrite (and cross-delete on eviction).
 var requestIDCounter atomic.Uint64
 
-// GenerateRequestID creates a short hash ID (7 chars, git-style) from request
+// GenerateRequestID creates a short hash ID (12 chars, git-style) from request
 // data plus a per-process counter, so IDs are unique within a process even for
-// simultaneous identical requests. (Truncating the hash to 28 bits leaves a
-// negligible birthday-collision residual across the 1000-record ring.)
-// Exported so the shared daemon can generate a request ID before proxying
-// (needed for capture file naming).
+// simultaneous identical requests. (Truncating the hash to 48 bits keeps the
+// birthday-collision residual across the 1000-record ring negligible, unlike
+// the 28 bits of a 7-char ID whose ~0.2%-per-full-ring collision odds could
+// overwrite capture files.) Exported so the shared daemon can generate a
+// request ID before proxying (needed for capture file naming).
 func GenerateRequestID(timestamp time.Time, method, url string) string {
 	data := fmt.Sprintf("%d:%d:%s:%s", timestamp.UnixNano(), requestIDCounter.Add(1), method, url)
 	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])[:7]
+	return hex.EncodeToString(hash[:])[:12]
 }
 
 // RequestFilter specifies criteria for filtering requests.

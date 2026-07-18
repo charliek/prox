@@ -82,6 +82,23 @@ func TestRenderBodySection_NonJSONTextUnchanged(t *testing.T) {
 	assert.Contains(t, lines, "  line2")
 }
 
+// TestRenderBodyLines_ControlCharsSanitized pins that terminal control
+// sequences embedded in a (mislabeled non-binary) captured body are neutralized
+// before rendering, so a socket-supplied record cannot emit raw ESC/BEL/OSC
+// bytes that manipulate the terminal.
+func TestRenderBodyLines_ControlCharsSanitized(t *testing.T) {
+	b := &BodyData{
+		ContentType: "text/plain",
+		Data:        "before\x1b]0;evil\x07after",
+	}
+	joined := strings.Join(renderBodyLines(b), "\n")
+	assert.NotContains(t, joined, "\x1b", "raw ESC must not reach the terminal")
+	assert.NotContains(t, joined, "\x07", "raw BEL must not reach the terminal")
+	assert.Contains(t, joined, "before")
+	assert.Contains(t, joined, "after")
+	assert.Contains(t, joined, "�", "control chars replaced with U+FFFD")
+}
+
 // TestRenderBodySection_EmptyContentTypeTitle pins that an absent
 // Content-Type/Content-Encoding leaves no dangling comma or empty-segment
 // artifact in the section title.

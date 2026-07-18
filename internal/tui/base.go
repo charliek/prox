@@ -527,8 +527,12 @@ func bodySectionTitle(title string, b *BodyData) string {
 // unavailable (evicted) notice, a binary-data marker, or the body text split
 // into lines. Non-binary JSON bodies (Content-Type contains "json", or the
 // raw text is itself valid JSON) are pretty-printed 2-space indented; any
-// json.Indent failure falls back to the raw text unchanged, and non-JSON
-// text always renders byte-for-byte unchanged.
+// json.Indent failure falls back to the raw text. Text otherwise renders
+// unchanged except that ASCII control characters (< 0x20, other than tab and
+// the newlines used for line splitting) and DEL (0x7F) are replaced with the
+// Unicode replacement character, so ESC/BEL/OSC sequences from a captured body
+// cannot manipulate the terminal. (Classification usually marks such bodies
+// binary, but a socket-supplied record could lie; this is a cheap defense.)
 func renderBodyLines(body *BodyData) []string {
 	if body.Unavailable {
 		return []string{dimStyle.Render("(body no longer available)")}
@@ -550,9 +554,25 @@ func renderBodyLines(body *BodyData) []string {
 
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {
-		lines = append(lines, "  "+line)
+		lines = append(lines, "  "+sanitizeControlChars(line))
 	}
 	return lines
+}
+
+// sanitizeControlChars replaces ASCII control characters that could manipulate
+// the terminal (everything < 0x20 except tab, plus DEL 0x7F) with the Unicode
+// replacement character. Newlines are already consumed by line splitting before
+// this runs, so only intra-line control bytes (ESC, BEL, etc.) are affected.
+func sanitizeControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return '�'
+		}
+		return r
+	}, s)
 }
 
 // shouldPrettyPrintJSON reports whether a non-binary body should be run

@@ -451,8 +451,8 @@ Examples:
   prox requests --since 5m         # Show requests from the last 5 minutes
   prox requests --url /api         # Filter by URL substring (path+query)
   prox requests --json             # Output as JSON
-  prox requests abc1234            # Show details for request abc1234
-  prox requests abc1234 --body     # Include captured request/response bodies`,
+  prox requests abc1234def56       # Show details for request abc1234def56
+  prox requests abc1234def56 --body # Include captured request/response bodies`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runRequests,
 }
@@ -607,7 +607,7 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 func printCapturedBody(label string, body *api.CapturedBodyResponse, includeBody bool) {
 	fmt.Printf("\n--- %s (%d bytes", label, body.Size)
 	if body.Truncated {
-		fmt.Print(", truncated")
+		fmt.Printf(", %d bytes captured, truncated", body.CapturedSize)
 	}
 	if body.ContentType != "" {
 		fmt.Printf(", %s", body.ContentType)
@@ -664,6 +664,9 @@ func parseSinceFlag(value string) (time.Time, error) {
 		return t, nil
 	}
 	if d, err := time.ParseDuration(value); err == nil {
+		if d < 0 {
+			return time.Time{}, fmt.Errorf("invalid --since value %q: duration must not be negative", value)
+		}
 		return time.Now().Add(-d), nil
 	}
 	return time.Time{}, fmt.Errorf("invalid --since value %q: must be an RFC3339 timestamp or a duration (e.g. 5m, 1h)", value)

@@ -202,11 +202,13 @@ func gunzipLimited(raw []byte, limit int64) ([]byte, bool) {
 
 // LoadDecodedBody composes LoadCapturedBody + DecodeCapturedBody.
 //
-// A nil body yields an unavailable result. When the raw load fails (a FilePath
-// body whose file was evicted/removed, or an out-of-allowlist path), the record
-// itself is still valid (D7): the result is marked unavailable with reason
-// "evicted" and a nil error, so the caller returns HTTP 200 with no data rather
-// than failing the request.
+// A nil body yields an unavailable result. A missing capture file (the record
+// is still valid, but its FilePath body was evicted/removed) is treated as a
+// benign condition (D7): the result is marked unavailable with reason "evicted"
+// and a nil error, so the caller returns HTTP 200 with no data rather than
+// failing the request. Any other load failure (e.g. an out-of-allowlist path or
+// an I/O error) is marked unavailable with reason "unavailable" and returned
+// together with the underlying error so callers can log it.
 func LoadDecodedBody(body *CapturedBody, allowedDirs []string) (DecodedBody, error) {
 	if body == nil {
 		return DecodedBody{Available: false}, nil
@@ -214,7 +216,10 @@ func LoadDecodedBody(body *CapturedBody, allowedDirs []string) (DecodedBody, err
 
 	raw, err := LoadCapturedBody(body, allowedDirs)
 	if err != nil {
-		return DecodedBody{Available: false, UnavailableReason: "evicted"}, nil
+		if os.IsNotExist(err) {
+			return DecodedBody{Available: false, UnavailableReason: "evicted"}, nil
+		}
+		return DecodedBody{Available: false, UnavailableReason: "unavailable"}, err
 	}
 
 	return DecodeCapturedBody(body, raw), nil

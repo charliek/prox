@@ -198,9 +198,9 @@ func TestRequestManager_Unsubscribe(t *testing.T) {
 func TestGenerateRequestID(t *testing.T) {
 	timestamp := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
 
-	t.Run("generates 7 character ID", func(t *testing.T) {
+	t.Run("generates 12 character ID", func(t *testing.T) {
 		id := GenerateRequestID(timestamp, "GET", "/api/users")
-		assert.Len(t, id, 7)
+		assert.Len(t, id, 12)
 	})
 
 	t.Run("same inputs produce different IDs", func(t *testing.T) {
@@ -243,7 +243,7 @@ func TestRequestManager_Record_GeneratesID(t *testing.T) {
 
 	records := m.Recent(RequestFilter{})
 	require.Len(t, records, 1)
-	assert.Len(t, records[0].ID, 7, "expected ID to be generated")
+	assert.Len(t, records[0].ID, 12, "expected ID to be generated")
 }
 
 func TestRequestManager_Record_PreservesExistingID(t *testing.T) {

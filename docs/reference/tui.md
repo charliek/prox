@@ -107,9 +107,11 @@ Request Body (35 bytes, application/json)
   present.
 - Bodies are pretty-printed 2-space indented JSON when the Content-Type
   contains `json`, or when the raw body is itself valid JSON. Any other text
-  renders unchanged. Binary bodies show `[binary data]`; bodies that could
-  no longer be loaded (e.g. evicted from disk) show `(body no longer
-  available)`.
+  renders unchanged except that ASCII control characters (other than tab and
+  newline) and DEL are sanitized to the Unicode replacement character, so a
+  captured body cannot emit ESC/BEL/OSC sequences that manipulate the terminal.
+  Binary bodies show `[binary data]`; bodies that could no longer be loaded
+  (e.g. evicted from disk) show `(body no longer available)`.
 
 ## Process Filter Mode
 

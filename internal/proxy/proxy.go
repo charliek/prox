@@ -393,9 +393,16 @@ func (s *Service) createRouter() http.Handler {
 		var details *RequestDetails
 		var statusCode int
 		if crw != nil && crw.Hijacked() {
-			// Post-upgrade traffic bypassed the capture writer; record metadata
-			// only rather than a garbage 200/empty-body capture.
-			statusCode = crw.StatusCode()
+			// A successful reverse-proxy upgrade writes the 101 raw to the
+			// hijacked conn, bypassing WriteHeader, so the writer's statusCode
+			// is meaningless here. Record the protocol switch and record
+			// metadata only rather than a garbage 200/empty-body capture.
+			statusCode = http.StatusSwitchingProtocols
+			// The metadata-only record carries no Details, so eviction would
+			// never clean a request-body file spilled to disk before the
+			// upgrade; finalize and clean it up here to avoid orphaning it.
+			FinalizeRequestBody(r.Body)
+			s.captureManager.CleanupRequest(requestID)
 		} else if crw != nil {
 			statusCode = crw.StatusCode()
 			// Freeze the request-body capture before the record is published

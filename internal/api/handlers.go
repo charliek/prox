@@ -503,6 +503,7 @@ func (h *Handlers) convertCapturedBody(body *proxy.CapturedBody, includeData boo
 	decoded, err := proxy.LoadDecodedBody(body, h.captureAllowedDirs())
 	if err != nil {
 		log.Printf("Error loading captured body: %v", err)
+		resp.UnavailableReason = decoded.UnavailableReason
 		return resp
 	}
 
