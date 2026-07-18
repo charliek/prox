@@ -474,12 +474,28 @@ func runUp(cmd *cobra.Command, args []string) error {
 	apiCancel()
 
 	// Stop supervisor with a deadline sized from the live per-process stop
-	// budgets, plus a small margin for the SIGKILL escalation and finalization.
-	supCtx, supCancel := context.WithTimeout(context.Background(), sup.MaxStopBudget()+teardownStageTimeout)
-	if err := sup.Stop(supCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-	}
+	// budgets, plus stopVerdictMargin (so a stop joining an in-flight primary
+	// outlives its finalization window) and a stage margin. StopWaitBound()
+	// folds in the per-process budget + verdict margin so this call site does not
+	// duplicate the constant (#36, D3).
+	supCtx, supCancel := context.WithTimeout(context.Background(), sup.StopWaitBound()+teardownStageTimeout)
+	stopErr := sup.Stop(supCtx)
 	supCancel()
+	if stopErr != nil {
+		// Surface each survivor via the existing SystemLog pattern so operators see
+		// which process leaked a group. C4 wires this outcome into the shutdown
+		// coordinator (the blocking endpoint's failure body and the foreground exit
+		// contract); C3 only captures and logs it and does NOT change runUp's return.
+		var stopFail *domain.ProcessStopError
+		if errors.As(stopErr, &stopFail) {
+			for _, f := range stopFail.Failures {
+				sup.SystemLog("process %s did not stop cleanly: %v", f.Name, f.Err)
+			}
+		} else {
+			sup.SystemLog("supervisor stop error: %v", stopErr)
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", stopErr)
+	}
 
 	// Log shutdown complete before closing the log manager
 	sup.SystemLog("shutdown complete")

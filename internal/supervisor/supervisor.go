@@ -15,6 +15,16 @@ import (
 	"github.com/charliek/prox/internal/logs"
 )
 
+// stopVerdictMargin is the slack added to each per-process stop budget when
+// Supervisor.Stop sizes its goroutine contexts (and the outer bound up.go grants
+// via StopWaitBound). A Supervisor.Stop joining an in-flight primary stop must
+// outlive the primary's finalization window: the primary's verdict can land up
+// to ~budget + outputDrainTimeout + 1s after the primary began (see the
+// finalization gate in process.go). Sizing the secondary at budget +
+// stopVerdictMargin keeps it alive through that tail so it aggregates the real
+// PROCESS_GROUP_NOT_REAPED verdict instead of ctx-expiring first (#36, D3).
+const stopVerdictMargin = outputDrainTimeout + 2*time.Second
+
 // SupervisorConfig holds configuration for the supervisor
 type SupervisorConfig struct {
 	ShutdownTimeout time.Duration
@@ -363,7 +373,31 @@ func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 	wg.Wait()
 }
 
-// Stop stops all processes and the supervisor
+// stopEvent maps a per-process Stop result to the event that Supervisor.Stop and
+// StopProcess both emit, so the event semantics stay uniform across the two paths
+// by construction (#36, D3): a clean stop (or already-not-running) is
+// process_stopped; a surviving group is process_crashed (state is already
+// Crashed); any other error (ctx expiry/cancellation) is not proof of anything
+// and emits no event (ok == false).
+func stopEvent(err error) (EventType, bool) {
+	switch {
+	case err == nil || errors.Is(err, domain.ErrProcessNotRunning):
+		return EventTypeProcessStopped, true
+	case errors.Is(err, domain.ErrProcessGroupNotReaped):
+		return EventTypeProcessCrashed, true
+	default:
+		return "", false
+	}
+}
+
+// Stop stops all processes and the supervisor.
+//
+// The signature stays the idiomatic Stop(ctx) error, but the concrete failure
+// value is a *domain.ProcessStopError aggregating every process that did not stop
+// cleanly (each failure wraps a sentinel such as ErrProcessGroupNotReaped, so
+// errors.Is/errors.As see through the aggregate). It returns a literal nil --
+// never a typed-nil *ProcessStopError -- when the stop is clean, and likewise nil
+// from the not-running early return (nothing to do) (#36, D3).
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.state != "running" {
@@ -383,12 +417,16 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Stop all processes concurrently. Each process gets its own timeout context
-	// sized from its effective stop budget (StopTimeout), so a per-process
-	// stop_timeout is honored individually. This replaces the single shared
-	// shutdownCtx that previously truncated every process to one common deadline
-	// (#35, D2). The daemon's outer deadline is sized by up.go from
-	// MaxStopBudget() so ctx here rarely bounds anything.
-	var wg sync.WaitGroup
+	// sized from its effective stop budget (StopTimeout) plus stopVerdictMargin,
+	// so a per-process stop_timeout is honored individually AND a stop joining an
+	// in-flight primary as a secondary outlives the primary's finalization window
+	// (#35, D2 / #36, D3). The daemon's outer deadline is sized by up.go from
+	// StopWaitBound() so ctx here rarely bounds anything.
+	var (
+		wg       sync.WaitGroup
+		failMu   sync.Mutex
+		failures []domain.ProcessStopFailure
+	)
 	for _, mp := range processes {
 		wg.Add(1)
 		go func(mp *ManagedProcess) {
@@ -397,31 +435,38 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 			// so read it once here rather than taking the process lock a second
 			// time via mp.StopTimeout().
 			info := mp.Info()
-			stopCtx, cancel := context.WithTimeout(ctx, info.StopTimeout)
+			stopCtx, cancel := context.WithTimeout(ctx, info.StopTimeout+stopVerdictMargin)
 			defer cancel()
 			if info.PID > 0 {
 				s.SystemLog("sending SIGTERM to %s (pid %d)", info.Name, info.PID)
 			}
-			if err := mp.Stop(stopCtx); err != nil && err != domain.ErrProcessNotRunning {
+			err := mp.Stop(stopCtx)
+			if evt, ok := stopEvent(err); ok {
+				s.emit(SupervisorEvent{
+					Type:      evt,
+					Process:   mp.Name(),
+					Timestamp: time.Now(),
+					Info:      mp.Info(),
+				})
+			}
+			// A non-clean stop (anything but nil/ErrProcessNotRunning) is logged once
+			// and recorded for the aggregate, whichever class it is. A surviving group
+			// is additionally surfaced prominently (D4); its process_crashed event was
+			// already emitted above (#36, D3).
+			if err != nil && !errors.Is(err, domain.ErrProcessNotRunning) {
 				s.logManager.Write(domain.LogEntry{
 					Timestamp: time.Now(),
 					Process:   mp.Name(),
 					Stream:    domain.StreamStderr,
 					Line:      fmt.Sprintf("Error stopping: %v", err),
 				})
-				// Full-instance stop is best-effort, but surface an
-				// un-reapable group prominently so operators can see which
-				// process leaked (D4). We do not abort the rest of shutdown.
 				if errors.Is(err, domain.ErrProcessGroupNotReaped) {
 					s.SystemLog("could not reap process group for %s", mp.Name())
 				}
+				failMu.Lock()
+				failures = append(failures, domain.ProcessStopFailure{Name: mp.Name(), Err: err})
+				failMu.Unlock()
 			}
-			s.emit(SupervisorEvent{
-				Type:      EventTypeProcessStopped,
-				Process:   mp.Name(),
-				Timestamp: time.Now(),
-				Info:      mp.Info(),
-			})
 		}(mp)
 	}
 	wg.Wait()
@@ -438,7 +483,14 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		Timestamp: time.Now(),
 	})
 
-	return nil
+	if len(failures) == 0 {
+		// Return a literal nil, never a typed-nil *ProcessStopError (which would be
+		// a non-nil error interface).
+		return nil
+	}
+	// Stable output: sort by process name after the concurrent collection.
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Name < failures[j].Name })
+	return &domain.ProcessStopError{Failures: failures}
 }
 
 // Processes returns info for all processes
@@ -544,10 +596,13 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 	stopCtx, cancel := context.WithTimeout(ctx, mp.StopTimeout())
 	defer cancel()
 
+	// Event semantics are uniform with Supervisor.Stop via the shared stopEvent
+	// classifier (#36, D3): process_stopped on a clean/already-not-running stop,
+	// process_crashed on a surviving group, no event on any other error.
 	err := mp.Stop(stopCtx)
-	if err == nil || err == domain.ErrProcessNotRunning {
+	if evt, ok := stopEvent(err); ok {
 		s.emit(SupervisorEvent{
-			Type:      EventTypeProcessStopped,
+			Type:      evt,
 			Process:   name,
 			Timestamp: time.Now(),
 			Info:      mp.Info(),
@@ -633,6 +688,16 @@ func (s *Supervisor) MaxStopBudget() time.Duration {
 		return constants.DefaultShutdownTimeout
 	}
 	return maxBudget
+}
+
+// StopWaitBound returns the deadline a caller should grant Supervisor.Stop: the
+// largest live per-process stop budget plus stopVerdictMargin. The margin lets a
+// per-process stop goroutine that joins an in-flight primary as a secondary
+// outlive the primary's finalization window (see stopVerdictMargin). up.go sizes
+// its supervisor teardown stage from this so it does not duplicate the constant
+// (#36, D3).
+func (s *Supervisor) StopWaitBound() time.Duration {
+	return s.MaxStopBudget() + stopVerdictMargin
 }
 
 // Status returns supervisor status

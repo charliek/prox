@@ -148,7 +148,7 @@ type ManagedProcess struct {
 	launchGate func() error
 
 	// stopBarrier is a test-only seam (nil in production). Stop invokes it,
-	// unlocked, at two interleaving-sensitive points identified by phase:
+	// unlocked, at interleaving-sensitive points identified by phase:
 	//
 	//   - "primary-installed": in the primary path just after the stop episode is
 	//     installed and the lock released (before any signalling/verdict work), so
@@ -156,6 +156,12 @@ type ManagedProcess struct {
 	//   - "secondary-joined": in the Stopping branch just after a secondary
 	//     captured the in-flight episode and released the lock (before it waits on
 	//     the verdict), so a test can confirm the join happened.
+	//   - "finalizing": in the primary path inside the finalization window, after
+	//     the monitor-drain wait and BEFORE the authoritative verdict/state commit,
+	//     so a test can hold a verdict late and prove a concurrent secondary
+	//     waiter outlives exactly this tail (the window stopVerdictMargin covers).
+	//   - "verdict-committed": in the primary path just after the terminal state
+	//     and episode were committed atomically, to probe that boundary.
 	//
 	// Together they make concurrent-stop interleavings deterministic without
 	// sleeps (#32), mirroring the restartStartBarrier seam pattern.
@@ -406,8 +412,14 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 // computeDeadlines derives the graceful (SIGTERM) and kill (SIGKILL/verify)
 // deadlines for a Stop from the caller's context.
 //
-//   - If ctx has no deadline, a fallback of shutdownTimeout (or
-//     constants.DefaultShutdownTimeout when unset) is used.
+//   - The per-process stop budget (shutdownTimeout, or
+//     constants.DefaultShutdownTimeout when unset) is the graceful+kill window.
+//     It is the fallback when ctx carries no deadline, AND an upper bound when
+//     ctx carries a LATER one: Supervisor.Stop deliberately grants each goroutine
+//     StopTimeout + stopVerdictMargin so a stop joining an in-flight primary as a
+//     secondary can outlive the primary's finalization window, but that oversized
+//     ctx must not stretch THIS process's own escalation past its stop_timeout
+//     (#35). An EARLIER ctx deadline (e.g. a short API request) is still honored.
 //   - KillGrace is reserved at the tail for the SIGKILL phase, so the graceful
 //     phase ends at (deadline - KillGrace).
 //   - If the budget is already spent (remaining <= 0) or too small to reserve
@@ -419,13 +431,24 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline, killDeadline time.Time) {
 	now := time.Now()
 
+	// Read the per-process budget exactly ONCE and use it for both the
+	// no-deadline fallback and the later-deadline cap below, so there is no
+	// double-read window. The budget in force when this stop began governs
+	// escalation; a caller ctx with a LATER deadline is only an outer bound and
+	// cannot stretch escalation past stop_timeout (#35). A config swap cannot
+	// occur mid-stop -- startWithConfig only swaps while a start is permitted, and
+	// this stop has already set state=Stopping, which blocks startWithConfig -- so
+	// this value is stable for the whole stop; it is exactly the budget the
+	// running (or replacement) process was launched under, the correct governor.
+	budget := p.StopTimeout()
+	if budget <= 0 {
+		budget = constants.DefaultShutdownTimeout
+	}
+	budgetDeadline := now.Add(budget)
+
 	dl, ok := ctx.Deadline()
-	if !ok {
-		timeout := p.StopTimeout()
-		if timeout <= 0 {
-			timeout = constants.DefaultShutdownTimeout
-		}
-		dl = now.Add(timeout)
+	if !ok || dl.After(budgetDeadline) {
+		dl = budgetDeadline
 	}
 
 	// If the budget is already spent (remaining <= 0) or too small to reserve
@@ -587,6 +610,14 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 	select {
 	case <-inst.done:
 	case <-time.After(outputDrainTimeout + time.Second):
+	}
+
+	// Test seam: park inside the finalization window, AFTER the monitor-drain
+	// wait and BEFORE the authoritative verdict/state commit, so a test can hold a
+	// primary's verdict late and prove a concurrent secondary waiter (sized by
+	// Supervisor.Stop's stopVerdictMargin) outlives exactly this tail (#32/#36).
+	if barrier != nil {
+		barrier("finalizing")
 	}
 
 	// Verdict: a fresh probe now that the leader has been reaped is
