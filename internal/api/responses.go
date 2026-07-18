@@ -213,6 +213,11 @@ type ProxyRequestResponse struct {
 	StatusCode int    `json:"status_code"`
 	DurationMs int64  `json:"duration_ms"`
 	RemoteAddr string `json:"remote_addr"`
+	// InFlight marks a record published at response-header time, before the
+	// body finished streaming; DurationMs stays 0 until the completion event
+	// replaces this record (same ID). Omitted for completed records so their
+	// JSON stays byte-identical to the pre-in-flight wire format.
+	InFlight bool `json:"in_flight,omitempty"`
 }
 
 // ProxyRequestsResponse represents the response for GET /proxy/requests
@@ -234,6 +239,7 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 		StatusCode: req.StatusCode,
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
+		InFlight:   req.InFlight,
 	}
 }
 

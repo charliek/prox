@@ -171,3 +171,63 @@ func TestFormatRequestDetail_BodySections(t *testing.T) {
 	assert.Contains(t, out, "Response Body (10 bytes)")
 	assert.Contains(t, out, "(body no longer available)")
 }
+
+// TestFormatRequestDetail_InFlight_ShowsDurationNote verifies the Duration
+// line reads "(in flight)" instead of a bogus "0ms" for a still-streaming
+// request (D10).
+func TestFormatRequestDetail_InFlight_ShowsDurationNote(t *testing.T) {
+	b := &BaseModel{
+		requestDetail: &RequestDetailData{
+			ID:         "req-1",
+			Timestamp:  "2026-07-18 00:00:00.000",
+			Method:     "GET",
+			URL:        "/api/v1/stream",
+			StatusCode: 200,
+			InFlight:   true,
+		},
+	}
+
+	out := strings.Join(b.formatRequestDetail(), "\n")
+	assert.Contains(t, out, "Duration: (in flight)")
+	assert.NotContains(t, out, "Duration: 0ms")
+}
+
+// TestFormatRequestDetail_InFlight_NoDetailsNote verifies that a nil-Details
+// in-flight record gets an explanatory note rather than silently rendering
+// no headers/bodies section (which would otherwise be indistinguishable from
+// "capture not enabled").
+func TestFormatRequestDetail_InFlight_NoDetailsNote(t *testing.T) {
+	b := &BaseModel{
+		requestDetail: &RequestDetailData{
+			ID:         "req-1",
+			Timestamp:  "2026-07-18 00:00:00.000",
+			Method:     "GET",
+			URL:        "/api/v1/stream",
+			StatusCode: 200,
+			InFlight:   true,
+		},
+	}
+
+	out := strings.Join(b.formatRequestDetail(), "\n")
+	assert.Contains(t, out, "(request in flight — details arrive on completion)")
+}
+
+// TestFormatRequestDetail_Completed_NoInFlightNote verifies a completed
+// record with no captured Details (capture disabled) does NOT get the
+// in-flight note.
+func TestFormatRequestDetail_Completed_NoInFlightNote(t *testing.T) {
+	b := &BaseModel{
+		requestDetail: &RequestDetailData{
+			ID:         "req-1",
+			Timestamp:  "2026-07-18 00:00:00.000",
+			Method:     "GET",
+			URL:        "/api/v1/stream",
+			StatusCode: 200,
+			DurationMs: 42,
+		},
+	}
+
+	out := strings.Join(b.formatRequestDetail(), "\n")
+	assert.NotContains(t, out, "in flight")
+	assert.Contains(t, out, "Duration: 42ms")
+}

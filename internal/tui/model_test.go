@@ -325,6 +325,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 
 	// Send a proxy request through Update()
 	req := proxy.RequestRecord{
+		ID:         "req-1",
 		Timestamp:  time.Now(),
 		Subdomain:  "web",
 		Method:     "POST",
@@ -352,6 +353,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 
 	// Add another request and verify both are present
 	req2 := proxy.RequestRecord{
+		ID:         "req-2",
 		Timestamp:  time.Now(),
 		Subdomain:  "api",
 		Method:     "GET",
@@ -372,6 +374,54 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	filtered = m.filteredProxyRequests()
 	assert.Len(t, filtered, 1)
 	assert.Equal(t, "/api/users", filtered[0].URL)
+
+	// A same-ID re-record (e.g. an in-flight row's completion event) updates
+	// the row in place rather than appending a duplicate.
+	req1Updated := req
+	req1Updated.StatusCode = 204
+	req1Updated.Duration = 99 * time.Millisecond
+
+	newModel, _ = m.Update(ProxyRequestMsg(req1Updated))
+	m = newModel.(Model)
+
+	assert.Len(t, m.proxyRequests, 2, "same-ID update must not duplicate the row")
+	assert.Equal(t, 204, m.proxyRequests[0].StatusCode)
+	assert.Equal(t, 99*time.Millisecond, m.proxyRequests[0].Duration)
+}
+
+// TestModel_ProxyRequestMsg_SelectionStable verifies that upserting an
+// earlier row in place (D10) leaves a scrolled/selected position untouched:
+// detail-selection maps viewport line numbers to indices into proxyRequests,
+// so an in-place replacement must not shift any other row's index.
+func TestModel_ProxyRequestMsg_SelectionStable(t *testing.T) {
+	model := newTestModel()
+	model.ready = true
+	model.viewMode = ViewModeRequests
+	model.followMode = false // otherwise handleProxyRequest re-snaps to bottom
+
+	model.proxyRequests = []proxy.RequestRecord{
+		{ID: "req-a", Timestamp: time.Now(), Method: "GET", URL: "/a", StatusCode: 200},
+		{ID: "req-b", Timestamp: time.Now(), Method: "GET", URL: "/b", StatusCode: 200},
+		{ID: "req-c", Timestamp: time.Now(), Method: "GET", URL: "/c", StatusCode: 200},
+	}
+	model.updateViewport()
+
+	// Simulate a scrolled selection sitting on the third row.
+	model.viewport.YOffset = 2
+	assert.Equal(t, "req-c", model.getSelectedRequest())
+
+	// Update the FIRST row in place (an earlier row completing).
+	updated := model.proxyRequests[0]
+	updated.StatusCode = 204
+	newModel, _ := model.Update(ProxyRequestMsg(updated))
+	m := newModel.(Model)
+
+	assert.Len(t, m.proxyRequests, 3, "in-place update must not change the row count")
+	assert.Equal(t, 2, m.viewport.YOffset, "scroll position must be unchanged")
+	assert.Equal(t, "req-c", m.getSelectedRequest(), "selection must be unchanged")
+	assert.Equal(t, 204, m.proxyRequests[0].StatusCode, "the target row must reflect the update")
+	assert.Equal(t, "req-b", m.proxyRequests[1].ID, "other rows must keep their index")
+	assert.Equal(t, "req-c", m.proxyRequests[2].ID, "other rows must keep their index")
 }
 
 func TestViewModeSwitch(t *testing.T) {
@@ -453,6 +503,28 @@ func TestFormatProxyRequest_DurationOverflow(t *testing.T) {
 
 	// Verify status code is 3 chars right-aligned
 	assert.Contains(t, formatted, "200")
+}
+
+func TestFormatProxyRequest_InFlight(t *testing.T) {
+	model := newTestModel()
+
+	// An in-flight record carries the real header-time status but no
+	// duration yet; the duration column renders dots instead of digits,
+	// padded to the same 5-char width as the completed-request case.
+	req := proxy.RequestRecord{
+		Timestamp:  time.Now(),
+		Subdomain:  "api",
+		Method:     "GET",
+		URL:        "/stream",
+		StatusCode: 200,
+		InFlight:   true,
+	}
+
+	formatted := model.formatProxyRequest(req)
+
+	assert.Contains(t, formatted, "  ...ms", "duration column should render dots, 5-char padded, with the ms suffix")
+	assert.NotContains(t, formatted, "0ms", "in-flight rows must not render a fake zero duration")
+	assert.Contains(t, formatted, "200", "status should show the real header-time code")
 }
 
 func TestFormatProxyRequest_Padding(t *testing.T) {

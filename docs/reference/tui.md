@@ -57,6 +57,8 @@ The TUI has two views you can switch between with `Tab`:
 
 Status codes are color-coded: green (2xx), cyan (3xx), yellow (4xx), red (5xx), gray (0/unknown).
 
+A request whose response is still streaming shows its real header-time status but `...` in place of the duration until it completes; the row then updates in place (same position, no duplicate) rather than adding a new line.
+
 ## Keybindings
 
 ### General
@@ -112,6 +114,11 @@ Request Body (35 bytes, application/json)
   captured body cannot emit ESC/BEL/OSC sequences that manipulate the terminal.
   Binary bodies show `[binary data]`; bodies that could no longer be loaded
   (e.g. evicted from disk) show `(body no longer available)`.
+- A request still streaming its response shows `Duration: (in flight)` and,
+  since headers/bodies haven't been captured yet, `(request in flight —
+  details arrive on completion)` instead of the usual body sections. Detail
+  views do not live-update — reopen the request after it completes to see
+  its final headers and bodies.
 
 ## Process Filter Mode
 

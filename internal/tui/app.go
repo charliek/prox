@@ -228,6 +228,7 @@ func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIC
 				StatusCode: req.StatusCode,
 				Duration:   time.Duration(req.DurationMs) * time.Millisecond,
 				RemoteAddr: req.RemoteAddr,
+				InFlight:   req.InFlight,
 			}
 			p.Send(ProxyRequestMsg(record))
 		}

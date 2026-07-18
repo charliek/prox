@@ -293,6 +293,11 @@ already-seen record, so this endpoint stays free of duplicates.
 `api.local.dev`); it is omitted when not recorded (older records, or a
 daemon-side record that predates this field).
 
+`in_flight` is `true` on a request whose response is still streaming (the
+backend has sent headers but the body hasn't finished); it is omitted
+entirely once the request completes. `duration_ms` stays `0` while
+`in_flight` is `true` — read it only once the field is gone.
+
 **Example:**
 
 ```bash
@@ -385,6 +390,15 @@ The stream is long-lived: it is exempt from the 30s request-timeout class and en
 
 data: {"id":"a1b2c3d4e5f6","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","hostname":"api.local.dev","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```
+
+A proxied request emits **two** `data:` events sharing the same `id`: a
+start event the moment the backend's response headers arrive
+(`"in_flight":true`, `duration_ms` still `0`), and a completion event once
+the body finishes (no `in_flight` field, final `duration_ms`). There is no
+`event:` type field distinguishing them — consumers that key by `id` see a
+clean upsert; naive line-oriented consumers see one extra `data:` line per
+request. Early routing failures (no matching subdomain) emit only the
+completion event, since nothing was proxied.
 
 **Example:**
 

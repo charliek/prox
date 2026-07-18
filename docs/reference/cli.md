@@ -328,6 +328,8 @@ Each request is assigned a short hash ID (12 characters, git-style). These IDs a
 
 Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`. Capture applies in both standalone and shared-daemon mode — the enablement is propagated to the daemon at registration, and a daemon captures bodies only for the projects that opted in. When a request has no captured detail, `prox requests <id>` shows `(capture not enabled - use 'prox up --capture' to enable)`; if the body was captured but has since been evicted from the request buffer, it shows `(body no longer available)` instead. See [Request Capture](configuration.md#request-capture) for capture directories and daemon-upgrade notes.
 
+**In-flight requests:** a request whose response is still streaming (headers received, body not yet finished) shows `...` in the DURATION column of the table, `(in flight)` instead of `(Nms)` in `-f/--follow` output, and `Duration: (in flight)` with `(request in flight — details arrive on completion)` in the detail view. Table and TUI rows update in place once the request completes; `-f/--follow` output is a stream, so it prints a second line for the completion event (same ID, no `in_flight`). `--json` carries this as `"in_flight": true`, omitted once done.
+
 ### proxy
 
 Inspect and control the shared proxy daemon.
