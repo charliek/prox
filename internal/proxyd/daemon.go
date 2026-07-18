@@ -219,8 +219,11 @@ func RunDaemon(ctx context.Context) error {
 					)
 				}
 				if len(stale) > 0 && registry.IsEmpty() {
-					logger.Info("all routes cleaned up, shutting down")
-					server.RequestShutdown()
+					// Graced (not immediate) so a crash restart landing during
+					// this sweep — its self-heal replace completing just after —
+					// cancels the shutdown when the re-check sees its registration.
+					logger.Info("all routes cleaned up, scheduling shutdown check")
+					server.scheduleShutdownWhenEmpty()
 				}
 			}
 		}

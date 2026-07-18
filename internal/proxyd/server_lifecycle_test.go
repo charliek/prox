@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"os/exec"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -65,13 +68,11 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 	s := newLifecycleServer()
 
 	// Produce a PID that is guaranteed dead: run a process to completion.
-	cmd := exec.Command("true")
-	require.NoError(t, cmd.Run())
-	deadPID := cmd.Process.Pid
+	dead := deadPID(t)
 
 	req := newTestRequest("/projects/dead", "local.dev",
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
-	req.PID = deadPID
+	req.PID = dead
 	_, _, err := s.registry.Register(req)
 	require.NoError(t, err)
 
@@ -80,7 +81,7 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 
 	// The daemon sweep: detect stale PIDs, then remove via the PID-guarded path.
 	stale := s.registry.StalePIDs()
-	require.Equal(t, []StaleProject{{Dir: "/projects/dead", PID: deadPID}}, stale)
+	require.Equal(t, []StaleProject{{Dir: "/projects/dead", PID: dead}}, stale)
 	for _, sp := range stale {
 		removed, _, _ := s.removeStaleProject(sp.Dir, sp.PID)
 		assert.True(t, removed)
@@ -97,13 +98,9 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 func TestServer_RemoveStaleProject_SkipsReRegistered(t *testing.T) {
 	s := newLifecycleServer()
 
-	cmd := exec.Command("true")
-	require.NoError(t, cmd.Run())
-	deadPID := cmd.Process.Pid
-
 	req := newTestRequest("/projects/x", "local.dev",
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
-	req.PID = deadPID
+	req.PID = deadPID(t)
 	_, _, err := s.registry.Register(req)
 	require.NoError(t, err)
 
@@ -219,6 +216,223 @@ func TestHandleGetRequests_LimitClamp(t *testing.T) {
 	t.Run("max limit applies", func(t *testing.T) {
 		assert.Equal(t, 150, getCount(t, "&limit=1000"))
 	})
+}
+
+// TestServer_SelfHeal_DeadPIDReRegister pins the #55 crash-restart fix at the
+// server level: a same-dir registration whose holder PID is dead is replaced
+// inline (200-equivalent), the dead generation's records AND their on-disk body
+// files are purged, and an unrelated project is left completely untouched.
+func TestServer_SelfHeal_DeadPIDReRegister(t *testing.T) {
+	s := newLifecycleServer()
+
+	// A body file that must be deleted when the dead generation's record is
+	// purged — the eviction callback fires only for records carrying Details.
+	bodyFile := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(bodyFile, []byte("stale body"), 0o600))
+	s.requestManager.SetEvictionCallback(func(id string) {
+		if id == "dead-rec" {
+			_ = os.Remove(bodyFile)
+		}
+	})
+
+	// An unrelated project whose registration and records must survive.
+	otherReq := newTestRequest("/projects/other", "other.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 5000}}, 0, 8443)
+	otherReq.PID = os.Getpid()
+	_, _, err := s.registry.Register(otherReq)
+	require.NoError(t, err)
+	s.requestManager.Record(proxy.RequestRecord{ID: "other-rec", ProjectDir: "/projects/other", Method: "GET", URL: "/o", Details: &proxy.RequestDetails{}})
+
+	// Dead generation: register under a PID that is guaranteed dead.
+	deadReq := newTestRequest("/projects/dead", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	deadReq.PID = deadPID(t)
+	_, _, err = s.registry.Register(deadReq)
+	require.NoError(t, err)
+	s.requestManager.Record(proxy.RequestRecord{ID: "dead-rec", ProjectDir: "/projects/dead", Method: "GET", URL: "/d", Details: &proxy.RequestDetails{}})
+
+	// Restart: same dir, a live PID. Self-heal replaces the dead registration.
+	reReq := deadReq
+	reReq.PID = os.Getpid()
+	status, body := s.register(reReq)
+	require.Equal(t, http.StatusOK, status, "self-heal re-register should succeed: %v", body)
+
+	// New generation is registered under the live PID.
+	assert.Equal(t, 2, s.registry.ProjectCount())
+	route, ok := s.registry.Lookup("api.local.dev", 443)
+	require.True(t, ok, "new generation's route must be registered")
+	assert.Equal(t, os.Getpid(), route.PID, "route must carry the live generation's PID")
+
+	// Dead generation's record purged, including its on-disk body file.
+	_, ok = s.requestManager.GetByID("dead-rec")
+	assert.False(t, ok, "dead generation's record must be purged")
+	assert.NoFileExists(t, bodyFile, "dead generation's body file must be deleted")
+
+	// Unrelated project untouched.
+	_, ok = s.registry.Lookup("api.other.dev", 8443)
+	assert.True(t, ok, "unrelated project's route must survive")
+	_, ok = s.requestManager.GetByID("other-rec")
+	assert.True(t, ok, "unrelated project's records must survive")
+}
+
+// TestServer_SelfHeal_LivePIDStillConflicts pins that a second prox up in the
+// same dir while the first is ALIVE still fails with a 409 naming the holder,
+// never a silent replace.
+func TestServer_SelfHeal_LivePIDStillConflicts(t *testing.T) {
+	s := newLifecycleServer()
+
+	req := newTestRequest("/projects/live", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	req.PID = os.Getpid() // self — guaranteed alive
+	_, _, err := s.registry.Register(req)
+	require.NoError(t, err)
+
+	status, body := s.register(req)
+	require.Equal(t, http.StatusConflict, status)
+	errResp, ok := body.(ErrorResponse)
+	require.True(t, ok, "conflict body should be an ErrorResponse")
+	assert.Equal(t, "REGISTRATION_CONFLICT", errResp.Code)
+	assert.Contains(t, errResp.Error, "already registered by a running prox up")
+	assert.Contains(t, errResp.Error, strconv.Itoa(os.Getpid()), "message must name the holding PID")
+}
+
+// TestServer_Register_RouteConflictNotRetried pins that a different-project
+// route conflict (another project owning the hostname:port) is a plain 409 and
+// is never mistaken for a replaceable stale registration.
+func TestServer_Register_RouteConflictNotRetried(t *testing.T) {
+	s := newLifecycleServer()
+
+	reqA := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	reqA.PID = os.Getpid()
+	_, _, err := s.registry.Register(reqA)
+	require.NoError(t, err)
+
+	reqB := newTestRequest("/projects/b", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 4000}}, 0, 443)
+	reqB.PID = os.Getpid()
+	status, body := s.register(reqB)
+	require.Equal(t, http.StatusConflict, status)
+	errResp := body.(ErrorResponse)
+	assert.Equal(t, "REGISTRATION_CONFLICT", errResp.Code)
+
+	// A's registration is intact; B never displaced it.
+	assert.Equal(t, 1, s.registry.ProjectCount())
+	route, ok := s.registry.Lookup("api.local.dev", 443)
+	require.True(t, ok)
+	assert.Equal(t, "/projects/a", route.ProjectDir)
+}
+
+// TestHandleRegister_RejectsNonPositivePID pins the PID>0 validation: a PID of
+// 0 or negative has signal-broadcast semantics that would read as permanently
+// alive, so a crashed generation with such a PID could never be replaced.
+func TestHandleRegister_RejectsNonPositivePID(t *testing.T) {
+	_, client, _ := startTestServer(t)
+
+	for _, pid := range []int{0, -1} {
+		req := newTestRequest("/projects/a", "local.dev",
+			map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+		req.Version = "test-version"
+		req.PID = pid
+		_, err := client.Register(req)
+		require.Error(t, err, "pid=%d must be rejected", pid)
+		assert.Contains(t, err.Error(), "pid must be a positive process id")
+	}
+}
+
+// TestScheduleShutdownWhenEmpty_StaysEmpty pins that an emptied registry gets a
+// graced shutdown request when it is still empty after the delay.
+func TestScheduleShutdownWhenEmpty_StaysEmpty(t *testing.T) {
+	s := newLifecycleServer()
+	s.shutdownDelay = 20 * time.Millisecond
+
+	s.scheduleShutdownWhenEmpty()
+
+	select {
+	case <-s.ShutdownCh():
+		// shutdown requested — correct
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a shutdown request for a registry that stays empty")
+	}
+}
+
+// TestScheduleShutdownWhenEmpty_RegistrationDuringDelayCancels pins that a
+// registration landing within the grace window cancels the shutdown.
+func TestScheduleShutdownWhenEmpty_RegistrationDuringDelayCancels(t *testing.T) {
+	s := newLifecycleServer()
+	s.shutdownDelay = 60 * time.Millisecond
+
+	s.scheduleShutdownWhenEmpty()
+
+	// A registration lands during the grace window, through the real locked
+	// register path (the timer's re-check synchronizes on lifecycleMu, so the
+	// direct registry call would not exercise the race this test pins).
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	req.PID = os.Getpid()
+	status, body := s.register(req)
+	require.Equal(t, http.StatusOK, status, "register failed: %v", body)
+
+	select {
+	case <-s.ShutdownCh():
+		t.Fatal("shutdown must not fire when a registration lands during the grace period")
+	case <-time.After(200 * time.Millisecond):
+		// no shutdown — correct
+	}
+}
+
+// TestScheduleShutdownWhenEmpty_StaleEpochStandsDown pins that a grace timer
+// from an older empty period stands down after ANY lifecycle mutation, so it
+// cannot cut a newer empty period's grace short.
+func TestScheduleShutdownWhenEmpty_StaleEpochStandsDown(t *testing.T) {
+	s := newLifecycleServer()
+	s.shutdownDelay = 30 * time.Millisecond
+
+	s.scheduleShutdownWhenEmpty() // timer A captures the pre-mutation epoch
+
+	// Mutations during A's grace: a register then a removal, leaving the
+	// registry empty again but at a newer epoch.
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	req.PID = os.Getpid()
+	status, body := s.register(req)
+	require.Equal(t, http.StatusOK, status, "register failed: %v", body)
+	s.removeProject("/projects/a")
+
+	// Timer A fires into an empty registry but a changed epoch — it must
+	// stand down rather than shut the daemon.
+	select {
+	case <-s.ShutdownCh():
+		t.Fatal("a stale-epoch timer must not shut the daemon down")
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	// A fresh timer at the current epoch shuts down normally.
+	s.scheduleShutdownWhenEmpty()
+	select {
+	case <-s.ShutdownCh():
+		// correct
+	case <-time.After(2 * time.Second):
+		t.Fatal("a current-epoch timer over an empty registry must shut down")
+	}
+}
+
+// TestRegister_WhileShuttingDown_Returns503 pins that a register that queued
+// behind a shutdown decision reports SHUTTING_DOWN instead of a false success
+// from a daemon that is already exiting.
+func TestRegister_WhileShuttingDown_Returns503(t *testing.T) {
+	s := newLifecycleServer()
+	s.RequestShutdown()
+
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	req.PID = os.Getpid()
+	status, body := s.register(req)
+	require.Equal(t, http.StatusServiceUnavailable, status)
+	er, ok := body.(ErrorResponse)
+	require.True(t, ok, "expected ErrorResponse, got %T", body)
+	assert.Equal(t, "SHUTTING_DOWN", er.Code)
+	assert.True(t, s.registry.IsEmpty(), "no registration may land after shutdown")
 }
 
 // TestServer_RemoveProject_NilRequestManager guards the daemon-startup window

@@ -3,6 +3,7 @@ package proxyd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,9 +11,11 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/go-chi/chi/v5"
 )
@@ -30,6 +33,24 @@ type Server struct {
 	shutdownCh chan struct{}
 	shutdownMu sync.Mutex
 	startedAt  time.Time
+
+	// shutdownDelay is the grace period scheduleShutdownWhenEmpty waits before
+	// re-checking an emptied registry, giving a rapid down/up (or a crash
+	// restart landing during a sweep) time to re-register. Injectable in tests.
+	shutdownDelay time.Duration
+
+	// lifecycleMu serializes control-plane lifecycle transactions
+	// (registry mutation + physical listener add/remove + record purge) so a
+	// concurrent sweep tick can't close a fresh registration's listeners, fail
+	// its retry with PORT_BIND_FAILED, or purge its records. The data plane
+	// (route Lookup, proxying, SSE) never touches this mutex.
+	lifecycleMu sync.Mutex
+
+	// lifecycleEpoch increments on every registry mutation. A grace timer
+	// scheduled by scheduleShutdownWhenEmpty captures the epoch and stands
+	// down if it changed, so a timer from an older empty period can't cut a
+	// newer grace period short.
+	lifecycleEpoch atomic.Uint64
 
 	// Core components
 	registry       *Registry
@@ -49,12 +70,13 @@ func NewServer(cfg ServerConfig) *Server {
 	r := chi.NewRouter()
 
 	s := &Server{
-		socketPath: cfg.SocketPath,
-		version:    cfg.Version,
-		router:     r,
-		logger:     cfg.Logger,
-		shutdownCh: make(chan struct{}),
-		startedAt:  time.Now(),
+		socketPath:    cfg.SocketPath,
+		version:       cfg.Version,
+		router:        r,
+		logger:        cfg.Logger,
+		shutdownCh:    make(chan struct{}),
+		startedAt:     time.Now(),
+		shutdownDelay: 5 * time.Second,
 	}
 
 	s.registerRoutes()
@@ -79,6 +101,16 @@ func (s *Server) SetRequestManager(rm *proxy.RequestManager) {
 // ShutdownCh returns a channel that is closed when the daemon should exit.
 func (s *Server) ShutdownCh() <-chan struct{} {
 	return s.shutdownCh
+}
+
+// isShuttingDown reports whether daemon shutdown has been requested.
+func (s *Server) isShuttingDown() bool {
+	select {
+	case <-s.shutdownCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // RequestShutdown signals the daemon to exit.
@@ -153,14 +185,64 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register routes
-	hostnames, newPorts, err := s.registry.Register(req)
-	if err != nil {
-		writeJSON(w, http.StatusConflict, ErrorResponse{
-			Error: err.Error(),
-			Code:  "REGISTRATION_CONFLICT",
+	// PID identifies the registration's generation and is the liveness key for
+	// crash-restart self-heal. ProcessExists(0)/negative PIDs have
+	// signal-broadcast semantics and would read as permanently alive, so a
+	// crashed generation with a bad PID could never be replaced.
+	if req.PID <= 0 {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "pid must be a positive process id",
+			Code:  "BAD_REQUEST",
 		})
 		return
+	}
+
+	status, body := s.register(req)
+	writeJSON(w, status, body)
+}
+
+// register runs the full register-through-listener-start lifecycle transaction
+// under lifecycleMu (registry mutation, crash-restart self-heal, cert
+// generation, listener add, and all rollbacks) and returns the HTTP status and
+// response body for the caller to write once the lock is released. Serializing
+// the whole transaction means a concurrent sweep tick can't tear down the new
+// generation's listeners or purge its records mid-flow.
+func (s *Server) register(req RegisterRequest) (int, any) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// A register that queued behind a shutdown decision must not report
+	// success from a daemon that is already exiting.
+	if s.isShuttingDown() {
+		return http.StatusServiceUnavailable, ErrorResponse{
+			Error: "daemon is shutting down; retry to start a fresh daemon",
+			Code:  "SHUTTING_DOWN",
+		}
+	}
+
+	hostnames, newPorts, err := s.registry.Register(req)
+	replaced := false
+	if err != nil {
+		var conflict *ProjectConflictError
+		if !errors.As(err, &conflict) {
+			// Route/validation conflict — a real error, never retried.
+			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
+		}
+		if daemon.ProcessExists(conflict.PID) {
+			// A second live prox up in the same dir is a genuine conflict.
+			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
+		}
+		// The holder crashed without deregistering. Replace its stale
+		// registration inline (PID-guarded; purges its records + body files and
+		// closes its listeners) and retry once. Under lifecycleMu the retry
+		// cannot lose a race, so a single retry is a correctness guarantee.
+		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID)
+		s.removeStaleProjectLocked(conflict.Dir, conflict.PID)
+		hostnames, newPorts, err = s.registry.Register(req)
+		if err != nil {
+			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
+		}
+		replaced = true
 	}
 
 	// Ensure certs exist for HTTPS domains before starting listeners
@@ -169,32 +251,41 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			if ps.Protocol == "https" {
 				if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
 					s.registry.Deregister(req.ProjectDir)
-					writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+					s.lifecycleEpoch.Add(1)
+					s.scheduleShutdownWhenEmpty()
+					return http.StatusInternalServerError, ErrorResponse{
 						Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
 						Code:  "CERT_GENERATION_FAILED",
-					})
-					return
+					}
 				}
 				break // one EnsureDomain per domain is sufficient
 			}
 		}
 	}
 
-	// Start listeners for new ports
+	// Start listeners for new ports. A self-heal replace closed the crashed
+	// generation's listener just now and rebinds the same port back-to-back;
+	// the OS can hold the port for a few ms after close, so that path needs a
+	// brief bind retry to keep the restart this fix exists for from failing.
 	if s.proxy != nil {
+		bind := s.proxy.AddListener
+		if replaced {
+			bind = s.addListenerWithBriefRetry
+		}
 		var startedPorts []int
 		for _, ps := range newPorts {
-			if err := s.proxy.AddListener(ps.Port, ps.Protocol); err != nil {
-				// Rollback: stop listeners we already started, then deregister
+			if err := bind(ps.Port, ps.Protocol); err != nil {
+				// Rollback: stop listeners we already started, then deregister.
 				for _, p := range startedPorts {
 					_ = s.proxy.RemoveListener(p)
 				}
 				s.registry.Deregister(req.ProjectDir)
-				writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+				s.lifecycleEpoch.Add(1)
+				s.scheduleShutdownWhenEmpty()
+				return http.StatusInternalServerError, ErrorResponse{
 					Error: fmt.Sprintf("failed to bind port %d: %v", ps.Port, err),
 					Code:  "PORT_BIND_FAILED",
-				})
-				return
+				}
 			}
 			startedPorts = append(startedPorts, ps.Port)
 		}
@@ -207,7 +298,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"hostnames", hostnames,
 	)
 
-	writeJSON(w, http.StatusOK, RegisterResponse{Registered: hostnames})
+	s.lifecycleEpoch.Add(1)
+	return http.StatusOK, RegisterResponse{Registered: hostnames}
 }
 
 func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
@@ -241,17 +333,35 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		"removed": removedHostnames,
 	})
 
-	// If registry is empty, shut down the daemon
-	if s.registry.IsEmpty() {
-		s.logger.Info("no routes registered, shutting down daemon")
-		go func() {
-			// Brief grace period for rapid down/up cycles
-			time.Sleep(5 * time.Second)
-			if s.registry.IsEmpty() {
-				s.RequestShutdown()
-			}
-		}()
+	// If registry is empty, schedule a graced shutdown check.
+	s.scheduleShutdownWhenEmpty()
+}
+
+// scheduleShutdownWhenEmpty requests daemon shutdown after a grace period when
+// the registry has no routes left, but only if it is STILL empty when the grace
+// expires — a rapid down/up cycle, or a crash restart landing during a sweep,
+// re-registers within the window and cancels the shutdown. Used by explicit
+// deregister, the stale-PID sweep, and register rollback paths (an emptied
+// registry after a failed self-heal replace would otherwise strand an idle
+// daemon forever). No-op when the registry is non-empty at call time.
+func (s *Server) scheduleShutdownWhenEmpty() {
+	if s.registry == nil || !s.registry.IsEmpty() {
+		return
 	}
+	s.logger.Info("no routes registered, scheduling shutdown check")
+	epoch := s.lifecycleEpoch.Load()
+	go func() {
+		time.Sleep(s.shutdownDelay)
+		// Re-check under lifecycleMu so an in-flight register transaction
+		// finishes before the decision, and stand down if ANY lifecycle
+		// mutation happened since scheduling — a newer empty period gets its
+		// own timer with the full grace.
+		s.lifecycleMu.Lock()
+		defer s.lifecycleMu.Unlock()
+		if s.lifecycleEpoch.Load() == epoch && s.registry.IsEmpty() {
+			s.RequestShutdown()
+		}
+	}()
 }
 
 // removeProject is the single consolidated project-removal path: it removes the
@@ -261,11 +371,19 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // the stale-PID crash-recovery sweep so the crash path can't leak records or
 // body files. Returns the removed hostnames and now-empty ports for logging.
 func (s *Server) removeProject(projectDir string) (removedHostnames []string, emptyPorts []int) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.removeProjectLocked(projectDir)
+}
+
+// removeProjectLocked is removeProject's body; lifecycleMu must be held. It lets
+// register run a stale-registration replace while already holding the mutex.
+func (s *Server) removeProjectLocked(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	if s.registry == nil {
 		return nil, nil
 	}
-
 	removedHostnames, emptyPorts = s.registry.Deregister(projectDir)
+	s.lifecycleEpoch.Add(1)
 	s.finishRemoval(projectDir, emptyPorts)
 	return removedHostnames, emptyPorts
 }
@@ -274,14 +392,22 @@ func (s *Server) removeProject(projectDir string) (removedHostnames []string, em
 // guarded on the registration still carrying the detected dead PID, so a
 // project that re-registered between detection and removal is left alone.
 func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.removeStaleProjectLocked(projectDir, pid)
+}
+
+// removeStaleProjectLocked is removeStaleProject's body; lifecycleMu must be
+// held. register calls it to replace a crashed generation inline.
+func (s *Server) removeStaleProjectLocked(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
 	if s.registry == nil {
 		return false, nil, nil
 	}
-
 	removed, removedHostnames, emptyPorts = s.registry.DeregisterIfPID(projectDir, pid)
 	if !removed {
 		return false, nil, nil
 	}
+	s.lifecycleEpoch.Add(1)
 	s.finishRemoval(projectDir, emptyPorts)
 	return true, removedHostnames, emptyPorts
 }
@@ -301,6 +427,28 @@ func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 	if s.requestManager != nil {
 		s.requestManager.PurgeByProject(projectDir)
 	}
+}
+
+// addListenerWithBriefRetry binds a listener, retrying briefly on a transient
+// bind failure. Used only on the self-heal replace path, where the crashed
+// generation's listener was just closed and the same port is rebound
+// immediately: the kernel can hold the port for a few milliseconds after close,
+// so a single bind would intermittently return EADDRINUSE and fail the very
+// restart this fix exists to make succeed. A genuinely occupied port still
+// fails after the bounded window.
+func (s *Server) addListenerWithBriefRetry(port int, protocol string) error {
+	const (
+		attempts = 10
+		backoff  = 20 * time.Millisecond
+	)
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = s.proxy.AddListener(port, protocol); err == nil {
+			return nil
+		}
+		time.Sleep(backoff)
+	}
+	return err
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
