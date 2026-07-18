@@ -215,6 +215,13 @@ func TestSelfHeal_RollbackBindFailSchedulesShutdown(t *testing.T) {
 	}
 	registerOK(t, s, deadReq)
 
+	// A record captured for the project while its routes were briefly visible
+	// (shared-port listener window) must not survive the rollback as an
+	// orphan — pre-seed one to pin the purge.
+	s.requestManager.Record(proxy.RequestRecord{
+		ID: "rollback-orphan", ProjectDir: "/projects/dead", Method: "GET", URL: "/w",
+	})
+
 	// Restart onto the occupied port: self-heal replaces the dead registration,
 	// then the rebind fails, rolling back to an empty registry.
 	reReq := deadReq
@@ -223,6 +230,8 @@ func TestSelfHeal_RollbackBindFailSchedulesShutdown(t *testing.T) {
 	status, body := s.register(reReq)
 	require.Equal(t, http.StatusInternalServerError, status, "bind failure expected: %v", body)
 	require.True(t, s.registry.IsEmpty(), "rollback must empty the registry")
+	_, found := s.requestManager.GetByID("rollback-orphan")
+	require.False(t, found, "rollback must purge the project's captured records")
 
 	select {
 	case <-s.ShutdownCh():

@@ -248,9 +248,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		for _, ps := range newPorts {
 			if ps.Protocol == "https" {
 				if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
-					s.registry.Deregister(req.ProjectDir)
-					s.lifecycleEpoch.Add(1)
-					s.scheduleShutdownWhenEmpty()
+					s.rollbackRegistration(req.ProjectDir)
 					return http.StatusInternalServerError, ErrorResponse{
 						Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
 						Code:  "CERT_GENERATION_FAILED",
@@ -276,9 +274,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 				for _, p := range startedPorts {
 					_ = s.proxy.RemoveListener(p)
 				}
-				s.registry.Deregister(req.ProjectDir)
-				s.lifecycleEpoch.Add(1)
-				s.scheduleShutdownWhenEmpty()
+				s.rollbackRegistration(req.ProjectDir)
 				return http.StatusInternalServerError, ErrorResponse{
 					Error: fmt.Sprintf("failed to bind port %d: %v", ps.Port, err),
 					Code:  "PORT_BIND_FAILED",
@@ -424,6 +420,21 @@ func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 	if s.requestManager != nil {
 		s.requestManager.PurgeByProject(projectDir)
 	}
+}
+
+// rollbackRegistration unwinds a registration whose cert or listener phase
+// failed: deregister, purge any records captured for the project in the window
+// where its routes were already visible to existing shared-port listeners
+// (raw Deregister would orphan them until FIFO eviction), bump the lifecycle
+// epoch, and schedule the graced shutdown check so an emptied registry can't
+// strand an idle daemon. lifecycleMu must be held.
+func (s *Server) rollbackRegistration(projectDir string) {
+	s.registry.Deregister(projectDir)
+	if s.requestManager != nil {
+		s.requestManager.PurgeByProject(projectDir)
+	}
+	s.lifecycleEpoch.Add(1)
+	s.scheduleShutdownWhenEmpty()
 }
 
 // addListenerWithBriefRetry binds a listener, retrying briefly on a transient

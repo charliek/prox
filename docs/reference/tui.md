@@ -83,7 +83,7 @@ A request whose response is still streaming shows its real header-time status bu
 | `f` | Open process filter (multi-select) |
 | `/` | Substring filter, committed on `Enter` (hides non-matching) |
 | `s` | Substring filter, applied live (hides non-matching) |
-| `r` | Restart highlighted process |
+| `r` | Restart the soloed process (select with `1`-`9` first) |
 
 ### Requests View
 
