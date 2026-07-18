@@ -430,7 +430,7 @@ func TestResponseWriter_FirstResponseHook(t *testing.T) {
 		return &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 	}
 
-	t.Run("hook fires once but status is last-write-wins", func(t *testing.T) {
+	t.Run("hook and status both latch the first final status", func(t *testing.T) {
 		rw := newRW(httptest.NewRecorder())
 		var calls []int
 		rw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
@@ -439,7 +439,8 @@ func TestResponseWriter_FirstResponseHook(t *testing.T) {
 		rw.WriteHeader(http.StatusAccepted)
 
 		assert.Equal(t, []int{http.StatusCreated}, calls, "hook fires once on first >=200")
-		assert.Equal(t, http.StatusAccepted, rw.statusCode, "status is last-write-wins")
+		assert.Equal(t, http.StatusCreated, rw.statusCode,
+			"status latches the first final code — net/http ignores later WriteHeader calls")
 	})
 
 	t.Run("1xx then 200 fires once with 200 and records 200", func(t *testing.T) {

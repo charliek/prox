@@ -182,7 +182,12 @@ func backfillSnapshot(ctx context.Context, client *Client, projectDir string, lo
 
 	// The endpoint returns records newest-first; replay oldest-first so ring
 	// order tracks arrival order as closely as the live stream would have.
+	// Bail out mid-replay if the attempt ended: a snapshot fetched by a dying
+	// attempt should not keep replaying after a newer attempt took over.
 	for i := len(records) - 1; i >= 0; i-- {
+		if ctx.Err() != nil {
+			return
+		}
 		localRM.Upsert(records[i])
 	}
 }

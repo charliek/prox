@@ -380,11 +380,10 @@ func (s *Service) createRouter() http.Handler {
 				"target", target.String(),
 				"error", err,
 			)
-			if crw != nil {
-				crw.WriteHeader(http.StatusBadGateway)
-			} else {
-				brw.WriteHeader(http.StatusBadGateway)
-			}
+			// http.Error writes the 502 through the wrapped writer (latching
+			// the status and firing the first-response hook); an explicit
+			// WriteHeader first would commit the response before http.Error
+			// could set its error headers.
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
 		}
 
@@ -583,10 +582,11 @@ type responseWriter struct {
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-	// Last-write-wins status, except 1xx provisional responses (e.g. 103 Early
-	// Hints) are ignored: they are not the final status and must not fire the
-	// hook or overwrite a real status.
-	if code >= 200 {
+	// Latch the FIRST final (>=200) status — net/http ignores later
+	// WriteHeader calls, so the first one is what the client actually got.
+	// 1xx provisional responses (e.g. 103 Early Hints) are delegated but are
+	// not the final status: they neither latch nor fire the hook.
+	if code >= 200 && !rw.responded {
 		rw.statusCode = code
 		// Order: latch status → invoke callback → delegate.
 		rw.fireFirstResponse(code)

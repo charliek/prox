@@ -157,17 +157,22 @@ func (c *Client) Requests(ctx context.Context, projectDir string, limit int) ([]
 		return nil, c.readError(resp)
 	}
 
-	// Read the whole body before decoding so a truncated response fails the
-	// unmarshal (all-or-nothing) rather than yielding a partial slice.
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading requests response: %w", err)
-	}
+	// Stream-decode into the wrapper (no io.ReadAll: a full snapshot's raw
+	// JSON alongside its decoded records would double peak memory). The
+	// all-or-nothing contract holds: Decode either fully unmarshals the
+	// wrapper or errors, and on error no records are returned; a truncated
+	// response fails the decode rather than yielding a partial slice.
 	var result struct {
 		Requests []proxy.RequestRecord `json:"requests"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&result); err != nil {
 		return nil, fmt.Errorf("decoding requests response: %w", err)
+	}
+	// Reject trailing non-whitespace data — a concatenated or garbled
+	// response should not pass as a valid snapshot.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("trailing data after requests response")
 	}
 	// The daemon always emits a non-nil slice ("requests":[] when empty), so a
 	// nil slice means valid JSON of the wrong shape ({} or a misspelled key) —

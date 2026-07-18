@@ -236,11 +236,10 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				"target", target.String(),
 				"error", err,
 			)
-			if crw != nil {
-				crw.WriteHeader(http.StatusBadGateway)
-			} else {
-				srw.statusCode = http.StatusBadGateway
-			}
+			// http.Error writes the 502 through the wrapped writer (latching
+			// the status and firing the first-response hook); an explicit
+			// WriteHeader first would commit the response before http.Error
+			// could set its error headers.
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
 		}
 

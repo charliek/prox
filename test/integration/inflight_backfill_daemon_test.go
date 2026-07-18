@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,11 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	// on `released` until the test lets it finish. Other paths respond normally
 	// so waitBridgeLive's pings succeed.
 	released := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+	// Always unblock the backend on exit: a failed assertion before the
+	// explicit release would otherwise leave backend.Close() hanging.
+	t.Cleanup(release)
 	const partial = "partial-body-"
 	const rest = "rest-of-body"
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +132,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	inflightID := inflight.ID
 
 	// Release the backend and let the request complete.
-	close(released)
+	release()
 	res := <-resultCh
 	if res.err != nil {
 		t.Fatalf("slow request failed: %v", res.err)
