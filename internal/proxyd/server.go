@@ -221,7 +221,6 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 	}
 
 	hostnames, newPorts, err := s.registry.Register(req)
-	replaced := false
 	if err != nil {
 		var conflict *ProjectConflictError
 		if !errors.As(err, &conflict) {
@@ -242,7 +241,6 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		if err != nil {
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
-		replaced = true
 	}
 
 	// Ensure certs exist for HTTPS domains before starting listeners
@@ -263,18 +261,17 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		}
 	}
 
-	// Start listeners for new ports. A self-heal replace closed the crashed
-	// generation's listener just now and rebinds the same port back-to-back;
-	// the OS can hold the port for a few ms after close, so that path needs a
-	// brief bind retry to keep the restart this fix exists for from failing.
+	// Start listeners for new ports, retrying briefly on a transient bind
+	// failure: the OS can hold a just-closed port for a few ms, and the close
+	// may be OURS from moments ago on EITHER path — the self-heal replace
+	// closes the crashed generation's listener inline, and a registration
+	// landing right after a sweep tick rebinds a port the sweep just closed
+	// (the sweep-wins ordering; caught by CI in the register-vs-sweep race
+	// test). A genuinely occupied port still fails after the bounded window.
 	if s.proxy != nil {
-		bind := s.proxy.AddListener
-		if replaced {
-			bind = s.addListenerWithBriefRetry
-		}
 		var startedPorts []int
 		for _, ps := range newPorts {
-			if err := bind(ps.Port, ps.Protocol); err != nil {
+			if err := s.addListenerWithBriefRetry(ps.Port, ps.Protocol); err != nil {
 				// Rollback: stop listeners we already started, then deregister.
 				for _, p := range startedPorts {
 					_ = s.proxy.RemoveListener(p)
@@ -430,12 +427,13 @@ func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 }
 
 // addListenerWithBriefRetry binds a listener, retrying briefly on a transient
-// bind failure. Used only on the self-heal replace path, where the crashed
-// generation's listener was just closed and the same port is rebound
-// immediately: the kernel can hold the port for a few milliseconds after close,
-// so a single bind would intermittently return EADDRINUSE and fail the very
-// restart this fix exists to make succeed. A genuinely occupied port still
-// fails after the bounded window.
+// bind failure: the kernel can hold a just-closed port for a few milliseconds,
+// and the daemon itself may have closed it moments earlier — the self-heal
+// replace closes the crashed generation's listener inline, and a registration
+// arriving right after a sweep tick rebinds a port the sweep just closed.
+// A single bind would intermittently return EADDRINUSE and fail the very
+// restart the self-heal exists to make succeed. Used for every registration
+// bind; a genuinely occupied port still fails after the bounded window.
 func (s *Server) addListenerWithBriefRetry(port int, protocol string) error {
 	const (
 		attempts = 10
