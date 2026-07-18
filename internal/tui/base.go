@@ -54,8 +54,14 @@ type BaseModel struct {
 	// Filtering
 	filterProcesses map[string]bool // Which processes to show
 	soloProcess     string          // Single process to show (1-9 keys)
-	searchPattern   string          // Current search/filter pattern
-	searchMatches   []int           // Line indices matching search
+	searchPattern   string          // Current search/filter pattern (the `s` filter)
+
+	// requestSearchQuery is the requests-view `/` search term. It is DELIBERATELY
+	// separate from searchPattern: in the requests view `/` navigates (jumps the
+	// cursor to matches) rather than filtering, so it composes with — never
+	// overwrites — an active `s` filter. Match state is never stored; n/N rescan
+	// the filtered list at keypress time (D12/D13).
+	requestSearchQuery string
 
 	// Auto-scroll
 	followMode bool // Auto-scroll to bottom on new logs
@@ -255,10 +261,19 @@ func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, nil
 
 	case "enter":
-		b.searchPattern = b.textInput.Value()
 		b.mode = ModeNormal
 		b.textInput.Blur()
-		b.updateSearchMatches()
+		if b.viewMode == ViewModeRequests {
+			// Requests view: `/` is navigation, not filtration. Commit the query
+			// to requestSearchQuery (searchPattern — the `s` filter — untouched)
+			// and jump the cursor to the first match at-or-after it (D12).
+			b.requestSearchQuery = b.textInput.Value()
+			b.jumpToRequestSearchMatch()
+			b.updateViewport()
+			return true, nil
+		}
+		// Logs view: `/` is a substring filter committed on Enter (D14).
+		b.searchPattern = b.textInput.Value()
 		b.updateViewport()
 		return true, nil
 	}
@@ -347,6 +362,21 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		}
 		return true
 
+	case "n", "N":
+		// Requests-view search navigation only: n jumps to the next match
+		// strictly after the cursor, N to the previous, both wrapping (D13).
+		// No-op (and unhandled elsewhere) outside the requests view.
+		if b.viewMode == ViewModeRequests {
+			dir := 1
+			if msg.String() == "N" {
+				dir = -1
+			}
+			b.cycleRequestSearchMatch(dir)
+			b.updateViewport()
+			return true
+		}
+		return false
+
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		// Solo process in logs view only (1-9 keys do nothing in requests view)
 		if b.viewMode == ViewModeLogs {
@@ -374,10 +404,10 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.updateViewport()
 			return true
 		}
-		// Clear filters
+		// Clear filters (and the requests-view search query — D13).
 		b.soloProcess = ""
 		b.searchPattern = ""
-		b.searchMatches = nil
+		b.requestSearchQuery = ""
 		b.updateViewport()
 		return true
 
@@ -488,19 +518,102 @@ func (b *BaseModel) halfPageStep() int {
 	return step
 }
 
-// updateSearchMatches updates the search match indices
-func (b *BaseModel) updateSearchMatches() {
-	b.searchMatches = nil
-	if b.searchPattern == "" {
+// requestMatchesSearch reports whether a request matches the requests-view `/`
+// query: a case-insensitive substring over URL, Method, and Subdomain — the
+// same fields the `s` filter matches (D12).
+func requestMatchesSearch(req proxy.RequestRecord, query string) bool {
+	return containsIgnoreCase(req.URL, query) ||
+		containsIgnoreCase(req.Method, query) ||
+		containsIgnoreCase(req.Subdomain, query)
+}
+
+// jumpToRequestSearchMatch moves the cursor to the first row matching
+// requestSearchQuery at-or-after the current cursor, wrapping (D12). "At-or-after"
+// is deliberate: a fresh search may already sit on the best match; n advances.
+// No-op when the query is empty or nothing matches (cursor unmoved). A match
+// disengages follow so the jump sticks (resolveRequestCursor would otherwise
+// re-pin to the newest row); it never RE-engages follow — a search jump is
+// positioning, not scrolling intent (D13).
+func (b *BaseModel) jumpToRequestSearchMatch() {
+	b.seekRequestSearchMatch(0)
+}
+
+// cycleRequestSearchMatch moves the cursor to the next (dir +1) or previous
+// (dir -1) matching row STRICTLY past the current cursor, wrapping (D13).
+func (b *BaseModel) cycleRequestSearchMatch(dir int) {
+	b.seekRequestSearchMatch(dir)
+}
+
+// seekRequestSearchMatch scans the filtered list for a matching row and moves
+// the cursor to it. dir 0 = at-or-after the cursor (the `/`-commit jump,
+// includes the cursor's own row); dir +1/-1 = strictly next/previous (n/N).
+// Derived at keypress time — no match list is ever stored (D13).
+func (b *BaseModel) seekRequestSearchMatch(dir int) {
+	if b.requestSearchQuery == "" {
 		return
 	}
-
-	// Find matching lines
-	for i, entry := range b.logEntries {
-		if containsIgnoreCase(entry.Line, b.searchPattern) {
-			b.searchMatches = append(b.searchMatches, i)
+	requests := b.filteredProxyRequests()
+	n := len(requests)
+	if n == 0 {
+		return
+	}
+	start := b.cursorIdx
+	if start < 0 {
+		start = 0
+	}
+	if dir == 0 {
+		// At-or-after: offsets 0..n-1 forward, cursor row first.
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			if requestMatchesSearch(requests[idx], b.requestSearchQuery) {
+				b.landSearchJump(requests, idx, n)
+				return
+			}
+		}
+		return
+	}
+	// Strictly past the cursor: offsets 1..n-1 in dir, wrapping. The cursor's
+	// own row is never revisited, so n/N are no-ops when it is the sole match.
+	for i := 1; i < n; i++ {
+		idx := ((start+dir*i)%n + n) % n
+		if requestMatchesSearch(requests[idx], b.requestSearchQuery) {
+			b.landSearchJump(requests, idx, n)
+			return
 		}
 	}
+}
+
+// landSearchJump places the cursor on a search match. Follow mode is
+// disengaged only when the jump moves the cursor off the newest row — a jump
+// must stick against follow's pin-to-newest, but a match landing ON the
+// newest row leaves follow untouched (never re-engaged either; search jumps
+// are positioning, not scrolling intent).
+func (b *BaseModel) landSearchJump(requests []proxy.RequestRecord, idx, n int) {
+	if idx != n-1 {
+		b.followMode = false
+	}
+	b.setRequestCursor(requests, idx)
+}
+
+// requestSearchMatchInfo derives the status-bar match indicator for the current
+// requestSearchQuery over requests (the filtered list): total match count, and
+// the cursor's 1-based position among matches (0 when the cursor is not on a
+// match). Never stored — recomputed for the status bar (D13). requests is
+// passed in rather than recomputed here so statusBar can share a single
+// filteredProxyRequests() scan with the visible/total count.
+func (b *BaseModel) requestSearchMatchInfo(requests []proxy.RequestRecord) (position, total int) {
+	if b.requestSearchQuery == "" {
+		return 0, 0
+	}
+	for i, req := range requests {
+		if requestMatchesSearch(req, b.requestSearchQuery) {
+			total++
+			if i == b.cursorIdx {
+				position = total
+			}
+		}
+	}
+	return position, total
 }
 
 // isNearBottom checks if the viewport is at or near the bottom
@@ -979,6 +1092,50 @@ func (b *BaseModel) processPanel() string {
 	return headerStyle.Render(header)
 }
 
+// statusLeftDefault builds the left status-bar text for normal mode (no input
+// prompt active). requests is the requests-view filtered list (unused in the
+// logs view), passed in so callers can share one filteredProxyRequests() scan
+// with the visible/total count. Precedence differs by view (D13):
+//   - Requests view: the `/` search indicator wins when a query is set —
+//     "/<query> (i/k)" with i the cursor's 1-based position among matches when
+//     the cursor is on a match, else "/<query> (k matches)" (0 included) — with
+//     "| filter: <pattern>" appended when the `s` filter is also active. soloProcess
+//     is a logs-view concept and is never shown here.
+//   - Logs view: today's precedence — solo wins, then the `s` filter.
+//   - Otherwise (either view): the `s` filter line, then the default hint.
+func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.RequestRecord) string {
+	if b.viewMode == ViewModeRequests && b.requestSearchQuery != "" {
+		position, total := b.requestSearchMatchInfo(requests)
+		var indicator string
+		if position > 0 {
+			indicator = fmt.Sprintf("/%s (%d/%d)", b.requestSearchQuery, position, total)
+		} else {
+			indicator = fmt.Sprintf("/%s (%d matches)", b.requestSearchQuery, total)
+		}
+		if b.searchPattern != "" {
+			indicator += fmt.Sprintf(" | filter: %s", b.searchPattern)
+		}
+		return indicator
+	}
+	if b.viewMode != ViewModeRequests && b.soloProcess != "" {
+		return fmt.Sprintf("Showing: %s (ESC to clear)", b.soloProcess)
+	}
+	if b.searchPattern != "" {
+		return fmt.Sprintf("Filter: %s (ESC to clear)", b.searchPattern)
+	}
+	return b.statusDefaultHint(extraInfo)
+}
+
+// statusDefaultHint is the fallback status-bar hint shown when no filter, search,
+// or solo is active.
+func (b *BaseModel) statusDefaultHint(extraInfo string) string {
+	hint := "Tab: switch view | ? for help"
+	if extraInfo != "" {
+		hint += " | " + extraInfo
+	}
+	return hint
+}
+
 // statusBar renders the bottom status bar
 func (b *BaseModel) statusBar(extraInfo string) string {
 	var left, right string
@@ -992,6 +1149,14 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		viewIndicator = "[Request Detail]"
 	}
 
+	// Requests-view filtered list, computed once and shared below between the
+	// left-side search indicator and the right-side visible count so a single
+	// render doesn't rescan b.proxyRequests twice.
+	var requests []proxy.RequestRecord
+	if b.viewMode == ViewModeRequests {
+		requests = b.filteredProxyRequests()
+	}
+
 	// Left side: mode/filter info
 	switch b.mode {
 	case ModeFilter:
@@ -1001,23 +1166,14 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 	case ModeStringFilter:
 		left = "String filter: " + b.textInput.View()
 	default:
-		if b.soloProcess != "" {
-			left = fmt.Sprintf("Showing: %s (ESC to clear)", b.soloProcess)
-		} else if b.searchPattern != "" {
-			left = fmt.Sprintf("Filter: %s (ESC to clear)", b.searchPattern)
-		} else {
-			left = "Tab: switch view | ? for help"
-			if extraInfo != "" {
-				left += " | " + extraInfo
-			}
-		}
+		left = b.statusLeftDefault(extraInfo, requests)
 	}
 
 	// Right side: follow mode and count
 	var visible, total int
 	var label string
 	if b.viewMode == ViewModeRequests {
-		visible = len(b.filteredProxyRequests())
+		visible = len(requests)
 		total = len(b.proxyRequests)
 		label = "requests"
 	} else {
@@ -1031,8 +1187,10 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 	}
 	right = fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 
-	// Calculate widths
-	leftWidth := b.width - len(right) - 4
+	// Calculate widths. Use display width (lipgloss.Width), never byte len: a
+	// Unicode search query in `left` would misplace the right-aligned counts if
+	// the layout math counted bytes (D13).
+	leftWidth := b.width - lipgloss.Width(right) - 4
 	if leftWidth < 0 {
 		leftWidth = 0
 	}
@@ -1099,8 +1257,8 @@ Navigation:
 Filtering:
   1-9        Solo process (toggle)
   f          Filter mode (process selection)
-  /          Pattern filter (regex)
-  s          String filter (substring)
+  /          Substring filter (hide non-matching, commit on Enter)
+  s          Substring filter (hide non-matching, applied live)
   ESC        Clear filters
 
 Other:
@@ -1133,21 +1291,25 @@ func (b *BaseModel) requestsHelpView() string {
 Views:
   Tab        Switch to Logs view
 
-Navigation:
-  j/↓        Scroll down
-  k/↑        Scroll up (pauses auto-follow)
-  g/Home     Go to top (pauses auto-follow)
-  G/End      Go to bottom (resumes auto-follow)
-  PgUp/PgDn  Page up/down
+Navigation (moves the cursor row):
+  j/↓        Move cursor down (onto newest row resumes auto-follow)
+  k/↑        Move cursor up (pauses auto-follow)
+  g/Home     Move cursor to top (pauses auto-follow)
+  G/End      Move cursor to bottom (resumes auto-follow)
+  PgUp/PgDn  Move cursor half a page
   F          Toggle auto-follow mode
 
+Search (jumps the cursor, does NOT filter):
+  /          Search URL/method/subdomain (jump to match at/after cursor)
+  n/N        Jump to next/previous match (wraps)
+
 Request Details:
-  Enter      View details for selected request
-  ESC        Return to request list (or clear filters)
+  Enter      View details for the cursor row
+  ESC        Return to request list (or clear filters/search)
 
 Filtering:
   s          String filter (URL/method/subdomain)
-  ESC        Clear filters
+  ESC        Clear filters and search
 
 Other:
   ?          Toggle help

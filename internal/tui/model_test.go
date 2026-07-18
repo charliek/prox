@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -171,24 +172,6 @@ func TestContainsIgnoreCase(t *testing.T) {
 		got := containsIgnoreCase(tt.s, tt.substr)
 		assert.Equal(t, tt.want, got, "containsIgnoreCase(%q, %q)", tt.s, tt.substr)
 	}
-}
-
-func TestUpdateSearchMatches(t *testing.T) {
-	model := newTestModel()
-
-	model.logEntries = []domain.LogEntry{
-		{Line: "error: something failed"},
-		{Line: "info: all good"},
-		{Line: "error: another failure"},
-		{Line: "debug: test message"},
-	}
-
-	model.searchPattern = "error"
-	model.updateSearchMatches()
-
-	assert.Len(t, model.searchMatches, 2)
-	assert.Equal(t, 0, model.searchMatches[0])
-	assert.Equal(t, 2, model.searchMatches[1])
 }
 
 func TestFollowModeDefaults(t *testing.T) {
@@ -615,10 +598,7 @@ func updateModel(m Model, msg tea.Msg) Model {
 // header+footer margin). followMode starts true, so the cursor begins pinned
 // to the newest row.
 func newRequestsModel(n, viewportHeight int) Model {
-	m := newTestModel()
-	m.viewMode = ViewModeRequests
-	m.proxyRequests = makeTestRequests(n)
-	return updateModel(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	return newSearchModel(viewportHeight, makeTestRequests(n))
 }
 
 // makeTestRequests builds n proxy request records with the shared fixture
@@ -993,4 +973,307 @@ func TestRequestsCursor_MarkerOnCursorRow(t *testing.T) {
 	}
 	assert.Equal(t, 1, markerCount, "exactly one cursor marker is rendered")
 	assert.Contains(t, markerLine, "/path/001", "the marker sits on the cursor row")
+}
+
+// --- Requests-view search navigation tests (C3 / D12-D13) ---
+
+// newSearchModel builds a Model in the requests view holding the given request
+// records, viewport sized to viewportHeight, follow-mode default (true) so the
+// cursor starts pinned to the newest row.
+func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) Model {
+	m := newTestModel()
+	m.viewMode = ViewModeRequests
+	m.proxyRequests = reqs
+	return updateModel(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+}
+
+// commitSearch drives the `/`-search flow: enter search mode, set the query,
+// and press Enter. handleSearchKey's enter case routes the commit itself
+// (jump in the requests view, filter in the logs view) based on m.viewMode,
+// so one driver helper serves both views.
+func commitSearch(m Model, query string) Model {
+	m = updateModel(m, keyRune('/'))
+	m.textInput.SetValue(query)
+	return updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+// searchFixture builds requests where /alpha matches rows 0 and 2 (with a POST
+// at row 3 and /beta rows between), for at-or-after and n/N tests.
+func searchFixture() []proxy.RequestRecord {
+	base := time.Unix(0, 0)
+	specs := []struct {
+		id, method, url string
+	}{
+		{"r0", "GET", "/alpha"},
+		{"r1", "GET", "/beta"},
+		{"r2", "GET", "/alpha/2"},
+		{"r3", "POST", "/gamma"},
+	}
+	reqs := make([]proxy.RequestRecord, len(specs))
+	for i, s := range specs {
+		reqs[i] = proxy.RequestRecord{
+			ID: s.id, Timestamp: base.Add(time.Duration(i) * time.Second),
+			Method: s.method, URL: s.url, StatusCode: 200, Duration: 5 * time.Millisecond,
+		}
+	}
+	return reqs
+}
+
+func TestRequestsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
+	m := newSearchModel(20, searchFixture())
+	m = updateModel(m, keyRune('g')) // cursor row 0 (/alpha), follow off
+	require.Equal(t, "r0", m.cursorID)
+
+	// Cursor already sits on a match: at-or-after leaves it in place.
+	m = commitSearch(m, "alpha")
+	assert.Equal(t, "alpha", m.requestSearchQuery)
+	assert.Equal(t, "r0", m.cursorID, "at-or-after stays on a cursor that already matches")
+
+	// From row 1 (/beta, no match), the next match at-or-after is row 2.
+	m = updateModel(m, keyRune('g'))
+	m = updateModel(m, keyRune('j')) // row 1
+	require.Equal(t, "r1", m.cursorID)
+	m = commitSearch(m, "alpha")
+	assert.Equal(t, "r2", m.cursorID, "jumps forward to the next match")
+
+	// From row 3 (/gamma, no match), at-or-after wraps to row 0.
+	m = updateModel(m, keyRune('j')) // row 3 (last)
+	require.Equal(t, "r3", m.cursorID)
+	m = commitSearch(m, "alpha")
+	assert.Equal(t, "r0", m.cursorID, "at-or-after wraps around to the first match")
+}
+
+func TestRequestsSearch_NextPrevWrap(t *testing.T) {
+	m := newSearchModel(20, searchFixture())
+	m = updateModel(m, keyRune('g')) // row 0
+	m = commitSearch(m, "alpha")
+	require.Equal(t, "r0", m.cursorID)
+
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "r2", m.cursorID, "n advances to the next match")
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "r0", m.cursorID, "n wraps to the first match")
+
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, "r2", m.cursorID, "N wraps backward to the last match")
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, "r0", m.cursorID, "N retreats to the previous match")
+}
+
+func TestRequestsSearch_OffScreenScrollsMinimally(t *testing.T) {
+	reqs := makeTestRequests(30)
+	reqs[2].URL = "/target/a"
+	reqs[25].URL = "/target/b"
+	m := newSearchModel(5, reqs) // viewport height 5
+	m = updateModel(m, keyRune('g'))
+	require.Equal(t, 0, m.viewport.YOffset)
+
+	// Jump to the first match (row 2), already on-screen: no scroll.
+	m = commitSearch(m, "target")
+	assert.Equal(t, 2, m.cursorIdx)
+	assert.True(t, cursorVisible(m))
+
+	// n jumps down to row 25 off-screen: scroll the minimum (YOffset = 25-5+1).
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 25, m.cursorIdx)
+	assert.True(t, cursorVisible(m))
+	assert.Equal(t, 21, m.viewport.YOffset, "downward jump scrolls minimally")
+
+	// N jumps back up to row 2 off-screen: scroll up to place it at the top.
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, 2, m.cursorIdx)
+	assert.True(t, cursorVisible(m))
+	assert.Equal(t, 2, m.viewport.YOffset, "upward jump scrolls minimally")
+}
+
+func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
+	reqs := makeTestRequests(20)
+	for i := range reqs {
+		if i%2 == 0 {
+			reqs[i].Subdomain = "api"
+		} else {
+			reqs[i].Subdomain = "web"
+		}
+	}
+	reqs[4].URL = "/match/a"  // api  -> in the filtered list
+	reqs[5].URL = "/match/b"  // web  -> filtered OUT, must never be selected
+	reqs[12].URL = "/match/c" // api  -> in the filtered list
+
+	m := newSearchModel(40, reqs)
+	m.searchPattern = "api" // active `s` filter: only the 10 api rows remain
+	m.followMode = false
+	m.updateViewport()
+	m = updateModel(m, keyRune('g'))
+
+	// Matches are computed over the FILTERED list, so /match/b (web) is skipped.
+	m = commitSearch(m, "match")
+	assert.Equal(t, "req-004", m.cursorID, "search over the filtered list finds the first api match")
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "req-012", m.cursorID)
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "req-004", m.cursorID, "wraps over api matches only, skipping the filtered-out web row")
+	assert.Equal(t, "api", m.searchPattern, "the `s` filter is untouched")
+}
+
+func TestRequestsSearch_DoesNotFilter(t *testing.T) {
+	reqs := makeTestRequests(10)
+	reqs[3].URL = "/needle"
+	m := newSearchModel(20, reqs)
+	before := len(m.filteredProxyRequests())
+
+	m = commitSearch(m, "needle")
+	assert.Empty(t, m.searchPattern, "/ in the requests view must not touch the `s` filter")
+	assert.Equal(t, "needle", m.requestSearchQuery)
+	assert.Len(t, m.filteredProxyRequests(), before, "/ navigates; it must not hide rows")
+	assert.Len(t, m.proxyRequests, 10)
+}
+
+func TestRequestsSearch_NoMatch(t *testing.T) {
+	reqs := makeTestRequests(10)
+	m := newSearchModel(20, reqs)
+	m = updateModel(m, keyRune('g'))
+	m = updateModel(m, keyRune('j')) // row 1
+	require.Equal(t, 1, m.cursorIdx)
+
+	m = commitSearch(m, "zzz-nomatch")
+	assert.Equal(t, 1, m.cursorIdx, "a query with no match leaves the cursor unmoved")
+	assert.Equal(t, "req-001", m.cursorID)
+
+	// n/N are also no-ops when nothing matches.
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 1, m.cursorIdx)
+
+	bar := m.statusBar("")
+	assert.Contains(t, bar, "/zzz-nomatch (0 matches)", "status shows the 0-match form")
+}
+
+func TestRequestsSearch_EscClearsQuery(t *testing.T) {
+	reqs := makeTestRequests(10)
+	reqs[3].URL = "/needle"
+	m := newSearchModel(20, reqs)
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.requestSearchQuery)
+
+	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.requestSearchQuery, "esc clears the requests-view search query")
+}
+
+func TestLogsSearch_SlashStillFilters(t *testing.T) {
+	m := newTestModel()
+	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
+	m.logEntries = []domain.LogEntry{
+		{Process: "p", Line: "keep me"},
+		{Process: "p", Line: "drop it"},
+		{Process: "p", Line: "keep this too"},
+	}
+	require.Equal(t, ViewModeLogs, m.viewMode)
+
+	m = commitSearch(m, "keep")
+	assert.Equal(t, "keep", m.searchPattern, "logs-view / commits the substring filter (unchanged)")
+	assert.Empty(t, m.requestSearchQuery, "logs-view / must not set the requests query")
+	assert.Len(t, m.filteredEntries(), 2, "logs-view / hides non-matching lines")
+}
+
+func TestRequestsSearch_StatusPrecedence(t *testing.T) {
+	reqs := makeTestRequests(10)
+	reqs[3].URL = "/path/needle" // matches both the `path` filter and the search
+	m := newSearchModel(40, reqs)
+	m.soloProcess = "web" // a logs concept: must NOT appear in the requests view
+	m.searchPattern = "path"
+	m.followMode = false
+	m.updateViewport()
+	m = updateModel(m, keyRune('g'))
+
+	m = commitSearch(m, "needle")
+	bar := m.statusBar("")
+	assert.Contains(t, bar, "/needle (1/1)", "search indicator wins, with the cursor's match position")
+	assert.Contains(t, bar, "filter: path", "the active `s` filter is appended")
+	assert.NotContains(t, bar, "Showing:", "solo is never shown in the requests view")
+
+	// Prompt precedence: while typing a search, the input prompt wins over the
+	// committed indicator.
+	m2 := updateModel(m, keyRune('/'))
+	assert.Contains(t, m2.statusBar(""), "Search:", "the mode prompt takes precedence")
+}
+
+func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
+	m := newSearchModel(40, makeTestRequests(5))
+	m.width = 120
+
+	m.requestSearchQuery = "日本語テスト"
+	unicodeBar := m.statusBar("")
+
+	// The layout is measured in display columns, not bytes: an ASCII query of
+	// the same DISPLAY width must produce a bar of the same rendered width.
+	// Scope note: this guards layout stability for wide-rune queries (the
+	// left side, laid out by lipgloss). It cannot catch a regression of the
+	// right side's lipgloss.Width back to len — the right side is
+	// structurally ASCII, so no assertion can distinguish them there.
+	m.requestSearchQuery = strings.Repeat("x", lipgloss.Width("日本語テスト"))
+	asciiBar := m.statusBar("")
+	assert.Equal(t, lipgloss.Width(asciiBar), lipgloss.Width(unicodeBar),
+		"a Unicode query must not change the status-bar layout width")
+}
+
+func TestRequestsSearch_WrapToNewestNoFollow(t *testing.T) {
+	reqs := makeTestRequests(6)
+	reqs[0].URL = "/hit/a"
+	reqs[5].URL = "/hit/b" // the newest (last) row also matches
+	m := newSearchModel(20, reqs)
+	m = updateModel(m, keyRune('g')) // cursor row 0, follow off
+	require.False(t, m.followMode)
+
+	m = commitSearch(m, "hit")
+	require.Equal(t, 0, m.cursorIdx)
+	require.False(t, m.followMode)
+
+	// n wraps forward onto the newest row. Unlike `j`, a search jump is
+	// positioning, not scrolling intent: it must NOT re-engage follow.
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 5, m.cursorIdx)
+	assert.Equal(t, "req-005", m.cursorID)
+	assert.False(t, m.followMode, "a search jump onto the newest row must not re-engage follow")
+}
+
+func TestRequestsSearch_FollowPreservedOnNewestRowMatch(t *testing.T) {
+	// Follow on, cursor pinned to the newest row, which matches the query: the
+	// jump lands where the cursor already is, so follow must stay engaged —
+	// disengaging would silently stop auto-follow after a no-op jump.
+	reqs := makeTestRequests(6)
+	reqs[5].URL = "/hit/newest"
+	m := newSearchModel(20, reqs)
+	require.True(t, m.followMode)
+	require.Equal(t, 5, m.cursorIdx, "follow pins the cursor to the newest row")
+
+	m = commitSearch(m, "hit")
+	assert.Equal(t, 5, m.cursorIdx)
+	assert.True(t, m.followMode, "a jump landing on the newest row must preserve follow")
+
+	// A jump that MOVES the cursor off the newest row must disengage follow,
+	// or resolveRequestCursor's pin-to-newest would immediately undo it.
+	reqs2 := makeTestRequests(6)
+	reqs2[2].URL = "/hit/mid"
+	m2 := newSearchModel(20, reqs2)
+	require.True(t, m2.followMode)
+	m2 = commitSearch(m2, "hit")
+	assert.Equal(t, 2, m2.cursorIdx, "the jump must stick")
+	assert.Equal(t, "req-002", m2.cursorID)
+	assert.False(t, m2.followMode, "jumping off the newest row must disengage follow")
+}
+
+func TestRequestsSearch_SingleMatchNextPrevNoop(t *testing.T) {
+	// n/N scan strictly past the cursor and never revisit its own row, so with
+	// the sole match under the cursor they are documented no-ops.
+	reqs := makeTestRequests(5)
+	reqs[2].URL = "/only/hit"
+	m := newSearchModel(20, reqs)
+	m = updateModel(m, keyRune('g'))
+	m = commitSearch(m, "hit")
+	require.Equal(t, 2, m.cursorIdx)
+
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 2, m.cursorIdx, "n with a sole match is a no-op")
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, 2, m.cursorIdx, "N with a sole match is a no-op")
+	assert.Equal(t, "req-002", m.cursorID)
 }

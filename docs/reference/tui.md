@@ -81,17 +81,42 @@ A request whose response is still streaming shows its real header-time status bu
 | --- | ------ |
 | `1-9` | Solo process (press again for all) |
 | `f` | Open process filter (multi-select) |
-| `/` | Search (highlight matches) |
-| `n` / `N` | Next/previous search match |
-| `s` | String filter (hide non-matching) |
+| `/` | Substring filter, committed on `Enter` (hides non-matching) |
+| `s` | Substring filter, applied live (hides non-matching) |
 | `r` | Restart highlighted process |
 
 ### Requests View
 
+The requests view has an explicit **cursor row** (marked with `❯`). The
+navigation keys move that cursor rather than scrolling raw lines, and the
+viewport scrolls the minimum needed to keep the cursor on screen.
+
 | Key | Action |
 | --- | ------ |
-| `s` | String filter (on URL/method/subdomain) |
-| `Enter` | Open detail view for the selected request |
+| `j` / `↓` | Move cursor down (onto the newest row resumes auto-follow) |
+| `k` / `↑` | Move cursor up (pauses auto-follow) |
+| `g` / `Home` | Move cursor to the top (pauses auto-follow) |
+| `G` / `End` | Move cursor to the bottom (resumes auto-follow) |
+| `PgUp` / `PgDn` | Move cursor half a page |
+| `F` | Toggle auto-follow (on pins the cursor to the newest row) |
+| `/` | Search URL/method/subdomain — jumps the cursor to a match (does not filter) |
+| `n` / `N` | Jump the cursor to the next/previous match (wraps) |
+| `s` | String filter (on URL/method/subdomain) — hides non-matching rows |
+| `Enter` | Open detail view for the cursor row |
+| `Esc` | Return from detail, or clear the filter and search |
+
+**Auto-follow** pins the cursor to the newest row and keeps the list scrolled
+to the bottom as requests arrive. Moving the cursor up (`k`, `PgUp`, `g`)
+pauses follow; moving it back onto the newest row (`j`/`PgDn`), or pressing
+`G`/`End`/`F`, resumes it. While follow is paused, arriving requests never move
+the cursor off the row you selected.
+
+**Search vs. filter.** `/` in the requests view *navigates* — it jumps the
+cursor to matching rows and leaves every row visible — so it composes with an
+active `s` filter (matches are computed over the filtered list) instead of
+replacing it. `s` still *filters*, hiding non-matching rows. The status bar
+shows the search indicator as `/<query> (i/k)` (cursor on match _i_ of _k_) or
+`/<query> (k matches)` when the cursor is not on a match.
 
 ## Request Detail View
 
@@ -147,14 +172,20 @@ Press `f` to open the multi-select process filter:
 
 ## Search Mode
 
-Press `/` to enter search mode:
+Press `/` to enter search mode. An input field appears at the bottom; the
+behavior depends on the active view:
 
-- Input field appears at bottom
-- Matching text is highlighted in the log view
-- Logs continue to flow while searching
-- `n` / `N` navigate between matches
-- `Enter` exits search mode (highlights remain)
-- `Esc` clears search and highlights
+- **Logs view:** `/` is a case-insensitive substring filter committed on
+  `Enter` — matching lines are kept and non-matching ones hidden (the same
+  effect as `s`, which applies live instead of on `Enter`). There is no match
+  highlighting and no `n`/`N` navigation in the logs view.
+- **Requests view:** `/` is case-insensitive substring *navigation* over
+  URL/method/subdomain. On `Enter` the cursor jumps to the first match
+  at-or-after its current row (wrapping); `n`/`N` then jump to the next and
+  previous matches (wrapping). No rows are hidden, so search composes with an
+  active `s` filter.
+- `Esc` cancels the input; in normal mode `Esc` clears the committed
+  filter/search.
 
 ## String Filter Mode
 
