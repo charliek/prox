@@ -191,7 +191,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detailLoading = true
 				m.requestDetail = nil
 				m.detailError = nil
-				m.updateViewport()
+				m.renderDetailFromTop()
 				return m, m.fetchRequestDetail(requestID)
 			}
 		}

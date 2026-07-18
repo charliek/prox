@@ -60,6 +60,14 @@ type BaseModel struct {
 	// Auto-scroll
 	followMode bool // Auto-scroll to bottom on new logs
 
+	// Requests-view cursor (ID-anchored). cursorID names the row the cursor
+	// sits on; cursorIdx is its index in the filtered list. Both are mutated
+	// ONLY through setRequestCursor so they can never disagree. cursorID "" is
+	// the explicit no-cursor sentinel (production record IDs are always
+	// non-empty — both proxy paths mint them), and cursorIdx -1 pairs with it.
+	cursorID  string
+	cursorIdx int
+
 	// Last restart result for feedback
 	lastRestartProcess string
 	lastRestartError   error
@@ -150,12 +158,9 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 // a same-ID re-record (in-flight followed by its completion) replaces the
 // existing row in place rather than appending a duplicate, scanning from the
 // newest entry since that's where a live in-flight row lives. In-place
-// replacement keeps every other row's index stable, which matters because
-// detail-selection maps viewport line numbers to indices into proxyRequests.
+// replacement keeps every other row's index stable, and the ID-anchored cursor
+// (resolveRequestCursor) rides along on its row regardless.
 func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
-	// Check if we're at/near bottom BEFORE adding new content
-	wasNearBottom := b.isNearBottom()
-
 	replaced := false
 	if req.ID != "" {
 		for i := len(b.proxyRequests) - 1; i >= 0; i-- {
@@ -175,9 +180,30 @@ func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
 			b.proxyRequests = newRequests
 		}
 	}
-	b.updateViewport()
 
-	// If user was at bottom, re-enable follow mode and stay at bottom
+	// In the detail view an arrival updates only the list data: the viewport is
+	// showing the open detail, so re-rendering/scrolling it would yank the
+	// reader (today's GotoBottom wart). No follow change either. C4 layers the
+	// in-place detail refresh on top of this guard.
+	if b.viewMode == ViewModeRequestDetail {
+		return
+	}
+
+	// In the requests view, follow re-engagement is cursor-based, never
+	// isNearBottom-based: with a short list that fits the viewport AtBottom()
+	// is ALWAYS true, so consulting it would re-engage follow on every arrival
+	// and yank the cursor off the row the user navigated to. Arrivals never
+	// change followMode here; updateViewport re-resolves the cursor and, per
+	// D7, either GotoBottom (follow on) or keeps the cursor row visible.
+	if b.viewMode == ViewModeRequests {
+		b.updateViewport()
+		return
+	}
+
+	// Logs view: the requests list isn't on screen, so keep today's
+	// isNearBottom follow semantics for the (logs) viewport untouched.
+	wasNearBottom := b.isNearBottom()
+	b.updateViewport()
 	if wasNearBottom {
 		b.followMode = true
 		b.viewport.GotoBottom()
@@ -356,34 +382,74 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		return true
 
 	case "up", "k":
+		if b.viewMode == ViewModeRequests {
+			b.moveRequestCursor(-1)
+			return true
+		}
 		b.viewport.LineUp(1)
 		b.followMode = false
 		return true
 
 	case "down", "j":
+		if b.viewMode == ViewModeRequests {
+			b.moveRequestCursor(1)
+			return true
+		}
 		b.viewport.LineDown(1)
 		return true
 
 	case "pgup":
+		if b.viewMode == ViewModeRequests {
+			b.moveRequestCursor(-b.halfPageStep())
+			return true
+		}
 		b.viewport.HalfViewUp()
 		b.followMode = false
 		return true
 
 	case "pgdown":
+		if b.viewMode == ViewModeRequests {
+			b.moveRequestCursor(b.halfPageStep())
+			return true
+		}
 		b.viewport.HalfViewDown()
 		return true
 
 	case "home", "g":
+		if b.viewMode == ViewModeRequests {
+			requests := b.filteredProxyRequests()
+			b.setRequestCursor(requests, 0)
+			b.followMode = false
+			b.updateViewport()
+			return true
+		}
 		b.viewport.GotoTop()
 		b.followMode = false
 		return true
 
 	case "end", "G":
+		if b.viewMode == ViewModeRequests {
+			requests := b.filteredProxyRequests()
+			b.followMode = true
+			b.setRequestCursor(requests, len(requests)-1)
+			b.updateViewport()
+			return true
+		}
 		b.viewport.GotoBottom()
 		b.followMode = true
 		return true
 
 	case "F":
+		if b.viewMode == ViewModeRequests {
+			b.followMode = !b.followMode
+			if b.followMode {
+				// Toggling follow on pins the cursor to the newest row.
+				requests := b.filteredProxyRequests()
+				b.setRequestCursor(requests, len(requests)-1)
+			}
+			b.updateViewport()
+			return true
+		}
 		b.followMode = !b.followMode
 		if b.followMode {
 			b.viewport.GotoBottom()
@@ -392,6 +458,34 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 	}
 
 	return false
+}
+
+// moveRequestCursor moves the requests-view cursor by delta rows (negative =
+// up, positive = down) through the sole mutator, then re-renders. The follow
+// rule is sign-driven and matches the per-key semantics exactly: upward
+// movement (k/pgup) disengages follow, while downward movement (j/pgdown)
+// re-engages follow only when the cursor lands on the last (newest) row — the
+// cursor analog of "scrolled back to the bottom".
+func (b *BaseModel) moveRequestCursor(delta int) {
+	requests := b.filteredProxyRequests()
+	b.setRequestCursor(requests, b.cursorIdx+delta)
+	if delta < 0 {
+		b.followMode = false
+	} else if len(requests) > 0 && b.cursorIdx == len(requests)-1 {
+		b.followMode = true
+	}
+	b.updateViewport()
+}
+
+// halfPageStep is the cursor step for pgup/pgdown in the requests view: half a
+// viewport page, matching the logs view's HalfView semantics, and never less
+// than one row so paging always makes progress on a tiny viewport.
+func (b *BaseModel) halfPageStep() int {
+	step := b.viewport.Height / 2
+	if step < 1 {
+		step = 1
+	}
+	return step
 }
 
 // updateSearchMatches updates the search match indices
@@ -417,6 +511,81 @@ func (b *BaseModel) isNearBottom() bool {
 	return b.viewport.ScrollPercent() >= nearBottomThreshold
 }
 
+// setRequestCursor is the SOLE mutator of the requests-view cursor. It clamps
+// idx into [0, len(requests)-1] and updates cursorIdx and cursorID together so
+// the pair can never disagree; an empty list resets to the no-cursor sentinel
+// (cursorIdx -1, cursorID ""). Every mover — nav keys and resolveRequestCursor —
+// goes through here.
+func (b *BaseModel) setRequestCursor(requests []proxy.RequestRecord, idx int) {
+	if len(requests) == 0 {
+		b.cursorIdx = -1
+		b.cursorID = ""
+		return
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx > len(requests)-1 {
+		idx = len(requests) - 1
+	}
+	b.cursorIdx = idx
+	b.cursorID = requests[idx].ID
+}
+
+// resolveRequestCursor re-anchors the cursor against the current filtered list
+// at the render choke point, so every mutation source (upsert, append+trim,
+// live filter keystrokes, esc clear, follow toggles, view transitions) lands
+// with a coherent cursor. Precedence:
+//   - follow mode pins the cursor to the newest (last) row;
+//   - else if cursorID is still present, its current index (in-place upserts and
+//     appends never move the cursor off its row);
+//   - else the stale cursorIdx is clamped and re-anchored to whatever row now
+//     sits at that index (trim/filter removed the old row; empty→non-empty with
+//     follow off lands on row 0).
+func (b *BaseModel) resolveRequestCursor(requests []proxy.RequestRecord) {
+	if len(requests) == 0 {
+		b.setRequestCursor(requests, 0) // resets to the no-cursor sentinel
+		return
+	}
+	if b.followMode {
+		b.setRequestCursor(requests, len(requests)-1)
+		return
+	}
+	if b.cursorID != "" { // "" is the no-cursor sentinel; never a real ID
+		for i, req := range requests {
+			if req.ID == b.cursorID {
+				b.setRequestCursor(requests, i)
+				return
+			}
+		}
+	}
+	// Stale cursor (row filtered/trimmed away) or first anchor with follow off:
+	// clamp the last-known index and re-anchor to the row now there.
+	b.setRequestCursor(requests, b.cursorIdx)
+}
+
+// ensureCursorVisible scrolls the viewport the minimum amount needed to bring
+// the cursor row on-screen. Called from updateViewport (the SetContent choke
+// point) so the marker is visible after EVERY transition — tab-in from a
+// scrolled logs view, resize, append/trim, filter edit, detail-return — not
+// just after a keypress.
+func (b *BaseModel) ensureCursorVisible() {
+	if b.cursorIdx < 0 {
+		return // no-cursor sentinel (empty list)
+	}
+	// A grown viewport (or shrunk list) can leave YOffset past the last valid
+	// offset — the cursor then sits "in range" of a window that shows blank
+	// overscroll. Reclamp before the minimal-scroll branches.
+	if maxOffset := b.viewport.TotalLineCount() - b.viewport.Height; b.viewport.YOffset > maxOffset {
+		b.viewport.SetYOffset(max(0, maxOffset))
+	}
+	if b.cursorIdx < b.viewport.YOffset {
+		b.viewport.SetYOffset(b.cursorIdx)
+	} else if b.cursorIdx >= b.viewport.YOffset+b.viewport.Height {
+		b.viewport.SetYOffset(b.cursorIdx - b.viewport.Height + 1)
+	}
+}
+
 // updateViewport updates the viewport content
 func (b *BaseModel) updateViewport() {
 	var lines []string
@@ -426,9 +595,18 @@ func (b *BaseModel) updateViewport() {
 		lines = b.formatRequestDetail()
 	case ViewModeRequests:
 		requests := b.filteredProxyRequests()
-		for _, req := range requests {
-			line := b.formatProxyRequest(req)
-			lines = append(lines, line)
+		// Resolve the cursor against the just-computed filtered list BEFORE
+		// formatting so the marker (baked into content below) and the scroll
+		// invariant agree within this single render (D6/D8).
+		b.resolveRequestCursor(requests)
+		for i, req := range requests {
+			// Prefix the cursor row with a styled marker and every other row
+			// with two spaces so columns stay aligned (D10).
+			marker := "  "
+			if i == b.cursorIdx {
+				marker = cursorStyle.Render("❯ ")
+			}
+			lines = append(lines, marker+b.formatProxyRequest(req))
 		}
 	default: // ViewModeLogs
 		entries := b.filteredEntries()
@@ -440,6 +618,29 @@ func (b *BaseModel) updateViewport() {
 
 	content := strings.Join(lines, "\n")
 	b.viewport.SetContent(content)
+
+	// Cursor visibility invariant for the requests view (D7). Runs after
+	// SetContent so the marker is on-screen after every transition, not just
+	// keypresses. Follow mode overrides to the bottom. Logs/detail views keep
+	// their own scroll untouched.
+	if b.viewMode == ViewModeRequests {
+		if b.followMode {
+			b.viewport.GotoBottom()
+		} else {
+			b.ensureCursorVisible()
+		}
+	}
+}
+
+// renderDetailFromTop re-renders the viewport and scrolls it to the top. It is
+// the shared tail of both models' Enter-into-detail transitions: a detail
+// opened from deep in the list would otherwise inherit the list's YOffset. The
+// GotoTop must follow updateViewport (the detail-view render deliberately never
+// touches YOffset) and must stay out of updateViewport itself, which also runs
+// on background arrivals where re-scrolling would yank the reader.
+func (b *BaseModel) renderDetailFromTop() {
+	b.updateViewport()
+	b.viewport.GotoTop()
 }
 
 // formatRequestDetail formats the request detail view
@@ -665,25 +866,15 @@ func (b *BaseModel) filteredProxyRequests() []proxy.RequestRecord {
 	return result
 }
 
-// getSelectedRequest returns the request ID at the current viewport line in requests view.
-// Returns empty string if not in requests view or no request is selected.
+// getSelectedRequest returns the ID of the cursor row in the requests view,
+// which Enter opens. Returns "" outside the requests view or when the list is
+// empty (the no-cursor sentinel). The cursor is kept current by
+// resolveRequestCursor at every render, so cursorID is always a live row's ID.
 func (b *BaseModel) getSelectedRequest() string {
 	if b.viewMode != ViewModeRequests {
 		return ""
 	}
-
-	requests := b.filteredProxyRequests()
-	if len(requests) == 0 {
-		return ""
-	}
-
-	// Get the line index from viewport position
-	lineIdx := b.viewport.YOffset
-	if lineIdx >= 0 && lineIdx < len(requests) {
-		return requests[lineIdx].ID
-	}
-
-	return ""
+	return b.cursorID
 }
 
 // formatProxyRequest formats a single proxy request for display

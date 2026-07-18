@@ -118,7 +118,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						break
 					}
 				}
-				m.updateViewport()
+				m.renderDetailFromTop()
 			}
 		}
 		return m, nil
