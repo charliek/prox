@@ -305,7 +305,7 @@ func (s *Service) createRouter() http.Handler {
 		startTime := time.Now()
 
 		// Generate request ID early for capture
-		requestID := generateRequestID(startTime, r.Method, r.URL.String())
+		requestID := GenerateRequestID(startTime, r.Method, r.URL.String())
 
 		// Extract subdomain from host
 		subdomain := s.extractSubdomain(r.Host)
@@ -363,9 +363,9 @@ func (s *Service) createRouter() http.Handler {
 
 		// Choose response writer based on capture mode
 		var rw http.ResponseWriter
-		var crw *capturingResponseWriter
+		var crw *CaptureResponseWriter
 		if s.captureManager != nil && s.captureManager.Enabled() {
-			crw = newCapturingResponseWriter(w, s.captureManager.maxBodySize)
+			crw = s.captureManager.WrapResponseWriter(w)
 			rw = crw
 		} else {
 			rw = &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -394,7 +394,7 @@ func (s *Service) createRouter() http.Handler {
 		var statusCode int
 		if crw != nil {
 			statusCode = crw.StatusCode()
-			resBody, resHeaders := s.captureManager.CaptureResponse(requestID, crw)
+			resBody, resHeaders := s.captureManager.FinalizeResponse(requestID, crw)
 			details = &RequestDetails{
 				RequestHeaders:  reqHeaders,
 				ResponseHeaders: resHeaders,

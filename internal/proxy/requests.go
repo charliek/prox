@@ -48,8 +48,10 @@ type CapturedBody struct {
 	FilePath        string `json:"file_path"`                  // Disk path for large bodies (Data is nil when set)
 }
 
-// generateRequestID creates a short hash ID (7 chars, git-style) from request data.
-func generateRequestID(timestamp time.Time, method, url string) string {
+// GenerateRequestID creates a short hash ID (7 chars, git-style) from request
+// data. Exported so the shared daemon can generate a request ID before proxying
+// (needed for capture file naming).
+func GenerateRequestID(timestamp time.Time, method, url string) string {
 	data := fmt.Sprintf("%d:%s:%s", timestamp.UnixNano(), method, url)
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])[:7]
@@ -119,7 +121,7 @@ func (m *RequestManager) SetEvictionCallback(fn EvictionCallback) {
 // If the record doesn't have an ID, one is generated.
 func (m *RequestManager) Record(record RequestRecord) {
 	if record.ID == "" {
-		record.ID = generateRequestID(record.Timestamp, record.Method, record.URL)
+		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
 
 	var evictedID string

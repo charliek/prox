@@ -563,42 +563,49 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 
 		// Print request body
 		if resp.Details.RequestBody != nil {
-			fmt.Printf("\n--- Request Body (%d bytes", resp.Details.RequestBody.Size)
-			if resp.Details.RequestBody.Truncated {
-				fmt.Print(", truncated")
-			}
-			fmt.Println(") ---")
-			if includeBody && resp.Details.RequestBody.Data != "" {
-				if resp.Details.RequestBody.IsBinary {
-					fmt.Println("[binary data, base64 encoded]")
-				}
-				fmt.Println(resp.Details.RequestBody.Data)
-			} else if !includeBody && resp.Details.RequestBody.Size > 0 {
-				fmt.Println("(use --body to show content)")
-			}
+			printCapturedBody("Request Body", resp.Details.RequestBody, includeBody)
 		}
 
 		// Print response body
 		if resp.Details.ResponseBody != nil {
-			fmt.Printf("\n--- Response Body (%d bytes", resp.Details.ResponseBody.Size)
-			if resp.Details.ResponseBody.Truncated {
-				fmt.Print(", truncated")
-			}
-			fmt.Println(") ---")
-			if includeBody && resp.Details.ResponseBody.Data != "" {
-				if resp.Details.ResponseBody.IsBinary {
-					fmt.Println("[binary data, base64 encoded]")
-				}
-				fmt.Println(resp.Details.ResponseBody.Data)
-			} else if !includeBody && resp.Details.ResponseBody.Size > 0 {
-				fmt.Println("(use --body to show content)")
-			}
+			printCapturedBody("Response Body", resp.Details.ResponseBody, includeBody)
 		}
 	} else {
 		fmt.Println("\n(capture not enabled - use 'prox up --capture' to enable)")
 	}
 
 	return nil
+}
+
+// printCapturedBody prints one captured body section: a header line with size,
+// truncation, content type and content encoding, followed by the body content
+// (or a note that it is unavailable / must be requested with --body).
+func printCapturedBody(label string, body *api.CapturedBodyResponse, includeBody bool) {
+	fmt.Printf("\n--- %s (%d bytes", label, body.Size)
+	if body.Truncated {
+		fmt.Print(", truncated")
+	}
+	if body.ContentType != "" {
+		fmt.Printf(", %s", body.ContentType)
+	}
+	if body.ContentEncoding != "" {
+		fmt.Printf(", encoding: %s", body.ContentEncoding)
+	}
+	fmt.Println(") ---")
+
+	if body.UnavailableReason != "" {
+		fmt.Println("(body no longer available)")
+		return
+	}
+
+	if includeBody && body.Data != "" {
+		if body.IsBinary {
+			fmt.Println("[binary data, base64 encoded]")
+		}
+		fmt.Println(body.Data)
+	} else if !includeBody && body.Size > 0 {
+		fmt.Println("(use --body to show content)")
+	}
 }
 
 // printHeaders prints HTTP headers in a readable format

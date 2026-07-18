@@ -1,7 +1,10 @@
 // Package constants provides shared configuration values used across the prox application.
 package constants
 
-import "time"
+import (
+	"path/filepath"
+	"time"
+)
 
 // Configuration file defaults
 const (
@@ -110,7 +113,20 @@ const (
 
 	// CaptureDirectory is the directory name for storing captured body files
 	CaptureDirectory = ".prox/capture"
+
+	// MaxDecodedBodySize caps the number of bytes produced when decoding a
+	// content-encoded (e.g. gzip) captured body at serve time. Exceeding the cap
+	// is treated as a decode failure so a highly-compressible payload (zip bomb)
+	// cannot exhaust memory. 10MB.
+	MaxDecodedBodySize = 10 * 1024 * 1024
 )
+
+// DaemonCaptureDir returns the daemon's shared capture directory
+// (homeDir/.prox/capture) given a home directory. Kept here so both the api and
+// proxyd packages can derive the path without an import cycle.
+func DaemonCaptureDir(homeDir string) string {
+	return filepath.Join(homeDir, CaptureDirectory)
+}
 
 // Proxy timeouts
 const (

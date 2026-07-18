@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -462,40 +463,71 @@ func (h *Handlers) convertRequestDetails(details *proxy.RequestDetails, includeB
 	return resp
 }
 
-// convertCapturedBody converts proxy.CapturedBody to CapturedBodyResponse
+// captureAllowedDirs returns the directories a captured body's FilePath is
+// permitted to resolve within: the local capture manager's dir (when present)
+// and the shared daemon capture dir under the user's home. A socket-supplied
+// path outside these is rejected by the loader.
+func (h *Handlers) captureAllowedDirs() []string {
+	var primary string
+	if h.captureManager != nil {
+		primary = h.captureManager.CaptureDir()
+	}
+	return proxy.CaptureAllowedDirs(primary)
+}
+
+// convertCapturedBody converts proxy.CapturedBody to CapturedBodyResponse.
+//
+// Metadata fields are always populated. When includeData is set, the body is
+// loaded and content-decoded via proxy.LoadDecodedBody: is_binary in the
+// response reflects the served (decoded) bytes, binary data is base64-encoded,
+// and a body that could no longer be loaded reports unavailable_reason with no
+// data (HTTP 200 preserved). file_path is never exposed.
 func (h *Handlers) convertCapturedBody(body *proxy.CapturedBody, includeData bool) *CapturedBodyResponse {
 	if body == nil {
 		return nil
 	}
 
 	resp := &CapturedBodyResponse{
-		Size:        body.Size,
-		Truncated:   body.Truncated,
-		ContentType: body.ContentType,
-		IsBinary:    body.IsBinary,
+		Size:            body.Size,
+		CapturedSize:    body.CapturedSize,
+		Truncated:       body.Truncated,
+		ContentType:     body.ContentType,
+		ContentEncoding: body.ContentEncoding,
+		IsBinary:        body.IsBinary,
 	}
 
-	if includeData {
-		// Load body data (may be from disk)
-		var data []byte
-		var err error
+	if !includeData {
+		return resp
+	}
 
-		if h.captureManager != nil {
-			data, err = h.captureManager.LoadBody(body)
-		} else if body.Data != nil {
-			data = body.Data
-		}
+	decoded, err := proxy.LoadDecodedBody(body, h.captureAllowedDirs())
+	if err != nil {
+		log.Printf("Error loading captured body: %v", err)
+		return resp
+	}
 
-		if err != nil {
-			log.Printf("Error loading captured body: %v", err)
-		} else if data != nil {
-			if body.IsBinary {
-				// Encode binary data as base64
-				resp.Data = base64Encode(data)
-			} else {
-				resp.Data = string(data)
-			}
-		}
+	if !decoded.Available {
+		resp.UnavailableReason = decoded.UnavailableReason
+		return resp
+	}
+
+	// Report served (decoded) binary semantics.
+	resp.IsBinary = decoded.IsBinary
+
+	if len(decoded.Data) == 0 {
+		return resp
+	}
+
+	switch {
+	case decoded.IsBinary:
+		resp.Data = base64Encode(decoded.Data)
+	case utf8.Valid(decoded.Data):
+		resp.Data = string(decoded.Data)
+	default:
+		// Defense in depth: never JSON-encode invalid UTF-8 as a string even if
+		// the classifier considered it text.
+		resp.IsBinary = true
+		resp.Data = base64Encode(decoded.Data)
 	}
 
 	return resp

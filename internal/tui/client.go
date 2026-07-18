@@ -3,6 +3,7 @@ package tui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
@@ -230,27 +231,31 @@ func (m ClientModel) fetchRequestDetail(id string) tea.Cmd {
 			detail.ResponseHeaders = resp.Details.ResponseHeaders
 
 			if resp.Details.RequestBody != nil {
-				detail.RequestBody = &BodyData{
-					Size:        resp.Details.RequestBody.Size,
-					Truncated:   resp.Details.RequestBody.Truncated,
-					ContentType: resp.Details.RequestBody.ContentType,
-					IsBinary:    resp.Details.RequestBody.IsBinary,
-					Data:        resp.Details.RequestBody.Data,
-				}
+				detail.RequestBody = clientBodyToBodyData(resp.Details.RequestBody)
 			}
 
 			if resp.Details.ResponseBody != nil {
-				detail.ResponseBody = &BodyData{
-					Size:        resp.Details.ResponseBody.Size,
-					Truncated:   resp.Details.ResponseBody.Truncated,
-					ContentType: resp.Details.ResponseBody.ContentType,
-					IsBinary:    resp.Details.ResponseBody.IsBinary,
-					Data:        resp.Details.ResponseBody.Data,
-				}
+				detail.ResponseBody = clientBodyToBodyData(resp.Details.ResponseBody)
 			}
 		}
 
 		return RequestDetailMsg{ID: id, Details: detail}
+	}
+}
+
+// clientBodyToBodyData maps an API CapturedBodyResponse to TUI BodyData. Data
+// is already decoded (text) or base64 (binary) by the server; an
+// unavailable_reason marks an evicted body.
+func clientBodyToBodyData(body *api.CapturedBodyResponse) *BodyData {
+	return &BodyData{
+		Size:              body.Size,
+		Truncated:         body.Truncated,
+		ContentType:       body.ContentType,
+		ContentEncoding:   body.ContentEncoding,
+		IsBinary:          body.IsBinary,
+		Data:              body.Data,
+		Unavailable:       body.UnavailableReason != "",
+		UnavailableReason: body.UnavailableReason,
 	}
 }
 

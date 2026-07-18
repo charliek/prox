@@ -2,13 +2,17 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
@@ -481,17 +485,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 		}
 		bodyTitle += ")"
 		lines = append(lines, headerStyle.Render(bodyTitle))
-		if d.RequestBody.Data != "" {
-			if d.RequestBody.IsBinary {
-				lines = append(lines, dimStyle.Render("[binary data]"))
-			} else {
-				// Split body into lines
-				bodyLines := strings.Split(d.RequestBody.Data, "\n")
-				for _, line := range bodyLines {
-					lines = append(lines, "  "+line)
-				}
-			}
-		}
+		lines = append(lines, renderBodyLines(d.RequestBody)...)
 	}
 
 	// Response body
@@ -503,23 +497,33 @@ func (b *BaseModel) formatRequestDetail() []string {
 		}
 		bodyTitle += ")"
 		lines = append(lines, headerStyle.Render(bodyTitle))
-		if d.ResponseBody.Data != "" {
-			if d.ResponseBody.IsBinary {
-				lines = append(lines, dimStyle.Render("[binary data]"))
-			} else {
-				// Split body into lines
-				bodyLines := strings.Split(d.ResponseBody.Data, "\n")
-				for _, line := range bodyLines {
-					lines = append(lines, "  "+line)
-				}
-			}
-		}
+		lines = append(lines, renderBodyLines(d.ResponseBody)...)
 	}
 
 	// Footer hint
 	lines = append(lines, "")
 	lines = append(lines, dimStyle.Render("Press ESC to go back"))
 
+	return lines
+}
+
+// renderBodyLines renders the content lines for a captured body: an
+// unavailable (evicted) notice, a binary-data marker, or the body text split
+// into lines. Full rendering polish (JSON pretty-print) lands in a later commit.
+func renderBodyLines(body *BodyData) []string {
+	if body.Unavailable {
+		return []string{dimStyle.Render("(body no longer available)")}
+	}
+	if body.IsBinary {
+		return []string{dimStyle.Render("[binary data]")}
+	}
+	if body.Data == "" {
+		return nil
+	}
+	var lines []string
+	for _, line := range strings.Split(body.Data, "\n") {
+		lines = append(lines, "  "+line)
+	}
 	return lines
 }
 
@@ -889,7 +893,15 @@ func truncateError(err error, maxLen int) string {
 
 // convertRequestRecordToDetail converts a proxy.RequestRecord to RequestDetailData.
 // This is shared between Model (local mode) and ClientModel (API mode).
+// Bodies are loaded and content-decoded via the proxy loader so FilePath-backed
+// (disk-spilled) bodies are read rather than dropped.
 func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
+	return convertRequestRecordToDetailWithDirs(req, captureAllowedDirs())
+}
+
+// convertRequestRecordToDetailWithDirs is convertRequestRecordToDetail with an
+// explicit FilePath allowlist, separated so tests can supply a temp directory.
+func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs []string) *RequestDetailData {
 	detail := &RequestDetailData{
 		ID:         req.ID,
 		Timestamp:  req.Timestamp.Format("2006-01-02 15:04:05.000"),
@@ -906,25 +918,59 @@ func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
 		detail.ResponseHeaders = req.Details.ResponseHeaders
 
 		if req.Details.RequestBody != nil {
-			detail.RequestBody = &BodyData{
-				Size:        req.Details.RequestBody.Size,
-				Truncated:   req.Details.RequestBody.Truncated,
-				ContentType: req.Details.RequestBody.ContentType,
-				IsBinary:    req.Details.RequestBody.IsBinary,
-				Data:        string(req.Details.RequestBody.Data),
-			}
+			detail.RequestBody = convertCapturedBodyToBodyData(req.Details.RequestBody, allowedDirs)
 		}
-
 		if req.Details.ResponseBody != nil {
-			detail.ResponseBody = &BodyData{
-				Size:        req.Details.ResponseBody.Size,
-				Truncated:   req.Details.ResponseBody.Truncated,
-				ContentType: req.Details.ResponseBody.ContentType,
-				IsBinary:    req.Details.ResponseBody.IsBinary,
-				Data:        string(req.Details.ResponseBody.Data),
-			}
+			detail.ResponseBody = convertCapturedBodyToBodyData(req.Details.ResponseBody, allowedDirs)
 		}
 	}
 
 	return detail
+}
+
+// convertCapturedBodyToBodyData loads/decodes a captured body for TUI display.
+// An unavailable (evicted) body is marked so the renderer can note it rather
+// than showing garbage; binary and decoded-text semantics follow the loader.
+func convertCapturedBodyToBodyData(body *proxy.CapturedBody, allowedDirs []string) *BodyData {
+	bd := &BodyData{
+		Size:            body.Size,
+		Truncated:       body.Truncated,
+		ContentType:     body.ContentType,
+		ContentEncoding: body.ContentEncoding,
+		IsBinary:        body.IsBinary,
+	}
+
+	decoded, err := proxy.LoadDecodedBody(body, allowedDirs)
+	if err != nil || !decoded.Available {
+		bd.Unavailable = true
+		if decoded.UnavailableReason != "" {
+			bd.UnavailableReason = decoded.UnavailableReason
+		} else {
+			bd.UnavailableReason = "evicted"
+		}
+		return bd
+	}
+
+	bd.IsBinary = decoded.IsBinary
+	// Defense in depth (mirrors the API serve path): never string-convert bytes
+	// that are not valid UTF-8, even if the loaded record claims they are text —
+	// a socket-supplied flag or a mutated disk file must not reach the terminal
+	// as raw control bytes.
+	if !decoded.IsBinary && utf8.Valid(decoded.Data) {
+		bd.Data = string(decoded.Data)
+	} else {
+		bd.IsBinary = true
+	}
+	return bd
+}
+
+// captureAllowedDirs returns the directories a captured body's FilePath may
+// resolve within for the in-TUI loader: the local project capture dir
+// (cwd/.prox/capture) and the shared daemon capture dir under the user's home.
+func captureAllowedDirs() []string {
+	var primary string
+	if cwd, err := os.Getwd(); err == nil {
+		primary = filepath.Join(cwd, constants.CaptureDirectory)
+	}
+	return proxy.CaptureAllowedDirs(primary)
 }

@@ -209,11 +209,11 @@ func TestCaptureResponse(t *testing.T) {
 		require.NoError(t, err)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		crw.Header().Set("Content-Type", "text/html")
 		crw.Write([]byte("hello"))
 
-		body, headers := cm.CaptureResponse("req1", crw)
+		body, headers := cm.FinalizeResponse("req1", crw)
 		assert.Nil(t, body)
 		assert.Equal(t, "text/html", headers.Get("Content-Type"))
 	})
@@ -222,11 +222,11 @@ func TestCaptureResponse(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, constants.DefaultCaptureMaxBodySize)
+		crw := newCaptureResponseWriter(w, constants.DefaultCaptureMaxBodySize)
 		crw.Header().Set("Content-Type", "application/json")
 		crw.Write([]byte(`{"ok":true}`))
 
-		body, headers := cm.CaptureResponse("req1", crw)
+		body, headers := cm.FinalizeResponse("req1", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, int64(11), body.Size)
 		assert.False(t, body.Truncated)
@@ -245,13 +245,13 @@ func TestCaptureResponse(t *testing.T) {
 		cm.inlineThreshold = 10
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, constants.DefaultCaptureMaxBodySize)
+		crw := newCaptureResponseWriter(w, constants.DefaultCaptureMaxBodySize)
 		crw.Header().Set("Content-Type", "text/plain")
 
 		payload := strings.Repeat("y", 100)
 		crw.Write([]byte(payload))
 
-		body, _ := cm.CaptureResponse("req-disk", crw)
+		body, _ := cm.FinalizeResponse("req-disk", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, int64(100), body.Size)
 		assert.Nil(t, body.Data)
@@ -266,13 +266,13 @@ func TestCaptureResponse(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 20)
+		crw := newCaptureResponseWriter(w, 20)
 		crw.Header().Set("Content-Type", "text/plain")
 
 		payload := strings.Repeat("z", 50)
 		crw.Write([]byte(payload))
 
-		body, _ := cm.CaptureResponse("req-trunc", crw)
+		body, _ := cm.FinalizeResponse("req-trunc", crw)
 		require.NotNil(t, body)
 		assert.True(t, body.Truncated)
 		assert.Equal(t, int64(50), body.Size)         // total bytes observed
@@ -305,8 +305,8 @@ func TestLoadBody(t *testing.T) {
 	t.Run("file-backed body reads from disk", func(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
-		// Write a test file
-		tmpFile := filepath.Join(t.TempDir(), "test_body.bin")
+		// Write a test file inside the manager's capture dir (the allowlist root).
+		tmpFile := filepath.Join(cm.CaptureDir(), "test_body.bin")
 		err := os.WriteFile(tmpFile, []byte("file content"), 0600)
 		require.NoError(t, err)
 
@@ -566,12 +566,12 @@ func TestCaptureReadCloser(t *testing.T) {
 	})
 }
 
-// --- capturingResponseWriter tests ---
+// --- CaptureResponseWriter tests ---
 
 func TestCapturingResponseWriter(t *testing.T) {
 	t.Run("captures status code on first WriteHeader", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 
 		crw.WriteHeader(http.StatusCreated)
 		assert.Equal(t, http.StatusCreated, crw.StatusCode())
@@ -583,13 +583,13 @@ func TestCapturingResponseWriter(t *testing.T) {
 
 	t.Run("defaults to 200 if WriteHeader not called", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		assert.Equal(t, http.StatusOK, crw.StatusCode())
 	})
 
 	t.Run("captures body while forwarding to underlying writer", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 
 		n, err := crw.Write([]byte("hello "))
 		require.NoError(t, err)
@@ -605,7 +605,7 @@ func TestCapturingResponseWriter(t *testing.T) {
 
 	t.Run("truncates capture at max size but forwards full data", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 5)
+		crw := newCaptureResponseWriter(w, 5)
 
 		crw.Write([]byte("hello world"))
 
@@ -616,14 +616,14 @@ func TestCapturingResponseWriter(t *testing.T) {
 
 	t.Run("Flush delegates to underlying flusher", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		// Should not panic even if underlying doesn't implement Flusher
 		crw.Flush()
 	})
 
 	t.Run("Hijack returns error when unsupported", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		_, _, err := crw.Hijack()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "hijacking not supported")
@@ -631,20 +631,20 @@ func TestCapturingResponseWriter(t *testing.T) {
 
 	t.Run("Push returns ErrNotSupported when unsupported", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		err := crw.Push("/resource", nil)
 		assert.ErrorIs(t, err, http.ErrNotSupported)
 	})
 
 	t.Run("Unwrap returns underlying writer", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 1024)
+		crw := newCaptureResponseWriter(w, 1024)
 		assert.Equal(t, w, crw.Unwrap())
 	})
 
 	t.Run("multiple writes with truncation mid-write", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 8)
+		crw := newCaptureResponseWriter(w, 8)
 
 		crw.Write([]byte("abcd"))
 		assert.False(t, crw.Truncated())
@@ -868,14 +868,14 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 10)
+		crw := newCaptureResponseWriter(w, 10)
 		crw.Header().Set("Content-Type", "text/plain")
 
 		crw.Write([]byte("aaaaaa"))
 		crw.Write([]byte("bbbbbb"))
 		crw.Write([]byte("cccccc"))
 
-		body, _ := cm.CaptureResponse("req-total", crw)
+		body, _ := cm.FinalizeResponse("req-total", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, int64(18), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -886,13 +886,13 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 10)
+		crw := newCaptureResponseWriter(w, 10)
 		crw.Header().Set("Content-Type", "text/plain")
 
 		crw.Write([]byte("aaaaa"))
 		crw.Write([]byte("bbbbb"))
 
-		body, _ := cm.CaptureResponse("req-exact", crw)
+		body, _ := cm.FinalizeResponse("req-exact", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, int64(10), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -904,13 +904,13 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, 10)
+		crw := newCaptureResponseWriter(w, 10)
 		crw.Header().Set("Content-Type", "text/plain")
 
 		crw.Write([]byte("aaaaaaaaaa"))
 		crw.Write([]byte{})
 
-		body, _ := cm.CaptureResponse("req-zero", crw)
+		body, _ := cm.FinalizeResponse("req-zero", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, int64(10), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -942,12 +942,12 @@ func TestContentEncodingCaptured(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		w := httptest.NewRecorder()
-		crw := newCapturingResponseWriter(w, constants.DefaultCaptureMaxBodySize)
+		crw := newCaptureResponseWriter(w, constants.DefaultCaptureMaxBodySize)
 		crw.Header().Set("Content-Type", "application/json")
 		crw.Header().Set("Content-Encoding", "gzip")
 		crw.Write([]byte("compressed-ish"))
 
-		body, _ := cm.CaptureResponse("res-enc", crw)
+		body, _ := cm.FinalizeResponse("res-enc", crw)
 		require.NotNil(t, body)
 		assert.Equal(t, "gzip", body.ContentEncoding)
 	})

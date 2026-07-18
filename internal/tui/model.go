@@ -123,11 +123,16 @@ type RequestDetailData struct {
 
 // BodyData holds captured body information
 type BodyData struct {
-	Size        int64
-	Truncated   bool
-	ContentType string
-	IsBinary    bool
-	Data        string
+	Size            int64
+	Truncated       bool
+	ContentType     string
+	ContentEncoding string
+	IsBinary        bool
+	Data            string
+	// Unavailable is true when the body existed but could no longer be loaded
+	// (e.g. its disk file was evicted); UnavailableReason explains why.
+	Unavailable       bool
+	UnavailableReason string
 }
 
 // restartResultClearDelay is how long to show restart result before clearing

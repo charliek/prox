@@ -235,13 +235,19 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 	}
 }
 
-// CapturedBodyResponse represents a captured request or response body in API responses
+// CapturedBodyResponse represents a captured request or response body in API responses.
+// It never exposes the on-disk file_path of a spilled body.
 type CapturedBodyResponse struct {
-	Size        int64  `json:"size"`
-	Truncated   bool   `json:"truncated,omitempty"`
-	ContentType string `json:"content_type,omitempty"`
-	IsBinary    bool   `json:"is_binary,omitempty"`
-	Data        string `json:"data,omitempty"` // base64 for binary, plain text otherwise
+	Size            int64  `json:"size"`
+	CapturedSize    int64  `json:"captured_size"` // Bytes retained after truncation
+	Truncated       bool   `json:"truncated,omitempty"`
+	ContentType     string `json:"content_type,omitempty"`
+	ContentEncoding string `json:"content_encoding,omitempty"` // Stored Content-Encoding (e.g. "gzip")
+	IsBinary        bool   `json:"is_binary,omitempty"`        // With include=body: the SERVED (post-decode) bytes; otherwise the stored raw-bytes classification
+	Data            string `json:"data,omitempty"`             // base64 for binary, plain text otherwise
+	// UnavailableReason is set (e.g. "evicted") when include=body was requested
+	// but the body could no longer be loaded; Data is empty in that case.
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
 }
 
 // RequestDetailsResponse represents captured request/response details in API responses

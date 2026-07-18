@@ -320,6 +320,7 @@ Body data is available only when capture was enabled with `prox up --capture` or
     },
     "request_body": {
       "size": 27,
+      "captured_size": 27,
       "truncated": false,
       "content_type": "application/json",
       "is_binary": false,
@@ -328,6 +329,21 @@ Body data is available only when capture was enabled with `prox up --capture` or
   }
 }
 ```
+
+**Captured body fields:**
+
+| Field | Description |
+|-------|-------------|
+| `size` | Total encoded bytes observed by the capture wrapper before truncation (not Content-Length, not the decoded size) |
+| `captured_size` | Encoded bytes actually retained; `truncated` is true when `captured_size < size` |
+| `truncated` | Whether the body exceeded the 1MB capture cap and was truncated |
+| `content_type` | Captured `Content-Type` header value |
+| `content_encoding` | Captured `Content-Encoding` header value (e.g. `gzip`); omitted when unencoded |
+| `is_binary` | With `include=body`: whether the **served** (post-decode) bytes are binary. Without it: the stored classification of the **raw wire** bytes (a gzip body reports `true` here even when its decoded form would serve as text) — see decoded-body semantics below |
+| `data` | Body content (only with `include=body`): plain text for text bodies, base64 for binary |
+| `unavailable_reason` | Set (e.g. `evicted`) when `include=body` was requested but the body could no longer be loaded; `data` is absent |
+
+**Decoded-body semantics:** captured bodies store the raw wire bytes and are decoded at serve time. When `content_encoding` is `gzip` or `x-gzip` and the body was not truncated, the decoded bytes are served and `is_binary` reflects the decoded content (readable JSON/text decodes to `is_binary: false`). Unsupported encodings (`deflate`, `br`, `zstd`, chained values like `gzip, br`), truncated bodies, corrupt streams, and payloads whose decoded size would exceed the 10MB cap are served as the raw bytes, base64-encoded, with `is_binary: true` and `content_encoding` preserved. The stored (raw) binary classification and the served `is_binary` may therefore legitimately differ. The on-disk path of a spilled body is never exposed.
 
 **Examples:**
 
