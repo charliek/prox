@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.1.4
 
 ### Breaking
 
@@ -112,6 +112,8 @@ All notable changes to this project will be documented in this file.
   `prox stop`) was silently inert against `prox up --tui` — the request returned
   200 but the daemon kept running. The trigger is now routed into the TUI so it
   quits and runs the normal shutdown sequence.
+- `GET /api/v1/logs/stream` now returns a clean JSON error (`STREAMING_NOT_SUPPORTED`)
+  when the connection cannot stream, instead of writing SSE headers first (#40).
 - **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**
   (#31). Previously only `healthcheck.cmd` took effect; the timing/retry fields
   were silently dropped and replaced by the built-in defaults (`10s`/`5s`/`3`/
