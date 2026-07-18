@@ -592,6 +592,123 @@ func TestRunRequests_URLFilterPassthrough(t *testing.T) {
 	}
 }
 
+// TestRunRequests_TableRendersInFlightDuration verifies the list table's
+// DURATION column shows "..." for an in-flight row instead of the
+// misleading "0ms" (D10).
+func TestRunRequests_TableRendersInFlightDuration(t *testing.T) {
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+			Requests: []api.ProxyRequestResponse{
+				{
+					ID:         "inflight1",
+					Timestamp:  time.Now().Format(time.RFC3339Nano),
+					Method:     "GET",
+					URL:        "/stream",
+					StatusCode: 200,
+					DurationMs: 0,
+					InFlight:   true,
+				},
+			},
+			FilteredCount: 1,
+			TotalCount:    1,
+		})
+	}))
+	defer server.Close()
+	apiAddr = server.URL
+
+	requestsFollow = false
+	requestsJSON = false
+
+	stdout, _ := captureOutput(t, func() {
+		if err := runRequests(requestsCmd, []string{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "...") {
+		t.Errorf("expected DURATION column to render '...' for an in-flight row, got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "0ms") {
+		t.Errorf("expected no '0ms' duration for an in-flight row, got:\n%s", stdout)
+	}
+}
+
+// TestPrintProxyRequest_InFlight verifies follow-mode prints "(in flight)"
+// instead of a fake "(0ms)" for an in-flight streamed record (D10).
+func TestPrintProxyRequest_InFlight(t *testing.T) {
+	req := api.ProxyRequestResponse{
+		ID:         "inflight1",
+		Timestamp:  time.Now().Format(time.RFC3339Nano),
+		Method:     "GET",
+		URL:        "/stream",
+		StatusCode: 200,
+		DurationMs: 0,
+		InFlight:   true,
+	}
+
+	stdout, _ := captureOutput(t, func() {
+		printProxyRequest(req)
+	})
+
+	if !strings.Contains(stdout, "(in flight)") {
+		t.Errorf("expected '(in flight)' in follow-mode output, got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "(0ms)") {
+		t.Errorf("expected no '(0ms)' for an in-flight row, got:\n%s", stdout)
+	}
+}
+
+// TestShowRequestDetail_InFlight verifies the detail view shows
+// "(in flight)" for Duration and the in-flight note in place of the
+// "capture not enabled" hint when Details is nil because the request is
+// still streaming (D10).
+func TestShowRequestDetail_InFlight(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestDetailResponse{
+			ProxyRequestResponse: api.ProxyRequestResponse{
+				ID:         "inflight1",
+				Timestamp:  time.Now().Format(time.RFC3339Nano),
+				Method:     "GET",
+				URL:        "/stream",
+				StatusCode: 200,
+				DurationMs: 0,
+				InFlight:   true,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+
+	stdout, _ := captureOutput(t, func() {
+		if err := showRequestDetail(client, "inflight1", false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "Duration: (in flight)") {
+		t.Errorf("expected 'Duration: (in flight)', got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "(request in flight — details arrive on completion)") {
+		t.Errorf("expected in-flight details note, got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "capture not enabled") {
+		t.Errorf("expected the misleading capture-not-enabled hint to be suppressed, got:\n%s", stdout)
+	}
+}
+
 func TestDownCmd_NoArgs(t *testing.T) {
 	// Verify downCmd has NoArgs validation
 	if downCmd.Args == nil {

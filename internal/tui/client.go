@@ -224,6 +224,7 @@ func (m ClientModel) fetchRequestDetail(id string) tea.Cmd {
 			StatusCode: resp.StatusCode,
 			DurationMs: resp.DurationMs,
 			RemoteAddr: resp.RemoteAddr,
+			InFlight:   resp.InFlight,
 		}
 
 		if resp.Details != nil {

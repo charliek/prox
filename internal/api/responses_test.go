@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -414,5 +416,55 @@ func TestToProxyRequestResponse_OmitsEmptyHostname(t *testing.T) {
 
 	if resp.Hostname != "" {
 		t.Errorf("expected empty Hostname, got %q", resp.Hostname)
+	}
+}
+
+func TestToProxyRequestResponse_MapsInFlight(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:         "abc1234",
+		URL:        "/api/users",
+		StatusCode: 200,
+		InFlight:   true,
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if !resp.InFlight {
+		t.Error("expected InFlight to be true")
+	}
+}
+
+func TestToProxyRequestResponse_InFlightOmittedFromJSONWhenFalse(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:  "abc1234",
+		URL: "/api/users",
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+	if strings.Contains(string(data), "in_flight") {
+		t.Errorf("expected in_flight to be omitted from JSON, got %s", data)
+	}
+}
+
+func TestToProxyRequestResponse_InFlightPresentInJSONWhenTrue(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:       "abc1234",
+		URL:      "/api/users",
+		InFlight: true,
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+	if !strings.Contains(string(data), `"in_flight":true`) {
+		t.Errorf("expected in_flight:true in JSON, got %s", data)
 	}
 }

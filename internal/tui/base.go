@@ -146,17 +146,34 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	}
 }
 
-// handleProxyRequest handles a new proxy request message
+// handleProxyRequest handles a new proxy request message. It upserts by ID:
+// a same-ID re-record (in-flight followed by its completion) replaces the
+// existing row in place rather than appending a duplicate, scanning from the
+// newest entry since that's where a live in-flight row lives. In-place
+// replacement keeps every other row's index stable, which matters because
+// detail-selection maps viewport line numbers to indices into proxyRequests.
 func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
 	// Check if we're at/near bottom BEFORE adding new content
 	wasNearBottom := b.isNearBottom()
 
-	b.proxyRequests = append(b.proxyRequests, req)
-	// Keep only last requests - create new slice to release memory from old requests
-	if len(b.proxyRequests) > maxProxyRequests {
-		newRequests := make([]proxy.RequestRecord, maxProxyRequests)
-		copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
-		b.proxyRequests = newRequests
+	replaced := false
+	if req.ID != "" {
+		for i := len(b.proxyRequests) - 1; i >= 0; i-- {
+			if b.proxyRequests[i].ID == req.ID {
+				b.proxyRequests[i] = req
+				replaced = true
+				break
+			}
+		}
+	}
+	if !replaced {
+		b.proxyRequests = append(b.proxyRequests, req)
+		// Keep only last requests - create new slice to release memory from old requests
+		if len(b.proxyRequests) > maxProxyRequests {
+			newRequests := make([]proxy.RequestRecord, maxProxyRequests)
+			copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
+			b.proxyRequests = newRequests
+		}
 	}
 	b.updateViewport()
 
@@ -453,8 +470,22 @@ func (b *BaseModel) formatRequestDetail() []string {
 	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
 	lines = append(lines, fmt.Sprintf("  URL:      %s", d.URL))
 	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
-	lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
+	if d.InFlight {
+		lines = append(lines, "  Duration: (in flight)")
+	} else {
+		lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
+	}
 	lines = append(lines, fmt.Sprintf("  Remote:   %s", d.RemoteAddr))
+
+	// Details arrive only on completion: an in-flight record is guaranteed
+	// nil Details (see proxy.RequestRecord.InFlight), so it never has
+	// headers/bodies to render here. That's expected, not a "capture
+	// disabled" state, so it gets its own note instead of silently
+	// rendering nothing.
+	if d.InFlight {
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
+	}
 
 	// Request headers
 	if len(d.RequestHeaders) > 0 {
@@ -682,12 +713,17 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	}
 	status := statusStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
 
-	// Format duration with overflow handling
+	// Format duration with overflow handling. In-flight rows have no
+	// duration yet (the response is still streaming) — render dots in place
+	// of digits, padded to the same 5-char width so columns stay aligned.
 	durationMs := req.Duration.Milliseconds()
 	var duration string
-	if durationMs > 9999 {
+	switch {
+	case req.InFlight:
+		duration = "  ..."
+	case durationMs > 9999:
 		duration = "9999+"
-	} else {
+	default:
 		duration = fmt.Sprintf("%5d", durationMs)
 	}
 
@@ -969,6 +1005,7 @@ func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs [
 		StatusCode: req.StatusCode,
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
+		InFlight:   req.InFlight,
 	}
 
 	if req.Details != nil {

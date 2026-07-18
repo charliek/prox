@@ -3,6 +3,7 @@ package proxyd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -13,11 +14,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestBackend starts an httptest server running h and returns its host, port,
@@ -230,6 +234,11 @@ func TestDynamicProxy_Hijacked_RecordsSwitchingProtocols(t *testing.T) {
 
 	dp, rm, _ := newCaptureProxy(t, true, host, port, 10)
 
+	// Subscribe before driving: the ring holds ONE record (in-flight 101 then a
+	// final 101 upserted in place), but a subscriber sees TWO events.
+	sub := rm.Subscribe(proxy.RequestFilter{ProjectDir: "/projects/a"})
+	defer rm.Unsubscribe(sub.ID)
+
 	clientEnd, testEnd := net.Pipe()
 	defer clientEnd.Close()
 	defer testEnd.Close()
@@ -265,6 +274,17 @@ func TestDynamicProxy_Hijacked_RecordsSwitchingProtocols(t *testing.T) {
 	if rec0.Details != nil {
 		t.Error("Details should be nil for a hijacked (metadata-only) record")
 	}
+
+	// Two subscriber events: in-flight 101 then final 101 metadata-only.
+	ev1 := readProxydEvent(t, sub.Ch)
+	ev2 := readProxydEvent(t, sub.Ch)
+	assertNoMoreProxydEvents(t, sub.Ch)
+	assert.True(t, ev1.InFlight)
+	assert.Equal(t, http.StatusSwitchingProtocols, ev1.StatusCode)
+	assert.False(t, ev2.InFlight)
+	assert.Equal(t, http.StatusSwitchingProtocols, ev2.StatusCode)
+	assert.Nil(t, ev2.Details)
+	assertProxydFieldParity(t, ev1, ev2)
 }
 
 func TestDynamicProxy_ErrorHandler_CaptureRecordsBadGateway(t *testing.T) {
@@ -331,4 +351,302 @@ func TestDaemonCaptureDir_IsolatedHome(t *testing.T) {
 	if fi, err := os.Stat(want); err != nil || !fi.IsDir() {
 		t.Errorf("capture dir %s not created (err=%v)", want, err)
 	}
+}
+
+// --- first-response hook + two-phase recording (C4) ---
+
+func readProxydEvent(t *testing.T, ch <-chan proxy.RequestRecord) proxy.RequestRecord {
+	t.Helper()
+	select {
+	case rec := <-ch:
+		return rec
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected a subscriber event, got none")
+		return proxy.RequestRecord{}
+	}
+}
+
+func assertNoMoreProxydEvents(t *testing.T, ch <-chan proxy.RequestRecord) {
+	t.Helper()
+	select {
+	case rec := <-ch:
+		t.Fatalf("unexpected extra subscriber event: %+v", rec)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// assertProxydFieldParity pins that the in-flight and completion records agree
+// on every field except InFlight, Duration, and Details (StatusCode is the same
+// value in these tests, so it is asserted equal too).
+func assertProxydFieldParity(t *testing.T, inflight, final proxy.RequestRecord) {
+	t.Helper()
+	assert.Equal(t, inflight.ID, final.ID)
+	assert.Equal(t, inflight.Timestamp, final.Timestamp)
+	assert.Equal(t, inflight.Method, final.Method)
+	assert.Equal(t, inflight.URL, final.URL)
+	assert.Equal(t, inflight.Subdomain, final.Subdomain)
+	assert.Equal(t, inflight.Hostname, final.Hostname)
+	assert.Equal(t, inflight.ProjectDir, final.ProjectDir)
+	assert.Equal(t, inflight.RemoteAddr, final.RemoteAddr)
+	assert.Equal(t, inflight.StatusCode, final.StatusCode)
+}
+
+// newPipeHijackRecorder returns a hijackRecorder whose Hijack() succeeds,
+// backed by an in-memory net.Pipe.
+func newPipeHijackRecorder(t *testing.T) *hijackRecorder {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
+	go func() { _, _ = io.Copy(io.Discard, c2) }() // drain what the writer flushes
+	return &hijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: c1}
+}
+
+func TestStatusResponseWriter_FirstResponseHook(t *testing.T) {
+	newSRW := func(w http.ResponseWriter) *statusResponseWriter {
+		return &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	}
+
+	t.Run("repeated WriteHeader fires once with the first >=200 code", func(t *testing.T) {
+		srw := newSRW(httptest.NewRecorder())
+		var calls []int
+		srw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		srw.WriteHeader(http.StatusCreated)
+		srw.WriteHeader(http.StatusInternalServerError)
+
+		assert.Equal(t, []int{http.StatusCreated}, calls)
+		assert.Equal(t, http.StatusCreated, srw.statusCode, "first-wins latch")
+	})
+
+	t.Run("1xx then 200 fires once with 200 and records 200", func(t *testing.T) {
+		srw := newSRW(httptest.NewRecorder())
+		var calls []int
+		srw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		srw.WriteHeader(http.StatusEarlyHints) // 103
+		assert.Empty(t, calls, "1xx must not fire the hook")
+		assert.Equal(t, http.StatusOK, srw.statusCode, "1xx must not latch the status")
+
+		srw.WriteHeader(http.StatusOK)
+		assert.Equal(t, []int{http.StatusOK}, calls)
+		assert.Equal(t, http.StatusOK, srw.statusCode)
+	})
+
+	t.Run("implicit bare Write does not fire the hook", func(t *testing.T) {
+		srw := newSRW(httptest.NewRecorder())
+		var calls []int
+		srw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _ = srw.Write([]byte("hi"))
+		assert.Empty(t, calls)
+	})
+
+	t.Run("failed hijack does not fire the hook", func(t *testing.T) {
+		srw := newSRW(httptest.NewRecorder()) // ResponseRecorder is not a Hijacker
+		var calls []int
+		srw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _, err := srw.Hijack()
+		require.Error(t, err)
+		assert.Empty(t, calls)
+		assert.False(t, srw.Hijacked())
+	})
+
+	t.Run("successful hijack fires 101 once, no re-fire on late WriteHeader", func(t *testing.T) {
+		srw := newSRW(newPipeHijackRecorder(t))
+		var calls []int
+		srw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _, err := srw.Hijack()
+		require.NoError(t, err)
+		assert.Equal(t, []int{http.StatusSwitchingProtocols}, calls)
+		assert.True(t, srw.Hijacked())
+
+		srw.WriteHeader(http.StatusOK)
+		assert.Equal(t, []int{http.StatusSwitchingProtocols}, calls)
+	})
+}
+
+func TestDynamicProxy_TwoPhaseRecording(t *testing.T) {
+	for _, capture := range []bool{false, true} {
+		capture := capture
+		name := "capture-off"
+		if capture {
+			name = "capture-on"
+		}
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			var once sync.Once
+			doRelease := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(doRelease)
+
+			host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusAccepted) // 202
+				_, _ = w.Write([]byte("partial"))
+				w.(http.Flusher).Flush()
+				<-release
+				_, _ = w.Write([]byte("-rest"))
+			})
+
+			dp, rm, _ := newCaptureProxy(t, capture, host, port, 10)
+			filter := proxy.RequestFilter{ProjectDir: "/projects/a"}
+
+			sub := rm.Subscribe(filter)
+			defer rm.Unsubscribe(sub.ID)
+
+			req := httptest.NewRequest("GET", "http://api.local.dev/stream", nil)
+			req.Host = "api.local.dev"
+			rec := httptest.NewRecorder()
+
+			done := make(chan struct{})
+			go func() {
+				dp.handler(80).ServeHTTP(rec, req)
+				close(done)
+			}()
+
+			var inflightID string
+			require.Eventually(t, func() bool {
+				recs := rm.Recent(filter)
+				if len(recs) != 1 || !recs[0].InFlight {
+					return false
+				}
+				inflightID = recs[0].ID
+				return recs[0].StatusCode == http.StatusAccepted
+			}, 3*time.Second, 5*time.Millisecond, "in-flight record should appear mid-stream")
+
+			mid := rm.Recent(filter)
+			require.Len(t, mid, 1)
+			assert.Equal(t, time.Duration(0), mid[0].Duration)
+			assert.Nil(t, mid[0].Details, "in-flight record carries no Details")
+
+			doRelease()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("handler did not complete after release")
+			}
+
+			finals := rm.Recent(filter)
+			require.Len(t, finals, 1, "completion replaces the same ID in place")
+			f := finals[0]
+			assert.Equal(t, inflightID, f.ID)
+			assert.False(t, f.InFlight)
+			assert.Equal(t, http.StatusAccepted, f.StatusCode)
+			assert.Greater(t, f.Duration, time.Duration(0))
+			if capture {
+				require.NotNil(t, f.Details)
+				require.NotNil(t, f.Details.ResponseBody)
+				assert.Equal(t, "partial-rest", string(f.Details.ResponseBody.Data))
+			} else {
+				assert.Nil(t, f.Details)
+			}
+
+			ev1 := readProxydEvent(t, sub.Ch)
+			ev2 := readProxydEvent(t, sub.Ch)
+			assertNoMoreProxydEvents(t, sub.Ch)
+			assert.True(t, ev1.InFlight)
+			assert.False(t, ev2.InFlight)
+			assertProxydFieldParity(t, ev1, ev2)
+		})
+	}
+}
+
+func TestDynamicProxy_Hijacked_NonCapture_Records101(t *testing.T) {
+	// The deliberate D8 behavior change: a non-capture hijacked request now
+	// records 101 (previously the writer's default 200).
+	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+	})
+
+	dp, rm, _ := newCaptureProxy(t, false, host, port, 10) // capture OFF
+	sub := rm.Subscribe(proxy.RequestFilter{ProjectDir: "/projects/a"})
+	defer rm.Unsubscribe(sub.ID)
+
+	hr := newPipeHijackRecorder(t)
+	req := httptest.NewRequest("GET", "http://api.local.dev/ws", nil)
+	req.Host = "api.local.dev"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+	go func() {
+		dp.handler(80).ServeHTTP(hr, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hijacked request did not complete within 5s")
+	}
+
+	records := rm.Recent(proxy.RequestFilter{ProjectDir: "/projects/a"})
+	require.Len(t, records, 1)
+	assert.Equal(t, http.StatusSwitchingProtocols, records[0].StatusCode,
+		"non-capture hijack now records 101, not the writer's default 200")
+	assert.Nil(t, records[0].Details)
+
+	ev1 := readProxydEvent(t, sub.Ch)
+	ev2 := readProxydEvent(t, sub.Ch)
+	assertNoMoreProxydEvents(t, sub.Ch)
+	assert.True(t, ev1.InFlight)
+	assert.Equal(t, http.StatusSwitchingProtocols, ev1.StatusCode)
+	assert.False(t, ev2.InFlight)
+	assert.Equal(t, http.StatusSwitchingProtocols, ev2.StatusCode)
+}
+
+func TestDynamicProxy_ClientDisconnect_RecordsCompletion(t *testing.T) {
+	// Real front server so ReverseProxy panics http.ErrAbortHandler on the
+	// mid-stream copy failure; the deferred completion must still record.
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 10000; i++ {
+			if _, err := w.Write([]byte("chunk-of-streaming-body-")); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			select {
+			case <-release:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	})
+
+	dp, rm, _ := newCaptureProxy(t, true, host, port, 10)
+	front := httptest.NewServer(dp.handler(80))
+	defer front.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", front.URL+"/stream", nil)
+	require.NoError(t, err)
+	req.Host = "api.local.dev"
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	buf := make([]byte, 8)
+	_, _ = io.ReadFull(resp.Body, buf)
+	cancel()
+	_ = resp.Body.Close()
+
+	filter := proxy.RequestFilter{ProjectDir: "/projects/a"}
+	require.Eventually(t, func() bool {
+		recs := rm.Recent(filter)
+		return len(recs) == 1 && !recs[0].InFlight && recs[0].Duration > 0
+	}, 3*time.Second, 10*time.Millisecond, "aborted stream must produce a final record")
+
+	f := rm.Recent(filter)[0]
+	assert.Equal(t, http.StatusOK, f.StatusCode)
+	require.NotNil(t, f.Details, "capture-on aborted stream still records details")
 }

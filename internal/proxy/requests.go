@@ -28,6 +28,13 @@ type RequestRecord struct {
 	// even when two projects own the same hostname on different ports.
 	ProjectDir string `json:"project_dir,omitempty"`
 
+	// InFlight marks a record published at response-header time, before the
+	// response body finished. Such records carry the header-time status but
+	// zero Duration and nil Details; a completion update (same ID, InFlight
+	// false) replaces them via Upsert. Completed records are terminal:
+	// omitempty keeps their JSON identical to the pre-in-flight wire format.
+	InFlight bool `json:"in_flight,omitempty"`
+
 	// Details contains captured headers and bodies (nil when capture is disabled)
 	Details *RequestDetails `json:"details,omitempty"`
 }
@@ -174,6 +181,76 @@ func (m *RequestManager) Record(record RequestRecord) {
 
 	// Notify subscribers
 	m.notifySubscribers(record)
+}
+
+// Upsert applies a record as a monotonic two-state transition keyed by ID:
+//
+//	existing absent               → append (Record's eviction logic) + notify
+//	existing in-flight, incoming in-flight → no-op (duplicate delivery)
+//	existing in-flight, incoming final     → replace in place + notify
+//	existing final                → no-op (final is terminal)
+//
+// The no-op rows make concurrent interleavings safe: replaying a snapshot
+// while live stream events apply converges to the final record in any order,
+// with no duplicate or regressed notifications. Replace-in-place keeps the
+// ring slot (no head/count change, no eviction) — safe because in-flight
+// records carry no Details, so the transition only ever adds capture state.
+//
+// Unlike Record, subscribers are notified INSIDE the ring critical section:
+// same-ID notifications can never be observed out of transition order.
+// notifySubscribers only performs non-blocking channel sends under subMu,
+// and no path acquires mu while holding subMu, so this cannot block or
+// deadlock. The eviction callback (disk IO) still runs after unlock.
+func (m *RequestManager) Upsert(record RequestRecord) {
+	if record.ID == "" {
+		// Defensive: callers always supply IDs. Generate one and fall through
+		// to the normal append path (NOT Record, whose after-unlock notify
+		// would escape the ordering guarantee above).
+		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
+	}
+
+	var evictedID string
+	var onEvict EvictionCallback
+
+	m.mu.Lock()
+	// Scan newest→oldest: in-flight records live in the newest slots.
+	idx := -1
+	for i := 0; i < m.count; i++ {
+		j := (m.head - 1 - i + m.capacity) % m.capacity
+		if m.buffer[j].ID == record.ID {
+			idx = j
+			break
+		}
+	}
+
+	switch {
+	case idx >= 0 && (!m.buffer[idx].InFlight || record.InFlight):
+		// Terminal existing record, or duplicate in-flight delivery.
+		m.mu.Unlock()
+		return
+	case idx >= 0:
+		// In-flight → final: replace in place, ring position preserved.
+		m.buffer[idx] = record
+	default:
+		if m.count == m.capacity {
+			evicted := m.buffer[m.head]
+			if evicted.ID != "" && evicted.Details != nil {
+				evictedID = evicted.ID
+				onEvict = m.onEvict
+			}
+		}
+		m.buffer[m.head] = record
+		m.head = (m.head + 1) % m.capacity
+		if m.count < m.capacity {
+			m.count++
+		}
+	}
+	m.notifySubscribers(record)
+	m.mu.Unlock()
+
+	if evictedID != "" && onEvict != nil {
+		onEvict(evictedID)
+	}
 }
 
 // Recent returns the most recent requests matching the filter.

@@ -175,10 +175,16 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		captureEnabled := route.CaptureEnabled && dp.captureManager != nil && dp.captureManager.Enabled()
 
 		// Generate the request ID BEFORE proxying so capture files (written by
-		// FinalizeResponse) are named consistently with the recorded record.
-		requestID := ""
-		if captureEnabled {
-			requestID = proxy.GenerateRequestID(startTime, r.Method, r.URL.String())
+		// FinalizeResponse) are named consistently with the recorded record,
+		// AND so the in-flight and completion records share an ID on every
+		// route (capture or not).
+		requestID := proxy.GenerateRequestID(startTime, r.Method, r.URL.String())
+
+		// Extract subdomain for backward compat (computed before ServeHTTP so
+		// the in-flight and completion records share the expression).
+		subdomain := ""
+		if idx := strings.Index(hostname, "."); idx != -1 {
+			subdomain = hostname[:idx]
 		}
 
 		target := &url.URL{
@@ -230,22 +236,62 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				"target", target.String(),
 				"error", err,
 			)
-			if crw != nil {
-				crw.WriteHeader(http.StatusBadGateway)
-			} else {
-				srw.statusCode = http.StatusBadGateway
-			}
+			// http.Error writes the 502 through the wrapped writer (latching
+			// the status and firing the first-response hook); an explicit
+			// WriteHeader first would commit the response before http.Error
+			// could set its error headers.
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
 		}
 
-		rp.ServeHTTP(rw, r)
+		// buildRecord is the single field-parity point for the two-phase
+		// recording: the in-flight and completion records for one request differ
+		// ONLY in inFlight (which zeroes Duration), the StatusCode source, and
+		// Details. Every other field is this one expression.
+		buildRecord := func(statusCode int, details *proxy.RequestDetails, inFlight bool) proxy.RequestRecord {
+			duration := time.Duration(0)
+			if !inFlight {
+				duration = time.Since(startTime)
+			}
+			return proxy.RequestRecord{
+				ID:         requestID,
+				Timestamp:  startTime,
+				Method:     r.Method,
+				URL:        r.URL.String(),
+				Subdomain:  subdomain,
+				Hostname:   hostname,
+				ProjectDir: route.ProjectDir,
+				StatusCode: statusCode,
+				Duration:   duration,
+				RemoteAddr: r.RemoteAddr,
+				InFlight:   inFlight,
+				Details:    details,
+			}
+		}
 
-		// Record the request
+		// Phase 1 (in-flight): register a first-response hook that publishes a
+		// header-time record via Record (plain append — the fresh ID cannot
+		// already exist). buildRecord pins field parity with the completion
+		// record below.
 		if dp.requestManager != nil {
-			// Extract subdomain for backward compat
-			subdomain := ""
-			if idx := strings.Index(hostname, "."); idx != -1 {
-				subdomain = hostname[:idx]
+			onFirst := func(statusCode int) {
+				dp.requestManager.Record(buildRecord(statusCode, nil, true))
+			}
+			if crw != nil {
+				crw.SetFirstResponseCallback(onFirst)
+			} else {
+				srw.SetFirstResponseCallback(onFirst)
+			}
+		}
+
+		// Phase 2 (completion): the finalize-freeze + record build runs in a
+		// defer registered BEFORE ServeHTTP with NO recover, so it executes on
+		// normal return AND while unwinding ReverseProxy's http.ErrAbortHandler
+		// panic (client disconnect / backend death mid-stream). The panic keeps
+		// propagating; net/http suppresses ErrAbortHandler. Completion goes
+		// through Upsert (same ID as the in-flight record; final beats it).
+		defer func() {
+			if dp.requestManager == nil {
+				return
 			}
 
 			// Finalize capture (if enabled) and derive the status code from the
@@ -280,24 +326,19 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 					RequestBody:     reqBody,
 					ResponseBody:    resBody,
 				}
+			case srw.Hijacked():
+				// Non-capture WebSocket upgrade: record 101 to match the
+				// in-flight record and the capture path (the writer's default
+				// 200 would otherwise disagree).
+				statusCode = http.StatusSwitchingProtocols
 			default:
 				statusCode = srw.statusCode
 			}
 
-			dp.requestManager.Record(proxy.RequestRecord{
-				ID:         requestID, // empty for non-capture routes; Record generates one
-				Timestamp:  startTime,
-				Method:     r.Method,
-				URL:        r.URL.String(),
-				Subdomain:  subdomain,
-				Hostname:   hostname,
-				ProjectDir: route.ProjectDir,
-				StatusCode: statusCode,
-				Duration:   time.Since(startTime),
-				RemoteAddr: r.RemoteAddr,
-				Details:    details,
-			})
-		}
+			dp.requestManager.Upsert(buildRecord(statusCode, details, false))
+		}()
+
+		rp.ServeHTTP(rw, r)
 	})
 }
 
@@ -306,12 +347,45 @@ type statusResponseWriter struct {
 	http.ResponseWriter
 	statusCode  int
 	wroteHeader bool
+	hijacked    bool
+
+	// onFirstResponse, if set, fires exactly once at the first final response
+	// event — see fireFirstResponse. responded latches so it can never re-fire.
+	onFirstResponse func(statusCode int)
+	responded       bool
+}
+
+// SetFirstResponseCallback registers a callback that fires exactly once at the
+// first FINAL response event (see fireFirstResponse). Single-goroutine access
+// per the http.ResponseWriter contract; set before serving.
+func (w *statusResponseWriter) SetFirstResponseCallback(fn func(statusCode int)) {
+	w.onFirstResponse = fn
+}
+
+// fireFirstResponse invokes the first-response callback at most once. It is
+// driven ONLY from WriteHeader (final status) and a successful Hijack — never
+// from an implicit bare Write. The reverse proxy always calls WriteHeader
+// explicitly for normal responses and hijacks for upgrades.
+func (w *statusResponseWriter) fireFirstResponse(code int) {
+	if w.responded {
+		return
+	}
+	w.responded = true
+	if w.onFirstResponse != nil {
+		w.onFirstResponse(code)
+	}
 }
 
 func (w *statusResponseWriter) WriteHeader(code int) {
-	if !w.wroteHeader {
-		w.statusCode = code
-		w.wroteHeader = true
+	// 1xx provisional responses (e.g. 103 Early Hints) are not the final
+	// status: they neither latch the recorded status nor fire the hook.
+	if code >= 200 {
+		if !w.wroteHeader {
+			w.statusCode = code
+			w.wroteHeader = true
+		}
+		// Order: latch status → invoke callback → delegate.
+		w.fireFirstResponse(code)
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
@@ -326,9 +400,21 @@ func (w *statusResponseWriter) Flush() {
 // Hijack implements http.Hijacker for WebSocket support.
 func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
+		conn, rw, err := h.Hijack()
+		if err == nil {
+			w.hijacked = true
+			// A successful upgrade never calls WriteHeader (the 101 is written
+			// raw to the hijacked conn), so fire the hook here with 101.
+			w.fireFirstResponse(http.StatusSwitchingProtocols)
+		}
+		return conn, rw, err
 	}
 	return nil, nil, errors.New("hijacking not supported")
+}
+
+// Hijacked reports whether the connection was taken over (WebSocket upgrade).
+func (w *statusResponseWriter) Hijacked() bool {
+	return w.hijacked
 }
 
 // Unwrap returns the underlying ResponseWriter for http.ResponseController compatibility.

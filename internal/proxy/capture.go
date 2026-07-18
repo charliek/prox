@@ -365,6 +365,10 @@ type CaptureResponseWriter struct {
 	wroteHeader bool
 	hijacked    bool
 	totalSeen   int64 // total bytes observed across all writes, counting past truncation
+
+	// firstResponseHook fires the registered callback once at the first final
+	// response event (see fireFirstResponse).
+	firstResponseHook
 }
 
 // newCaptureResponseWriter creates a new capturing response writer.
@@ -377,9 +381,17 @@ func newCaptureResponseWriter(w http.ResponseWriter, maxBodySize int64) *Capture
 }
 
 func (crw *CaptureResponseWriter) WriteHeader(code int) {
-	if !crw.wroteHeader {
-		crw.statusCode = code
-		crw.wroteHeader = true
+	// 1xx provisional responses (e.g. 103 Early Hints) are not the final
+	// status: they neither latch the recorded status nor fire the hook.
+	// ReverseProxy may forward them via WriteHeader before the real status.
+	if code >= 200 {
+		if !crw.wroteHeader {
+			crw.statusCode = code
+			crw.wroteHeader = true
+		}
+		// Order: latch status → invoke callback → delegate, so the in-flight
+		// record exists before any response bytes hit the wire.
+		crw.fireFirstResponse(code)
 	}
 	crw.ResponseWriter.WriteHeader(code)
 }
@@ -440,6 +452,9 @@ func (crw *CaptureResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) 
 		conn, rw, err := h.Hijack()
 		if err == nil {
 			crw.hijacked = true
+			// A successful upgrade never calls WriteHeader (the 101 is written
+			// raw to the hijacked conn), so fire the hook here with 101.
+			crw.fireFirstResponse(http.StatusSwitchingProtocols)
 		}
 		return conn, rw, err
 	}

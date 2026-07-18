@@ -1,11 +1,20 @@
 package proxyd
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/proxy"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func startTestServer(t *testing.T) (*Server, *Client, string) {
@@ -213,6 +222,76 @@ func TestShutdownProtected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Shutdown(force): %v", err)
 	}
+}
+
+// TestClientRequests pins the Client.Requests contract against the real daemon
+// endpoint: it URL-escapes awkward project dirs (spaces/#) so the server matches
+// them, honors the explicit limit, and decodes the {"requests":[...]} wrapper.
+func TestClientRequests(t *testing.T) {
+	server, client, _ := startTestServer(t)
+
+	daemonRM := proxy.NewRequestManager(100)
+	server.SetRequestManager(daemonRM)
+
+	// A project dir with a space and a '#': if the client did not URL-escape it,
+	// the '#' would be treated as a fragment and the server's project filter
+	// would never match, returning zero records.
+	const dir = "/weird dir #1"
+	for i := 0; i < 5; i++ {
+		daemonRM.Record(proxy.RequestRecord{
+			ID: fmt.Sprintf("r%d", i), ProjectDir: dir, Method: "GET", URL: "/x", Timestamp: time.Now(),
+		})
+	}
+	// A record for a different project must never leak into the filtered result.
+	daemonRM.Record(proxy.RequestRecord{ID: "other", ProjectDir: "/other", Method: "GET", URL: "/y", Timestamp: time.Now()})
+
+	t.Run("escapes dir, honors limit, decodes wrapper", func(t *testing.T) {
+		recs, err := client.Requests(t.Context(), dir, 3)
+		require.NoError(t, err)
+		require.Len(t, recs, 3, "explicit limit honored")
+		for _, r := range recs {
+			assert.Equal(t, dir, r.ProjectDir, "escaped project matched server-side")
+		}
+	})
+
+	t.Run("full snapshot with MaxProxyRequests limit", func(t *testing.T) {
+		recs, err := client.Requests(t.Context(), dir, constants.MaxProxyRequests)
+		require.NoError(t, err)
+		assert.Len(t, recs, 5, "all of the project's records, none of /other's")
+	})
+}
+
+// TestClientRequests_TruncatedBodyAllOrNothing pins that a truncated 200
+// response yields (nil, error) — no partial records leak through the wrapper.
+func TestClientRequests_TruncatedBodyAllOrNothing(t *testing.T) {
+	socketPath := startRawSSEServerMux(t,
+		func(_ http.ResponseWriter, _ *http.Request) {},
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"requests":[{"id":"abc","method":"GET"`) // truncated mid-object
+		})
+
+	client := NewClient(socketPath)
+	recs, err := client.Requests(context.Background(), "/p", constants.MaxProxyRequests)
+	require.Error(t, err)
+	assert.Nil(t, recs, "all-or-nothing: no partial records on a truncated body")
+}
+
+// TestClientRequests_WrongShapeWrapper pins that a 200 with valid JSON of the
+// wrong shape ({} — missing the "requests" key) is treated as malformed rather
+// than a silent empty backfill: the daemon always emits a non-nil slice.
+func TestClientRequests_WrongShapeWrapper(t *testing.T) {
+	socketPath := startRawSSEServerMux(t,
+		func(_ http.ResponseWriter, _ *http.Request) {},
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		})
+
+	client := NewClient(socketPath)
+	recs, err := client.Requests(context.Background(), "/p", constants.MaxProxyRequests)
+	require.Error(t, err)
+	assert.Nil(t, recs, "missing requests key must error, not read as empty")
 }
 
 func TestDomainConflictViaClient(t *testing.T) {

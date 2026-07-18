@@ -107,14 +107,18 @@ type RequestDetailErrorMsg struct {
 
 // RequestDetailData holds the detailed information about a request for TUI display
 type RequestDetailData struct {
-	ID              string
-	Timestamp       string
-	Method          string
-	URL             string
-	Subdomain       string
-	StatusCode      int
-	DurationMs      int64
-	RemoteAddr      string
+	ID         string
+	Timestamp  string
+	Method     string
+	URL        string
+	Subdomain  string
+	StatusCode int
+	DurationMs int64
+	RemoteAddr string
+	// InFlight marks a request whose response is still streaming: Duration
+	// renders as "(in flight)" and a nil Details gets an explanatory note
+	// instead of being treated as "capture not enabled".
+	InFlight        bool
 	RequestHeaders  map[string][]string
 	ResponseHeaders map[string][]string
 	RequestBody     *BodyData

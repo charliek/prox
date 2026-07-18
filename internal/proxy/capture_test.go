@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1025,5 +1027,85 @@ func TestContentEncodingCaptured(t *testing.T) {
 		require.NoError(t, wrappedBody.Close())
 
 		assert.Empty(t, capturedBody.ContentEncoding)
+	})
+}
+
+// hookHijacker is an http.ResponseWriter that also implements http.Hijacker,
+// backed by an in-memory net.Pipe, so a SUCCESSFUL Hijack() can be exercised in
+// a unit test (httptest.ResponseRecorder is not a Hijacker so it fails hijack).
+type hookHijacker struct {
+	*httptest.ResponseRecorder
+	conn net.Conn
+}
+
+func (h *hookHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return h.conn, bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn)), nil
+}
+
+func newHookHijacker(t *testing.T) *hookHijacker {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
+	return &hookHijacker{ResponseRecorder: httptest.NewRecorder(), conn: c1}
+}
+
+func TestCaptureResponseWriter_FirstResponseHook(t *testing.T) {
+	t.Run("repeated WriteHeader fires once with the first >=200 code", func(t *testing.T) {
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		var calls []int
+		crw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		crw.WriteHeader(http.StatusCreated)
+		crw.WriteHeader(http.StatusInternalServerError)
+
+		assert.Equal(t, []int{http.StatusCreated}, calls)
+		assert.Equal(t, http.StatusCreated, crw.StatusCode(), "first-wins latch")
+	})
+
+	t.Run("1xx then 200 fires once with 200 and records 200", func(t *testing.T) {
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		var calls []int
+		crw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		crw.WriteHeader(http.StatusEarlyHints) // 103
+		assert.Empty(t, calls, "1xx must not fire the hook")
+		assert.Equal(t, http.StatusOK, crw.StatusCode(), "1xx must not latch the status")
+
+		crw.WriteHeader(http.StatusOK)
+		assert.Equal(t, []int{http.StatusOK}, calls)
+		assert.Equal(t, http.StatusOK, crw.StatusCode())
+	})
+
+	t.Run("implicit bare Write does not fire the hook", func(t *testing.T) {
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		var calls []int
+		crw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _ = crw.Write([]byte("hi"))
+		assert.Empty(t, calls)
+	})
+
+	t.Run("failed hijack does not fire the hook", func(t *testing.T) {
+		// httptest.ResponseRecorder does not implement http.Hijacker.
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		var calls []int
+		crw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _, err := crw.Hijack()
+		require.Error(t, err)
+		assert.Empty(t, calls)
+	})
+
+	t.Run("successful hijack fires 101 once, no re-fire on late WriteHeader", func(t *testing.T) {
+		crw := newCaptureResponseWriter(newHookHijacker(t), 1024)
+		var calls []int
+		crw.SetFirstResponseCallback(func(code int) { calls = append(calls, code) })
+
+		_, _, err := crw.Hijack()
+		require.NoError(t, err)
+		assert.Equal(t, []int{http.StatusSwitchingProtocols}, calls)
+
+		crw.WriteHeader(http.StatusOK)
+		assert.Equal(t, []int{http.StatusSwitchingProtocols}, calls, "hook must not re-fire after hijack")
 	})
 }

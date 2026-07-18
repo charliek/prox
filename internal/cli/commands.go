@@ -534,8 +534,12 @@ func runRequests(cmd *cobra.Command, args []string) error {
 			for _, req := range resp.Requests {
 				ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
 				timeStr := ts.Format("15:04:05")
-				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%dms\t%s\n",
-					req.ID, timeStr, req.Method, req.StatusCode, req.DurationMs, req.URL)
+				duration := fmt.Sprintf("%dms", req.DurationMs)
+				if req.InFlight {
+					duration = "..."
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
+					req.ID, timeStr, req.Method, req.StatusCode, duration, req.URL)
 			}
 			w.Flush()
 
@@ -569,7 +573,11 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 	fmt.Printf("Method:  %s\n", resp.Method)
 	fmt.Printf("URL:     %s\n", resp.URL)
 	fmt.Printf("Status:  %d\n", resp.StatusCode)
-	fmt.Printf("Duration: %dms\n", resp.DurationMs)
+	if resp.InFlight {
+		fmt.Printf("Duration: (in flight)\n")
+	} else {
+		fmt.Printf("Duration: %dms\n", resp.DurationMs)
+	}
 	fmt.Printf("Remote:  %s\n", resp.RemoteAddr)
 
 	if resp.Details != nil {
@@ -594,6 +602,8 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 		if resp.Details.ResponseBody != nil {
 			printCapturedBody("Response Body", resp.Details.ResponseBody, includeBody)
 		}
+	} else if resp.InFlight {
+		fmt.Println("\n(request in flight — details arrive on completion)")
 	} else {
 		fmt.Println("\n(capture not enabled - use 'prox up --capture' to enable)")
 	}
@@ -693,8 +703,12 @@ func printProxyRequest(req api.ProxyRequestResponse) {
 		}
 	}
 
-	fmt.Printf("%s %s %s%d%s %s (%dms)\n",
-		req.ID, timeStr, statusColor, req.StatusCode, resetColor, req.Method, req.DurationMs)
+	duration := fmt.Sprintf("(%dms)", req.DurationMs)
+	if req.InFlight {
+		duration = "(in flight)"
+	}
+	fmt.Printf("%s %s %s%d%s %s %s\n",
+		req.ID, timeStr, statusColor, req.StatusCode, resetColor, req.Method, duration)
 	fmt.Printf("       %s\n", req.URL)
 }
 

@@ -852,6 +852,54 @@ func TestStreamProxyRequests(t *testing.T) {
 		assert.Contains(t, requestDataLines[0], "/api/orders/123")
 		assert.NotContains(t, body, "/api/products")
 	})
+
+	t.Run("emits in_flight for an in-flight record", func(t *testing.T) {
+		// A real server + incremental body read makes this deterministic: the
+		// handler writes ": connected" only after subscribing, so once that
+		// line is read the push below is guaranteed to be delivered.
+		srv := httptest.NewServer(http.HandlerFunc(handlers.StreamProxyRequests))
+		defer srv.Close()
+
+		// Bound the reads: if the handler stops emitting, the context ends the
+		// request and the blocked ReadString fails instead of hanging the suite.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		reader := bufio.NewReader(resp.Body)
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		require.Contains(t, line, ": connected")
+
+		// Push an in-flight record straight through the manager (the record
+		// itself, not the producer path, is under test here).
+		rm.Record(proxy.RequestRecord{
+			ID:         "inflight1",
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/inflight",
+			Subdomain:  "test",
+			StatusCode: 200,
+			InFlight:   true,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		var dataLine string
+		for {
+			l, err := reader.ReadString('\n')
+			require.NoError(t, err)
+			if strings.HasPrefix(l, "data: ") {
+				dataLine = l
+				break
+			}
+		}
+		assert.Contains(t, dataLine, "/inflight")
+		assert.Contains(t, dataLine, `"in_flight":true`)
+	})
 }
 
 func TestStreamProxyRequests_ProxyNotEnabled(t *testing.T) {
