@@ -83,6 +83,9 @@ type RequestManager struct {
 	subMu  sync.RWMutex
 	subs   map[string]*RequestSubscription
 	nextID int
+	// closed latches after Close: new Subscribe calls get an already-closed
+	// channel so post-shutdown streams end immediately.
+	closed bool
 
 	// onEvict is called when a request is evicted from the buffer
 	onEvict EvictionCallback
@@ -187,6 +190,9 @@ func (m *RequestManager) GetByID(id string) (RequestRecord, bool) {
 }
 
 // Subscribe creates a subscription for real-time request updates.
+// After Close, the returned subscription's channel is already closed, so an
+// SSE handler that races the shutdown-time Close observes end-of-stream
+// immediately instead of blocking on a channel nothing will ever close.
 func (m *RequestManager) Subscribe(filter RequestFilter) *RequestSubscription {
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
@@ -196,6 +202,10 @@ func (m *RequestManager) Subscribe(filter RequestFilter) *RequestSubscription {
 		ID:     fmt.Sprintf("sub-%d", m.nextID),
 		Filter: filter,
 		Ch:     make(chan RequestRecord, 100),
+	}
+	if m.closed {
+		close(sub.Ch)
+		return sub
 	}
 	m.subs[sub.ID] = sub
 
@@ -220,11 +230,15 @@ func (m *RequestManager) Count() int {
 	return m.count
 }
 
-// Close closes all subscription channels and cleans up resources.
+// Close closes all subscription channels and cleans up resources. It latches:
+// subsequent Subscribe calls receive an already-closed channel, so a stream
+// request racing a shutdown-time Close cannot re-subscribe and pin the API
+// server open. Idempotent.
 func (m *RequestManager) Close() {
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
+	m.closed = true
 	for id, sub := range m.subs {
 		close(sub.Ch)
 		delete(m.subs, id)

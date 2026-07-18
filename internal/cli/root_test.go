@@ -133,3 +133,48 @@ processes:
 		}
 	})
 }
+
+// TestClientCommandsDiscoveryAllowlist pins the discovery allowlist contract:
+// every command whose handler reaches the daemon API through the shared apiAddr
+// global (the NewClient(apiAddr) call sites in this package, plus attach, which
+// falls back to apiAddr when --addr is set) must be in clientCommands, or it
+// silently talks to the :5555 default and breaks against dynamic-port daemons.
+// 'start' (#41) and 'requests' (#43) both shipped with exactly that gap; when
+// adding a new client command, add it to clientCommands AND to this list.
+func TestClientCommandsDiscoveryAllowlist(t *testing.T) {
+	// The enumerated apiAddr-consuming commands. downCmd reuses runStop, and
+	// attachCmd honors apiAddr when explicitly set, so both belong here.
+	apiAddrCommands := []string{
+		"status",   // runStatus
+		"logs",     // runLogs
+		"stop",     // runStop
+		"down",     // RunE: runStop
+		"start",    // runStartProcess
+		"restart",  // runRestart
+		"attach",   // runAttach (apiAddr fallback + state discovery)
+		"requests", // runRequests
+	}
+
+	for _, name := range apiAddrCommands {
+		if !clientCommands[name] {
+			t.Errorf("command %q performs client calls via apiAddr but is missing from the clientCommands discovery allowlist", name)
+		}
+	}
+
+	// Every allowlist entry must be a real registered subcommand, so a renamed
+	// or removed command can't leave a stale entry silently matching nothing.
+	registered := make(map[string]bool)
+	for _, cmd := range rootCmd.Commands() {
+		registered[cmd.Name()] = true
+	}
+	for name := range clientCommands {
+		if !registered[name] {
+			t.Errorf("clientCommands allowlist entry %q is not a registered command", name)
+		}
+	}
+
+	if len(clientCommands) != len(apiAddrCommands) {
+		t.Errorf("clientCommands has %d entries but %d apiAddr-consuming commands are enumerated here; keep the allowlist and this test in sync",
+			len(clientCommands), len(apiAddrCommands))
+	}
+}

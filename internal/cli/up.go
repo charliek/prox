@@ -462,6 +462,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		apiServer:    apiServer,
 		coordinator:  coordinator,
 		logMgr:       logMgr,
+		reqMgr:       localRequestManager(proxyService, handlers),
 		cwd:          cwd,
 		stageTimeout: teardownStageTimeout,
 	})
@@ -511,6 +512,7 @@ type shutdownDeps struct {
 	apiServer    *api.Server
 	coordinator  *shutdownCoordinator
 	logMgr       *logs.Manager
+	reqMgr       *proxy.RequestManager
 	cwd          string
 	stageTimeout time.Duration
 }
@@ -549,14 +551,21 @@ type shutdownDeps struct {
 //
 // Deviation from the plan's D4 stage order (API shutdown → flush): the log manager
 // is closed BEFORE the API stage. GET /logs/stream (SSE) handlers range over a log
-// subscription channel and would otherwise hold their connection until the 30s
-// route timeout, making apiServer.Shutdown sit out its full 5s stage on every
-// shutdown with a stream attached. Closing the manager closes those subscriber
-// channels so the handlers return at once; the API stage then only waits for any
-// small wait=true JSON write. This is safe because Write-after-Close is a no-op
-// (RingBuffer.Write always succeeds; Broadcast/Send short-circuit on a closed
-// subscription) and non-streaming GET /logs still reads the intact ring buffer, so
-// no handler panics.
+// subscription channel and carry no route timeout at all (#42), so they would
+// otherwise hold their connection indefinitely, making apiServer.Shutdown sit out
+// its full 5s stage on every shutdown with a stream attached. Closing the manager
+// closes those subscriber channels so the handlers return at once; the API stage
+// then only waits for any small wait=true JSON write. This is safe because
+// Write-after-Close is a no-op (RingBuffer.Write always succeeds; Broadcast/Send
+// short-circuit on a closed subscription) and non-streaming GET /logs still reads
+// the intact ring buffer, so no handler panics.
+//
+// The request manager is closed here for the same reason: GET
+// /proxy/requests/stream (SSE) handlers range over a request subscription channel
+// with no route timeout. In standalone-proxy mode the proxy stage already closed
+// it (Close is idempotent — subscriptions are removed as they close); in
+// shared-daemon mode this is the only close of the local forwarding manager,
+// which nothing else tears down.
 func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	// Stage 0: refuse new launches for the whole shutdown, including the deregister
 	// stage below (the API still serves there, before Stop's own gate flip).
@@ -647,6 +656,12 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	time.Sleep(logFlushDelay)
 	if deps.logMgr != nil {
 		deps.logMgr.Close()
+	}
+	// Release any /proxy/requests/stream subscribers for the same reason (see the
+	// doc comment); without this, a connected stream pins the API stage to its
+	// full deadline in shared-daemon mode (#42 codex review finding).
+	if deps.reqMgr != nil {
+		deps.reqMgr.Close()
 	}
 
 	// Stage 5: stop the API server, now that the verdict is published, the log

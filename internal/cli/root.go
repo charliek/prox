@@ -43,19 +43,28 @@ processes for local development. It supports:
 		}
 
 		// For client commands, try to discover API address if not explicitly set
-		clientCommands := map[string]bool{
-			"status":  true,
-			"logs":    true,
-			"stop":    true,
-			"start":   true,
-			"restart": true,
-			"down":    true,
-			"attach":  true,
-		}
 		if clientCommands[cmd.Name()] && !apiAddrExplicitlySet {
 			apiAddr = discoverAPIAddress()
 		}
 	},
+}
+
+// clientCommands is the discovery allowlist: the commands that talk to the
+// daemon API via apiAddr and therefore need the address discovered from
+// .prox/prox.state (or the config file) when --addr is not given. Every
+// command whose handler calls NewClient with apiAddr MUST be listed here, or
+// it silently talks to the :5555 default and breaks against dynamic-port
+// daemons (the default) — the exact bug 'start' had (#41) and 'requests' had
+// (#43). TestClientCommandsDiscoveryAllowlist pins this contract.
+var clientCommands = map[string]bool{
+	"status":   true,
+	"logs":     true,
+	"stop":     true,
+	"start":    true,
+	"restart":  true,
+	"down":     true,
+	"attach":   true,
+	"requests": true,
 }
 
 // Execute runs the root command.

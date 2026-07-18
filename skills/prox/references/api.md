@@ -224,6 +224,8 @@ The `lines` parameter is capped at 10000.
 
 Stream logs via Server-Sent Events (SSE).
 
+The stream is long-lived: it is exempt from the 30s request-timeout class and ends only on client disconnect or daemon shutdown.
+
 **Query Parameters:** Same as `GET /logs` (except `lines`)
 
 **Response:** SSE stream
@@ -337,6 +339,8 @@ curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d?include=body"
 ### GET /proxy/requests/stream
 
 Stream proxy requests via Server-Sent Events (SSE).
+
+The stream is long-lived: it is exempt from the 30s request-timeout class and ends only on client disconnect or daemon shutdown.
 
 **Query Parameters:** Same as `GET /proxy/requests` (except `limit`)
 

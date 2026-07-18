@@ -96,6 +96,10 @@ type SubscriptionManager struct {
 	mu            sync.RWMutex
 	subscriptions map[string]*Subscription
 	bufferSize    int
+	// closed latches after Close: new Subscribe calls get an already-closed
+	// channel so post-shutdown streams end immediately instead of blocking on
+	// a channel nothing will ever close.
+	closed bool
 }
 
 // NewSubscriptionManager creates a new subscription manager
@@ -109,7 +113,9 @@ func NewSubscriptionManager(bufferSize int) *SubscriptionManager {
 	}
 }
 
-// Subscribe creates a new subscription
+// Subscribe creates a new subscription. After Close, the returned channel is
+// already closed, so an SSE handler that races the shutdown-time Close
+// observes end-of-stream immediately.
 func (m *SubscriptionManager) Subscribe(filter domain.LogFilter) (string, <-chan domain.LogEntry, error) {
 	sub, err := newSubscription(filter, m.bufferSize)
 	if err != nil {
@@ -117,6 +123,11 @@ func (m *SubscriptionManager) Subscribe(filter domain.LogFilter) (string, <-chan
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		sub.Close()
+		return sub.id, sub.ch, nil
+	}
 	m.subscriptions[sub.id] = sub
 	m.mu.Unlock()
 
@@ -154,9 +165,13 @@ func (m *SubscriptionManager) Count() int {
 	return len(m.subscriptions)
 }
 
-// Close closes all subscriptions
+// Close closes all subscriptions. It latches: subsequent Subscribe calls
+// receive an already-closed channel, so a stream request racing a
+// shutdown-time Close cannot re-subscribe and pin the API server open.
+// Idempotent.
 func (m *SubscriptionManager) Close() {
 	m.mu.Lock()
+	m.closed = true
 	subs := make([]*Subscription, 0, len(m.subscriptions))
 	for _, sub := range m.subscriptions {
 		subs = append(subs, sub)
