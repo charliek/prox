@@ -3,6 +3,8 @@ package integration
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +127,142 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		killProx(cmd)
 		t.Fatal("process did not shut down within timeout")
+	}
+}
+
+// TestStopCommand_WaitsForCleanExit drives the real `prox stop` CLI against a
+// foreground daemon: it must wait for the outcome, exit 0, print a stopped
+// summary, and the daemon's state + PID files must be gone afterward (#36, D4).
+func TestStopCommand_WaitsForCleanExit(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
+	defer killProx(cmd)
+
+	waitForAPI(t, testAPIAddr, 10*time.Second)
+	time.Sleep(500 * time.Millisecond)
+
+	out, exitCode := runProx(t, binary, "stop", "-c", configPath("integration"))
+	if exitCode != 0 {
+		t.Fatalf("prox stop exited %d, want 0\noutput:\n%s", exitCode, out)
+	}
+	if !strings.Contains(out, "Stopped") {
+		t.Errorf("expected a stopped summary, got:\n%s", out)
+	}
+
+	// The foreground daemon must have exited cleanly as part of the waited stop.
+	if err := waitCmdExit(t, cmd, 10*time.Second); err != nil {
+		t.Errorf("foreground prox up should exit 0 on a clean stop, got %v", err)
+	}
+
+	// State + PID files must be cleaned up.
+	root := projectRoot(t)
+	for _, name := range []string{".prox/prox.state", ".prox/prox.pid"} {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be gone after stop, stat err=%v", name, err)
+		}
+	}
+}
+
+// TestStopCommand_AsyncPostReturnsImmediately confirms the legacy async POST
+// /shutdown (no wait param) still returns an immediate 200 while the daemon tears
+// down in the background.
+func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
+	defer killProx(cmd)
+
+	waitForAPI(t, testAPIAddr, 10*time.Second)
+	time.Sleep(500 * time.Millisecond)
+
+	start := time.Now()
+	if err := stopProx(t, testAPIAddr); err != nil {
+		t.Fatalf("async shutdown POST failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("async POST /shutdown should return promptly, took %v", elapsed)
+	}
+
+	if err := waitCmdExit(t, cmd, 15*time.Second); err != nil {
+		t.Errorf("foreground prox up should exit 0 after an async clean stop, got %v", err)
+	}
+}
+
+// TestStopCommand_DoubleStopNoPanic runs `prox stop` twice against the same
+// daemon. The daemon must not panic (regression for the double-close bug), and
+// the second invocation must exit sanely (a waited result, a connection-refused
+// unknown-outcome path, or a not-running message) rather than crashing.
+func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
+	defer killProx(prox.cmd)
+
+	waitForAPI(t, testAPIAddr, 10*time.Second)
+	time.Sleep(500 * time.Millisecond)
+
+	// Fire the first stop in the background; it waits for the drain. Capture its
+	// output and exit code — the first stop should observe the clean verdict.
+	var out1 string
+	var exit1 int
+	firstDone := make(chan struct{})
+	go func() {
+		out1, exit1 = runProx(t, binary, "stop", "-c", configPath("integration"))
+		close(firstDone)
+	}()
+
+	// A moment later, fire a second stop that races/follows the first.
+	time.Sleep(200 * time.Millisecond)
+	out2, exit2 := runProx(t, binary, "stop", "-c", configPath("integration"))
+
+	select {
+	case <-firstDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("first prox stop did not finish")
+	}
+
+	// The daemon does a clean stop (reapable processes), so the foreground exits 0
+	// regardless of how many stop clients connected.
+	if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+		t.Errorf("daemon should exit 0 on a clean double stop, got %v", err)
+	}
+
+	// The daemon must not have panicked.
+	if daemonOut := prox.Output(); strings.Contains(daemonOut, "panic:") {
+		t.Errorf("daemon panicked during double stop:\n%s", daemonOut)
+	}
+
+	// The first stop reached the live daemon and should have seen the clean verdict:
+	// exit 0 with a stopped summary.
+	if exit1 != 0 {
+		t.Errorf("first prox stop exited %d, want 0\noutput:\n%s", exit1, out1)
+	}
+	if !strings.Contains(out1, "Stopped") {
+		t.Errorf("first prox stop should print a stopped summary, got:\n%s", out1)
+	}
+
+	// The second stop races the shutdown: depending on the window it either joins
+	// the latched clean verdict (exit 0, stopped summary), hits a
+	// connection-refused / unknown-outcome path (exit 1), or finds the daemon
+	// already gone (a not-running style message). Assert it landed on one of those
+	// recognized, non-panicking outcomes rather than only checking for panic text.
+	if strings.Contains(out2, "panic:") {
+		t.Errorf("second prox stop panicked:\n%s", out2)
+	}
+	if exit2 != 0 && exit2 != 1 {
+		t.Errorf("second prox stop exited %d, want 0 or 1\noutput:\n%s", exit2, out2)
+	}
+	recognized := strings.Contains(out2, "Stopped") ||
+		strings.Contains(out2, "Shutdown initiated") ||
+		strings.Contains(out2, "outcome unknown") ||
+		strings.Contains(out2, "not running") ||
+		strings.Contains(out2, "connection refused")
+	if !recognized {
+		t.Errorf("second prox stop produced an unrecognized outcome (exit %d):\n%s", exit2, out2)
 	}
 }
 

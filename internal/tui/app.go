@@ -13,12 +13,29 @@ import (
 	"github.com/charliek/prox/internal/supervisor"
 )
 
-// Run starts the TUI application
-func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.RequestManager) error {
+// Run starts the TUI application.
+//
+// shutdownCh, when it closes, quits the program: this is how an out-of-band
+// shutdown request (POST /shutdown, via the coordinator's trigger channel)
+// reaches a --tui daemon, which otherwise blocks here forever. On quit -- whether
+// triggered this way or by the user pressing q/Ctrl-C -- Run returns and the
+// caller runs the normal shutdown sequence, so both routes are identical.
+func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.RequestManager, shutdownCh <-chan struct{}) error {
 	model := NewModel(sup, logMgr)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Quit the program when an external shutdown is requested. The goroutine also
+	// exits when ctx is cancelled (after p.Run returns), so a hand-quit TUI never
+	// leaks it.
+	go func() {
+		select {
+		case <-shutdownCh:
+			p.Quit()
+		case <-ctx.Done():
+		}
+	}()
 
 	// Subscribe to logs before starting the forwarder
 	subID, ch, err := logMgr.Subscribe(domain.LogFilter{})

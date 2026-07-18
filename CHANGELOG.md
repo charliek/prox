@@ -4,7 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Breaking
+
+- **Foreground `prox up` now exits non-zero when a process group survives
+  shutdown** (#36). Previously foreground `prox up` (Ctrl-C or an API shutdown)
+  always exited `0`, even if a process group could not be reaped and still held
+  its ports. It now exits `1` with a one-line `shutdown incomplete: …` summary
+  (per-survivor detail is written to the log stream). Scripts that asserted a `0`
+  exit from a foreground `prox up` regardless of outcome must be updated. A clean
+  shutdown still exits `0`.
+
 ### Features
+
+- **Full-stop failure contract** (#36). `prox stop` (no arguments) and `prox down`
+  now **wait for the shutdown outcome** instead of firing and forgetting. The
+  daemon reports the process-stop verdict over a new `POST /api/v1/shutdown?wait=true`
+  path, which responds **HTTP 200** with `{success, waited, failures[]}` — 200 even
+  when a group survived, so the structured survivor list (each carrying the stable
+  `PROCESS_GROUP_NOT_REAPED` code) is not discarded. The CLI maps this to exit
+  codes: **0** when everything stopped cleanly (after a brief bounded wait for the
+  daemon's state/PID files to disappear), **1** when a process group survived (each
+  printed as a `process: error` line), and **1** when the connection drops mid-wait
+  and the outcome is unknown. An older daemon that predates the `wait` parameter is
+  detected (the response omits `waited`) and the CLI falls back to the legacy
+  `Shutdown initiated` message with exit `0`. The daemon shutdown stages were
+  reordered so the API server is stopped **last** (after the supervisor stage and
+  the verdict publish), letting it deliver the waited response, with the launch
+  gate closed first so a lifecycle request during the drain cannot orphan a
+  process.
+- **Concurrent stops return the same verdict** (#32). Two `Stop` calls against the
+  same process (or a daemon shutdown overlapping an in-flight per-process stop) now
+  resolve to the **same** result: a secondary waiter joins the primary's stop
+  episode and observes its authoritative verdict — including a
+  `PROCESS_GROUP_NOT_REAPED` failure — instead of returning success early when the
+  leader is reaped. A caller whose own context is canceled first still gets
+  `ctx.Err()`. A reap failure now emits a `process_crashed` event uniformly from
+  both the per-process stop and full-stop paths.
+
 
 - **`restart` and `start` apply the current `prox.yaml`** (#33). An API-driven
   (re)start — `prox restart <name>`, and `prox start <name>` after a
@@ -53,6 +89,16 @@ All notable changes to this project will be documented in this file.
   like the other client commands; previously it always used the default `:5555`
   address and failed against daemons on dynamic API ports (found during #33
   verification).
+- **A second `POST /shutdown` no longer panics the daemon** (#36). The shutdown
+  trigger was a bare `close(shutdownCh)`, so a duplicate or concurrent shutdown
+  request (e.g. a rapid double `prox stop`) closed an already-closed channel and
+  crashed the daemon. Shutdown is now latched through a `sync.Once` coordinator, so
+  repeated triggers are safe no-ops.
+- **`POST /shutdown` now works against a `--tui` daemon** (#36). The TUI event loop
+  never observed the shutdown channel, so an API shutdown (and therefore
+  `prox stop`) was silently inert against `prox up --tui` — the request returned
+  200 but the daemon kept running. The trigger is now routed into the TUI so it
+  quits and runs the normal shutdown sequence.
 - **Healthcheck `interval`/`timeout`/`retries`/`start_period` are now honored**
   (#31). Previously only `healthcheck.cmd` took effect; the timing/retry fields
   were silently dropped and replaced by the built-in defaults (`10s`/`5s`/`3`/

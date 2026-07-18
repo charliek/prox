@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/daemon"
 )
 
 // captureOutput redirects stdout and stderr for testing
@@ -495,5 +497,153 @@ func TestLogPrinter(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("unexpected color: %q", color1)
+	}
+}
+
+// shutdownStub builds an httptest server that answers POST /api/v1/shutdown with
+// the given status + body, so runFullStop's outcome matrix can be driven without
+// a live daemon.
+func shutdownStub(t *testing.T, status int, body interface{}) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/shutdown" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if body != nil {
+			_ = json.NewEncoder(w).Encode(body)
+		}
+	}))
+}
+
+// runFullStopStub spins up a shutdown stub returning status/body, runs
+// runFullStop against it with a fresh temp cwd, and returns the captured
+// output plus the resulting error. Shared setup for the outcome-matrix tests
+// below that don't need to control the server's lifetime themselves (compare
+// TestRunFullStop_TransportFailure, which closes the server early).
+func runFullStopStub(t *testing.T, status int, body interface{}) (stdout, stderr string, err error) {
+	t.Helper()
+	server := shutdownStub(t, status, body)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	stdout, stderr = captureOutput(t, func() {
+		// Temp cwd has no state/PID files, so the daemon-exit wait returns at once
+		// regardless of the bound; a short bound keeps the test snappy anyway.
+		err = runFullStop(client, t.TempDir(), 2*time.Second)
+	})
+	return stdout, stderr, err
+}
+
+// TestRunFullStop_CleanVerdict: a waited clean response with no failures, and a
+// cwd with no state/PID files (so the daemon-exit wait returns immediately),
+// yields a nil error (exit 0) and a stopped summary.
+func TestRunFullStop_CleanVerdict(t *testing.T) {
+	stdout, _, err := runFullStopStub(t, http.StatusOK, api.ShutdownResponse{
+		Success: true, Waited: true, Failures: []api.ShutdownFailureResponse{},
+	})
+	if err != nil {
+		t.Fatalf("expected nil error on clean stop, got %v", err)
+	}
+	if !strings.Contains(stdout, "Stopped") {
+		t.Errorf("expected a stopped summary, got %q", stdout)
+	}
+}
+
+// TestRunFullStop_Survivors: a waited response listing survivors prints one line
+// each and returns a non-nil summary error (cobra -> exit 1). The returned error
+// must NOT reprint the whole per-process list.
+func TestRunFullStop_Survivors(t *testing.T) {
+	_, stderr, err := runFullStopStub(t, http.StatusOK, api.ShutdownResponse{
+		Success: false, Waited: true,
+		Failures: []api.ShutdownFailureResponse{
+			{Process: "web", Error: "process group could not be terminated: web", Code: "PROCESS_GROUP_NOT_REAPED"},
+			{Process: "worker", Error: "process group could not be terminated: worker", Code: "PROCESS_GROUP_NOT_REAPED"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected a non-nil error when process groups survive")
+	}
+	if !strings.Contains(stderr, "web:") || !strings.Contains(stderr, "worker:") {
+		t.Errorf("expected each survivor printed to stderr, got %q", stderr)
+	}
+	// The summary error is a short count, not the whole list re-rendered.
+	if strings.Contains(err.Error(), "worker:") {
+		t.Errorf("summary error should not reprint the per-process list, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "2 process") {
+		t.Errorf("expected a survivor count in the summary error, got %q", err.Error())
+	}
+}
+
+// TestRunFullStop_OldDaemon: a bare {"success":true} (no waited field) is the
+// old-daemon fallback -> legacy message, exit 0.
+func TestRunFullStop_OldDaemon(t *testing.T) {
+	stdout, _, err := runFullStopStub(t, http.StatusOK, api.SuccessResponse{Success: true})
+	if err != nil {
+		t.Fatalf("old-daemon fallback should exit 0, got %v", err)
+	}
+	if !strings.Contains(stdout, "Shutdown initiated") {
+		t.Errorf("expected legacy message, got %q", stdout)
+	}
+}
+
+// TestRunFullStop_TransportFailure: a dead server (connection refused) mid-wait
+// yields an unknown-outcome error (exit 1).
+func TestRunFullStop_TransportFailure(t *testing.T) {
+	server := shutdownStub(t, http.StatusOK, api.SuccessResponse{Success: true})
+	url := server.URL
+	server.Close() // now refuses connections
+
+	client := NewClient(url)
+	var err error
+	captureOutput(t, func() {
+		err = runFullStop(client, t.TempDir(), 2*time.Second)
+	})
+	if err == nil {
+		t.Fatal("expected an error on transport failure")
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("expected an unknown-outcome message, got %q", err.Error())
+	}
+}
+
+// TestRunFullStop_CleanVerdictPollTimeout: a clean verdict but the daemon's
+// state/PID files never disappear within the bounded wait -> the CLI prints a
+// Warning to stderr yet stays exit 0 (the process-stop verdict already
+// succeeded). The state + PID files are pre-created so the poll actually times
+// out under a short injected bound.
+func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
+	server := shutdownStub(t, http.StatusOK, api.ShutdownResponse{
+		Success: true, Waited: true, Failures: []api.ShutdownFailureResponse{},
+	})
+	defer server.Close()
+
+	cwd := t.TempDir()
+	if err := daemon.EnsureStateDir(cwd); err != nil {
+		t.Fatalf("failed to create state dir: %v", err)
+	}
+	// Leave both files in place so waitForDaemonExit never sees them vanish.
+	if err := os.WriteFile(daemon.StatePath(cwd), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("failed to write state file: %v", err)
+	}
+	if err := os.WriteFile(daemon.PIDPath(cwd), []byte("1"), 0o600); err != nil {
+		t.Fatalf("failed to write pid file: %v", err)
+	}
+
+	client := NewClient(server.URL)
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = runFullStop(client, cwd, 150*time.Millisecond)
+	})
+	if err != nil {
+		t.Fatalf("poll timeout must keep exit 0, got %v", err)
+	}
+	if !strings.Contains(stdout, "Stopped processes") {
+		t.Errorf("expected a stopped summary on stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "Warning:") || !strings.Contains(stderr, "still finishing shutdown") {
+		t.Errorf("expected a Warning about the daemon still finishing, got stderr %q", stderr)
 	}
 }

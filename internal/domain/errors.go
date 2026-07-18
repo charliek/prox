@@ -1,6 +1,10 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
 
 // Domain errors
 var (
@@ -22,6 +26,58 @@ var (
 	// caller must run `prox up` to reconcile added/removed processes.
 	ErrProcessNotInConfig = errors.New("no longer in config")
 )
+
+// ProcessStopFailure names one process whose whole-supervisor stop did not
+// complete cleanly, carrying the error that process's Stop returned. Err wraps a
+// sentinel (e.g. ErrProcessGroupNotReaped) so callers can classify it with
+// errors.Is through the aggregate below (#36, D3).
+type ProcessStopFailure struct {
+	Name string
+	Err  error
+}
+
+// ProcessStopError aggregates the per-process failures from a single
+// Supervisor.Stop. It is returned (as a non-nil *ProcessStopError) only when at
+// least one process failed to stop cleanly; a clean stop -- or a stop with
+// nothing to do -- returns a nil error. Failures are sorted by process name for
+// stable output.
+//
+// It implements Unwrap() []error so errors.Is/errors.As see through the
+// aggregate to each failure's wrapped sentinel: errors.Is(err,
+// ErrProcessGroupNotReaped) is true when any survivor could not be reaped, and
+// errors.As(err, &*ProcessStopError) extracts the typed aggregate for
+// serialization (#36, D3).
+type ProcessStopError struct {
+	Failures []ProcessStopFailure
+}
+
+// Error renders a readable multi-process message naming each survivor and its
+// underlying error.
+func (e *ProcessStopError) Error() string {
+	if len(e.Failures) == 0 {
+		// Defensive: a ProcessStopError is only constructed with failures, but
+		// never render an empty, misleading "0 processes" message.
+		return "process stop failed"
+	}
+	parts := make([]string, len(e.Failures))
+	for i, f := range e.Failures {
+		parts[i] = fmt.Sprintf("%s: %v", f.Name, f.Err)
+	}
+	if len(parts) == 1 {
+		return "process failed to stop cleanly: " + parts[0]
+	}
+	return fmt.Sprintf("%d processes failed to stop cleanly: %s", len(parts), strings.Join(parts, "; "))
+}
+
+// Unwrap exposes each failure's error so errors.Is/errors.As traverse the
+// aggregate (Go 1.20 multi-error unwrap).
+func (e *ProcessStopError) Unwrap() []error {
+	errs := make([]error, len(e.Failures))
+	for i, f := range e.Failures {
+		errs[i] = f.Err
+	}
+	return errs
+}
 
 // Error codes for API responses
 const (

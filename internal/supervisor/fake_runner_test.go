@@ -35,6 +35,14 @@ type fakeProcess struct {
 	waitClosed bool
 	waitErr    error
 
+	// groupAliveCalls counts GroupAlive invocations; groupAliveFn, when set,
+	// overrides the flat alive/aliveErr with a per-call script (call index
+	// passed in). This lets a test model a group that looks gone to Stop's
+	// graceful poll yet alive to the authoritative post-reap verdict re-probe --
+	// the fast, deterministic path to an unreapable verdict (#32).
+	groupAliveCalls int
+	groupAliveFn    func(call int) (bool, error)
+
 	// onSignal, when set, is invoked (synchronously, outside fp.mu) for every
 	// signal received so the test can drive liveness/leader-exit in response.
 	onSignal func(fp *fakeProcess, sig os.Signal)
@@ -83,6 +91,11 @@ func (fp *fakeProcess) Signal(sig os.Signal) error {
 func (fp *fakeProcess) GroupAlive() (bool, error) {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
+	call := fp.groupAliveCalls
+	fp.groupAliveCalls++
+	if fp.groupAliveFn != nil {
+		return fp.groupAliveFn(call)
+	}
 	return fp.alive, fp.aliveErr
 }
 

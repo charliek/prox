@@ -115,10 +115,44 @@ func (c *Client) RestartProcess(name string) error {
 	return c.postLifecycle("/api/v1/processes/"+url.PathEscape(name)+"/restart", &resp)
 }
 
-// Shutdown shuts down the supervisor
-func (c *Client) Shutdown() error {
-	var resp api.SuccessResponse
-	return c.post("/api/v1/shutdown", &resp)
+// ShutdownFailure is one process whose group survived a waited full stop.
+type ShutdownFailure struct {
+	Process string `json:"process"`
+	Error   string `json:"error"`
+	Code    string `json:"code"`
+}
+
+// ShutdownResult decodes a POST /api/v1/shutdown?wait=true response.
+//
+// Waited is a POINTER on purpose: an old daemon predates the wait param, ignores
+// the query, and acks with a bare {"success":true} that has no "waited" field —
+// leaving Waited nil. A nil Waited therefore means "old daemon, fire-and-forget",
+// which is distinct from a false value (never sent on the wire). Callers MUST
+// treat nil as the legacy path rather than as waited==false.
+type ShutdownResult struct {
+	Success  bool              `json:"success"`
+	Waited   *bool             `json:"waited"`
+	Failures []ShutdownFailure `json:"failures"`
+}
+
+// Shutdown requests a full daemon shutdown.
+//
+// With wait=true it posts /api/v1/shutdown?wait=true on the lifecycle client
+// (11m ceiling), blocks until the daemon returns the process-stop verdict, and
+// returns the decoded *ShutdownResult. With wait=false it posts the legacy async
+// shutdown on the plain client and returns a nil result (the daemon acks
+// immediately and tears down in the background).
+func (c *Client) Shutdown(wait bool) (*ShutdownResult, error) {
+	if !wait {
+		var resp api.SuccessResponse
+		return nil, c.post("/api/v1/shutdown", &resp)
+	}
+
+	var result ShutdownResult
+	if err := c.postLifecycle("/api/v1/shutdown?wait=true", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // buildLogQueryParams builds URL query parameters from LogParams

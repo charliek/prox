@@ -62,6 +62,32 @@ type pendingConfig struct {
 	stopTimeout time.Duration
 }
 
+// stopEpisode carries the verdict of a single in-flight Stop to any concurrent
+// secondary Stop that joins while the process is Stopping. Exactly one episode
+// is installed at every state->Stopping transition (both the normal entry and
+// the crashed-retry fall-through) and resolved exactly once, via
+// resolveStopEpisodeLocked, IN THE SAME p.mu critical section that commits the
+// terminal state verdict.
+//
+// Invariant: any goroutine that observes the terminal state (Stopped/Crashed)
+// under p.mu also observes the episode resolved -- state commit and episode
+// resolution are one atomic step. A Stop that arrives after the commit is by
+// definition NOT concurrent with the episode; it correctly sees
+// ErrProcessNotRunning (clean case) or starts a legitimate fresh retry episode
+// (surviving-group case). That boundary is expected behavior, not divergence.
+//
+// resolved (guarded by p.mu) makes resolution idempotent so the deferred panic
+// backstop is a no-op once the explicit in-critical-section resolution has run.
+// done is closed AFTER err is written, so a waiter that reads err after <-done
+// needs no lock (the write happens-before the close). Episodes are distinct
+// objects per transition, so a waiter that captured episode N never observes
+// episode N+1's verdict (#32, D1).
+type stopEpisode struct {
+	done     chan struct{}
+	err      error
+	resolved bool
+}
+
 // ManagedProcess handles the lifecycle of a single process
 type ManagedProcess struct {
 	mu sync.RWMutex
@@ -105,6 +131,41 @@ type ManagedProcess struct {
 	// hold a restart open in the unlocked gap between its stop and start and race
 	// a concurrent StartProcess into it. Read once under the lock in Restart.
 	restartStartBarrier func()
+
+	// episode is the in-flight stop's verdict carrier, installed under mu at every
+	// state->Stopping transition and cleared by finishStopEpisode when that stop
+	// resolves. A secondary Stop joining while state==Stopping captures it under
+	// mu and waits on it for the primary's verdict (#32, D1). nil when no stop is
+	// in flight.
+	episode *stopEpisode
+
+	// launchGate, when set, is the supervisor's launch gate closure (#32/#36, D2).
+	// startWithConfig invokes it inside its p.mu critical section, after the state
+	// and surviving-group guards and BEFORE the pending-config swap; a non-nil
+	// error (ErrShutdownInProgress) aborts the launch with no swap applied and the
+	// state unchanged. supervisor.createManagedProcess injects it; nil (direct
+	// NewManagedProcess construction in tests) means "always allow".
+	launchGate func() error
+
+	// stopBarrier is a test-only seam (nil in production). Stop invokes it,
+	// unlocked, at interleaving-sensitive points identified by phase:
+	//
+	//   - "primary-installed": in the primary path just after the stop episode is
+	//     installed and the lock released (before any signalling/verdict work), so
+	//     a test can hold the primary open with its episode published.
+	//   - "secondary-joined": in the Stopping branch just after a secondary
+	//     captured the in-flight episode and released the lock (before it waits on
+	//     the verdict), so a test can confirm the join happened.
+	//   - "finalizing": in the primary path inside the finalization window, after
+	//     the monitor-drain wait and BEFORE the authoritative verdict/state commit,
+	//     so a test can hold a verdict late and prove a concurrent secondary
+	//     waiter outlives exactly this tail (the window stopVerdictMargin covers).
+	//   - "verdict-committed": in the primary path just after the terminal state
+	//     and episode were committed atomically, to probe that boundary.
+	//
+	// Together they make concurrent-stop interleavings deterministic without
+	// sleeps (#32), mirroring the restartStartBarrier seam pattern.
+	stopBarrier func(phase string)
 
 	// shutdownTimeout is this process's effective stop budget: the
 	// no-context-deadline fallback in computeDeadlines. supervisor.
@@ -245,6 +306,29 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 		}
 	}
 
+	// Launch gate (#32/#36, D2). Called here -- inside the p.mu critical section,
+	// after the state and surviving-group guards, before the pending-config swap
+	// and the runner launch -- so a refusal applies no swap, leaves the state
+	// unchanged, and returns the gate's error (ErrShutdownInProgress). The closure
+	// reads only an atomic (see createManagedProcess); it must NOT take s.mu, whose
+	// s.mu -> p.mu order would AB-BA here.
+	//
+	// Invariant (D2, deliberately weak): a launcher that OBSERVES the gate closed
+	// never launches. A launcher that read the gate open just before Supervisor.Stop
+	// flipped it may still launch while holding p.mu -- but that is harmless: Stop
+	// flips the gate under s.mu before it spawns the per-process stop goroutines, so
+	// this process's stop goroutine, queued on p.mu behind this very launch, reaps
+	// the replacement before Supervisor.Stop returns. No replacement outlives
+	// Supervisor.Stop. The stronger "cannot launch after Stop began" is NOT claimed;
+	// a full launch lease (RWMutex) was considered and rejected -- a new lock class
+	// and ordering rules to exclude a transient the invariant already renders
+	// harmless (no orphan survives daemon exit).
+	if p.launchGate != nil {
+		if err := p.launchGate(); err != nil {
+			return err
+		}
+	}
+
 	// Commit point: both guards passed, so this call is the one that launches.
 	// Swap in the reloaded runtime now (config, env loader, effective stop
 	// budget) -- from here on a failure keeps the new config active.
@@ -328,8 +412,14 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 // computeDeadlines derives the graceful (SIGTERM) and kill (SIGKILL/verify)
 // deadlines for a Stop from the caller's context.
 //
-//   - If ctx has no deadline, a fallback of shutdownTimeout (or
-//     constants.DefaultShutdownTimeout when unset) is used.
+//   - The per-process stop budget (shutdownTimeout, or
+//     constants.DefaultShutdownTimeout when unset) is the graceful+kill window.
+//     It is the fallback when ctx carries no deadline, AND an upper bound when
+//     ctx carries a LATER one: Supervisor.Stop deliberately grants each goroutine
+//     StopTimeout + stopVerdictMargin so a stop joining an in-flight primary as a
+//     secondary can outlive the primary's finalization window, but that oversized
+//     ctx must not stretch THIS process's own escalation past its stop_timeout
+//     (#35). An EARLIER ctx deadline (e.g. a short API request) is still honored.
 //   - KillGrace is reserved at the tail for the SIGKILL phase, so the graceful
 //     phase ends at (deadline - KillGrace).
 //   - If the budget is already spent (remaining <= 0) or too small to reserve
@@ -341,13 +431,24 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline, killDeadline time.Time) {
 	now := time.Now()
 
+	// Read the per-process budget exactly ONCE and use it for both the
+	// no-deadline fallback and the later-deadline cap below, so there is no
+	// double-read window. The budget in force when this stop began governs
+	// escalation; a caller ctx with a LATER deadline is only an outer bound and
+	// cannot stretch escalation past stop_timeout (#35). A config swap cannot
+	// occur mid-stop -- startWithConfig only swaps while a start is permitted, and
+	// this stop has already set state=Stopping, which blocks startWithConfig -- so
+	// this value is stable for the whole stop; it is exactly the budget the
+	// running (or replacement) process was launched under, the correct governor.
+	budget := p.StopTimeout()
+	if budget <= 0 {
+		budget = constants.DefaultShutdownTimeout
+	}
+	budgetDeadline := now.Add(budget)
+
 	dl, ok := ctx.Deadline()
-	if !ok {
-		timeout := p.StopTimeout()
-		if timeout <= 0 {
-			timeout = constants.DefaultShutdownTimeout
-		}
-		dl = now.Add(timeout)
+	if !ok || dl.After(budgetDeadline) {
+		dl = budgetDeadline
 	}
 
 	// If the budget is already spent (remaining <= 0) or too small to reserve
@@ -365,13 +466,14 @@ func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline
 // Stop stops the process gracefully, escalating to SIGKILL if the group does
 // not exit within the graceful window, and reports an error only if the group
 // truly survives. See design doc D3.
-func (p *ManagedProcess) Stop(ctx context.Context) error {
+func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 	p.mu.Lock()
 
 	switch p.state {
 	case domain.ProcessStateStopped, domain.ProcessStateCrashed:
 		// Nothing running, unless a group survived a prior stop / unexpected
-		// leader exit -- in which case fall through and reap it (retry path).
+		// leader exit -- in which case fall through and reap it (retry path),
+		// installing a fresh episode below.
 		if p.current == nil || p.current.proc == nil {
 			p.mu.Unlock()
 			return domain.ErrProcessNotRunning
@@ -382,37 +484,78 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 		}
 		// Surviving group: fall through to reap it.
 	case domain.ProcessStateStopping:
-		// A stop is already in flight; wait for it (or ctx) on the in-flight
-		// run's done channel.
-		//
-		// Known limitation: inst.done closing means the run's monitor finished
-		// (leader reaped), not that the PRIMARY Stop finished its group polling
-		// and verdict. So a concurrent secondary Stop can return nil slightly
-		// before the primary's verdict, and -- only in the doubly-rare case of
-		// two concurrent Stops on the same process AND a genuinely unreapable
-		// group -- can report success while the primary returns
-		// ErrProcessGroupNotReaped. The common (killable) case is consistent:
-		// both return nil. Serializing concurrent same-process stops (or
-		// propagating the primary's result to waiters) is tracked as future
-		// work; the primary always reaps/reports correctly.
+		// A stop is already in flight. Wait for the PRIMARY's published verdict
+		// via the stop episode -- NOT merely the run monitor's leader-reaped
+		// signal -- so two concurrent Stops on the same process return the same
+		// result when both caller contexts stay live through episode completion
+		// (#32, D1). A caller whose context dies first still gets ctx.Err().
+		ep := p.episode
 		inst := p.current
+		barrier := p.stopBarrier
 		p.mu.Unlock()
-		if inst == nil {
-			return nil
+
+		if ep == nil {
+			// Defensive: a Stopping state should always carry an episode (every
+			// transition installs one), so with the atomic commit+resolution above
+			// this branch is unreachable. If it ever isn't, wait on the run monitor
+			// and then take a fresh authoritative probe -- mirroring the primary's
+			// verdict logic -- rather than blindly reporting success.
+			if inst == nil || inst.proc == nil {
+				return nil
+			}
+			select {
+			case <-inst.done:
+				if alive, _ := inst.proc.GroupAlive(); alive {
+					return fmt.Errorf("%w: %s", domain.ErrProcessGroupNotReaped, p.name)
+				}
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
+
+		if barrier != nil {
+			barrier("secondary-joined")
+		}
+
 		select {
-		case <-inst.done:
-			return nil
+		case <-ep.done:
+			// The err write happens-before close(ep.done), so no lock is needed.
+			return ep.err
 		case <-ctx.Done():
-			return ctx.Err()
+			// Simultaneous readiness: re-check the episode non-blocking and prefer
+			// a published verdict over ctx.Err(), so a real result is never
+			// dropped when done and ctx fire at once (#32, D1).
+			select {
+			case <-ep.done:
+				return ep.err
+			default:
+				return ctx.Err()
+			}
 		}
 	}
 
+	// Primary path: commit the Stopping transition and install a fresh episode to
+	// carry this call's verdict to any secondary waiter. The episode is resolved
+	// in-line with each terminal-state commit below (early-exit and the final
+	// verdict), inside the SAME p.mu critical section, so the two are observed
+	// atomically. The deferred backstop only fires if a recovered panic skipped
+	// that resolution (#32, D1).
 	p.state = domain.ProcessStateStopping
+	ep := &stopEpisode{done: make(chan struct{})}
+	p.episode = ep
+
 	inst := p.current
 	healthChecker := p.healthChecker
 	p.healthChecker = nil
+	barrier := p.stopBarrier
 	p.mu.Unlock()
+
+	defer func() { p.backstopStopEpisode(ep, inst, retErr) }()
+
+	if barrier != nil {
+		barrier("primary-installed")
+	}
 
 	// Stop the health checker for this run.
 	if healthChecker != nil {
@@ -422,6 +565,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 	if inst == nil || inst.proc == nil {
 		p.mu.Lock()
 		p.state = domain.ProcessStateStopped
+		p.resolveStopEpisodeLocked(ep, nil)
 		p.mu.Unlock()
 		return nil
 	}
@@ -468,9 +612,22 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 	case <-time.After(outputDrainTimeout + time.Second):
 	}
 
+	// Test seam: park inside the finalization window, AFTER the monitor-drain
+	// wait and BEFORE the authoritative verdict/state commit, so a test can hold a
+	// primary's verdict late and prove a concurrent secondary waiter (sized by
+	// Supervisor.Stop's stopVerdictMargin) outlives exactly this tail (#32/#36).
+	if barrier != nil {
+		barrier("finalizing")
+	}
+
 	// Verdict: a fresh probe now that the leader has been reaped is
 	// authoritative.
 	alive, _ := inst.proc.GroupAlive()
+
+	var verdict error
+	if alive {
+		verdict = fmt.Errorf("%w: %s", domain.ErrProcessGroupNotReaped, p.name)
+	}
 
 	p.mu.Lock()
 	if p.current == inst {
@@ -484,12 +641,59 @@ func (p *ManagedProcess) Stop(ctx context.Context) error {
 	if inst.cancel != nil {
 		inst.cancel()
 	}
+	// Resolve the episode in the SAME critical section that commits the terminal
+	// state, so any goroutine observing the state under p.mu also observes the
+	// published verdict -- no torn window between commit and resolution.
+	p.resolveStopEpisodeLocked(ep, verdict)
 	p.mu.Unlock()
 
-	if alive {
-		return fmt.Errorf("%w: %s", domain.ErrProcessGroupNotReaped, p.name)
+	if barrier != nil {
+		barrier("verdict-committed")
 	}
-	return nil
+
+	return verdict
+}
+
+// resolveStopEpisodeLocked resolves a stop episode exactly once. The caller MUST
+// hold p.mu, and MUST call it in the same critical section that commits the
+// terminal state verdict, so the two are observed atomically (see stopEpisode's
+// invariant). It records the verdict, detaches the episode (only if p.episode
+// still points at ep -- a later Stop may already have installed a newer one),
+// and closes ep.done so waiters observe the result. Idempotent: a second call
+// (e.g. the deferred panic backstop after the explicit resolution) is a no-op.
+// Writing err before closing done gives waiters a lock-free read.
+func (p *ManagedProcess) resolveStopEpisodeLocked(ep *stopEpisode, err error) {
+	if ep.resolved {
+		return
+	}
+	ep.resolved = true
+	ep.err = err
+	if p.episode == ep {
+		p.episode = nil
+	}
+	close(ep.done)
+}
+
+// backstopStopEpisode is the deferred panic backstop for a primary Stop. On every
+// normal exit the episode is already resolved in-line with the state commit, so
+// this is a no-op. It only acts when a (recovered) panic skipped the explicit
+// resolution: it publishes a verdict so waiters never hang and -- if the process
+// is still stranded mid-stop (state Stopping, this run still current) -- moves it
+// to Crashed so the group stays reapable by a retry. Unrecovered panics kill the
+// process anyway; this is belt-and-braces for recovered ones.
+func (p *ManagedProcess) backstopStopEpisode(ep *stopEpisode, inst *processInstance, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ep.resolved {
+		return
+	}
+	if p.state == domain.ProcessStateStopping && p.current == inst {
+		p.state = domain.ProcessStateCrashed
+	}
+	if err == nil {
+		err = fmt.Errorf("%w: %s (stop aborted before verdict)", domain.ErrProcessGroupNotReaped, p.name)
+	}
+	p.resolveStopEpisodeLocked(ep, err)
 }
 
 // waitGroupGone polls proc's group liveness on groupPollInterval until the

@@ -20,6 +20,22 @@ import (
 	"github.com/charliek/prox/internal/supervisor"
 )
 
+// ShutdownController is the narrow view of the daemon shutdown coordinator the
+// shutdown handler needs. The daemon passes its *shutdownCoordinator; a wait=true
+// request Trigger()s the sequence, then blocks on Done() to read the latched
+// Outcome() (the process-stop verdict). Kept as an interface here so the handler
+// package does not depend on the cli package (which owns the coordinator) and so
+// tests can drive the handler with a fake (#36, D4).
+type ShutdownController interface {
+	// Trigger requests shutdown. Idempotent (backed by sync.Once in the daemon).
+	Trigger()
+	// Done is closed once the shutdown sequence has latched its outcome.
+	Done() <-chan struct{}
+	// Outcome is the process-stop verdict; valid only after Done() is observed.
+	// A nil return means a clean stop (no survivors).
+	Outcome() *domain.ProcessStopError
+}
+
 // Handlers contains all HTTP handlers
 type Handlers struct {
 	supervisor     *supervisor.Supervisor
@@ -27,16 +43,17 @@ type Handlers struct {
 	requestManager *proxy.RequestManager
 	captureManager *proxy.CaptureManager
 	configFile     string
-	shutdownFn     func()
+	shutdown       ShutdownController
 }
 
-// NewHandlers creates new HTTP handlers
-func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile string, shutdownFn func()) *Handlers {
+// NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
+// exercise POST /shutdown; the handler guards against it.
+func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile string, shutdown ShutdownController) *Handlers {
 	return &Handlers{
 		supervisor: sup,
 		logManager: logMgr,
 		configFile: configFile,
-		shutdownFn: shutdownFn,
+		shutdown:   shutdown,
 	}
 }
 
@@ -178,17 +195,72 @@ func (h *Handlers) GetLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// Shutdown handles POST /api/v1/shutdown
+// Shutdown handles POST /api/v1/shutdown.
+//
+// With ?wait=true (exactly the string "true") the handler triggers the shutdown
+// sequence and blocks until the daemon latches the process-stop verdict, then
+// returns it as a ShutdownResponse. Any other or absent wait value keeps the
+// legacy async behavior: ack 200 immediately, then trigger after a short delay so
+// the response flushes first. The route lives in the lifecycle timeout group
+// (see registerRoutes) because the waited path can block for the whole drain.
 func (h *Handlers) Shutdown(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, SuccessResponse{Success: true})
+	if h.shutdown != nil && r.URL.Query().Get("wait") == "true" {
+		h.shutdownWait(w, r)
+		return
+	}
 
-	// Trigger shutdown asynchronously
-	go func() {
-		time.Sleep(100 * time.Millisecond) // Let response complete
-		if h.shutdownFn != nil {
-			h.shutdownFn()
+	// Legacy async path: ack immediately, then trigger after a short delay so the
+	// response completes first. Trigger is idempotent, so a duplicate POST is
+	// safe. h.shutdown may be nil (unit-test handler that never exercises this
+	// path); guard before triggering, but the ack itself is unconditional so a
+	// nil coordinator still preserves the legacy response shape.
+	writeJSON(w, http.StatusOK, SuccessResponse{Success: true})
+	if h.shutdown != nil {
+		go func() {
+			time.Sleep(100 * time.Millisecond) // Let response complete
+			h.shutdown.Trigger()
+		}()
+	}
+}
+
+// shutdownWait triggers shutdown and blocks until the coordinator latches the
+// process-stop verdict, then writes it. It always responds HTTP 200 — even when a
+// process group survived — because the CLI discards structured bodies on non-2xx
+// responses; the survivor list must ride a 200 to reach the client (#36, D4). If
+// the client disconnects first, shutdown proceeds regardless (already triggered)
+// and nothing is written to the dead connection.
+func (h *Handlers) shutdownWait(w http.ResponseWriter, r *http.Request) {
+	h.shutdown.Trigger()
+
+	select {
+	case <-h.shutdown.Done():
+		outcome := h.shutdown.Outcome()
+		resp := ShutdownResponse{
+			Waited:   true,
+			Failures: shutdownFailures(outcome),
 		}
-	}()
+		resp.Success = len(resp.Failures) == 0
+		writeJSON(w, http.StatusOK, resp)
+	case <-r.Context().Done():
+		// Client gone; nothing to write. Shutdown is already in progress.
+	}
+}
+
+// shutdownFailures flattens a *ProcessStopError into wire failures. Always
+// returns a non-nil slice so the JSON body carries "failures": [] on a clean stop.
+func shutdownFailures(outcome *domain.ProcessStopError) []ShutdownFailureResponse {
+	failures := make([]ShutdownFailureResponse, 0)
+	if outcome == nil {
+		return failures
+	}
+	for _, f := range outcome.Failures {
+		failures = append(failures, ShutdownFailureResponse{
+			Process: f.Name,
+			Error:   f.Err.Error(),
+			Code:    domain.ErrorCode(f.Err),
+		})
+	}
+	return failures
 }
 
 // parseLogParams extracts log filter parameters from request

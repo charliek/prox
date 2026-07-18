@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charliek/prox/internal/config"
@@ -13,6 +14,16 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 )
+
+// stopVerdictMargin is the slack added to each per-process stop budget when
+// Supervisor.Stop sizes its goroutine contexts (and the outer bound up.go grants
+// via StopWaitBound). A Supervisor.Stop joining an in-flight primary stop must
+// outlive the primary's finalization window: the primary's verdict can land up
+// to ~budget + outputDrainTimeout + 1s after the primary began (see the
+// finalization gate in process.go). Sizing the secondary at budget +
+// stopVerdictMargin keeps it alive through that tail so it aggregates the real
+// PROCESS_GROUP_NOT_REAPED verdict instead of ctx-expiring first (#36, D3).
+const stopVerdictMargin = outputDrainTimeout + 2*time.Second
 
 // SupervisorConfig holds configuration for the supervisor
 type SupervisorConfig struct {
@@ -59,6 +70,17 @@ type Supervisor struct {
 	startedAt time.Time
 	// state is the current supervisor state: "stopped", "running", or "stopping"
 	state string
+
+	// launchable is the launch gate (#32/#36, D2): true while the supervisor is
+	// running, flipped false at the top of Stop (under s.mu, alongside
+	// state="stopping") before the per-process stop goroutines are created, and
+	// reset true on every entry into "running" so a stop->start cycle reopens the
+	// gate. createManagedProcess injects a launchGate closure that reads this flag
+	// (atomic read only -- see the closure comment) and refuses a launch with
+	// ErrShutdownInProgress once it is false. It is an atomic (not guarded by s.mu)
+	// so the gate can be read inside startWithConfig's p.mu critical section without
+	// taking s.mu, which would AB-BA against the verified s.mu -> p.mu order.
+	launchable atomic.Bool
 
 	// ctx and cancel are used for coordinating graceful shutdown
 	ctx    context.Context
@@ -136,6 +158,9 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.state = "running"
+	// Reopen the launch gate. This also covers a stop->start cycle (Stop flipped
+	// it false): the fresh run must accept launches again (#32/#36, D2).
+	s.launchable.Store(true)
 	s.startedAt = time.Now()
 	s.mu.Unlock()
 
@@ -187,6 +212,17 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 	// StopTimeout() accessor and the lock-held loadEnv read in Start.
 	mp.loadEnv = loadEnv
 	mp.shutdownTimeout = effective
+	// Inject the launch gate (#32/#36, D2). ATOMIC READ ONLY: startWithConfig
+	// calls this inside its p.mu critical section, so this closure must NOT take
+	// s.mu -- the verified s.mu -> p.mu order would make an s.mu acquisition here
+	// an AB-BA deadlock against callers already holding s.mu while reaching for
+	// p.mu (Processes/Process/MaxStopBudget). Reading the atomic is sufficient.
+	mp.launchGate = func() error {
+		if !s.launchable.Load() {
+			return domain.ErrShutdownInProgress
+		}
+		return nil
+	}
 
 	return mp, nil
 }
@@ -337,7 +373,48 @@ func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 	wg.Wait()
 }
 
-// Stop stops all processes and the supervisor
+// stopEvent maps a per-process Stop result to the event that Supervisor.Stop and
+// StopProcess both emit, so the event semantics stay uniform across the two paths
+// by construction (#36, D3): a clean stop (or already-not-running) is
+// process_stopped; a surviving group is process_crashed (state is already
+// Crashed); any other error (ctx expiry/cancellation) is not proof of anything
+// and emits no event (ok == false).
+func stopEvent(err error) (EventType, bool) {
+	switch {
+	case err == nil || errors.Is(err, domain.ErrProcessNotRunning):
+		return EventTypeProcessStopped, true
+	case errors.Is(err, domain.ErrProcessGroupNotReaped):
+		return EventTypeProcessCrashed, true
+	default:
+		return "", false
+	}
+}
+
+// RefuseLaunches closes the launch gate ahead of Stop. Daemon shutdown runs an
+// earlier teardown stage (proxyd deregister, up to a few seconds) BEFORE Stop
+// flips the gate itself, and the API keeps serving through that stage; without
+// this a StartProcess/RestartProcess arriving in that window would still launch a
+// process the shutdown is about to orphan. Calling this at the very top of the
+// shutdown sequence closes the gate immediately. It is just s.launchable.Store(
+// false) -- idempotent with the identical flip Stop performs, so calling both is
+// harmless, and it does NOT change supervisor state (still "running") so the
+// read-only API stays fully answerable during the drain.
+//
+// Accepted residual: a restart already past its pre-checks can still stop its
+// current process and is only refused at the start half -- fine, shutdown was
+// about to stop that process anyway (#36, D4).
+func (s *Supervisor) RefuseLaunches() {
+	s.launchable.Store(false)
+}
+
+// Stop stops all processes and the supervisor.
+//
+// The signature stays the idiomatic Stop(ctx) error, but the concrete failure
+// value is a *domain.ProcessStopError aggregating every process that did not stop
+// cleanly (each failure wraps a sentinel such as ErrProcessGroupNotReaped, so
+// errors.Is/errors.As see through the aggregate). It returns a literal nil --
+// never a typed-nil *ProcessStopError -- when the stop is clean, and likewise nil
+// from the not-running early return (nothing to do) (#36, D3).
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.state != "running" {
@@ -345,6 +422,11 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		return nil
 	}
 	s.state = "stopping"
+	// Close the launch gate before spawning the per-process stop goroutines, so a
+	// launcher that observes it closed never launches, and a launcher already past
+	// the gate (the check/use window) is reaped by this process's stop goroutine --
+	// which is queued on p.mu behind that very launch -- before Stop returns (D2).
+	s.launchable.Store(false)
 	processes := make([]*ManagedProcess, 0, len(s.processes))
 	for _, mp := range s.processes {
 		processes = append(processes, mp)
@@ -352,12 +434,16 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Stop all processes concurrently. Each process gets its own timeout context
-	// sized from its effective stop budget (StopTimeout), so a per-process
-	// stop_timeout is honored individually. This replaces the single shared
-	// shutdownCtx that previously truncated every process to one common deadline
-	// (#35, D2). The daemon's outer deadline is sized by up.go from
-	// MaxStopBudget() so ctx here rarely bounds anything.
-	var wg sync.WaitGroup
+	// sized from its effective stop budget (StopTimeout) plus stopVerdictMargin,
+	// so a per-process stop_timeout is honored individually AND a stop joining an
+	// in-flight primary as a secondary outlives the primary's finalization window
+	// (#35, D2 / #36, D3). The daemon's outer deadline is sized by up.go from
+	// StopWaitBound() so ctx here rarely bounds anything.
+	var (
+		wg       sync.WaitGroup
+		failMu   sync.Mutex
+		failures []domain.ProcessStopFailure
+	)
 	for _, mp := range processes {
 		wg.Add(1)
 		go func(mp *ManagedProcess) {
@@ -366,31 +452,38 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 			// so read it once here rather than taking the process lock a second
 			// time via mp.StopTimeout().
 			info := mp.Info()
-			stopCtx, cancel := context.WithTimeout(ctx, info.StopTimeout)
+			stopCtx, cancel := context.WithTimeout(ctx, info.StopTimeout+stopVerdictMargin)
 			defer cancel()
 			if info.PID > 0 {
 				s.SystemLog("sending SIGTERM to %s (pid %d)", info.Name, info.PID)
 			}
-			if err := mp.Stop(stopCtx); err != nil && err != domain.ErrProcessNotRunning {
+			err := mp.Stop(stopCtx)
+			if evt, ok := stopEvent(err); ok {
+				s.emit(SupervisorEvent{
+					Type:      evt,
+					Process:   mp.Name(),
+					Timestamp: time.Now(),
+					Info:      mp.Info(),
+				})
+			}
+			// A non-clean stop (anything but nil/ErrProcessNotRunning) is logged once
+			// and recorded for the aggregate, whichever class it is. A surviving group
+			// is additionally surfaced prominently (D4); its process_crashed event was
+			// already emitted above (#36, D3).
+			if err != nil && !errors.Is(err, domain.ErrProcessNotRunning) {
 				s.logManager.Write(domain.LogEntry{
 					Timestamp: time.Now(),
 					Process:   mp.Name(),
 					Stream:    domain.StreamStderr,
 					Line:      fmt.Sprintf("Error stopping: %v", err),
 				})
-				// Full-instance stop is best-effort, but surface an
-				// un-reapable group prominently so operators can see which
-				// process leaked (D4). We do not abort the rest of shutdown.
 				if errors.Is(err, domain.ErrProcessGroupNotReaped) {
 					s.SystemLog("could not reap process group for %s", mp.Name())
 				}
+				failMu.Lock()
+				failures = append(failures, domain.ProcessStopFailure{Name: mp.Name(), Err: err})
+				failMu.Unlock()
 			}
-			s.emit(SupervisorEvent{
-				Type:      EventTypeProcessStopped,
-				Process:   mp.Name(),
-				Timestamp: time.Now(),
-				Info:      mp.Info(),
-			})
 		}(mp)
 	}
 	wg.Wait()
@@ -407,7 +500,14 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		Timestamp: time.Now(),
 	})
 
-	return nil
+	if len(failures) == 0 {
+		// Return a literal nil, never a typed-nil *ProcessStopError (which would be
+		// a non-nil error interface).
+		return nil
+	}
+	// Stable output: sort by process name after the concurrent collection.
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Name < failures[j].Name })
+	return &domain.ProcessStopError{Failures: failures}
 }
 
 // Processes returns info for all processes
@@ -513,10 +613,13 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 	stopCtx, cancel := context.WithTimeout(ctx, mp.StopTimeout())
 	defer cancel()
 
+	// Event semantics are uniform with Supervisor.Stop via the shared stopEvent
+	// classifier (#36, D3): process_stopped on a clean/already-not-running stop,
+	// process_crashed on a surviving group, no event on any other error.
 	err := mp.Stop(stopCtx)
-	if err == nil || err == domain.ErrProcessNotRunning {
+	if evt, ok := stopEvent(err); ok {
 		s.emit(SupervisorEvent{
-			Type:      EventTypeProcessStopped,
+			Type:      evt,
 			Process:   name,
 			Timestamp: time.Now(),
 			Info:      mp.Info(),
@@ -602,6 +705,16 @@ func (s *Supervisor) MaxStopBudget() time.Duration {
 		return constants.DefaultShutdownTimeout
 	}
 	return maxBudget
+}
+
+// StopWaitBound returns the deadline a caller should grant Supervisor.Stop: the
+// largest live per-process stop budget plus stopVerdictMargin. The margin lets a
+// per-process stop goroutine that joins an in-flight primary as a secondary
+// outlive the primary's finalization window (see stopVerdictMargin). up.go sizes
+// its supervisor teardown stage from this so it does not duplicate the constant
+// (#36, D3).
+func (s *Supervisor) StopWaitBound() time.Duration {
+	return s.MaxStopBudget() + stopVerdictMargin
 }
 
 // Status returns supervisor status

@@ -92,6 +92,28 @@ type SuccessResponse struct {
 	Success bool `json:"success"`
 }
 
+// ShutdownFailureResponse describes one process whose group survived the
+// full-stop shutdown. Code is the stable machine-readable classifier
+// (e.g. PROCESS_GROUP_NOT_REAPED) so tooling can branch without string matching.
+type ShutdownFailureResponse struct {
+	Process string `json:"process"`
+	Error   string `json:"error"`
+	Code    string `json:"code"`
+}
+
+// ShutdownResponse is the body of POST /api/v1/shutdown?wait=true once the
+// process-stop verdict has landed. Success is true only when Failures is empty.
+// Waited is always true on this path; its presence (vs its absence on the legacy
+// async 200, which sends a bare SuccessResponse) is how an older CLI detects that
+// it reached a waited-capable daemon. The endpoint responds HTTP 200 even when
+// Failures is non-empty, because the CLI discards structured bodies on non-2xx
+// responses — the survivor list must ride a 200 to be read (#36, D4).
+type ShutdownResponse struct {
+	Success  bool                      `json:"success"`
+	Waited   bool                      `json:"waited"`
+	Failures []ShutdownFailureResponse `json:"failures"`
+}
+
 // ErrorResponse represents an error response
 type ErrorResponse struct {
 	Error string `json:"error"`
