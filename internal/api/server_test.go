@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,14 +391,20 @@ func deadlineProbe(dst *time.Duration) http.HandlerFunc {
 // TestRouteGroupTimeoutWiring verifies the per-group timeout mechanism that
 // registerRoutes relies on: a route placed in a group with
 // middleware.Timeout(lifecycleRequestTimeout) sees a context deadline of ~11m,
-// while a route under defaultRequestTimeout sees ~30s. It mirrors the exact
-// group structure of registerRoutes with probe handlers (the real lifecycle
-// handlers cannot report their own deadline), keeping the test instant -- no
-// >30s sleep. Together with TestRequestTimeoutConstants and the routing smoke
-// test, this establishes that lifecycle requests are not cut at the old 30s
-// boundary.
+// a route under defaultRequestTimeout sees ~30s, and the SSE group carries NO
+// deadline at all (#42). It mirrors the exact group structure of registerRoutes
+// with probe handlers (the real lifecycle handlers cannot report their own
+// deadline), keeping the test instant -- no >30s sleep. Together with
+// TestRequestTimeoutConstants and the routing smoke test, this establishes
+// that lifecycle requests are not cut at the old 30s boundary and that the SSE
+// streams are not deadline-bounded at all. It also pins chi's static-over-param
+// precedence: /proxy/requests/stream (SSE group) must win over
+// /proxy/requests/{id} (default group) even though they live in different
+// groups.
 func TestRouteGroupTimeoutWiring(t *testing.T) {
-	var lifecycleBudget, defaultBudget time.Duration
+	var lifecycleBudget, defaultBudget, idBudget time.Duration
+	sseLogsSawDeadline := true
+	sseProxySawDeadline := true
 
 	r := chi.NewRouter()
 	r.Group(func(r chi.Router) {
@@ -404,17 +412,31 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 		r.Post("/processes/{name}/stop", deadlineProbe(&lifecycleBudget))
 	})
 	r.Group(func(r chi.Router) {
+		r.Get("/logs/stream", func(w http.ResponseWriter, r *http.Request) {
+			_, sseLogsSawDeadline = r.Context().Deadline()
+			w.WriteHeader(http.StatusOK)
+		})
+		r.Get("/proxy/requests/stream", func(w http.ResponseWriter, r *http.Request) {
+			_, sseProxySawDeadline = r.Context().Deadline()
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(defaultRequestTimeout))
 		r.Get("/status", deadlineProbe(&defaultBudget))
+		r.Get("/proxy/requests/{id}", deadlineProbe(&idBudget))
 	})
 
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest("POST", "/processes/web/stop", nil))
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	rec = httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
-	require.Equal(t, http.StatusOK, rec.Code)
+	for _, req := range []*http.Request{
+		httptest.NewRequest("POST", "/processes/web/stop", nil),
+		httptest.NewRequest("GET", "/status", nil),
+		httptest.NewRequest("GET", "/logs/stream", nil),
+		httptest.NewRequest("GET", "/proxy/requests/stream", nil),
+	} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, "%s %s", req.Method, req.URL.Path)
+	}
 
 	// Lifecycle route must carry the large ceiling, well past the old 30s.
 	assert.Greater(t, lifecycleBudget, 30*time.Second, "lifecycle route deadline must exceed the old 30s boundary")
@@ -422,6 +444,86 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 	// Default route keeps the 30s ceiling.
 	assert.LessOrEqual(t, defaultBudget, 30*time.Second)
 	assert.Greater(t, defaultBudget, 25*time.Second)
+	// SSE routes carry no deadline at all (#42).
+	assert.False(t, sseLogsSawDeadline, "/logs/stream must have no context deadline")
+	assert.False(t, sseProxySawDeadline, "/proxy/requests/stream must have no context deadline")
+	// GET /proxy/requests/stream resolved to the SSE probe, so the {id} probe
+	// under the timed group must never have run.
+	assert.Zero(t, idBudget, "/proxy/requests/stream must not match /proxy/requests/{id}")
+}
+
+// TestSSEStreamSurvivesTimeoutBoundary runs the real StreamLogs handler inside
+// the SSE (no-timeout) group structure of registerRoutes, next to a sibling
+// group carrying a short stand-in timeout (150ms instead of 30s, keeping the
+// test instant). The sibling is genuinely cut at the injected boundary, while
+// the stream still delivers an entry published well after it -- proving the
+// SSE group escapes the timeout class that would have killed it (#42). Like
+// TestRouteGroupTimeoutWiring, the router here is a reconstruction of
+// registerRoutes' group structure, not the real router.
+func TestSSEStreamSurvivesTimeoutBoundary(t *testing.T) {
+	const injectedTimeout = 150 * time.Millisecond
+
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100, SubscriptionBuffer: 10})
+	defer logMgr.Close()
+	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+
+	r := chi.NewRouter()
+	r.Group(func(r chi.Router) {
+		r.Get("/logs/stream", handlers.StreamLogs)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(injectedTimeout))
+		r.Get("/slow", func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		})
+	})
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	// The timed sibling is cut at the injected boundary.
+	resp, err := http.Get(srv.URL + "/slow")
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
+
+	// The stream outlives that same boundary.
+	stream, err := http.Get(srv.URL + "/logs/stream")
+	require.NoError(t, err)
+	defer stream.Body.Close()
+
+	reader := bufio.NewReader(stream.Body)
+	line, err := reader.ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, line, ": connected")
+
+	// Sail well past the injected boundary, then publish.
+	time.Sleep(3 * injectedTimeout)
+	logMgr.Write(domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "late",
+		Stream:    domain.StreamStdout,
+		Line:      "still alive",
+	})
+
+	got := make(chan struct{})
+	go func() {
+		for {
+			l, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.Contains(l, "still alive") {
+				close(got)
+				return
+			}
+		}
+	}()
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not deliver an entry published after the injected timeout boundary")
+	}
 }
 
 // TestRegisterRoutes_RoutingSmoke exercises the restructured router end-to-end to

@@ -173,10 +173,12 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 //     (11m). The supervisor bounds start/stop/restart internally per-process by
 //     the configured stop budget; /shutdown?wait=true blocks for the whole drain.
 //     This router ceiling is hang protection only.
-//   - Default group (everything else, including the SSE streams):
-//     defaultRequestTimeout (30s), preserving the prior behavior exactly. The
-//     SSE streams (/logs/stream, /proxy/requests/stream) watch r.Context() and
-//     were 30s-capped before this restructure; they remain so.
+//   - SSE group (/logs/stream, /proxy/requests/stream): NO timeout middleware.
+//     The streams are long-lived by design (WriteTimeout is 0 for the same
+//     reason); they end when the client disconnects (r.Context() is cancelled
+//     on connection close) or when the daemon shuts down (the log manager
+//     closes subscriber channels at shutdown). (#42)
+//   - Default group (everything else): defaultRequestTimeout (30s).
 func (s *Server) registerRoutes() {
 	// Health check at root (no auth required). Kept under the default 30s
 	// ceiling to preserve prior behavior (it returns immediately regardless).
@@ -207,6 +209,17 @@ func (s *Server) registerRoutes() {
 			r.Post("/shutdown", s.handlers.Shutdown)
 		})
 
+		// SSE streams: no timeout middleware. These are long-lived connections
+		// that end on client disconnect or daemon shutdown, matching the
+		// server's WriteTimeout of 0 (#42).
+		r.Group(func(r chi.Router) {
+			r.Get("/logs/stream", s.handlers.StreamLogs)
+			// Note: /proxy/requests/stream is registered here while
+			// /proxy/requests/{id} lives in the default group below; chi routes
+			// the literal "stream" segment ahead of the {id} parameter.
+			r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
+		})
+
 		// Everything else keeps the default 30s ceiling.
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Timeout(defaultRequestTimeout))
@@ -220,13 +233,9 @@ func (s *Server) registerRoutes() {
 
 			// Logs
 			r.Get("/logs", s.handlers.GetLogs)
-			r.Get("/logs/stream", s.handlers.StreamLogs)
 
 			// Proxy requests
-			// Note: /proxy/requests/stream must come before /proxy/requests/{id}
-			// to prevent the parameterized route from matching "stream" as an ID
 			r.Get("/proxy/requests", s.handlers.GetProxyRequests)
-			r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
 			r.Get("/proxy/requests/{id}", s.handlers.GetProxyRequest)
 		})
 	})
