@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -477,28 +479,10 @@ func (b *BaseModel) formatRequestDetail() []string {
 	}
 
 	// Request body
-	if d.RequestBody != nil && d.RequestBody.Size > 0 {
-		lines = append(lines, "")
-		bodyTitle := fmt.Sprintf("Request Body (%d bytes", d.RequestBody.Size)
-		if d.RequestBody.Truncated {
-			bodyTitle += ", truncated"
-		}
-		bodyTitle += ")"
-		lines = append(lines, headerStyle.Render(bodyTitle))
-		lines = append(lines, renderBodyLines(d.RequestBody)...)
-	}
+	lines = append(lines, renderBodySection("Request Body", d.RequestBody)...)
 
 	// Response body
-	if d.ResponseBody != nil && d.ResponseBody.Size > 0 {
-		lines = append(lines, "")
-		bodyTitle := fmt.Sprintf("Response Body (%d bytes", d.ResponseBody.Size)
-		if d.ResponseBody.Truncated {
-			bodyTitle += ", truncated"
-		}
-		bodyTitle += ")"
-		lines = append(lines, headerStyle.Render(bodyTitle))
-		lines = append(lines, renderBodyLines(d.ResponseBody)...)
-	}
+	lines = append(lines, renderBodySection("Response Body", d.ResponseBody)...)
 
 	// Footer hint
 	lines = append(lines, "")
@@ -507,9 +491,44 @@ func (b *BaseModel) formatRequestDetail() []string {
 	return lines
 }
 
+// renderBodySection renders one titled request/response body block: a header
+// line carrying size/Content-Type/Content-Encoding/truncation, followed by
+// the body content. Shared by both Model and ClientModel via BaseModel, so
+// this lands the rendering behavior once for both. Returns nil (nothing
+// rendered) when there is no body or it is empty, matching prior behavior.
+func renderBodySection(title string, b *BodyData) []string {
+	if b == nil || b.Size == 0 {
+		return nil
+	}
+	lines := []string{"", headerStyle.Render(bodySectionTitle(title, b))}
+	return append(lines, renderBodyLines(b)...)
+}
+
+// bodySectionTitle builds the section header, e.g.
+// "Request Body (35 bytes, application/json)" or
+// "Response Body (1234 bytes, application/json, gzip, truncated)". The
+// Content-Type and Content-Encoding segments are omitted when absent, and no
+// dangling comma/parens are left behind when every optional segment is empty.
+func bodySectionTitle(title string, b *BodyData) string {
+	parts := []string{fmt.Sprintf("%d bytes", b.Size)}
+	if b.ContentType != "" {
+		parts = append(parts, b.ContentType)
+	}
+	if b.ContentEncoding != "" {
+		parts = append(parts, b.ContentEncoding)
+	}
+	if b.Truncated {
+		parts = append(parts, "truncated")
+	}
+	return fmt.Sprintf("%s (%s)", title, strings.Join(parts, ", "))
+}
+
 // renderBodyLines renders the content lines for a captured body: an
 // unavailable (evicted) notice, a binary-data marker, or the body text split
-// into lines. Full rendering polish (JSON pretty-print) lands in a later commit.
+// into lines. Non-binary JSON bodies (Content-Type contains "json", or the
+// raw text is itself valid JSON) are pretty-printed 2-space indented; any
+// json.Indent failure falls back to the raw text unchanged, and non-JSON
+// text always renders byte-for-byte unchanged.
 func renderBodyLines(body *BodyData) []string {
 	if body.Unavailable {
 		return []string{dimStyle.Render("(body no longer available)")}
@@ -520,11 +539,30 @@ func renderBodyLines(body *BodyData) []string {
 	if body.Data == "" {
 		return nil
 	}
+
+	text := body.Data
+	if shouldPrettyPrintJSON(body) {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(body.Data), "", "  "); err == nil {
+			text = buf.String()
+		}
+	}
+
 	var lines []string
-	for _, line := range strings.Split(body.Data, "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		lines = append(lines, "  "+line)
 	}
 	return lines
+}
+
+// shouldPrettyPrintJSON reports whether a non-binary body should be run
+// through json.Indent before display: either its Content-Type declares JSON,
+// or (no such declaration) the raw text happens to be valid JSON on its own.
+func shouldPrettyPrintJSON(body *BodyData) bool {
+	if strings.Contains(strings.ToLower(body.ContentType), "json") {
+		return true
+	}
+	return json.Valid([]byte(body.Data))
 }
 
 // filteredEntries returns log entries after applying filters

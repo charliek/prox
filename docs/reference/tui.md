@@ -89,6 +89,27 @@ Status codes are color-coded: green (2xx), cyan (3xx), yellow (4xx), red (5xx), 
 | Key | Action |
 | --- | ------ |
 | `s` | String filter (on URL/method/subdomain) |
+| `Enter` | Open detail view for the selected request |
+
+## Request Detail View
+
+Press `Enter` on a request to see headers and captured bodies:
+
+```text
+Request Body (35 bytes, application/json)
+  {
+    "user": "alice"
+  }
+```
+
+- The body section title shows the byte count, Content-Type, and (when the
+  body was transfer-encoded, e.g. gzip) Content-Encoding — omitted when not
+  present.
+- Bodies are pretty-printed 2-space indented JSON when the Content-Type
+  contains `json`, or when the raw body is itself valid JSON. Any other text
+  renders unchanged. Binary bodies show `[binary data]`; bodies that could
+  no longer be loaded (e.g. evicted from disk) show `(body no longer
+  available)`.
 
 ## Process Filter Mode
 
