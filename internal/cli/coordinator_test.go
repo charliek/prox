@@ -30,12 +30,12 @@ func TestShutdownCoordinator_DoubleTriggerNoPanic(t *testing.T) {
 }
 
 // TestShutdownCoordinator_WiredShutdownFnDoublePost simulates the daemon wiring:
-// the API handler is handed shutdownFn := coordinator.Trigger. Two POST
-// /shutdown calls invoke it twice; the daemon must not panic (regression for the
-// bare close(shutdownCh) bug).
+// the API handler is handed the coordinator and calls Trigger() on POST
+// /shutdown. Two POST /shutdown calls invoke it twice; the daemon must not panic
+// (regression for the bare close(shutdownCh) bug).
 func TestShutdownCoordinator_WiredShutdownFnDoublePost(t *testing.T) {
 	c := newShutdownCoordinator()
-	shutdownFn := c.Trigger // exactly what runUp hands api.NewHandlers
+	shutdownFn := c.Trigger // exactly what api.NewHandlers calls via ShutdownController
 
 	assert.NotPanics(t, func() {
 		shutdownFn()

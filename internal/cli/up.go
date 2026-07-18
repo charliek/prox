@@ -298,11 +298,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create the shutdown coordinator. Its Trigger()/TriggerCh() replace the raw
 	// shutdownCh (a bare close was a latent double-close panic on a second POST
 	// /shutdown); its Done()/Outcome() latch the process-stop verdict for the
-	// foreground exit contract. For now the API handlers still receive the plain
-	// shutdownFn closure (= coordinator.Trigger) — C5 hands them the coordinator
-	// itself so wait=true handlers can read Done()/Outcome().
+	// foreground exit contract and for POST /shutdown?wait=true. The API handlers
+	// receive the coordinator itself (as api.ShutdownController) so a wait=true
+	// request can Trigger() the sequence and then read Done()/Outcome().
 	coordinator := newShutdownCoordinator()
-	shutdownFn := coordinator.Trigger
 
 	// Determine if authentication is required
 	authEnabled := isAuthRequired(cfg)
@@ -325,7 +324,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Create API handlers and server. The handlers get the absolute config path
 	// so GET /status reports the same file the reload path re-reads (#33, D3).
-	handlers := api.NewHandlers(sup, logMgr, absConfigPath, shutdownFn)
+	handlers := api.NewHandlers(sup, logMgr, absConfigPath, coordinator)
 	apiServer := api.NewServer(api.ServerConfig{
 		Host:        cfg.API.Host,
 		Port:        cfg.API.Port,
@@ -567,6 +566,11 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	}
 
 	// Stage 1b: stop the standalone proxy (listeners only, never processes).
+	// Accepted pre-existing behavior (out of scope for #36): proxyService.Shutdown
+	// performs an unbounded os.RemoveAll of on-disk capture bodies before this
+	// function reaches the verdict publish. It is small in practice (capture bodies
+	// are size-capped) and the daemon is exiting anyway, so it is left as-is rather
+	// than bounded here.
 	if deps.proxyService != nil {
 		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), deps.stageTimeout)
 		if err := deps.proxyService.Shutdown(proxyCtx); err != nil {

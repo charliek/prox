@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -179,6 +180,53 @@ func postProcessAction(t *testing.T, addr, name, action string) (int, ErrorRespo
 type ErrorResponse struct {
 	Error string `json:"error"`
 	Code  string `json:"code"`
+}
+
+// projectRoot returns the repo root (two dirs up from test/integration), where
+// the daemon and CLI both run so they share one .prox state directory.
+func projectRoot(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	return filepath.Join(wd, "..", "..")
+}
+
+// runProx runs a prox subcommand to completion in the repo root and returns its
+// combined output and exit code. Used to exercise the real CLI (e.g. `prox stop`)
+// rather than poking the API directly.
+func runProx(t *testing.T, binary string, args ...string) (string, int) {
+	t.Helper()
+
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = projectRoot(t)
+	out, err := cmd.CombinedOutput()
+
+	exitCode := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			t.Fatalf("failed to run prox %v: %v", args, err)
+		}
+	}
+	return string(out), exitCode
+}
+
+// waitCmdExit waits for a started command to exit within timeout, killing it and
+// failing the test on timeout.
+func waitCmdExit(t *testing.T, cmd *exec.Cmd, timeout time.Duration) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		killProx(cmd)
+		t.Fatalf("process did not exit within %v", timeout)
+	}
 }
 
 // killProx forcefully kills the prox process

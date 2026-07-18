@@ -297,8 +297,8 @@ func TestClient_RestartProcess(t *testing.T) {
 	}
 }
 
-func TestClient_Shutdown(t *testing.T) {
-	called := false
+func TestClient_Shutdown_AsyncLegacy(t *testing.T) {
+	var gotWait string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/shutdown" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
@@ -306,22 +306,102 @@ func TestClient_Shutdown(t *testing.T) {
 		if r.Method != "POST" {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		called = true
+		gotWait = r.URL.Query().Get("wait")
 
-		resp := api.SuccessResponse{Success: true}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	err := client.Shutdown()
-
+	result, err := client.Shutdown(false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !called {
-		t.Error("expected server to be called")
+	if result != nil {
+		t.Errorf("async shutdown should return a nil result, got %+v", result)
+	}
+	if gotWait != "" {
+		t.Errorf("async shutdown must not set wait, got wait=%q", gotWait)
+	}
+}
+
+func TestClient_Shutdown_WaitClean(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("wait"); got != "true" {
+			t.Errorf("expected wait=true, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ShutdownResponse{
+			Success:  true,
+			Waited:   true,
+			Failures: []api.ShutdownFailureResponse{},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	result, err := client.Shutdown(true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil || result.Waited == nil || !*result.Waited {
+		t.Fatalf("expected Waited=true, got %+v", result)
+	}
+	if len(result.Failures) != 0 {
+		t.Errorf("expected no failures, got %+v", result.Failures)
+	}
+}
+
+func TestClient_Shutdown_WaitFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ShutdownResponse{
+			Success: false,
+			Waited:  true,
+			Failures: []api.ShutdownFailureResponse{
+				{Process: "web", Error: "process group could not be terminated: web", Code: "PROCESS_GROUP_NOT_REAPED"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	result, err := client.Shutdown(true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil || result.Waited == nil || !*result.Waited {
+		t.Fatalf("expected Waited=true, got %+v", result)
+	}
+	if len(result.Failures) != 1 || result.Failures[0].Process != "web" {
+		t.Fatalf("expected one failure for web, got %+v", result.Failures)
+	}
+	if result.Failures[0].Code != "PROCESS_GROUP_NOT_REAPED" {
+		t.Errorf("expected PROCESS_GROUP_NOT_REAPED code, got %q", result.Failures[0].Code)
+	}
+}
+
+// TestClient_Shutdown_WaitOldDaemon: an old daemon ignores wait=true and returns
+// a bare {"success":true}. The absent "waited" field must decode to a nil
+// pointer, so the CLI can distinguish it from a real waited response.
+func TestClient_Shutdown_WaitOldDaemon(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	result, err := client.Shutdown(true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected a decoded result")
+	}
+	if result.Waited != nil {
+		t.Errorf("old-daemon response must leave Waited nil, got %v", *result.Waited)
 	}
 }
 

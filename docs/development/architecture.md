@@ -64,13 +64,14 @@ This document describes the internal design of prox for contributors.
 
 The daemon tears down in stages, each with its own deadline computed at shutdown
 time rather than one shared budget, so proxy/API teardown time can never eat
-into the supervisor's process-stop budget:
+into the supervisor's process-stop budget. The API server is stopped **last** so
+it outlives the supervisor stage and can still deliver the outcome to a
+`wait=true` caller:
 
-1. Deregister from (or stop) the proxy — a short fixed stage deadline
-2. Stop the API server — a short fixed stage deadline. The server stops
-   accepting new connections and waits up to the stage deadline for in-flight
-   requests; a still-running lifecycle request is not force-closed, and the
-   supervisor stage below stops its process regardless
+1. Close the launch gate — the supervisor refuses any new process launch for the
+   rest of shutdown, so a lifecycle request arriving during the drain cannot
+   start a process that teardown is about to orphan
+2. Deregister from (or stop) the proxy — a short fixed stage deadline
 3. Stop all processes (the supervisor stage), bounded by the maximum per-process
    stop budget currently in force plus a small margin. Each process is stopped
    concurrently on its **own** effective stop budget:
@@ -85,7 +86,26 @@ into the supervisor's process-stop budget:
       group and poll again until the kill deadline passes
    4. Verify the group is actually gone; if it survived SIGKILL, the stop reports
       `PROCESS_GROUP_NOT_REAPED` instead of succeeding
-4. Exit
+4. Publish the aggregate process-stop verdict to any `wait=true` shutdown caller
+   (a latched broadcast: every waiter reads the same stored outcome)
+5. Flush and close the log manager — this releases SSE log subscribers so their
+   handlers return instead of pinning the API server open through the next stage
+6. Stop the API server — a short fixed stage deadline. It stops accepting new
+   connections and waits up to the deadline for in-flight requests (including the
+   `wait=true` response's small JSON write); a still-running request is not
+   force-closed
+7. Cleanup and exit. In the foreground, a surviving process group makes `prox up`
+   exit non-zero with a one-line `shutdown incomplete: …` summary (per-survivor
+   detail is in the log stream)
+
+**Waited shutdown flow.** `POST /api/v1/shutdown?wait=true` (used by `prox stop`
+and `prox down`) triggers the sequence above, then blocks until stage 4 latches
+the verdict. The handler returns HTTP 200 with the verdict — `success: true` on a
+clean stop, or `success: false` plus a `failures` list naming each survivor. The
+CLI then waits briefly for the daemon's state/PID files to disappear (confirming
+the daemon process itself exited) before printing its summary. See
+[POST /shutdown](../reference/api.md#post-shutdown) and
+[`prox stop`](../reference/cli.md#stop).
 
 ### Process Restart
 

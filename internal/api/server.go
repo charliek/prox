@@ -169,10 +169,11 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 //
 // The request-timeout middleware is applied per route group, not globally, so
 // the lifecycle routes can carry a larger ceiling than everything else:
-//   - Lifecycle group (start/stop/restart): lifecycleRequestTimeout (11m). The
-//     supervisor bounds these operations internally per-process by the
-//     configured stop budget; this router ceiling is hang protection only.
-//   - Default group (everything else, including the SSE streams and /shutdown):
+//   - Lifecycle group (start/stop/restart, /shutdown): lifecycleRequestTimeout
+//     (11m). The supervisor bounds start/stop/restart internally per-process by
+//     the configured stop budget; /shutdown?wait=true blocks for the whole drain.
+//     This router ceiling is hang protection only.
+//   - Default group (everything else, including the SSE streams):
 //     defaultRequestTimeout (30s), preserving the prior behavior exactly. The
 //     SSE streams (/logs/stream, /proxy/requests/stream) watch r.Context() and
 //     were 30s-capped before this restructure; they remain so.
@@ -191,12 +192,19 @@ func (s *Server) registerRoutes() {
 
 		// Lifecycle routes: bounded internally by the supervisor per-process, so
 		// they get the large hang-protection ceiling rather than the 30s default.
+		// /shutdown lives here too: its wait=true path blocks for the whole drain
+		// (supervisor stop + finalization), which can exceed the 30s default (#36,
+		// D4). The legacy async /shutdown returns immediately, so the larger ceiling
+		// is harmless for it.
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Timeout(lifecycleRequestTimeout))
 
 			r.Post("/processes/{name}/start", s.handlers.StartProcess)
 			r.Post("/processes/{name}/stop", s.handlers.StopProcess)
 			r.Post("/processes/{name}/restart", s.handlers.RestartProcess)
+
+			// Shutdown (wait=true blocks for the drain; legacy default acks async).
+			r.Post("/shutdown", s.handlers.Shutdown)
 		})
 
 		// Everything else keeps the default 30s ceiling.
@@ -220,9 +228,6 @@ func (s *Server) registerRoutes() {
 			r.Get("/proxy/requests", s.handlers.GetProxyRequests)
 			r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
 			r.Get("/proxy/requests/{id}", s.handlers.GetProxyRequest)
-
-			// Shutdown (responds immediately, then triggers async teardown)
-			r.Post("/shutdown", s.handlers.Shutdown)
 		})
 	})
 }

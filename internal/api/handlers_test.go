@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1053,4 +1054,143 @@ func TestGetProxyRequest(t *testing.T) {
 		assert.Equal(t, []string{"application/json"}, resp.Details.RequestHeaders["Content-Type"])
 		assert.Equal(t, []string{"application/json"}, resp.Details.ResponseHeaders["Content-Type"])
 	})
+}
+
+// fakeShutdownController is a hand-driven ShutdownController for the shutdown
+// handler tests: complete() latches the outcome and closes Done().
+type fakeShutdownController struct {
+	mu        sync.Mutex
+	triggered int
+	done      chan struct{}
+	closeOnce sync.Once
+	outcome   *domain.ProcessStopError
+}
+
+func newFakeShutdownController() *fakeShutdownController {
+	return &fakeShutdownController{done: make(chan struct{})}
+}
+
+func (f *fakeShutdownController) Trigger() {
+	f.mu.Lock()
+	f.triggered++
+	f.mu.Unlock()
+}
+
+func (f *fakeShutdownController) triggerCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.triggered
+}
+
+func (f *fakeShutdownController) Done() <-chan struct{} { return f.done }
+
+func (f *fakeShutdownController) Outcome() *domain.ProcessStopError { return f.outcome }
+
+func (f *fakeShutdownController) complete(outcome *domain.ProcessStopError) {
+	f.outcome = outcome
+	f.closeOnce.Do(func() { close(f.done) })
+}
+
+func TestShutdownHandler_WaitClean(t *testing.T) {
+	fake := newFakeShutdownController()
+	fake.complete(nil) // clean verdict already latched
+	h := NewHandlers(nil, nil, "prox.yaml", fake)
+
+	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
+	w := httptest.NewRecorder()
+	h.Shutdown(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.GreaterOrEqual(t, fake.triggerCount(), 1)
+
+	var resp ShutdownResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.Success)
+	assert.True(t, resp.Waited)
+	assert.Empty(t, resp.Failures)
+}
+
+func TestShutdownHandler_WaitFailures(t *testing.T) {
+	fake := newFakeShutdownController()
+	fake.complete(&domain.ProcessStopError{
+		Failures: []domain.ProcessStopFailure{
+			{Name: "web", Err: fmt.Errorf("%w: web", domain.ErrProcessGroupNotReaped)},
+		},
+	})
+	h := NewHandlers(nil, nil, "prox.yaml", fake)
+
+	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
+	w := httptest.NewRecorder()
+	h.Shutdown(w, req)
+
+	// 200 even with survivors: the CLI drops structured bodies on non-2xx.
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp ShutdownResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.False(t, resp.Success)
+	assert.True(t, resp.Waited)
+	require.Len(t, resp.Failures, 1)
+	assert.Equal(t, "web", resp.Failures[0].Process)
+	assert.Equal(t, domain.ErrCodeProcessGroupNotReaped, resp.Failures[0].Code)
+}
+
+// TestShutdownHandler_WaitClientGone: when the request context is canceled before
+// the verdict lands, the handler returns without writing a body.
+func TestShutdownHandler_WaitClientGone(t *testing.T) {
+	fake := newFakeShutdownController() // never completed
+	h := NewHandlers(nil, nil, "prox.yaml", fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	returned := make(chan struct{})
+	go func() {
+		h.Shutdown(w, req)
+		close(returned)
+	}()
+
+	cancel() // client disconnects
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after client disconnect")
+	}
+	assert.Equal(t, 1, fake.triggerCount())
+	assert.Empty(t, w.Body.String(), "nothing should be written to a dead connection")
+}
+
+// TestShutdownHandler_LegacyAsync: without wait=true, the handler acks 200
+// immediately and triggers shutdown asynchronously.
+func TestShutdownHandler_LegacyAsync(t *testing.T) {
+	fake := newFakeShutdownController()
+	h := NewHandlers(nil, nil, "prox.yaml", fake)
+
+	req := httptest.NewRequest("POST", "/api/v1/shutdown", nil)
+	w := httptest.NewRecorder()
+	h.Shutdown(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp SuccessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.Success)
+
+	// Trigger fires from a background goroutine after a short delay.
+	require.Eventually(t, func() bool { return fake.triggerCount() >= 1 }, 2*time.Second, 10*time.Millisecond)
+}
+
+// TestShutdownHandler_NilControllerAcks: a handler with no coordinator wired
+// still acks (used by tests that never exercise the shutdown path).
+func TestShutdownHandler_NilControllerAcks(t *testing.T) {
+	h := NewHandlers(nil, nil, "prox.yaml", nil)
+	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
+	w := httptest.NewRecorder()
+	h.Shutdown(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp SuccessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.True(t, resp.Success)
 }

@@ -185,6 +185,12 @@ Examples:
 	ValidArgsFunction: completeProcessNames,
 }
 
+// stopStateWaitTimeout bounds how long `prox stop` waits, after a clean
+// process-stop verdict, for the daemon's own exit (state + PID files gone). The
+// verdict already confirms the processes stopped; this only confirms the daemon
+// process finished tearing down. A timeout here is a warning, not an error.
+const stopStateWaitTimeout = 15 * time.Second
+
 func runStop(cmd *cobra.Command, args []string) error {
 	client := NewClient(apiAddr)
 
@@ -198,13 +204,98 @@ func runStop(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// No args: stop the entire supervisor
-	if err := client.Shutdown(); err != nil {
-		return clientError(err, "Is prox running? Try 'prox up' first.")
+	// No args: stop the entire supervisor and wait for the outcome.
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "" // daemon.LoadState falls back to os.Getwd internally
+	}
+	return runFullStop(client, cwd, stopStateWaitTimeout)
+}
+
+// runFullStop performs a waited full daemon stop and maps the outcome to the CLI
+// exit contract (#36, D4):
+//   - transport failure: the outcome is unknown daemon-side → error (exit 1);
+//   - old daemon (Waited nil): legacy "Shutdown initiated" → exit 0;
+//   - survivors present: print each, return a one-line summary error → exit 1;
+//   - clean verdict: bounded-wait (stateWaitTimeout) for the daemon's state/PID
+//     files to vanish, print a stopped summary → exit 0 (a wait timeout prints a
+//     Warning to stderr but stays exit 0 — the process-stop verdict already
+//     succeeded). stateWaitTimeout is a parameter so tests can inject a short
+//     bound and exercise the poll-timeout branch.
+func runFullStop(client *Client, cwd string, stateWaitTimeout time.Duration) error {
+	result, err := client.Shutdown(true)
+	if err != nil {
+		// Transport failure mid-wait: the daemon may still be completing its
+		// shutdown; we cannot read the verdict from here (#36, D4).
+		return shutdownUnknownOutcomeError(cwd, err)
 	}
 
-	fmt.Println("Shutdown initiated")
+	// Old daemon: it ignored wait=true and acked immediately with no verdict.
+	if result.Waited == nil {
+		fmt.Println("Shutdown initiated")
+		return nil
+	}
+
+	// Survivors: print one line each (loud, systemd/docker-style), then return a
+	// short summary error so cobra exits 1 WITHOUT reprinting the whole list.
+	if len(result.Failures) > 0 {
+		for _, f := range result.Failures {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", f.Process, f.Error)
+		}
+		return fmt.Errorf("shutdown incomplete: %d process group(s) did not terminate", len(result.Failures))
+	}
+
+	// Clean process-stop verdict. Confirm the daemon itself has exited by waiting
+	// (bounded) for the state + PID files to disappear.
+	if waitForDaemonExit(cwd, stateWaitTimeout) {
+		fmt.Println("Stopped prox")
+	} else {
+		// Verdict was clean, so exit stays 0; the daemon just hasn't finished its
+		// own teardown within the bounded wait. Surface it as a stderr warning.
+		fmt.Println("Stopped processes")
+		fmt.Fprintln(os.Stderr, "Warning: the daemon is still finishing shutdown")
+	}
 	return nil
+}
+
+// waitForDaemonExit polls until the daemon's state and PID files are both gone
+// (its exit cleanup ran) or the timeout elapses. An IsNotExist stat on each path
+// means that file is gone. Returns true once both are absent, false on timeout.
+// Existence is checked with os.Stat rather than daemon.LoadState so a poll
+// iteration never pays for a JSON parse of content that isn't needed; once the
+// state file is confirmed gone, later iterations stop re-checking it.
+func waitForDaemonExit(cwd string, timeout time.Duration) bool {
+	statePath := daemon.StatePath(cwd)
+	pidPath := daemon.PIDPath(cwd)
+	deadline := time.Now().Add(timeout)
+	stateGone := false
+	for {
+		if !stateGone {
+			_, stateErr := os.Stat(statePath)
+			stateGone = os.IsNotExist(stateErr)
+		}
+		if stateGone {
+			if _, pidErr := os.Stat(pidPath); os.IsNotExist(pidErr) {
+				return true
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// shutdownUnknownOutcomeError wraps a transport failure that struck while waiting
+// for the shutdown verdict. The daemon may still be completing its teardown, so
+// the outcome is unknown; when a daemon log file exists (detached mode) we point
+// the user at it for the authoritative result.
+func shutdownUnknownOutcomeError(cwd string, err error) error {
+	msg := "shutdown may still be completing daemon-side; outcome unknown"
+	if _, statErr := os.Stat(daemon.LogPath(cwd)); statErr == nil {
+		msg = fmt.Sprintf("%s (see %s)", msg, daemon.LogPath(cwd))
+	}
+	return fmt.Errorf("%s: %w", msg, err)
 }
 
 // downCmd represents the down command (alias for stop without arguments)

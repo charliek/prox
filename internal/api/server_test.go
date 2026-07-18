@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/supervisor"
 )
@@ -371,6 +374,18 @@ func TestRequestTimeoutConstants(t *testing.T) {
 		"lifecycle ceiling must cover the maximum configurable stop budget")
 }
 
+// deadlineProbe returns a handler that records the remaining time until its
+// request's context deadline into dst, so a test can assert which timeout
+// middleware group a route landed in without exercising the real handler body.
+func deadlineProbe(dst *time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if dl, ok := r.Context().Deadline(); ok {
+			*dst = time.Until(dl)
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
 // TestRouteGroupTimeoutWiring verifies the per-group timeout mechanism that
 // registerRoutes relies on: a route placed in a group with
 // middleware.Timeout(lifecycleRequestTimeout) sees a context deadline of ~11m,
@@ -383,23 +398,14 @@ func TestRequestTimeoutConstants(t *testing.T) {
 func TestRouteGroupTimeoutWiring(t *testing.T) {
 	var lifecycleBudget, defaultBudget time.Duration
 
-	probe := func(dst *time.Duration) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if dl, ok := r.Context().Deadline(); ok {
-				*dst = time.Until(dl)
-			}
-			w.WriteHeader(http.StatusOK)
-		}
-	}
-
 	r := chi.NewRouter()
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(lifecycleRequestTimeout))
-		r.Post("/processes/{name}/stop", probe(&lifecycleBudget))
+		r.Post("/processes/{name}/stop", deadlineProbe(&lifecycleBudget))
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(defaultRequestTimeout))
-		r.Get("/status", probe(&defaultBudget))
+		r.Get("/status", deadlineProbe(&defaultBudget))
 	})
 
 	rec := httptest.NewRecorder()
@@ -445,6 +451,9 @@ func TestRegisterRoutes_RoutingSmoke(t *testing.T) {
 		{"POST", "/api/v1/processes/missing/start", http.StatusNotFound},
 		{"POST", "/api/v1/processes/missing/stop", http.StatusNotFound},
 		{"POST", "/api/v1/processes/missing/restart", http.StatusNotFound},
+		// Legacy async /shutdown (no wait) resolves to its handler and acks 200
+		// even with a nil coordinator wired.
+		{"POST", "/api/v1/shutdown", http.StatusOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
@@ -453,6 +462,87 @@ func TestRegisterRoutes_RoutingSmoke(t *testing.T) {
 			assert.Equal(t, tc.wantStatus, rec.Code)
 		})
 	}
+}
+
+// TestShutdownRouteInLifecycleGroup verifies POST /shutdown carries the large
+// lifecycle ceiling, not the 30s default: its wait=true path can block for the
+// whole drain, which would otherwise be cut at 30s (#36, D4). The handler reads
+// its request deadline and reports it back so the test can assert the ceiling.
+func TestShutdownRouteInLifecycleGroup(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0, Host: "127.0.0.1"},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
+
+	// Probe the deadline the router grants /shutdown. NOTE: probeRouter is a
+	// RECONSTRUCTION of registerRoutes' lifecycle group, not the real router — chi
+	// does not expose a per-route middleware chain to introspect, and proving the
+	// timeout CLASS distinction (11m vs 30s) directly would need a >30s test. It
+	// asserts only that a route wired the way registerRoutes wires /shutdown sees
+	// the lifecycle ceiling. The real route path (router + middleware + handler) is
+	// exercised by the sanity ack below, by TestRegisterRoutes_RoutingSmoke, and by
+	// TestShutdownRoute_WaitedResponseThroughRealRouter.
+	var shutdownBudget time.Duration
+	probeRouter := chi.NewRouter()
+	probeRouter.Route("/api/v1", func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(lifecycleRequestTimeout))
+			r.Post("/shutdown", deadlineProbe(&shutdownBudget))
+		})
+	})
+	rec := httptest.NewRecorder()
+	probeRouter.ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/shutdown", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Greater(t, shutdownBudget, 30*time.Second, "/shutdown must carry the lifecycle ceiling, not the 30s default")
+
+	// Sanity: the real server still routes legacy /shutdown to a 200 ack.
+	rec = httptest.NewRecorder()
+	server.router.ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/shutdown", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestShutdownRoute_WaitedResponseThroughRealRouter drives POST
+// /shutdown?wait=true through the REAL router + middleware chain (not the probe)
+// against a coordinator already completed with a survivor outcome, and asserts the
+// waited JSON body (HTTP 200, success=false, failures[]) comes back intact. This
+// proves the real route path delivers the waited verdict end to end.
+func TestShutdownRoute_WaitedResponseThroughRealRouter(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0, Host: "127.0.0.1"},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+
+	fake := newFakeShutdownController()
+	fake.complete(&domain.ProcessStopError{
+		Failures: []domain.ProcessStopFailure{
+			{Name: "web", Err: fmt.Errorf("%w: web", domain.ErrProcessGroupNotReaped)},
+		},
+	})
+	handlers := NewHandlers(sup, logMgr, "test.yaml", fake)
+	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
+
+	rec := httptest.NewRecorder()
+	server.router.ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code, "survivors still ride a 200 so the body is not discarded")
+	var resp ShutdownResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.False(t, resp.Success)
+	assert.True(t, resp.Waited)
+	require.Len(t, resp.Failures, 1)
+	assert.Equal(t, "web", resp.Failures[0].Process)
+	assert.Equal(t, domain.ErrCodeProcessGroupNotReaped, resp.Failures[0].Code)
+	assert.GreaterOrEqual(t, fake.triggerCount(), 1)
 }
 
 func TestIsLocalhostOrigin(t *testing.T) {

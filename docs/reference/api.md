@@ -359,7 +359,15 @@ curl -N "http://localhost:5555/api/v1/proxy/requests/stream?subdomain=api"
 
 Gracefully shut down supervisor and all processes.
 
-**Response:**
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `wait` | boolean | When exactly `true`, block until the process-stop verdict lands and return it (see below). Any other or absent value uses the legacy async behavior. |
+
+This route is in the lifecycle timeout class (the same long hang-protection ceiling as `start`/`stop`/`restart`), because the `wait=true` path can block for the full drain.
+
+**Legacy async response** (default, `wait` absent or not `true`):
 
 ```json
 {
@@ -367,6 +375,34 @@ Gracefully shut down supervisor and all processes.
 }
 ```
 
-Connection closes after response as supervisor terminates.
+The daemon acks immediately, then tears down in the background. The connection closes as the supervisor terminates.
 
-The daemon then tears down in stages, each with its own deadline: the proxy and API server are stopped on short fixed deadlines, then every process is stopped concurrently, each on its own configured stop budget (see [Stop Timeout](configuration.md#stop-timeout)). Graceful timing therefore derives from the configured `shutdown_timeout` / `stop_timeout` values, not a single fixed window.
+**Waited response** (`wait=true`):
+
+```json
+{
+  "success": true,
+  "waited": true,
+  "failures": []
+}
+```
+
+The request blocks until every process has been stopped and its group reaped, then returns the verdict. `success` is `true` only when `failures` is empty. When a process group survives shutdown, the response still uses **HTTP 200** (so the structured body is not discarded) and lists each survivor:
+
+```json
+{
+  "success": false,
+  "waited": true,
+  "failures": [
+    {
+      "process": "web",
+      "error": "process group could not be terminated: web",
+      "code": "PROCESS_GROUP_NOT_REAPED"
+    }
+  ]
+}
+```
+
+The `code` field is a stable machine-readable classifier (`PROCESS_GROUP_NOT_REAPED`). The `waited` field is present only on this path; a daemon that predates the `wait` parameter ignores it and returns the legacy body without `waited`, letting clients detect the older daemon.
+
+The daemon tears down in stages, each with its own deadline: the launch gate is closed, the proxy is deregistered/stopped on a short fixed deadline, then every process is stopped concurrently, each on its own configured stop budget (see [Stop Timeout](configuration.md#stop-timeout)); the verdict is then published to any `wait=true` caller, the logs are flushed and closed, and finally the API server is stopped. Graceful timing therefore derives from the configured `shutdown_timeout` / `stop_timeout` values, not a single fixed window.

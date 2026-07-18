@@ -169,6 +169,14 @@ With a process name, stops only that process while keeping prox and other proces
 
 The SIGTERM→SIGKILL timeout is configurable per process via `stop_timeout` (or globally via `shutdown_timeout`; default `10s`) — see [Stop Timeout](configuration.md#stop-timeout). A process with a large budget may make `prox stop` wait a while before returning: the server is authoritative and holds the request open until the process actually stops (up to the configured budget), so a long silent wait is expected rather than a hang. Pressing Ctrl-C on the CLI is safe — it only detaches the client; the daemon keeps stopping the process on its configured budget.
 
+**Full stop waits for the outcome.** `prox stop` (no arguments) and `prox down` block until the daemon reports the process-stop verdict, then wait briefly (up to ~15s) for the daemon's state and PID files to disappear before printing a stopped summary and exiting **0**. Exit codes:
+
+- **0** — all processes (and their process groups) stopped cleanly. A summary line is printed. If the daemon is still finishing its own exit when the bounded wait elapses, a `Warning: the daemon is still finishing shutdown` line is printed to stderr but the exit code stays `0` (the process-stop verdict already succeeded).
+- **1** — one or more process groups survived shutdown. Each survivor is printed as a `process: error` line, followed by a one-line summary; the group still holds whatever ports it bound.
+- **1** — the connection dropped mid-wait: the daemon may still be completing its shutdown and the outcome is unknown. When a daemon log file is present (detached mode), the message points at `.prox/prox.log` for the authoritative result.
+
+Against an older daemon that predates the waited protocol, `prox stop` falls back to the previous fire-and-forget behavior: it prints `Shutdown initiated` and exits `0`.
+
 **Examples:**
 
 ```bash
