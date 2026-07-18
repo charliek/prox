@@ -209,6 +209,7 @@ type ProxyRequestResponse struct {
 	Method     string `json:"method"`
 	URL        string `json:"url"`
 	Subdomain  string `json:"subdomain"`
+	Hostname   string `json:"hostname,omitempty"` // full hostname, port stripped (e.g. api.local.dev)
 	StatusCode int    `json:"status_code"`
 	DurationMs int64  `json:"duration_ms"`
 	RemoteAddr string `json:"remote_addr"`
@@ -229,6 +230,7 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 		Method:     req.Method,
 		URL:        req.URL,
 		Subdomain:  req.Subdomain,
+		Hostname:   req.Hostname,
 		StatusCode: req.StatusCode,
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,

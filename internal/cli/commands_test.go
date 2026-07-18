@@ -391,6 +391,200 @@ func TestRunRequests_MinStatusValidation(t *testing.T) {
 	}
 }
 
+func TestRunRequests_MaxStatusValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxStatus   int
+		expectError bool
+	}{
+		{"valid max 100", 100, false},
+		{"valid max 499", 499, false},
+		{"valid max 599", 599, false},
+		{"zero max (treated as no filter)", 0, false},
+		{"invalid max 99", 99, true},
+		{"invalid max 600", 600, true},
+		{"invalid max negative", -1, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origMaxStatus := requestsMaxStatus
+			origFollow := requestsFollow
+			origJSON := requestsJSON
+			defer func() {
+				requestsMaxStatus = origMaxStatus
+				requestsFollow = origFollow
+				requestsJSON = origJSON
+			}()
+
+			requestsMaxStatus = tt.maxStatus
+			requestsFollow = false
+			requestsJSON = false
+
+			if !tt.expectError {
+				originalApiAddr := apiAddr
+				defer func() { apiAddr = originalApiAddr }()
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+						Requests:      []api.ProxyRequestResponse{},
+						FilteredCount: 0,
+						TotalCount:    0,
+					})
+				}))
+				defer server.Close()
+				apiAddr = server.URL
+			}
+
+			_, _ = captureOutput(t, func() {
+				err := runRequests(requestsCmd, []string{})
+				if tt.expectError {
+					if err == nil {
+						t.Error("expected error for invalid max-status")
+					}
+				} else {
+					if err != nil {
+						t.Errorf("unexpected error: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestRunRequests_StatusRangeValidation(t *testing.T) {
+	origMinStatus := requestsMinStatus
+	origMaxStatus := requestsMaxStatus
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsMinStatus = origMinStatus
+		requestsMaxStatus = origMaxStatus
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	requestsMinStatus = 500
+	requestsMaxStatus = 400
+	requestsFollow = false
+	requestsJSON = false
+
+	_, _ = captureOutput(t, func() {
+		err := runRequests(requestsCmd, []string{})
+		if err == nil {
+			t.Error("expected error when --min-status exceeds --max-status")
+		}
+	})
+}
+
+func TestParseSinceFlag(t *testing.T) {
+	t.Run("empty value returns zero time", func(t *testing.T) {
+		got, err := parseSinceFlag("")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got.IsZero() {
+			t.Errorf("expected zero time, got %v", got)
+		}
+	})
+
+	t.Run("RFC3339 timestamp parsed exactly", func(t *testing.T) {
+		got, err := parseSinceFlag("2026-07-18T10:00:00Z")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+		if !got.Equal(want) {
+			t.Errorf("expected %v, got %v", want, got)
+		}
+	})
+
+	t.Run("duration sugar resolves relative to now", func(t *testing.T) {
+		before := time.Now()
+		got, err := parseSinceFlag("5m")
+		after := time.Now()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		wantEarliest := before.Add(-5 * time.Minute)
+		wantLatest := after.Add(-5 * time.Minute)
+		if got.Before(wantEarliest) || got.After(wantLatest) {
+			t.Errorf("expected time between %v and %v, got %v", wantEarliest, wantLatest, got)
+		}
+	})
+
+	t.Run("malformed value errors", func(t *testing.T) {
+		_, err := parseSinceFlag("not-a-time")
+		if err == nil {
+			t.Error("expected error for malformed --since value")
+		}
+	})
+}
+
+func TestRunRequests_SinceValidation(t *testing.T) {
+	origSince := requestsSince
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsSince = origSince
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	requestsSince = "not-a-valid-since-value"
+	requestsFollow = false
+	requestsJSON = false
+
+	_, _ = captureOutput(t, func() {
+		err := runRequests(requestsCmd, []string{})
+		if err == nil {
+			t.Error("expected error for malformed --since flag")
+		}
+	})
+}
+
+func TestRunRequests_URLFilterPassthrough(t *testing.T) {
+	origURL := requestsURL
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsURL = origURL
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("url_contains")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+			Requests:      []api.ProxyRequestResponse{},
+			FilteredCount: 0,
+			TotalCount:    0,
+		})
+	}))
+	defer server.Close()
+	apiAddr = server.URL
+
+	requestsURL = "/api"
+	requestsFollow = false
+	requestsJSON = false
+
+	_, _ = captureOutput(t, func() {
+		if err := runRequests(requestsCmd, []string{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if gotQuery != "/api" {
+		t.Errorf("expected url_contains=/api to reach the server, got %q", gotQuery)
+	}
+}
+
 func TestDownCmd_NoArgs(t *testing.T) {
 	// Verify downCmd has NoArgs validation
 	if downCmd.Args == nil {

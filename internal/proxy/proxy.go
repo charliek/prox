@@ -419,13 +419,23 @@ func (s *Service) createRouter() http.Handler {
 	})
 }
 
+// stripHostPort removes a trailing ":port" from a host header value, if
+// present. Shared by extractSubdomain and recordRequest so hostname handling
+// stays consistent. Uses net.SplitHostPort so IPv6 literals survive: a bare
+// "[::1]" has no port and is returned unchanged rather than mangled at its
+// last colon.
+func stripHostPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
 // extractSubdomain extracts the subdomain from the host header.
 // For example, "app.local.myapp.dev:6789" with domain "local.myapp.dev" returns "app".
 func (s *Service) extractSubdomain(host string) string {
 	// Remove port if present
-	if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
-		host = host[:colonIdx]
-	}
+	host = stripHostPort(host)
 
 	// Check if host ends with our domain with a proper label boundary (dot)
 	// This prevents "evilocal.myapp.dev" from matching domain "local.myapp.dev"
@@ -453,6 +463,7 @@ func (s *Service) recordRequest(r *http.Request, subdomain string, statusCode in
 		Method:     r.Method,
 		URL:        r.URL.String(),
 		Subdomain:  subdomain,
+		Hostname:   stripHostPort(r.Host),
 		StatusCode: statusCode,
 		Duration:   time.Since(startTime),
 		RemoteAddr: getClientIP(r),

@@ -89,6 +89,48 @@ func TestRequestManager_Filter(t *testing.T) {
 	})
 }
 
+func TestRequestManager_FilterByURLContains(t *testing.T) {
+	m := NewRequestManager(100)
+
+	m.Record(RequestRecord{Subdomain: "api", Method: "GET", URL: "/api/Users?id=1"})
+	m.Record(RequestRecord{Subdomain: "api", Method: "GET", URL: "/healthz"})
+	m.Record(RequestRecord{Subdomain: "api", Method: "GET", URL: "/api/orders"})
+
+	t.Run("case-insensitive substring match on path", func(t *testing.T) {
+		records := m.Recent(RequestFilter{URLContains: "users"})
+		assert.Len(t, records, 1)
+		assert.Equal(t, "/api/Users?id=1", records[0].URL)
+	})
+
+	t.Run("matches query string", func(t *testing.T) {
+		records := m.Recent(RequestFilter{URLContains: "id=1"})
+		assert.Len(t, records, 1)
+	})
+
+	t.Run("matches multiple records by common substring", func(t *testing.T) {
+		records := m.Recent(RequestFilter{URLContains: "/api/"})
+		assert.Len(t, records, 2)
+	})
+
+	t.Run("no match returns empty", func(t *testing.T) {
+		records := m.Recent(RequestFilter{URLContains: "nonexistent"})
+		assert.Len(t, records, 0)
+	})
+
+	t.Run("empty filter matches all", func(t *testing.T) {
+		records := m.Recent(RequestFilter{URLContains: ""})
+		assert.Len(t, records, 3)
+	})
+
+	t.Run("does not match against other fields", func(t *testing.T) {
+		// "api" appears in Subdomain but not URL for /healthz - ensure the
+		// filter only inspects URL, not Subdomain or Method.
+		records := m.Recent(RequestFilter{URLContains: "healthz"})
+		assert.Len(t, records, 1)
+		assert.Equal(t, "/healthz", records[0].URL)
+	})
+}
+
 func TestRequestManager_RingBuffer(t *testing.T) {
 	m := NewRequestManager(5)
 

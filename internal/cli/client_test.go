@@ -659,6 +659,7 @@ func TestBuildLogQueryParams(t *testing.T) {
 }
 
 func TestBuildProxyRequestQueryParams(t *testing.T) {
+	sinceFixture := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name     string
 		params   domain.ProxyRequestParams
@@ -690,18 +691,22 @@ func TestBuildProxyRequestQueryParams(t *testing.T) {
 		{
 			name: "all params",
 			params: domain.ProxyRequestParams{
-				Subdomain: "api",
-				Method:    "POST",
-				MinStatus: 400,
-				MaxStatus: 599,
-				Limit:     50,
+				Subdomain:   "api",
+				Method:      "POST",
+				MinStatus:   400,
+				MaxStatus:   599,
+				Since:       sinceFixture,
+				URLContains: "/orders",
+				Limit:       50,
 			},
 			expected: map[string]string{
-				"subdomain":  "api",
-				"method":     "POST",
-				"min_status": "400",
-				"max_status": "599",
-				"limit":      "50",
+				"subdomain":    "api",
+				"method":       "POST",
+				"min_status":   "400",
+				"max_status":   "599",
+				"since":        sinceFixture.Format(time.RFC3339Nano),
+				"url_contains": "/orders",
+				"limit":        "50",
 			},
 		},
 		{
@@ -714,6 +719,31 @@ func TestBuildProxyRequestQueryParams(t *testing.T) {
 			expected: map[string]string{
 				"subdomain": "api",
 			},
+		},
+		{
+			name: "url_contains only",
+			params: domain.ProxyRequestParams{
+				URLContains: "/api",
+			},
+			expected: map[string]string{
+				"url_contains": "/api",
+			},
+		},
+		{
+			name: "since only",
+			params: domain.ProxyRequestParams{
+				Since: sinceFixture,
+			},
+			expected: map[string]string{
+				"since": sinceFixture.Format(time.RFC3339Nano),
+			},
+		},
+		{
+			name: "zero since omitted",
+			params: domain.ProxyRequestParams{
+				Since: time.Time{},
+			},
+			expected: map[string]string{},
 		},
 	}
 

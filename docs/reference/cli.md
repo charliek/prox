@@ -276,6 +276,9 @@ prox requests [id] [options]
 | `--subdomain` | Filter by subdomain |
 | `--method` | Filter by HTTP method (GET, POST, etc.) |
 | `--min-status` | Filter by minimum status code (e.g., 400 for errors) |
+| `--max-status` | Filter by maximum status code (combine with `--min-status 400` for client errors only). Must be 100-599; when both `--min-status` and `--max-status` are set, `--min-status` must not exceed `--max-status` |
+| `--since` | Filter to requests since this time — an RFC3339 timestamp or a Go duration (e.g. `5m`, `1h`) evaluated as "ago" from the moment the command runs |
+| `--url` | Filter by URL substring (path+query only, case-insensitive) |
 | `--json` | Output as JSON |
 | `--body` | Include captured request/response bodies when showing one request by ID |
 
@@ -296,6 +299,18 @@ prox requests --method GET
 
 # Show only errors (4xx and 5xx)
 prox requests --min-status 400
+
+# Show only client errors (4xx)
+prox requests --min-status 400 --max-status 499
+
+# Show requests from the last 5 minutes
+prox requests --since 5m
+
+# Filter by URL substring
+prox requests --url /api
+
+# Agent-oriented: recent 4xx traffic to /api in the last 5 minutes
+prox requests --url /api --since 5m --min-status 400 --max-status 499
 
 # JSON output for piping
 prox requests --json | jq .

@@ -581,6 +581,22 @@ func TestGetProxyRequests(t *testing.T) {
 		assert.Equal(t, 500, resp.Requests[0].StatusCode)
 	})
 
+	t.Run("filter by url_contains", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?url_contains=Orders", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		assert.Len(t, resp.Requests, 1)
+		assert.Equal(t, "/api/orders", resp.Requests[0].URL)
+	})
+
 	t.Run("filter by limit", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?limit=2", nil)
 		w := httptest.NewRecorder()
@@ -778,6 +794,63 @@ func TestStreamProxyRequests(t *testing.T) {
 		assert.Len(t, requestDataLines, 1)
 		assert.Contains(t, requestDataLines[0], "/matched")
 		assert.NotContains(t, body, "/nomatch")
+	})
+
+	t.Run("filters streamed requests by url_contains", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream?url_contains=Orders", nil)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		done := make(chan struct{})
+		go func() {
+			handlers.StreamProxyRequests(w, req)
+			close(done)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Record a request that doesn't match the URL substring filter
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/api/products",
+			Subdomain:  "app",
+			StatusCode: 200,
+			Duration:   10 * time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		// Record a request that matches (case-insensitive substring)
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/api/orders/123",
+			Subdomain:  "app",
+			StatusCode: 200,
+			Duration:   10 * time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		<-done
+
+		body := w.Body.String()
+		reader := bufio.NewScanner(strings.NewReader(body))
+		var requestDataLines []string
+		for reader.Scan() {
+			line := reader.Text()
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"url":`) {
+				requestDataLines = append(requestDataLines, line)
+			}
+		}
+
+		assert.Len(t, requestDataLines, 1)
+		assert.Contains(t, requestDataLines[0], "/api/orders/123")
+		assert.NotContains(t, body, "/api/products")
 	})
 }
 

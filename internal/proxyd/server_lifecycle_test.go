@@ -1,10 +1,12 @@
 package proxyd
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/stretchr/testify/assert"
@@ -155,6 +157,68 @@ func TestRequestEndpoints_RequireProjectParam(t *testing.T) {
 	require.NoError(t, err)
 	defer respStream.Body.Close()
 	assert.Equal(t, 400, respStream.StatusCode)
+}
+
+// TestHandleGetRequests_LimitClamp pins that the daemon socket's ?limit=
+// honors the same clamp semantics as the project API's
+// parseProxyRequestParams: valid values in (0, MaxProxyRequests] apply,
+// anything else (missing, zero, negative, or over the max) falls back to the
+// default of 100.
+func TestHandleGetRequests_LimitClamp(t *testing.T) {
+	server, client, _ := startTestServer(t)
+	rm := proxy.NewRequestManager(1500)
+	server.SetRequestManager(rm)
+
+	for i := 0; i < 150; i++ {
+		rm.Record(proxy.RequestRecord{
+			ID:         proxy.GenerateRequestID(time.Now(), "GET", "/x"),
+			Method:     "GET",
+			URL:        "/x",
+			ProjectDir: "/projects/a",
+		})
+	}
+
+	getCount := func(t *testing.T, query string) int {
+		t.Helper()
+		resp, err := client.httpClient.Get("http://proxyd/api/v1/requests?project=/projects/a" + query)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 200, resp.StatusCode)
+
+		var body struct {
+			Requests []proxy.RequestRecord `json:"requests"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		return len(body.Requests)
+	}
+
+	t.Run("valid limit applies", func(t *testing.T) {
+		assert.Equal(t, 10, getCount(t, "&limit=10"))
+	})
+
+	t.Run("missing limit defaults to 100", func(t *testing.T) {
+		assert.Equal(t, 100, getCount(t, ""))
+	})
+
+	t.Run("zero limit defaults to 100", func(t *testing.T) {
+		assert.Equal(t, 100, getCount(t, "&limit=0"))
+	})
+
+	t.Run("negative limit defaults to 100", func(t *testing.T) {
+		assert.Equal(t, 100, getCount(t, "&limit=-5"))
+	})
+
+	t.Run("non-numeric limit defaults to 100", func(t *testing.T) {
+		assert.Equal(t, 100, getCount(t, "&limit=abc"))
+	})
+
+	t.Run("over-max limit defaults to 100", func(t *testing.T) {
+		assert.Equal(t, 100, getCount(t, "&limit=1001"))
+	})
+
+	t.Run("max limit applies", func(t *testing.T) {
+		assert.Equal(t, 150, getCount(t, "&limit=1000"))
+	})
 }
 
 // TestServer_RemoveProject_NilRequestManager guards the daemon-startup window

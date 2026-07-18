@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/go-chi/chi/v5"
 )
@@ -441,9 +443,20 @@ func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clamp limit with the same semantics as the project API's
+	// parseProxyRequestParams: invalid or out-of-range values fall back to
+	// the default rather than erroring, so a malformed limit degrades
+	// gracefully instead of rejecting the whole request.
+	limit := constants.DefaultProxyRequestLimit
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= constants.MaxProxyRequests {
+			limit = l
+		}
+	}
+
 	filter := proxy.RequestFilter{
 		ProjectDir: projectDir,
-		Limit:      100,
+		Limit:      limit,
 	}
 
 	records := s.requestManager.Recent(filter)

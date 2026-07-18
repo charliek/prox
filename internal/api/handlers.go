@@ -596,6 +596,7 @@ func parseProxyRequestParams(r *http.Request) proxy.RequestFilter {
 
 	filter.Subdomain = r.URL.Query().Get("subdomain")
 	filter.Method = r.URL.Query().Get("method")
+	filter.URLContains = r.URL.Query().Get("url_contains")
 
 	if minStatus := r.URL.Query().Get("min_status"); minStatus != "" {
 		if v, err := strconv.Atoi(minStatus); err == nil {

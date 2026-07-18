@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,14 +74,20 @@ func GenerateRequestID(timestamp time.Time, method, url string) string {
 
 // RequestFilter specifies criteria for filtering requests.
 type RequestFilter struct {
-	Subdomain  string
-	Hostnames  []string // match if record.Hostname is in this list (empty = match all)
-	ProjectDir string   // match if record.ProjectDir equals this exactly (empty = match all)
-	Method     string
-	MinStatus  int
-	MaxStatus  int
-	Since      time.Time
-	Limit      int
+	Subdomain string
+	Hostnames []string // match if record.Hostname is in this list (empty = match all)
+
+	// URLContains matches if record.URL contains this substring
+	// (case-insensitive). URL is path+query only (no scheme/host, matching
+	// the TUI 's' filter's reference behavior), since RequestRecord.URL is
+	// populated from r.URL.String() on the server side. Empty = match all.
+	URLContains string
+	ProjectDir  string // match if record.ProjectDir equals this exactly (empty = match all)
+	Method      string
+	MinStatus   int
+	MaxStatus   int
+	Since       time.Time
+	Limit       int
 }
 
 // RequestSubscription represents a subscription to request updates.
@@ -299,6 +306,9 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 		}
 	}
 	if filter.ProjectDir != "" && record.ProjectDir != filter.ProjectDir {
+		return false
+	}
+	if filter.URLContains != "" && !strings.Contains(strings.ToLower(record.URL), strings.ToLower(filter.URLContains)) {
 		return false
 	}
 	if filter.Method != "" && record.Method != filter.Method {

@@ -188,6 +188,12 @@ func buildProxyRequestQueryParams(params domain.ProxyRequestParams) url.Values {
 	if params.MaxStatus > 0 {
 		query.Set("max_status", fmt.Sprintf("%d", params.MaxStatus))
 	}
+	if !params.Since.IsZero() {
+		query.Set("since", params.Since.Format(time.RFC3339Nano))
+	}
+	if params.URLContains != "" {
+		query.Set("url_contains", params.URLContains)
+	}
 	if params.Limit > 0 {
 		query.Set("limit", fmt.Sprintf("%d", params.Limit))
 	}

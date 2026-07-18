@@ -424,6 +424,9 @@ var (
 	requestsSubdomain string
 	requestsMethod    string
 	requestsMinStatus int
+	requestsMaxStatus int
+	requestsSince     string
+	requestsURL       string
 	requestsLimit     int
 	requestsJSON      bool
 	requestsBody      bool
@@ -444,6 +447,9 @@ Examples:
   prox requests --subdomain api    # Filter by subdomain
   prox requests --method GET       # Filter by HTTP method
   prox requests --min-status 400   # Show errors only (4xx and 5xx)
+  prox requests --min-status 400 --max-status 499   # Show client errors only (4xx)
+  prox requests --since 5m         # Show requests from the last 5 minutes
+  prox requests --url /api         # Filter by URL substring (path+query)
   prox requests --json             # Output as JSON
   prox requests abc1234            # Show details for request abc1234
   prox requests abc1234 --body     # Include captured request/response bodies`,
@@ -464,11 +470,29 @@ func runRequests(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --min-status value %d: must be between 100 and 599", requestsMinStatus)
 	}
 
+	// Validate max-status is within valid HTTP status code range
+	if requestsMaxStatus != 0 && (requestsMaxStatus < 100 || requestsMaxStatus > 599) {
+		return fmt.Errorf("invalid --max-status value %d: must be between 100 and 599", requestsMaxStatus)
+	}
+
+	// When both bounds are set, min must not exceed max
+	if requestsMinStatus != 0 && requestsMaxStatus != 0 && requestsMinStatus > requestsMaxStatus {
+		return fmt.Errorf("invalid status range: --min-status %d is greater than --max-status %d", requestsMinStatus, requestsMaxStatus)
+	}
+
+	since, err := parseSinceFlag(requestsSince)
+	if err != nil {
+		return err
+	}
+
 	params := domain.ProxyRequestParams{
-		Subdomain: requestsSubdomain,
-		Method:    strings.ToUpper(requestsMethod),
-		MinStatus: requestsMinStatus,
-		Limit:     requestsLimit,
+		Subdomain:   requestsSubdomain,
+		Method:      strings.ToUpper(requestsMethod),
+		MinStatus:   requestsMinStatus,
+		MaxStatus:   requestsMaxStatus,
+		Since:       since,
+		URLContains: requestsURL,
+		Limit:       requestsLimit,
 	}
 
 	if requestsFollow {
@@ -626,6 +650,25 @@ func isTerminal() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+// parseSinceFlag parses the --since flag value, accepting either an RFC3339
+// timestamp or a Go duration (e.g. "5m", "1h"). A duration is treated as
+// "ago from now": time.Now() is captured exactly once here so a single
+// invocation (list or stream) uses one consistent cutoff instant rather than
+// re-evaluating "now" per record. Empty input returns the zero time (no
+// filter). A malformed value that matches neither format is a clear error.
+func parseSinceFlag(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid --since value %q: must be an RFC3339 timestamp or a duration (e.g. 5m, 1h)", value)
+}
+
 func printProxyRequest(req api.ProxyRequestResponse) {
 	ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
 	timeStr := ts.Format("15:04:05")
@@ -679,6 +722,9 @@ func init() {
 	requestsCmd.Flags().StringVar(&requestsSubdomain, "subdomain", "", "Filter by subdomain")
 	requestsCmd.Flags().StringVar(&requestsMethod, "method", "", "Filter by HTTP method (GET, POST, etc.)")
 	requestsCmd.Flags().IntVar(&requestsMinStatus, "min-status", 0, "Filter by minimum status code (e.g., 400 for errors)")
+	requestsCmd.Flags().IntVar(&requestsMaxStatus, "max-status", 0, "Filter by maximum status code (combine with --min-status for ranges)")
+	requestsCmd.Flags().StringVar(&requestsSince, "since", "", "Filter to requests since this time (RFC3339 timestamp or duration like 5m, 1h)")
+	requestsCmd.Flags().StringVar(&requestsURL, "url", "", "Filter by URL substring (path+query, case-insensitive)")
 	requestsCmd.Flags().IntVarP(&requestsLimit, "limit", "n", constants.DefaultProxyRequestLimit, "Number of requests to show")
 	requestsCmd.Flags().BoolVar(&requestsJSON, "json", false, "Output as JSON")
 	requestsCmd.Flags().BoolVar(&requestsBody, "body", false, "Include request/response bodies when showing details")

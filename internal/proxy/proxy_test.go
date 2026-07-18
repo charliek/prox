@@ -49,6 +49,27 @@ func TestExtractSubdomain(t *testing.T) {
 	}
 }
 
+func TestStripHostPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		host     string
+		expected string
+	}{
+		{"host with port", "api.local.myapp.dev:6789", "api.local.myapp.dev"},
+		{"host without port", "api.local.myapp.dev", "api.local.myapp.dev"},
+		{"bare hostname with port", "localhost:8080", "localhost"},
+		{"empty host", "", ""},
+		{"ipv6 with port", "[::1]:443", "::1"},
+		{"bare ipv6 without port", "[::1]", "[::1]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, stripHostPort(tt.host))
+		})
+	}
+}
+
 func TestGetClientIP(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -272,6 +293,41 @@ func TestCreateRouter_XForwardedProto(t *testing.T) {
 
 		assert.Equal(t, "https", receivedProto.Load())
 	})
+}
+
+func TestCreateRouter_StampsHostnameStripsPort(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	workDir := t.TempDir()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendPort := backend.Listener.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.ProxyConfig{
+		Enabled:  true,
+		HTTPPort: 6788,
+		Domain:   "local.myapp.dev",
+	}
+	services := map[string]config.ServiceConfig{
+		"app": {Port: backendPort, Host: "localhost"},
+	}
+
+	svc, err := NewService(cfg, services, nil, logger, workDir)
+	require.NoError(t, err)
+
+	router := svc.createRouter()
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Host = "app.local.myapp.dev:6788"
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	records := svc.RequestManager().Recent(RequestFilter{})
+	require.Len(t, records, 1)
+	assert.Equal(t, "app.local.myapp.dev", records[0].Hostname)
 }
 
 func TestPortConflictError_ErrorMessage(t *testing.T) {
