@@ -85,6 +85,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixes
 
+- **SSE streams are no longer cut at 30 seconds** (#42). `GET /api/v1/logs/stream`
+  and `GET /api/v1/proxy/requests/stream` sat in the router's default 30s
+  request-timeout class, so `prox logs -f`, `prox attach`, and proxy-request
+  streams silently terminated after ~30s. The two SSE routes are now exempt from
+  the request timeout: streams are long-lived and end only on client disconnect
+  or daemon shutdown. Shutdown now also closes the shared-proxy-daemon request
+  forwarder's subscriber channels, so an attached request stream no longer pins
+  the API server to its full teardown-stage deadline.
+- **`prox requests` now discovers the daemon's API address** (#43). `requests`
+  was missing from the client-command discovery allowlist, so it always talked
+  to the default `:5555` address and failed against daemons on dynamic API ports
+  (the default) — the same gap `start` had. The allowlist is now pinned by a
+  test so a new client command can't silently miss discovery.
 - `prox start <name>` now discovers the daemon's API address from `.prox/prox.state`
   like the other client commands; previously it always used the default `:5555`
   address and failed against daemons on dynamic API ports (found during #33
