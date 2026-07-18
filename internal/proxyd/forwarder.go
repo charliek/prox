@@ -2,15 +2,18 @@ package proxyd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
 )
 
@@ -72,24 +75,92 @@ func streamRequests(ctx context.Context, socketPath, projectDir string, localRM 
 		return fmt.Errorf("daemon SSE returned %d", resp.StatusCode)
 	}
 
-	// Read SSE events line by line
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
+	// Read SSE events line by line. bufio.Scanner is NOT used: its token size is
+	// capped (and even a raised cap would kill the subscription on the first
+	// oversized line). Records can legitimately exceed 64KB — on a capture
+	// disk-write failure both bodies fall back to inline storage up to 1MB each,
+	// and headers are unbounded — so we use a bufio.Reader with an explicit
+	// per-event cap (constants.MaxSSEEventSize). An oversized event is skipped
+	// (drained to its newline) with a logged warning and the stream continues,
+	// rather than tearing down the bridge.
+	reader := bufio.NewReaderSize(resp.Body, constants.ScannerBufferSize)
+	dataPrefix := []byte("data: ")
+	for {
+		line, oversize, readErr := readEventLine(reader, constants.MaxSSEEventSize)
 
-		// SSE format: "data: {json}"
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+		switch {
+		case readErr != nil:
+			// A line returned alongside a read error has no terminating
+			// newline — the SSE event is incomplete (mid-write disconnect).
+			// Discard it rather than recording a possibly-partial event; the
+			// reconnect loop will re-sync on fresh events.
+		case oversize:
+			log.Printf("prox: skipping oversized daemon request event (exceeds %d bytes)", constants.MaxSSEEventSize)
+		case len(line) > 0:
+			// SSE format: "data: {json}". Trim the trailing "\r\n"/"\n".
+			trimmed := bytes.TrimRight(line, "\r\n")
+			if bytes.HasPrefix(trimmed, dataPrefix) {
+				jsonData := trimmed[len(dataPrefix):]
+				var record proxy.RequestRecord
+				if err := json.Unmarshal(jsonData, &record); err == nil {
+					localRM.Record(record)
+				}
+				// Malformed events are skipped silently, as before.
+			}
 		}
 
-		jsonData := strings.TrimPrefix(line, "data: ")
-		var record proxy.RequestRecord
-		if err := json.Unmarshal([]byte(jsonData), &record); err != nil {
-			continue // skip malformed events
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
 		}
-
-		localRM.Record(record)
 	}
+}
 
-	return scanner.Err()
+// readEventLine reads a single '\n'-terminated line from r, enforcing maxSize.
+// It returns:
+//   - the line (including its trailing newline) when within the cap;
+//   - oversize=true with a nil line when the line exceeds maxSize — the excess is
+//     drained up to (and including) the newline so the reader is positioned at
+//     the start of the next event and the caller can continue the stream;
+//   - a non-nil error (e.g. io.EOF) from the underlying reader, alongside any
+//     partial line read so far.
+//
+// It uses ReadSlice against r's fixed internal buffer, so no single call buffers
+// more than that buffer's size; the accumulated line is bounded by maxSize.
+func readEventLine(r *bufio.Reader, maxSize int) (line []byte, oversize bool, err error) {
+	var buf []byte
+	for {
+		chunk, rerr := r.ReadSlice('\n')
+
+		if !oversize {
+			if len(buf)+len(chunk) > maxSize {
+				// Over the cap: stop accumulating and release what we have; keep
+				// draining until the newline so the next event is aligned.
+				oversize = true
+				buf = nil
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+
+		switch rerr {
+		case nil:
+			// Reached the newline: the line is complete.
+			if oversize {
+				return nil, true, nil
+			}
+			return buf, false, nil
+		case bufio.ErrBufferFull:
+			// No newline in this fill; keep reading the same line.
+			continue
+		default:
+			// Underlying error (io.EOF or a transport failure).
+			if oversize {
+				return nil, true, rerr
+			}
+			return buf, false, rerr
+		}
+	}
 }

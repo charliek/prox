@@ -324,7 +324,7 @@ services:
 
 ### Request Capture
 
-Request capture records request and response body metadata for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated.
+Request capture records request and response headers and bodies for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated.
 
 ```yaml
 proxy:
@@ -335,7 +335,16 @@ proxy:
     max_body_size: 1MB
 ```
 
-Captured body files are stored under `.prox/capture/` and cleaned up as request records age out of the in-memory request buffer.
+Capture is enabled per project, either with `proxy.capture.enabled: true` in config or with the `prox up --capture` flag.
+
+**Capture works in both standalone and shared-daemon mode.** The enablement (config or `--capture`) is sent to the shared proxy daemon when the project registers, so it applies whether prox runs a standalone proxy or routes through the per-user daemon. Capture is scoped per project: on a shared daemon, only capture-enabled projects have their bodies captured — a capture-disabled project sharing the same daemon has its requests recorded as metadata only (headers and bodies are not retained), and no project can see another project's captured records or bodies.
+
+Captured body files are stored under the capture directory and cleaned up as request records age out of the in-memory request buffer:
+
+- **Standalone proxy** (`prox up --no-proxy` disabled, i.e. an in-process proxy): `.prox/capture/` within the project directory.
+- **Shared daemon**: `~/.prox/capture/` (the per-user daemon's capture directory). The directory is removed when the daemon shuts down.
+
+> **Upgrading a running daemon:** daemon-mode capture requires a daemon built with this feature. A long-running daemon started before the upgrade must be restarted (`prox proxy stop --force`, then `prox up`) to pick up capture support; the daemon version gate makes the mismatch loud rather than silently dropping capture.
 
 ### Prerequisites (HTTPS only)
 

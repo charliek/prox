@@ -311,7 +311,7 @@ prox requests abc1234 --body
 
 Each request is assigned a short hash ID (7 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
 
-Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`.
+Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`. Capture applies in both standalone and shared-daemon mode — the enablement is propagated to the daemon at registration, and a daemon captures bodies only for the projects that opted in. When a request has no captured detail, `prox requests <id>` shows `(capture not enabled - use 'prox up --capture' to enable)`; if the body was captured but has since been evicted from the daemon's buffer, it shows `(body no longer available)` instead. See [Request Capture](configuration.md#request-capture) for capture directories and daemon-upgrade notes.
 
 ### proxy
 
