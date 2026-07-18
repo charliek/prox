@@ -248,6 +248,13 @@ curl -N "http://localhost:5555/api/v1/logs/stream?pattern=ERROR"
 
 Retrieve recent proxy requests (requires proxy to be enabled).
 
+When the project runs under the shared daemon, its request data is bridged from
+the daemon over the internal socket. On every (re)connect the bridge backfills a
+snapshot of the daemon's current ring for this project before resuming the live
+stream, closing gaps opened while the subscription was down (bounded by the
+daemon ring and the project's registration lifetime). Reconnects re-deliver no
+already-seen record, so this endpoint stays free of duplicates.
+
 **Query Parameters:**
 
 | Param | Type | Default | Description |

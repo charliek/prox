@@ -24,12 +24,24 @@ import (
 // projectDir must be the same value sent as RegisterRequest.ProjectDir so the
 // daemon-side filter (which scopes records by owning project) matches.
 //
+// On every (re)connect the bridge also backfills a snapshot of the daemon's
+// current ring for this project (see streamRequests / backfillSnapshot), closing
+// any gap opened while the subscription was down. The subscription itself stays
+// lossy (bounded, non-blocking channels), so the guarantee is bounded gap
+// closure, not losslessness.
+//
 // It runs until ctx is cancelled. On disconnect, it reconnects with backoff.
 func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager) {
+	// One snapshot client for the whole forwarder lifetime: its transport pools
+	// the idle unix connection across reconnect attempts, rather than leaking a
+	// fresh idle conn per attempt (the daemon only reaps idle conns after 60s, so
+	// a reconnect storm would otherwise accumulate them).
+	snapClient := NewClient(socketPath)
+
 	backoff := 500 * time.Millisecond
 
 	for {
-		err := streamRequests(ctx, socketPath, projectDir, localRM)
+		err := streamRequests(ctx, socketPath, snapClient, projectDir, localRM)
 		if ctx.Err() != nil {
 			return // context cancelled, clean shutdown
 		}
@@ -48,7 +60,8 @@ func ForwardRequests(ctx context.Context, socketPath string, projectDir string, 
 }
 
 // streamRequests opens an SSE connection to the daemon and processes events.
-func streamRequests(ctx context.Context, socketPath, projectDir string, localRM *proxy.RequestManager) error {
+// snapClient is the shared daemon client used for the backfill snapshot.
+func streamRequests(ctx context.Context, socketPath string, snapClient *Client, projectDir string, localRM *proxy.RequestManager) error {
 	// Create HTTP client that dials the Unix socket
 	dialer := &net.Dialer{}
 	client := &http.Client{
@@ -74,6 +87,25 @@ func streamRequests(ctx context.Context, socketPath, projectDir string, localRM 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("daemon SSE returned %d", resp.StatusCode)
 	}
+
+	// The daemon Subscribes before it writes response headers, so once Do
+	// returned 200 the subscription is already live. Backfill a snapshot of the
+	// daemon's ring concurrently with the read loop below: launching it in a
+	// goroutine (rather than fetching before entering the loop) ensures the
+	// forwarder never sits blocked on a slow snapshot while live events pile up
+	// — a >100-event burst during the fetch would overflow the daemon-side
+	// subscription channel, the exact gap this backfill exists to close.
+	//
+	// The fetch is scoped to attemptCtx, cancelled when streamRequests returns
+	// (defer). This bounds the snapshot to THIS connection attempt: a stalled
+	// fetch cannot outlive its stream and replay a stale snapshot after a later
+	// attempt has already established fresh state (whose distinct IDs would
+	// bypass Upsert's dedupe and cause wrong evictions / duplicate notifies).
+	// The goroutine exits when the fetch completes OR attemptCtx is cancelled,
+	// so it never leaks; it writes only to localRM, which outlives the stream.
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go backfillSnapshot(attemptCtx, snapClient, projectDir, localRM)
 
 	// Read SSE events line by line. bufio.Scanner is NOT used: its token size is
 	// capped (and even a raised cap would kill the subscription on the first
@@ -103,7 +135,11 @@ func streamRequests(ctx context.Context, socketPath, projectDir string, localRM 
 				jsonData := trimmed[len(dataPrefix):]
 				var record proxy.RequestRecord
 				if err := json.Unmarshal(jsonData, &record); err == nil {
-					localRM.Record(record)
+					// Upsert (not Record): applying live events through the
+					// monotonic state machine makes interleaving with the
+					// concurrent snapshot replay safe — duplicates and stale
+					// in-flight events are no-ops, so nothing is delivered twice.
+					localRM.Upsert(record)
 				}
 				// Malformed events are skipped silently, as before.
 			}
@@ -115,6 +151,39 @@ func streamRequests(ctx context.Context, socketPath, projectDir string, localRM 
 			}
 			return readErr
 		}
+	}
+}
+
+// backfillSnapshot fetches the daemon's current record snapshot for projectDir
+// and replays it into localRM, closing any gap opened while the SSE bridge was
+// disconnected. It is launched from streamRequests once the subscription is
+// live and drains concurrently with the read loop; Upsert's monotonic state
+// machine makes any interleaving of {snapshot copy, live copy, completion} safe
+// (duplicates and stale in-flight events are no-ops), so records are never
+// delivered twice.
+//
+// The limit is pinned to constants.MaxProxyRequests (the daemon ring size) so a
+// full ring backfills completely; an omitted limit would silently cap at the
+// daemon's default of 100. Client.Requests decodes all-or-nothing, so a
+// truncated body applies zero records.
+//
+// On any failure — non-200, decode error, timeout, or ctx cancellation — it
+// logs one warning and returns, leaving the stream to run in degraded,
+// stream-only mode. A failed backfill never tears down the bridge.
+//
+// ctx is the per-attempt context, so a stream error/return cancels an in-flight
+// fetch; client is the forwarder's shared snapshot client (pooled unix conn).
+func backfillSnapshot(ctx context.Context, client *Client, projectDir string, localRM *proxy.RequestManager) {
+	records, err := client.Requests(ctx, projectDir, constants.MaxProxyRequests)
+	if err != nil {
+		log.Printf("prox: request snapshot backfill failed: %v", err)
+		return
+	}
+
+	// The endpoint returns records newest-first; replay oldest-first so ring
+	// order tracks arrival order as closely as the live stream would have.
+	for i := len(records) - 1; i >= 0; i-- {
+		localRM.Upsert(records[i])
 	}
 }
 
