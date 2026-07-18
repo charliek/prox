@@ -220,3 +220,25 @@ func TestRequestManager_Record_PreservesExistingID(t *testing.T) {
 	require.Len(t, records, 1)
 	assert.Equal(t, "custom1", records[0].ID, "expected existing ID to be preserved")
 }
+
+// TestRequestManager_SubscribeAfterClose pins the shutdown latch: a subscribe
+// that races past Close must get an already-closed channel (so an SSE handler
+// returns immediately) and must not be registered — otherwise a late
+// /proxy/requests/stream request pins the API server open through shutdown.
+func TestRequestManager_SubscribeAfterClose(t *testing.T) {
+	m := NewRequestManager(10)
+	m.Close()
+
+	sub := m.Subscribe(RequestFilter{})
+	require.NotNil(t, sub)
+
+	_, ok := <-sub.Ch
+	assert.False(t, ok, "post-Close subscription channel must be closed")
+
+	// The dead subscription must not receive records or be tracked.
+	m.Record(RequestRecord{Method: "GET", URL: "/after-close"})
+
+	// Unsubscribing it must be a safe no-op, and Close must stay idempotent.
+	m.Unsubscribe(sub.ID)
+	m.Close()
+}

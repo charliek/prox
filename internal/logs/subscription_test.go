@@ -159,6 +159,28 @@ func TestSubscriptionManager_Close(t *testing.T) {
 	assert.False(t, ok2)
 }
 
+// TestSubscriptionManager_SubscribeAfterClose pins the shutdown latch: a
+// subscribe that races past Close must get an already-closed channel (so an
+// SSE handler returns immediately) and must not be registered — otherwise a
+// late stream request pins the API server open through shutdown.
+func TestSubscriptionManager_SubscribeAfterClose(t *testing.T) {
+	m := NewSubscriptionManager(10)
+	m.Close()
+
+	id, ch, err := m.Subscribe(domain.LogFilter{})
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+
+	_, ok := <-ch
+	assert.False(t, ok, "post-Close subscription channel must be closed")
+	assert.Equal(t, 0, m.Count(), "post-Close subscription must not be registered")
+
+	// Unsubscribing the unregistered id must be a safe no-op, and Close must
+	// stay idempotent.
+	m.Unsubscribe(id)
+	m.Close()
+}
+
 func TestSubscriptionManager_Concurrent(t *testing.T) {
 	m := NewSubscriptionManager(100)
 
