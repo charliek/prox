@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -356,4 +359,250 @@ func TestRequestManager_PurgeByProject(t *testing.T) {
 	// Purging an empty project dir is a no-op.
 	m.PurgeByProject("")
 	assert.Len(t, m.Recent(RequestFilter{}), 1)
+}
+
+// drainRecords empties a subscription channel without blocking.
+func drainRecords(ch chan RequestRecord) []RequestRecord {
+	var out []RequestRecord
+	for {
+		select {
+		case r := <-ch:
+			out = append(out, r)
+		default:
+			return out
+		}
+	}
+}
+
+func TestRequestManager_Upsert_StateMachine(t *testing.T) {
+	inflight := func(id string) RequestRecord {
+		return RequestRecord{ID: id, Method: "GET", URL: "/stream", StatusCode: 200, InFlight: true}
+	}
+	final := func(id string) RequestRecord {
+		return RequestRecord{ID: id, Method: "GET", URL: "/stream", StatusCode: 200, Duration: 42 * time.Millisecond}
+	}
+
+	t.Run("absent inflight appends and notifies", func(t *testing.T) {
+		m := NewRequestManager(10)
+		sub := m.Subscribe(RequestFilter{})
+		m.Upsert(inflight("r1"))
+		assert.Equal(t, 1, m.Count())
+		events := drainRecords(sub.Ch)
+		require.Len(t, events, 1)
+		assert.True(t, events[0].InFlight)
+	})
+
+	t.Run("absent final appends and notifies", func(t *testing.T) {
+		m := NewRequestManager(10)
+		sub := m.Subscribe(RequestFilter{})
+		m.Upsert(final("r1"))
+		assert.Equal(t, 1, m.Count())
+		assert.Len(t, drainRecords(sub.Ch), 1)
+	})
+
+	t.Run("inflight over inflight is a silent no-op", func(t *testing.T) {
+		m := NewRequestManager(10)
+		first := inflight("r1")
+		first.RemoteAddr = "10.0.0.1"
+		m.Upsert(first)
+		sub := m.Subscribe(RequestFilter{})
+
+		dup := inflight("r1")
+		dup.RemoteAddr = "10.0.0.2" // must NOT be written
+		m.Upsert(dup)
+
+		assert.Equal(t, 1, m.Count())
+		got, ok := m.GetByID("r1")
+		require.True(t, ok)
+		assert.Equal(t, "10.0.0.1", got.RemoteAddr)
+		assert.Empty(t, drainRecords(sub.Ch))
+	})
+
+	t.Run("inflight to final replaces in place and notifies", func(t *testing.T) {
+		m := NewRequestManager(10)
+		m.Upsert(inflight("r1"))
+		sub := m.Subscribe(RequestFilter{})
+
+		done := final("r1")
+		done.Details = &RequestDetails{RequestHeaders: map[string][]string{"X": {"y"}}}
+		m.Upsert(done)
+
+		assert.Equal(t, 1, m.Count())
+		got, ok := m.GetByID("r1")
+		require.True(t, ok)
+		assert.False(t, got.InFlight)
+		assert.Equal(t, 42*time.Millisecond, got.Duration)
+		require.NotNil(t, got.Details)
+
+		events := drainRecords(sub.Ch)
+		require.Len(t, events, 1)
+		assert.False(t, events[0].InFlight)
+	})
+
+	t.Run("final is terminal against inflight and final", func(t *testing.T) {
+		m := NewRequestManager(10)
+		m.Upsert(final("r1"))
+		sub := m.Subscribe(RequestFilter{})
+
+		m.Upsert(inflight("r1")) // stale buffered start event
+		dupFinal := final("r1")
+		dupFinal.StatusCode = 599 // must NOT be written
+		m.Upsert(dupFinal)
+
+		got, ok := m.GetByID("r1")
+		require.True(t, ok)
+		assert.False(t, got.InFlight)
+		assert.Equal(t, 200, got.StatusCode)
+		assert.Equal(t, 1, m.Count())
+		assert.Empty(t, drainRecords(sub.Ch))
+	})
+
+	t.Run("empty ID generates and appends", func(t *testing.T) {
+		m := NewRequestManager(10)
+		rec := final("")
+		rec.Timestamp = time.Now()
+		m.Upsert(rec)
+		assert.Equal(t, 1, m.Count())
+		assert.NotEmpty(t, m.Recent(RequestFilter{})[0].ID)
+	})
+}
+
+func TestRequestManager_Upsert_PreservesRingPosition(t *testing.T) {
+	m := NewRequestManager(10)
+
+	m.Upsert(RequestRecord{ID: "old", Method: "GET", URL: "/old"})
+	m.Upsert(RequestRecord{ID: "stream", Method: "GET", URL: "/stream", InFlight: true})
+	m.Upsert(RequestRecord{ID: "new", Method: "GET", URL: "/new"})
+
+	// Completing "stream" must not move it to the newest position.
+	m.Upsert(RequestRecord{ID: "stream", Method: "GET", URL: "/stream", Duration: time.Second})
+
+	recent := m.Recent(RequestFilter{})
+	require.Len(t, recent, 3)
+	assert.Equal(t, "new", recent[0].ID)
+	assert.Equal(t, "stream", recent[1].ID)
+	assert.Equal(t, "old", recent[2].ID)
+	assert.False(t, recent[1].InFlight)
+	assert.Equal(t, time.Second, recent[1].Duration)
+}
+
+func TestRequestManager_Upsert_AppendEvictsLikeRecord(t *testing.T) {
+	m := NewRequestManager(2)
+	var evicted []string
+	m.SetEvictionCallback(func(id string) { evicted = append(evicted, id) })
+
+	details := &RequestDetails{RequestHeaders: map[string][]string{"X": {"y"}}}
+	m.Record(RequestRecord{ID: "a", Details: details})
+	m.Record(RequestRecord{ID: "b"})
+
+	// Ring full: appending via Upsert must evict "a" (Details-carrying).
+	m.Upsert(RequestRecord{ID: "c"})
+	assert.Equal(t, []string{"a"}, evicted)
+
+	// Updating in place must NOT evict anything.
+	m.Upsert(RequestRecord{ID: "b", InFlight: true}) // no-op: b is final
+	m.Upsert(RequestRecord{ID: "c", InFlight: true}) // no-op: c is final
+	assert.Equal(t, []string{"a"}, evicted)
+	assert.Equal(t, 2, m.Count())
+}
+
+func TestRequestManager_Upsert_StuckInFlightWithoutCompletion(t *testing.T) {
+	// Documented outcome (plan 006 §9): if a completion event is lost and no
+	// later snapshot carries the final record, the row stays in-flight until
+	// evicted. Pinned so the semantics are deliberate, not accidental.
+	m := NewRequestManager(10)
+	m.Upsert(RequestRecord{ID: "lost", InFlight: true})
+	for i := 0; i < 5; i++ {
+		m.Upsert(RequestRecord{ID: GenerateRequestID(time.Now(), "GET", "/x"), StatusCode: 200})
+	}
+	got, ok := m.GetByID("lost")
+	require.True(t, ok)
+	assert.True(t, got.InFlight)
+}
+
+func TestRequestManager_Upsert_PurgeAfterUpdateCompacts(t *testing.T) {
+	m := NewRequestManager(10)
+	m.Upsert(RequestRecord{ID: "p1", ProjectDir: "/p", InFlight: true})
+	m.Upsert(RequestRecord{ID: "q1", ProjectDir: "/q", InFlight: true})
+	m.Upsert(RequestRecord{ID: "p1", ProjectDir: "/p", StatusCode: 200})
+	m.Upsert(RequestRecord{ID: "q1", ProjectDir: "/q", StatusCode: 200})
+
+	m.PurgeByProject("/p")
+
+	remaining := m.Recent(RequestFilter{})
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "q1", remaining[0].ID)
+
+	// The ring stays consistent for further writes after compaction.
+	m.Upsert(RequestRecord{ID: "q2", ProjectDir: "/q", StatusCode: 200})
+	assert.Equal(t, 2, m.Count())
+}
+
+func TestRequestManager_Upsert_ConcurrentTransitions(t *testing.T) {
+	// Race in-flight and final Upserts for the same IDs (with concurrent
+	// readers and purges) and assert: storage always converges to final, and
+	// no subscriber ever observes in-flight AFTER final for the same ID —
+	// the under-lock notify guarantee.
+	m := NewRequestManager(100)
+	sub := m.Subscribe(RequestFilter{})
+
+	seenFinal := make(map[string]bool)
+	violation := false
+	consumed := make(chan struct{})
+	go func() {
+		defer close(consumed)
+		for rec := range sub.Ch {
+			if rec.InFlight && seenFinal[rec.ID] {
+				violation = true
+			}
+			if !rec.InFlight {
+				seenFinal[rec.ID] = true
+			}
+		}
+	}()
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("req-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.Upsert(RequestRecord{ID: id, InFlight: true, StatusCode: 200})
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.Upsert(RequestRecord{ID: id, StatusCode: 200, Duration: time.Millisecond})
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			m.Recent(RequestFilter{})
+			m.PurgeByProject("/nonexistent")
+		}
+	}()
+	wg.Wait()
+	m.Close()
+	<-consumed
+
+	assert.False(t, violation, "subscriber observed in-flight after final for the same ID")
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("req-%d", i)
+		got, ok := m.GetByID(id)
+		require.True(t, ok, id)
+		assert.False(t, got.InFlight, id)
+	}
+}
+
+func TestRequestRecord_InFlightOmittedWhenFinal(t *testing.T) {
+	data, err := json.Marshal(RequestRecord{ID: "r1", StatusCode: 200})
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "in_flight")
+
+	data, err = json.Marshal(RequestRecord{ID: "r1", StatusCode: 200, InFlight: true})
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"in_flight":true`)
 }
