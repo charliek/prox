@@ -424,6 +424,9 @@ var (
 	requestsSubdomain string
 	requestsMethod    string
 	requestsMinStatus int
+	requestsMaxStatus int
+	requestsSince     string
+	requestsURL       string
 	requestsLimit     int
 	requestsJSON      bool
 	requestsBody      bool
@@ -444,9 +447,12 @@ Examples:
   prox requests --subdomain api    # Filter by subdomain
   prox requests --method GET       # Filter by HTTP method
   prox requests --min-status 400   # Show errors only (4xx and 5xx)
+  prox requests --min-status 400 --max-status 499   # Show client errors only (4xx)
+  prox requests --since 5m         # Show requests from the last 5 minutes
+  prox requests --url /api         # Filter by URL substring (path+query)
   prox requests --json             # Output as JSON
-  prox requests abc1234            # Show details for request abc1234
-  prox requests abc1234 --body     # Include captured request/response bodies`,
+  prox requests abc1234def56       # Show details for request abc1234def56
+  prox requests abc1234def56 --body # Include captured request/response bodies`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runRequests,
 }
@@ -464,11 +470,29 @@ func runRequests(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --min-status value %d: must be between 100 and 599", requestsMinStatus)
 	}
 
+	// Validate max-status is within valid HTTP status code range
+	if requestsMaxStatus != 0 && (requestsMaxStatus < 100 || requestsMaxStatus > 599) {
+		return fmt.Errorf("invalid --max-status value %d: must be between 100 and 599", requestsMaxStatus)
+	}
+
+	// When both bounds are set, min must not exceed max
+	if requestsMinStatus != 0 && requestsMaxStatus != 0 && requestsMinStatus > requestsMaxStatus {
+		return fmt.Errorf("invalid status range: --min-status %d is greater than --max-status %d", requestsMinStatus, requestsMaxStatus)
+	}
+
+	since, err := parseSinceFlag(requestsSince)
+	if err != nil {
+		return err
+	}
+
 	params := domain.ProxyRequestParams{
-		Subdomain: requestsSubdomain,
-		Method:    strings.ToUpper(requestsMethod),
-		MinStatus: requestsMinStatus,
-		Limit:     requestsLimit,
+		Subdomain:   requestsSubdomain,
+		Method:      strings.ToUpper(requestsMethod),
+		MinStatus:   requestsMinStatus,
+		MaxStatus:   requestsMaxStatus,
+		Since:       since,
+		URLContains: requestsURL,
+		Limit:       requestsLimit,
 	}
 
 	if requestsFollow {
@@ -563,42 +587,49 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 
 		// Print request body
 		if resp.Details.RequestBody != nil {
-			fmt.Printf("\n--- Request Body (%d bytes", resp.Details.RequestBody.Size)
-			if resp.Details.RequestBody.Truncated {
-				fmt.Print(", truncated")
-			}
-			fmt.Println(") ---")
-			if includeBody && resp.Details.RequestBody.Data != "" {
-				if resp.Details.RequestBody.IsBinary {
-					fmt.Println("[binary data, base64 encoded]")
-				}
-				fmt.Println(resp.Details.RequestBody.Data)
-			} else if !includeBody && resp.Details.RequestBody.Size > 0 {
-				fmt.Println("(use --body to show content)")
-			}
+			printCapturedBody("Request Body", resp.Details.RequestBody, includeBody)
 		}
 
 		// Print response body
 		if resp.Details.ResponseBody != nil {
-			fmt.Printf("\n--- Response Body (%d bytes", resp.Details.ResponseBody.Size)
-			if resp.Details.ResponseBody.Truncated {
-				fmt.Print(", truncated")
-			}
-			fmt.Println(") ---")
-			if includeBody && resp.Details.ResponseBody.Data != "" {
-				if resp.Details.ResponseBody.IsBinary {
-					fmt.Println("[binary data, base64 encoded]")
-				}
-				fmt.Println(resp.Details.ResponseBody.Data)
-			} else if !includeBody && resp.Details.ResponseBody.Size > 0 {
-				fmt.Println("(use --body to show content)")
-			}
+			printCapturedBody("Response Body", resp.Details.ResponseBody, includeBody)
 		}
 	} else {
 		fmt.Println("\n(capture not enabled - use 'prox up --capture' to enable)")
 	}
 
 	return nil
+}
+
+// printCapturedBody prints one captured body section: a header line with size,
+// truncation, content type and content encoding, followed by the body content
+// (or a note that it is unavailable / must be requested with --body).
+func printCapturedBody(label string, body *api.CapturedBodyResponse, includeBody bool) {
+	fmt.Printf("\n--- %s (%d bytes", label, body.Size)
+	if body.Truncated {
+		fmt.Printf(", %d bytes captured, truncated", body.CapturedSize)
+	}
+	if body.ContentType != "" {
+		fmt.Printf(", %s", body.ContentType)
+	}
+	if body.ContentEncoding != "" {
+		fmt.Printf(", encoding: %s", body.ContentEncoding)
+	}
+	fmt.Println(") ---")
+
+	if body.UnavailableReason != "" {
+		fmt.Println("(body no longer available)")
+		return
+	}
+
+	if includeBody && body.Data != "" {
+		if body.IsBinary {
+			fmt.Println("[binary data, base64 encoded]")
+		}
+		fmt.Println(body.Data)
+	} else if !includeBody && body.Size > 0 {
+		fmt.Println("(use --body to show content)")
+	}
 }
 
 // printHeaders prints HTTP headers in a readable format
@@ -617,6 +648,28 @@ func isTerminal() bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// parseSinceFlag parses the --since flag value, accepting either an RFC3339
+// timestamp or a Go duration (e.g. "5m", "1h"). A duration is treated as
+// "ago from now": time.Now() is captured exactly once here so a single
+// invocation (list or stream) uses one consistent cutoff instant rather than
+// re-evaluating "now" per record. Empty input returns the zero time (no
+// filter). A malformed value that matches neither format is a clear error.
+func parseSinceFlag(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		if d < 0 {
+			return time.Time{}, fmt.Errorf("invalid --since value %q: duration must not be negative", value)
+		}
+		return time.Now().Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid --since value %q: must be an RFC3339 timestamp or a duration (e.g. 5m, 1h)", value)
 }
 
 func printProxyRequest(req api.ProxyRequestResponse) {
@@ -672,6 +725,9 @@ func init() {
 	requestsCmd.Flags().StringVar(&requestsSubdomain, "subdomain", "", "Filter by subdomain")
 	requestsCmd.Flags().StringVar(&requestsMethod, "method", "", "Filter by HTTP method (GET, POST, etc.)")
 	requestsCmd.Flags().IntVar(&requestsMinStatus, "min-status", 0, "Filter by minimum status code (e.g., 400 for errors)")
+	requestsCmd.Flags().IntVar(&requestsMaxStatus, "max-status", 0, "Filter by maximum status code (combine with --min-status for ranges)")
+	requestsCmd.Flags().StringVar(&requestsSince, "since", "", "Filter to requests since this time (RFC3339 timestamp or duration like 5m, 1h)")
+	requestsCmd.Flags().StringVar(&requestsURL, "url", "", "Filter by URL substring (path+query, case-insensitive)")
 	requestsCmd.Flags().IntVarP(&requestsLimit, "limit", "n", constants.DefaultProxyRequestLimit, "Number of requests to show")
 	requestsCmd.Flags().BoolVar(&requestsJSON, "json", false, "Output as JSON")
 	requestsCmd.Flags().BoolVar(&requestsBody, "body", false, "Include request/response bodies when showing details")

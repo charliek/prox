@@ -24,15 +24,20 @@ type Route struct {
 	ProjectDir   string
 	PID          int
 	RegisteredAt time.Time
+	// CaptureEnabled is stamped from the owning project's registration so the
+	// dynamic proxy can gate body capture per project (a capture-disabled
+	// project's traffic is recorded as metadata only).
+	CaptureEnabled bool
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
 type ProjectRegistration struct {
-	Dir          string
-	PID          int
-	Domain       string
-	RouteKeys    []string // "hostname:port" keys into the routes map
-	RegisteredAt time.Time
+	Dir            string
+	PID            int
+	Domain         string
+	RouteKeys      []string // "hostname:port" keys into the routes map
+	RegisteredAt   time.Time
+	CaptureEnabled bool
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -143,13 +148,14 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	for _, p := range pending {
 		key := routeKey(p.hostname, p.port)
 		r.routes[key] = &Route{
-			Hostname:     p.hostname,
-			Port:         p.port,
-			Protocol:     p.protocol,
-			Target:       p.target,
-			ProjectDir:   req.ProjectDir,
-			PID:          req.PID,
-			RegisteredAt: now,
+			Hostname:       p.hostname,
+			Port:           p.port,
+			Protocol:       p.protocol,
+			Target:         p.target,
+			ProjectDir:     req.ProjectDir,
+			PID:            req.PID,
+			RegisteredAt:   now,
+			CaptureEnabled: req.CaptureEnabled,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -168,11 +174,12 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	r.projects[req.ProjectDir] = &ProjectRegistration{
-		Dir:          req.ProjectDir,
-		PID:          req.PID,
-		Domain:       req.Domain,
-		RouteKeys:    routeKeys,
-		RegisteredAt: now,
+		Dir:            req.ProjectDir,
+		PID:            req.PID,
+		Domain:         req.Domain,
+		RouteKeys:      routeKeys,
+		RegisteredAt:   now,
+		CaptureEnabled: req.CaptureEnabled,
 	}
 
 	for port, proto := range portsNeeded {
@@ -187,7 +194,29 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 func (r *Registry) Deregister(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.deregisterLocked(projectDir)
+}
 
+// DeregisterIfPID removes a project's routes only if its CURRENT registration
+// still carries pid. The check and removal happen under one lock acquisition,
+// closing the race where the stale-PID sweep detects a dead generation, the
+// project re-registers with a live PID, and the sweep would otherwise tear
+// down the new live registration. Returns removed=false when the project is
+// gone or has re-registered under a different PID.
+func (r *Registry) DeregisterIfPID(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[projectDir]
+	if !ok || proj.PID != pid {
+		return false, nil, nil
+	}
+	removedHostnames, emptyPorts = r.deregisterLocked(projectDir)
+	return true, removedHostnames, emptyPorts
+}
+
+// deregisterLocked is the shared removal body; r.mu must be held.
+func (r *Registry) deregisterLocked(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	proj, ok := r.projects[projectDir]
 	if !ok {
 		return nil, nil
@@ -270,20 +299,25 @@ func (r *Registry) IsEmpty() bool {
 	return len(r.routes) == 0
 }
 
-// CleanStalePIDs checks each registered project's PID and deregisters any
-// that are no longer running. Returns the project dirs that were cleaned up.
-func (r *Registry) CleanStalePIDs() []string {
+// StaleProject identifies a registration whose owning process has died.
+type StaleProject struct {
+	Dir string
+	PID int
+}
+
+// StalePIDs returns the registered projects whose PID is no longer running.
+// It only detects — removal goes through the consolidated removeProject path
+// (PID-guarded via DeregisterIfPID) so the crash path purges captured records
+// and body files the same way an explicit deregister does, without racing a
+// concurrent re-registration.
+func (r *Registry) StalePIDs() []StaleProject {
 	r.mu.RLock()
-	var stale []string
+	defer r.mu.RUnlock()
+	var stale []StaleProject
 	for dir, proj := range r.projects {
 		if !daemon.ProcessExists(proj.PID) {
-			stale = append(stale, dir)
+			stale = append(stale, StaleProject{Dir: dir, PID: proj.PID})
 		}
-	}
-	r.mu.RUnlock()
-
-	for _, dir := range stale {
-		r.Deregister(dir)
 	}
 	return stale
 }

@@ -150,7 +150,32 @@ func RunDaemon(ctx context.Context) error {
 	registry := NewRegistry()
 	certMgr := NewMultiDomainCertManager(constants.DefaultCertsDir)
 	requestMgr := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
-	dynamicProxy := NewDynamicProxy(registry, certMgr, requestMgr, logger)
+
+	// Create the daemon's capture manager, rooted at ~/.prox/capture. Resolve
+	// the home directory explicitly; on failure log and run without capture
+	// (nil manager, capture disabled) rather than failing the daemon.
+	var captureMgr *proxy.CaptureManager
+	if homeDir, herr := os.UserHomeDir(); herr != nil {
+		logger.Warn("could not resolve home directory; running without request capture", "error", herr)
+	} else if cm, cerr := proxy.NewCaptureManagerAt(constants.DaemonCaptureDir(homeDir), constants.DefaultCaptureMaxBodySize); cerr != nil {
+		logger.Warn("could not initialize capture manager; running without request capture", "error", cerr)
+	} else {
+		captureMgr = cm
+	}
+	// Cleanup runs on return. Because dynamicProxy.Shutdown and server.Shutdown
+	// run inline in the function body below, this deferred Cleanup necessarily
+	// runs AFTER both — in-flight handlers finish writing their capture files
+	// first. Registered immediately after construction so an early startup
+	// error still removes the capture dir. Cleanup is RemoveAll, so it is
+	// idempotent and safe to leave deferred here.
+	if captureMgr != nil {
+		defer func() { _ = captureMgr.Cleanup() }()
+		// Evicting a record from the ring buffer must delete its on-disk body
+		// files; the capture manager's per-request cleanup does exactly that.
+		requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
+	}
+
+	dynamicProxy := NewDynamicProxy(registry, certMgr, requestMgr, captureMgr, logger)
 
 	// Create and configure the socket server
 	server := NewServer(ServerConfig{
@@ -178,9 +203,20 @@ func RunDaemon(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				stale := registry.CleanStalePIDs()
-				for _, dir := range stale {
-					logger.Warn("cleaned stale project registration", "project", dir)
+				stale := registry.StalePIDs()
+				for _, sp := range stale {
+					removed, hostnames, emptyPorts := server.removeStaleProject(sp.Dir, sp.PID)
+					if !removed {
+						// Re-registered with a live PID between detection and
+						// removal — leave the new registration alone.
+						continue
+					}
+					logger.Warn("cleaned stale project registration",
+						"project", sp.Dir,
+						"pid", sp.PID,
+						"removed_hostnames", hostnames,
+						"closed_ports", emptyPorts,
+					)
 				}
 				if len(stale) > 0 && registry.IsEmpty() {
 					logger.Info("all routes cleaned up, shutting down")
@@ -221,6 +257,10 @@ func RunDaemon(ctx context.Context) error {
 	if err := dynamicProxy.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down proxy", "error", err)
 	}
+	// Close the request manager before the socket server so active SSE
+	// subscribers observe end-of-stream and release the server, rather than
+	// pinning it open through the shutdown grace period.
+	requestMgr.Close()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down server", "error", err)
 	}

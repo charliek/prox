@@ -840,7 +840,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	// daemon proxy requests into this project's TUI and API.
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	handlers.SetRequestManager(localRM)
-	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), resp.Registered, localRM)
+	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), cwd, localRM)
 
 	return client, true, nil
 }

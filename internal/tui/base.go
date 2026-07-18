@@ -1,14 +1,20 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
@@ -473,54 +479,110 @@ func (b *BaseModel) formatRequestDetail() []string {
 	}
 
 	// Request body
-	if d.RequestBody != nil && d.RequestBody.Size > 0 {
-		lines = append(lines, "")
-		bodyTitle := fmt.Sprintf("Request Body (%d bytes", d.RequestBody.Size)
-		if d.RequestBody.Truncated {
-			bodyTitle += ", truncated"
-		}
-		bodyTitle += ")"
-		lines = append(lines, headerStyle.Render(bodyTitle))
-		if d.RequestBody.Data != "" {
-			if d.RequestBody.IsBinary {
-				lines = append(lines, dimStyle.Render("[binary data]"))
-			} else {
-				// Split body into lines
-				bodyLines := strings.Split(d.RequestBody.Data, "\n")
-				for _, line := range bodyLines {
-					lines = append(lines, "  "+line)
-				}
-			}
-		}
-	}
+	lines = append(lines, renderBodySection("Request Body", d.RequestBody)...)
 
 	// Response body
-	if d.ResponseBody != nil && d.ResponseBody.Size > 0 {
-		lines = append(lines, "")
-		bodyTitle := fmt.Sprintf("Response Body (%d bytes", d.ResponseBody.Size)
-		if d.ResponseBody.Truncated {
-			bodyTitle += ", truncated"
-		}
-		bodyTitle += ")"
-		lines = append(lines, headerStyle.Render(bodyTitle))
-		if d.ResponseBody.Data != "" {
-			if d.ResponseBody.IsBinary {
-				lines = append(lines, dimStyle.Render("[binary data]"))
-			} else {
-				// Split body into lines
-				bodyLines := strings.Split(d.ResponseBody.Data, "\n")
-				for _, line := range bodyLines {
-					lines = append(lines, "  "+line)
-				}
-			}
-		}
-	}
+	lines = append(lines, renderBodySection("Response Body", d.ResponseBody)...)
 
 	// Footer hint
 	lines = append(lines, "")
 	lines = append(lines, dimStyle.Render("Press ESC to go back"))
 
 	return lines
+}
+
+// renderBodySection renders one titled request/response body block: a header
+// line carrying size/Content-Type/Content-Encoding/truncation, followed by
+// the body content. Shared by both Model and ClientModel via BaseModel, so
+// this lands the rendering behavior once for both. Returns nil (nothing
+// rendered) when there is no body or it is empty, matching prior behavior.
+func renderBodySection(title string, b *BodyData) []string {
+	if b == nil || b.Size == 0 {
+		return nil
+	}
+	lines := []string{"", headerStyle.Render(bodySectionTitle(title, b))}
+	return append(lines, renderBodyLines(b)...)
+}
+
+// bodySectionTitle builds the section header, e.g.
+// "Request Body (35 bytes, application/json)" or
+// "Response Body (1234 bytes, application/json, gzip, truncated)". The
+// Content-Type and Content-Encoding segments are omitted when absent, and no
+// dangling comma/parens are left behind when every optional segment is empty.
+func bodySectionTitle(title string, b *BodyData) string {
+	parts := []string{fmt.Sprintf("%d bytes", b.Size)}
+	if b.ContentType != "" {
+		parts = append(parts, b.ContentType)
+	}
+	if b.ContentEncoding != "" {
+		parts = append(parts, b.ContentEncoding)
+	}
+	if b.Truncated {
+		parts = append(parts, "truncated")
+	}
+	return fmt.Sprintf("%s (%s)", title, strings.Join(parts, ", "))
+}
+
+// renderBodyLines renders the content lines for a captured body: an
+// unavailable (evicted) notice, a binary-data marker, or the body text split
+// into lines. Non-binary JSON bodies (Content-Type contains "json", or the
+// raw text is itself valid JSON) are pretty-printed 2-space indented; any
+// json.Indent failure falls back to the raw text. Text otherwise renders
+// unchanged except that ASCII control characters (< 0x20, other than tab and
+// the newlines used for line splitting) and DEL (0x7F) are replaced with the
+// Unicode replacement character, so ESC/BEL/OSC sequences from a captured body
+// cannot manipulate the terminal. (Classification usually marks such bodies
+// binary, but a socket-supplied record could lie; this is a cheap defense.)
+func renderBodyLines(body *BodyData) []string {
+	if body.Unavailable {
+		return []string{dimStyle.Render("(body no longer available)")}
+	}
+	if body.IsBinary {
+		return []string{dimStyle.Render("[binary data]")}
+	}
+	if body.Data == "" {
+		return nil
+	}
+
+	text := body.Data
+	if shouldPrettyPrintJSON(body) {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(body.Data), "", "  "); err == nil {
+			text = buf.String()
+		}
+	}
+
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		lines = append(lines, "  "+sanitizeControlChars(line))
+	}
+	return lines
+}
+
+// sanitizeControlChars replaces ASCII control characters that could manipulate
+// the terminal (everything < 0x20 except tab, plus DEL 0x7F) with the Unicode
+// replacement character. Newlines are already consumed by line splitting before
+// this runs, so only intra-line control bytes (ESC, BEL, etc.) are affected.
+func sanitizeControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return '�'
+		}
+		return r
+	}, s)
+}
+
+// shouldPrettyPrintJSON reports whether a non-binary body should be run
+// through json.Indent before display: either its Content-Type declares JSON,
+// or (no such declaration) the raw text happens to be valid JSON on its own.
+func shouldPrettyPrintJSON(body *BodyData) bool {
+	if strings.Contains(strings.ToLower(body.ContentType), "json") {
+		return true
+	}
+	return json.Valid([]byte(body.Data))
 }
 
 // filteredEntries returns log entries after applying filters
@@ -889,7 +951,15 @@ func truncateError(err error, maxLen int) string {
 
 // convertRequestRecordToDetail converts a proxy.RequestRecord to RequestDetailData.
 // This is shared between Model (local mode) and ClientModel (API mode).
+// Bodies are loaded and content-decoded via the proxy loader so FilePath-backed
+// (disk-spilled) bodies are read rather than dropped.
 func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
+	return convertRequestRecordToDetailWithDirs(req, captureAllowedDirs())
+}
+
+// convertRequestRecordToDetailWithDirs is convertRequestRecordToDetail with an
+// explicit FilePath allowlist, separated so tests can supply a temp directory.
+func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs []string) *RequestDetailData {
 	detail := &RequestDetailData{
 		ID:         req.ID,
 		Timestamp:  req.Timestamp.Format("2006-01-02 15:04:05.000"),
@@ -906,25 +976,59 @@ func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
 		detail.ResponseHeaders = req.Details.ResponseHeaders
 
 		if req.Details.RequestBody != nil {
-			detail.RequestBody = &BodyData{
-				Size:        req.Details.RequestBody.Size,
-				Truncated:   req.Details.RequestBody.Truncated,
-				ContentType: req.Details.RequestBody.ContentType,
-				IsBinary:    req.Details.RequestBody.IsBinary,
-				Data:        string(req.Details.RequestBody.Data),
-			}
+			detail.RequestBody = convertCapturedBodyToBodyData(req.Details.RequestBody, allowedDirs)
 		}
-
 		if req.Details.ResponseBody != nil {
-			detail.ResponseBody = &BodyData{
-				Size:        req.Details.ResponseBody.Size,
-				Truncated:   req.Details.ResponseBody.Truncated,
-				ContentType: req.Details.ResponseBody.ContentType,
-				IsBinary:    req.Details.ResponseBody.IsBinary,
-				Data:        string(req.Details.ResponseBody.Data),
-			}
+			detail.ResponseBody = convertCapturedBodyToBodyData(req.Details.ResponseBody, allowedDirs)
 		}
 	}
 
 	return detail
+}
+
+// convertCapturedBodyToBodyData loads/decodes a captured body for TUI display.
+// An unavailable (evicted) body is marked so the renderer can note it rather
+// than showing garbage; binary and decoded-text semantics follow the loader.
+func convertCapturedBodyToBodyData(body *proxy.CapturedBody, allowedDirs []string) *BodyData {
+	bd := &BodyData{
+		Size:            body.Size,
+		Truncated:       body.Truncated,
+		ContentType:     body.ContentType,
+		ContentEncoding: body.ContentEncoding,
+		IsBinary:        body.IsBinary,
+	}
+
+	decoded, err := proxy.LoadDecodedBody(body, allowedDirs)
+	if err != nil || !decoded.Available {
+		bd.Unavailable = true
+		if decoded.UnavailableReason != "" {
+			bd.UnavailableReason = decoded.UnavailableReason
+		} else {
+			bd.UnavailableReason = "evicted"
+		}
+		return bd
+	}
+
+	bd.IsBinary = decoded.IsBinary
+	// Defense in depth (mirrors the API serve path): never string-convert bytes
+	// that are not valid UTF-8, even if the loaded record claims they are text —
+	// a socket-supplied flag or a mutated disk file must not reach the terminal
+	// as raw control bytes.
+	if !decoded.IsBinary && utf8.Valid(decoded.Data) {
+		bd.Data = string(decoded.Data)
+	} else {
+		bd.IsBinary = true
+	}
+	return bd
+}
+
+// captureAllowedDirs returns the directories a captured body's FilePath may
+// resolve within for the in-TUI loader: the local project capture dir
+// (cwd/.prox/capture) and the shared daemon capture dir under the user's home.
+func captureAllowedDirs() []string {
+	var primary string
+	if cwd, err := os.Getwd(); err == nil {
+		primary = filepath.Join(cwd, constants.CaptureDirectory)
+	}
+	return proxy.CaptureAllowedDirs(primary)
 }

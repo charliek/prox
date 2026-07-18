@@ -305,7 +305,7 @@ func (s *Service) createRouter() http.Handler {
 		startTime := time.Now()
 
 		// Generate request ID early for capture
-		requestID := generateRequestID(startTime, r.Method, r.URL.String())
+		requestID := GenerateRequestID(startTime, r.Method, r.URL.String())
 
 		// Extract subdomain from host
 		subdomain := s.extractSubdomain(r.Host)
@@ -363,9 +363,9 @@ func (s *Service) createRouter() http.Handler {
 
 		// Choose response writer based on capture mode
 		var rw http.ResponseWriter
-		var crw *capturingResponseWriter
+		var crw *CaptureResponseWriter
 		if s.captureManager != nil && s.captureManager.Enabled() {
-			crw = newCapturingResponseWriter(w, s.captureManager.maxBodySize)
+			crw = s.captureManager.WrapResponseWriter(w)
 			rw = crw
 		} else {
 			rw = &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -392,9 +392,23 @@ func (s *Service) createRouter() http.Handler {
 		// Build request details if capture is enabled
 		var details *RequestDetails
 		var statusCode int
-		if crw != nil {
+		if crw != nil && crw.Hijacked() {
+			// A successful reverse-proxy upgrade writes the 101 raw to the
+			// hijacked conn, bypassing WriteHeader, so the writer's statusCode
+			// is meaningless here. Record the protocol switch and record
+			// metadata only rather than a garbage 200/empty-body capture.
+			statusCode = http.StatusSwitchingProtocols
+			// The metadata-only record carries no Details, so eviction would
+			// never clean a request-body file spilled to disk before the
+			// upgrade; finalize and clean it up here to avoid orphaning it.
+			FinalizeRequestBody(r.Body)
+			s.captureManager.CleanupRequest(requestID)
+		} else if crw != nil {
 			statusCode = crw.StatusCode()
-			resBody, resHeaders := s.captureManager.CaptureResponse(requestID, crw)
+			// Freeze the request-body capture before the record is published
+			// (see FinalizeRequestBody).
+			FinalizeRequestBody(r.Body)
+			resBody, resHeaders := s.captureManager.FinalizeResponse(requestID, crw)
 			details = &RequestDetails{
 				RequestHeaders:  reqHeaders,
 				ResponseHeaders: resHeaders,
@@ -412,13 +426,23 @@ func (s *Service) createRouter() http.Handler {
 	})
 }
 
+// stripHostPort removes a trailing ":port" from a host header value, if
+// present. Shared by extractSubdomain and recordRequest so hostname handling
+// stays consistent. Uses net.SplitHostPort so IPv6 literals survive: a bare
+// "[::1]" has no port and is returned unchanged rather than mangled at its
+// last colon.
+func stripHostPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
 // extractSubdomain extracts the subdomain from the host header.
 // For example, "app.local.myapp.dev:6789" with domain "local.myapp.dev" returns "app".
 func (s *Service) extractSubdomain(host string) string {
 	// Remove port if present
-	if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
-		host = host[:colonIdx]
-	}
+	host = stripHostPort(host)
 
 	// Check if host ends with our domain with a proper label boundary (dot)
 	// This prevents "evilocal.myapp.dev" from matching domain "local.myapp.dev"
@@ -446,6 +470,7 @@ func (s *Service) recordRequest(r *http.Request, subdomain string, statusCode in
 		Method:     r.Method,
 		URL:        r.URL.String(),
 		Subdomain:  subdomain,
+		Hostname:   stripHostPort(r.Host),
 		StatusCode: statusCode,
 		Duration:   time.Since(startTime),
 		RemoteAddr: getClientIP(r),

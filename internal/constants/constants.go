@@ -1,7 +1,10 @@
 // Package constants provides shared configuration values used across the prox application.
 package constants
 
-import "time"
+import (
+	"path/filepath"
+	"time"
+)
 
 // Configuration file defaults
 const (
@@ -110,7 +113,32 @@ const (
 
 	// CaptureDirectory is the directory name for storing captured body files
 	CaptureDirectory = ".prox/capture"
+
+	// MaxDecodedBodySize caps the number of bytes produced when decoding a
+	// content-encoded (e.g. gzip) captured body at serve time. Exceeding the cap
+	// is treated as a decode failure so a highly-compressible payload (zip bomb)
+	// cannot exhaust memory. 10MB.
+	MaxDecodedBodySize = 10 * 1024 * 1024
+
+	// MaxSSEEventSize bounds a single SSE event the forwarder buffers from the
+	// daemon's request stream. It is derived from DefaultCaptureMaxBodySize
+	// rather than hard-coded: the 64KB inline threshold does NOT bound an event,
+	// because on a capture disk-write failure both the request and response body
+	// fall back to inline storage up to the max body size (see capture.go), so a
+	// single record can carry two max-size bodies base64-encoded (~1.4MB each),
+	// and headers are unbounded by the body threshold. The cap is twice the
+	// base64-expanded max body size plus 1MB of slack for headers and JSON
+	// framing (~3.7MB). An event exceeding it is skipped and the stream
+	// continues. base64 std-encoding expands n bytes to ((n+2)/3)*4.
+	MaxSSEEventSize = 2*(((DefaultCaptureMaxBodySize+2)/3)*4) + 1024*1024
 )
+
+// DaemonCaptureDir returns the daemon's shared capture directory
+// (homeDir/.prox/capture) given a home directory. Kept here so both the api and
+// proxyd packages can derive the path without an import cycle.
+func DaemonCaptureDir(homeDir string) string {
+	return filepath.Join(homeDir, CaptureDirectory)
+}
 
 // Proxy timeouts
 const (

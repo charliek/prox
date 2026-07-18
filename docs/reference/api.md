@@ -256,6 +256,8 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 | `method` | string | all | Filter by HTTP method (GET, POST, etc.) |
 | `min_status` | int | — | Minimum status code |
 | `max_status` | int | — | Maximum status code |
+| `since` | string | — | RFC3339 timestamp; only requests recorded at or after this time |
+| `url_contains` | string | — | Case-insensitive substring match against the request URL (path+query only — never scheme/host) |
 | `limit` | int | 100 | Max requests to return (max 1000) |
 
 **Response:**
@@ -264,11 +266,12 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 {
   "requests": [
     {
-      "id": "a1b2c3d",
+      "id": "a1b2c3d4e5f6",
       "timestamp": "2025-01-19T10:32:01.123Z",
       "method": "GET",
       "url": "/api/users",
       "subdomain": "api",
+      "hostname": "api.local.dev",
       "status_code": 200,
       "duration_ms": 45,
       "remote_addr": "127.0.0.1"
@@ -278,6 +281,10 @@ Retrieve recent proxy requests (requires proxy to be enabled).
   "total_count": 250
 }
 ```
+
+`hostname` is the request's Host header with the port stripped (e.g.
+`api.local.dev`); it is omitted when not recorded (older records, or a
+daemon-side record that predates this field).
 
 **Example:**
 
@@ -290,6 +297,9 @@ curl "http://localhost:5555/api/v1/proxy/requests?subdomain=api"
 
 # Filter for errors (5xx)
 curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
+
+# Filter by URL substring (path+query, case-insensitive)
+curl "http://localhost:5555/api/v1/proxy/requests?url_contains=/api/users"
 ```
 
 ### GET /proxy/requests/{id}
@@ -306,11 +316,12 @@ Body data is available only when capture was enabled with `prox up --capture` or
 
 ```json
 {
-  "id": "a1b2c3d",
+  "id": "a1b2c3d4e5f6",
   "timestamp": "2025-01-19T10:32:01.123Z",
   "method": "POST",
   "url": "/api/users",
   "subdomain": "api",
+  "hostname": "api.local.dev",
   "status_code": 201,
   "duration_ms": 45,
   "remote_addr": "127.0.0.1",
@@ -320,6 +331,7 @@ Body data is available only when capture was enabled with `prox up --capture` or
     },
     "request_body": {
       "size": 27,
+      "captured_size": 27,
       "truncated": false,
       "content_type": "application/json",
       "is_binary": false,
@@ -329,11 +341,26 @@ Body data is available only when capture was enabled with `prox up --capture` or
 }
 ```
 
+**Captured body fields:**
+
+| Field | Description |
+|-------|-------------|
+| `size` | Total encoded bytes observed by the capture wrapper before truncation (not Content-Length, not the decoded size) |
+| `captured_size` | Encoded bytes actually retained; `truncated` is true when `captured_size < size` |
+| `truncated` | Whether the body exceeded the 1MB capture cap and was truncated |
+| `content_type` | Captured `Content-Type` header value |
+| `content_encoding` | Captured `Content-Encoding` header value (e.g. `gzip`); omitted when unencoded |
+| `is_binary` | With `include=body`: whether the **served** (post-decode) bytes are binary. Without it: the stored classification of the **raw wire** bytes (a gzip body reports `true` here even when its decoded form would serve as text) — see decoded-body semantics below |
+| `data` | Body content (only with `include=body`): plain text for text bodies, base64 for binary |
+| `unavailable_reason` | Set (e.g. `evicted`) when `include=body` was requested but the body could no longer be loaded; `data` is absent |
+
+**Decoded-body semantics:** captured bodies store the raw wire bytes and are decoded at serve time. When `content_encoding` is `gzip` or `x-gzip` and the body was not truncated, the decoded bytes are served and `is_binary` reflects the decoded content (readable JSON/text decodes to `is_binary: false`). Unsupported encodings (`deflate`, `br`, `zstd`, chained values like `gzip, br`), truncated bodies, corrupt streams, and payloads whose decoded size would exceed the 10MB cap are served as the raw bytes, base64-encoded, with `is_binary: true` and `content_encoding` preserved. The stored (raw) binary classification and the served `is_binary` may therefore legitimately differ. The on-disk path of a spilled body is never exposed.
+
 **Examples:**
 
 ```bash
-curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d
-curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d?include=body"
+curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6
+curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6?include=body"
 ```
 
 ### GET /proxy/requests/stream
@@ -342,14 +369,14 @@ Stream proxy requests via Server-Sent Events (SSE).
 
 The stream is long-lived: it is exempt from the 30s request-timeout class and ends only on client disconnect or daemon shutdown.
 
-**Query Parameters:** Same as `GET /proxy/requests` (except `limit`)
+**Query Parameters:** Same as `GET /proxy/requests` (except `limit`), including `url_contains`
 
 **Response:** SSE stream
 
 ```
 : connected
 
-data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
+data: {"id":"a1b2c3d4e5f6","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","hostname":"api.local.dev","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```
 
 **Example:**
@@ -357,6 +384,7 @@ data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url
 ```bash
 curl -N http://localhost:5555/api/v1/proxy/requests/stream
 curl -N "http://localhost:5555/api/v1/proxy/requests/stream?subdomain=api"
+curl -N "http://localhost:5555/api/v1/proxy/requests/stream?url_contains=/api"
 ```
 
 ### POST /shutdown

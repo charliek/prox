@@ -1,5 +1,7 @@
 package domain
 
+import "time"
+
 // LogParams holds parameters for log retrieval and streaming.
 // This type is shared between the TUI and CLI packages.
 //
@@ -24,11 +26,16 @@ type LogParams struct {
 //   - Method: Filter to requests with a specific HTTP method. Empty string means all.
 //   - MinStatus: Filter to requests with status code >= this value. 0 means no minimum.
 //   - MaxStatus: Filter to requests with status code <= this value. 0 means no maximum.
+//   - Since: Filter to requests recorded at or after this time. Zero value means no lower bound.
+//   - URLContains: Filter to requests whose URL (path+query) contains this substring,
+//     case-insensitive. Empty string means no filtering.
 //   - Limit: Maximum number of requests to return. 0 means use server default.
 type ProxyRequestParams struct {
-	Subdomain string
-	Method    string
-	MinStatus int
-	MaxStatus int
-	Limit     int
+	Subdomain   string
+	Method      string
+	MinStatus   int
+	MaxStatus   int
+	Since       time.Time
+	URLContains string
+	Limit       int
 }

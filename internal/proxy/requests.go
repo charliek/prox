@@ -4,13 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // RequestRecord represents a single proxied request.
 type RequestRecord struct {
-	// ID is a 7-character hash generated from timestamp, method, and URL.
+	// ID is a 12-character hash generated from timestamp, method, and URL.
 	ID         string        `json:"id"`
 	Timestamp  time.Time     `json:"timestamp"`
 	Method     string        `json:"method"`
@@ -20,6 +22,11 @@ type RequestRecord struct {
 	StatusCode int           `json:"status_code"`
 	Duration   time.Duration `json:"duration"`
 	RemoteAddr string        `json:"remote_addr"`
+
+	// ProjectDir identifies the project that owns the route this request was
+	// proxied for. Set daemon-side so records/purges are scoped to a project
+	// even when two projects own the same hostname on different ports.
+	ProjectDir string `json:"project_dir,omitempty"`
 
 	// Details contains captured headers and bodies (nil when capture is disabled)
 	Details *RequestDetails `json:"details,omitempty"`
@@ -35,30 +42,53 @@ type RequestDetails struct {
 
 // CapturedBody represents a captured request or response body.
 type CapturedBody struct {
-	Size        int64  `json:"size"`         // Original body size
-	Truncated   bool   `json:"truncated"`    // True if body was truncated due to size limit
-	ContentType string `json:"content_type"` // Content-Type header value
-	IsBinary    bool   `json:"is_binary"`    // True if body appears to be binary data
-	Data        []byte `json:"data"`         // Inline data for small bodies
-	FilePath    string `json:"file_path"`    // Disk path for large bodies (Data is nil when set)
+	// Size is the total bytes observed by the capture wrapper, including
+	// bytes discarded past the truncation cap (not Content-Length, not
+	// decoded size).
+	Size            int64  `json:"size"`
+	CapturedSize    int64  `json:"captured_size"`              // Bytes actually retained after truncation
+	Truncated       bool   `json:"truncated"`                  // True if body was truncated due to size limit
+	ContentType     string `json:"content_type"`               // Content-Type header value
+	ContentEncoding string `json:"content_encoding,omitempty"` // Content-Encoding header value (raw wire bytes; not decoded here)
+	IsBinary        bool   `json:"is_binary"`                  // True if body appears to be binary data
+	Data            []byte `json:"data"`                       // Inline data for small bodies
+	FilePath        string `json:"file_path"`                  // Disk path for large bodies (Data is nil when set)
 }
 
-// generateRequestID creates a short hash ID (7 chars, git-style) from request data.
-func generateRequestID(timestamp time.Time, method, url string) string {
-	data := fmt.Sprintf("%d:%s:%s", timestamp.UnixNano(), method, url)
+// requestIDCounter disambiguates requests that share a timestamp/method/URL.
+// Without it, two simultaneous identical requests would hash to the same ID
+// and their capture files would overwrite (and cross-delete on eviction).
+var requestIDCounter atomic.Uint64
+
+// GenerateRequestID creates a short hash ID (12 chars, git-style) from request
+// data plus a per-process counter, so IDs are unique within a process even for
+// simultaneous identical requests. (Truncating the hash to 48 bits keeps the
+// birthday-collision residual across the 1000-record ring negligible, unlike
+// the 28 bits of a 7-char ID whose ~0.2%-per-full-ring collision odds could
+// overwrite capture files.) Exported so the shared daemon can generate a
+// request ID before proxying (needed for capture file naming).
+func GenerateRequestID(timestamp time.Time, method, url string) string {
+	data := fmt.Sprintf("%d:%d:%s:%s", timestamp.UnixNano(), requestIDCounter.Add(1), method, url)
 	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])[:7]
+	return hex.EncodeToString(hash[:])[:12]
 }
 
 // RequestFilter specifies criteria for filtering requests.
 type RequestFilter struct {
 	Subdomain string
 	Hostnames []string // match if record.Hostname is in this list (empty = match all)
-	Method    string
-	MinStatus int
-	MaxStatus int
-	Since     time.Time
-	Limit     int
+
+	// URLContains matches if record.URL contains this substring
+	// (case-insensitive). URL is path+query only (no scheme/host, matching
+	// the TUI 's' filter's reference behavior), since RequestRecord.URL is
+	// populated from r.URL.String() on the server side. Empty = match all.
+	URLContains string
+	ProjectDir  string // match if record.ProjectDir equals this exactly (empty = match all)
+	Method      string
+	MinStatus   int
+	MaxStatus   int
+	Since       time.Time
+	Limit       int
 }
 
 // RequestSubscription represents a subscription to request updates.
@@ -114,7 +144,7 @@ func (m *RequestManager) SetEvictionCallback(fn EvictionCallback) {
 // If the record doesn't have an ID, one is generated.
 func (m *RequestManager) Record(record RequestRecord) {
 	if record.ID == "" {
-		record.ID = generateRequestID(record.Timestamp, record.Method, record.URL)
+		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
 
 	var evictedID string
@@ -276,6 +306,12 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 			return false
 		}
 	}
+	if filter.ProjectDir != "" && record.ProjectDir != filter.ProjectDir {
+		return false
+	}
+	if filter.URLContains != "" && !strings.Contains(strings.ToLower(record.URL), strings.ToLower(filter.URLContains)) {
+		return false
+	}
 	if filter.Method != "" && record.Method != filter.Method {
 		return false
 	}
@@ -291,17 +327,15 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 	return true
 }
 
-// PurgeByHostnames removes all records matching any of the given hostnames
-// from the ring buffer and calls the eviction callback for each.
-// It compacts the buffer to preserve the contiguous ring invariant.
-func (m *RequestManager) PurgeByHostnames(hostnames []string) {
-	if len(hostnames) == 0 {
+// PurgeByProject removes all records owned by the given project from the ring
+// buffer and calls the eviction callback for each purged record that carried
+// captured Details (so its on-disk body files get cleaned up). It compacts the
+// buffer to preserve the contiguous ring invariant. Scoping by project (not
+// hostname) ensures two projects sharing a hostname on different ports don't
+// purge each other's records.
+func (m *RequestManager) PurgeByProject(projectDir string) {
+	if projectDir == "" {
 		return
-	}
-
-	hostSet := make(map[string]struct{}, len(hostnames))
-	for _, h := range hostnames {
-		hostSet[h] = struct{}{}
 	}
 
 	var evictIDs []string
@@ -318,7 +352,7 @@ func (m *RequestManager) PurgeByHostnames(hostnames []string) {
 		if rec.ID == "" {
 			continue
 		}
-		if _, match := hostSet[rec.Hostname]; match {
+		if rec.ProjectDir == projectDir {
 			if rec.Details != nil {
 				evictIDs = append(evictIDs, rec.ID)
 			}

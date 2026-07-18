@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/proxy"
 )
 
 func TestFilterSensitiveEnv(t *testing.T) {
@@ -379,5 +380,39 @@ func TestToLogEntryResponse(t *testing.T) {
 	// Verify timestamp is in RFC3339Nano format
 	if resp.Timestamp != now.Format(time.RFC3339Nano) {
 		t.Errorf("expected Timestamp %q, got %q", now.Format(time.RFC3339Nano), resp.Timestamp)
+	}
+}
+
+func TestToProxyRequestResponse_MapsHostname(t *testing.T) {
+	now := time.Now()
+	rec := proxy.RequestRecord{
+		ID:         "abc1234",
+		Timestamp:  now,
+		Method:     "GET",
+		URL:        "/api/users",
+		Subdomain:  "api",
+		Hostname:   "api.local.myapp.dev",
+		StatusCode: 200,
+		Duration:   10 * time.Millisecond,
+		RemoteAddr: "127.0.0.1",
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if resp.Hostname != "api.local.myapp.dev" {
+		t.Errorf("expected Hostname %q, got %q", "api.local.myapp.dev", resp.Hostname)
+	}
+}
+
+func TestToProxyRequestResponse_OmitsEmptyHostname(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:  "abc1234",
+		URL: "/api/users",
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if resp.Hostname != "" {
+		t.Errorf("expected empty Hostname, got %q", resp.Hostname)
 	}
 }

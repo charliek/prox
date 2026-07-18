@@ -276,6 +276,9 @@ prox requests [id] [options]
 | `--subdomain` | Filter by subdomain |
 | `--method` | Filter by HTTP method (GET, POST, etc.) |
 | `--min-status` | Filter by minimum status code (e.g., 400 for errors) |
+| `--max-status` | Filter by maximum status code (combine with `--min-status 400` for client errors only). Must be 100-599; when both `--min-status` and `--max-status` are set, `--min-status` must not exceed `--max-status` |
+| `--since` | Filter to requests since this time — an RFC3339 timestamp or a Go duration (e.g. `5m`, `1h`) evaluated as "ago" from the moment the command runs |
+| `--url` | Filter by URL substring (path+query only, case-insensitive) |
 | `--json` | Output as JSON |
 | `--body` | Include captured request/response bodies when showing one request by ID |
 
@@ -297,21 +300,33 @@ prox requests --method GET
 # Show only errors (4xx and 5xx)
 prox requests --min-status 400
 
+# Show only client errors (4xx)
+prox requests --min-status 400 --max-status 499
+
+# Show requests from the last 5 minutes
+prox requests --since 5m
+
+# Filter by URL substring
+prox requests --url /api
+
+# Agent-oriented: recent 4xx traffic to /api in the last 5 minutes
+prox requests --url /api --since 5m --min-status 400 --max-status 499
+
 # JSON output for piping
 prox requests --json | jq .
 
 # Show details for one request
-prox requests abc1234
+prox requests abc1234def56
 
 # Include captured bodies for one request
-prox requests abc1234 --body
+prox requests abc1234def56 --body
 ```
 
 **Request IDs:**
 
-Each request is assigned a short hash ID (7 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
+Each request is assigned a short hash ID (12 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
 
-Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`.
+Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`. Capture applies in both standalone and shared-daemon mode — the enablement is propagated to the daemon at registration, and a daemon captures bodies only for the projects that opted in. When a request has no captured detail, `prox requests <id>` shows `(capture not enabled - use 'prox up --capture' to enable)`; if the body was captured but has since been evicted from the request buffer, it shows `(body no longer available)` instead. See [Request Capture](configuration.md#request-capture) for capture directories and daemon-upgrade notes.
 
 ### proxy
 
