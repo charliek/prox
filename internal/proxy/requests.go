@@ -35,12 +35,17 @@ type RequestDetails struct {
 
 // CapturedBody represents a captured request or response body.
 type CapturedBody struct {
-	Size        int64  `json:"size"`         // Original body size
-	Truncated   bool   `json:"truncated"`    // True if body was truncated due to size limit
-	ContentType string `json:"content_type"` // Content-Type header value
-	IsBinary    bool   `json:"is_binary"`    // True if body appears to be binary data
-	Data        []byte `json:"data"`         // Inline data for small bodies
-	FilePath    string `json:"file_path"`    // Disk path for large bodies (Data is nil when set)
+	// Size is the total bytes observed by the capture wrapper, including
+	// bytes discarded past the truncation cap (not Content-Length, not
+	// decoded size).
+	Size            int64  `json:"size"`
+	CapturedSize    int64  `json:"captured_size"`              // Bytes actually retained after truncation
+	Truncated       bool   `json:"truncated"`                  // True if body was truncated due to size limit
+	ContentType     string `json:"content_type"`               // Content-Type header value
+	ContentEncoding string `json:"content_encoding,omitempty"` // Content-Encoding header value (raw wire bytes; not decoded here)
+	IsBinary        bool   `json:"is_binary"`                  // True if body appears to be binary data
+	Data            []byte `json:"data"`                       // Inline data for small bodies
+	FilePath        string `json:"file_path"`                  // Disk path for large bodies (Data is nil when set)
 }
 
 // generateRequestID creates a short hash ID (7 chars, git-style) from request data.

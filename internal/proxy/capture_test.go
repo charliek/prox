@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -177,7 +179,8 @@ func TestCaptureRequest(t *testing.T) {
 		err = wrappedBody.Close()
 		require.NoError(t, err)
 
-		assert.Equal(t, int64(50), capturedBody.Size)
+		assert.Equal(t, int64(100), capturedBody.Size)        // total bytes observed
+		assert.Equal(t, int64(50), capturedBody.CapturedSize) // bytes retained
 		assert.True(t, capturedBody.Truncated)
 	})
 
@@ -272,7 +275,8 @@ func TestCaptureResponse(t *testing.T) {
 		body, _ := cm.CaptureResponse("req-trunc", crw)
 		require.NotNil(t, body)
 		assert.True(t, body.Truncated)
-		assert.Equal(t, int64(20), body.Size) // captured size is truncated size
+		assert.Equal(t, int64(50), body.Size)         // total bytes observed
+		assert.Equal(t, int64(20), body.CapturedSize) // bytes retained
 	})
 }
 
@@ -529,7 +533,8 @@ func TestCaptureBuffer_Finalize(t *testing.T) {
 		cb.finalize()
 
 		assert.True(t, body.Truncated)
-		assert.Equal(t, int64(5), body.Size)
+		assert.Equal(t, int64(11), body.Size)        // total bytes observed
+		assert.Equal(t, int64(5), body.CapturedSize) // bytes retained
 	})
 }
 
@@ -698,23 +703,41 @@ func TestIsBinaryContent(t *testing.T) {
 		assert.False(t, isBinaryContent(withAllowed, ""))
 	})
 
-	t.Run("only samples first 512 bytes", func(t *testing.T) {
-		// Build 600 bytes: 512 valid ASCII + binary after
+	t.Run("scans the entire buffer, not just first 512 bytes", func(t *testing.T) {
+		// Regression for the 512-byte sampling bug (multipart-style):
+		// >512 bytes of valid ASCII followed by invalid-UTF-8 bytes.
 		data := make([]byte, 600)
 		for i := 0; i < 512; i++ {
 			data[i] = 'a'
 		}
 		for i := 512; i < 600; i++ {
-			data[i] = 0x01 // non-printable
+			data[i] = 0xff // invalid UTF-8 past the old sampling window
 		}
-		// Content type empty, so it falls to data inspection
-		assert.False(t, isBinaryContent(data, ""))
+		// Even with a text-y content type, invalid UTF-8 makes this binary.
+		assert.True(t, isBinaryContent(data, "multipart/form-data"))
+		assert.True(t, isBinaryContent(data, ""))
 	})
 
-	t.Run("content type takes precedence over data", func(t *testing.T) {
-		// Binary data but text content type
+	t.Run("text-y content type does not short-circuit invalid UTF-8", func(t *testing.T) {
+		// Invalid UTF-8 must classify binary regardless of a text-y CT.
 		binaryData := []byte{0xff, 0xfe, 0x00}
-		assert.False(t, isBinaryContent(binaryData, "application/json"))
+		assert.True(t, isBinaryContent(binaryData, "application/json"))
+	})
+
+	t.Run("gzip-compressed JSON with json content type is binary", func(t *testing.T) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, err := gz.Write([]byte(`{"hello":"world","n":42}`))
+		require.NoError(t, err)
+		require.NoError(t, gz.Close())
+
+		// Compressed bytes are (almost surely) not valid UTF-8 → binary,
+		// even though the declared content type is application/json.
+		assert.True(t, isBinaryContent(buf.Bytes(), "application/json"))
+	})
+
+	t.Run("known-binary content type is binary even with empty data", func(t *testing.T) {
+		assert.True(t, isBinaryContent([]byte{}, "image/png"))
 	})
 }
 
@@ -779,4 +802,166 @@ func TestRequestManager_EvictionCallbackCleanup(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "request file should be cleaned up on eviction")
 	_, err = os.Stat(resFile)
 	assert.True(t, os.IsNotExist(err), "response file should be cleaned up on eviction")
+}
+
+// --- Size semantics (D11): total observed vs retained ---
+
+func TestCaptureBuffer_SizeSemantics(t *testing.T) {
+	t.Run("counts bytes past the truncation cap", func(t *testing.T) {
+		body := &CapturedBody{}
+		cb := &captureBuffer{
+			maxSize: 10,
+			body:    body,
+			cm:      &CaptureManager{inlineThreshold: 1024},
+		}
+
+		// Three writes of 6 bytes each = 18 total, cap 10.
+		cb.Write([]byte("aaaaaa"))
+		cb.Write([]byte("bbbbbb"))
+		cb.Write([]byte("cccccc"))
+
+		require.NoError(t, cb.finalize())
+		assert.Equal(t, int64(18), body.Size)         // total observed, counting past the cap
+		assert.Equal(t, int64(10), body.CapturedSize) // bytes retained
+		assert.True(t, body.Truncated)
+	})
+
+	t.Run("exact-cap boundary is not truncated", func(t *testing.T) {
+		body := &CapturedBody{}
+		cb := &captureBuffer{
+			maxSize: 10,
+			body:    body,
+			cm:      &CaptureManager{inlineThreshold: 1024},
+		}
+
+		// Writes summing exactly to the cap.
+		cb.Write([]byte("aaaaa"))
+		cb.Write([]byte("bbbbb"))
+
+		require.NoError(t, cb.finalize())
+		assert.Equal(t, int64(10), body.Size)
+		assert.Equal(t, int64(10), body.CapturedSize)
+		assert.Equal(t, body.Size, body.CapturedSize)
+		assert.False(t, body.Truncated)
+	})
+
+	t.Run("zero-length write at exact cap does not mark truncated", func(t *testing.T) {
+		body := &CapturedBody{}
+		cb := &captureBuffer{
+			maxSize: 10,
+			body:    body,
+			cm:      &CaptureManager{inlineThreshold: 1024},
+		}
+
+		cb.Write([]byte("aaaaaaaaaa"))
+		cb.Write([]byte{})
+
+		require.NoError(t, cb.finalize())
+		assert.Equal(t, int64(10), body.Size)
+		assert.Equal(t, int64(10), body.CapturedSize)
+		assert.False(t, body.Truncated)
+	})
+}
+
+func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
+	t.Run("counts bytes past the truncation cap via CaptureResponse", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		w := httptest.NewRecorder()
+		crw := newCapturingResponseWriter(w, 10)
+		crw.Header().Set("Content-Type", "text/plain")
+
+		crw.Write([]byte("aaaaaa"))
+		crw.Write([]byte("bbbbbb"))
+		crw.Write([]byte("cccccc"))
+
+		body, _ := cm.CaptureResponse("req-total", crw)
+		require.NotNil(t, body)
+		assert.Equal(t, int64(18), body.Size)
+		assert.Equal(t, int64(10), body.CapturedSize)
+		assert.True(t, body.Truncated)
+	})
+
+	t.Run("exact-cap boundary is not truncated via CaptureResponse", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		w := httptest.NewRecorder()
+		crw := newCapturingResponseWriter(w, 10)
+		crw.Header().Set("Content-Type", "text/plain")
+
+		crw.Write([]byte("aaaaa"))
+		crw.Write([]byte("bbbbb"))
+
+		body, _ := cm.CaptureResponse("req-exact", crw)
+		require.NotNil(t, body)
+		assert.Equal(t, int64(10), body.Size)
+		assert.Equal(t, int64(10), body.CapturedSize)
+		assert.Equal(t, body.Size, body.CapturedSize)
+		assert.False(t, body.Truncated)
+	})
+
+	t.Run("zero-length write at exact cap does not mark truncated", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		w := httptest.NewRecorder()
+		crw := newCapturingResponseWriter(w, 10)
+		crw.Header().Set("Content-Type", "text/plain")
+
+		crw.Write([]byte("aaaaaaaaaa"))
+		crw.Write([]byte{})
+
+		body, _ := cm.CaptureResponse("req-zero", crw)
+		require.NotNil(t, body)
+		assert.Equal(t, int64(10), body.Size)
+		assert.Equal(t, int64(10), body.CapturedSize)
+		assert.False(t, body.Truncated)
+	})
+}
+
+// --- ContentEncoding capture (data model only; no decode) ---
+
+func TestContentEncodingCaptured(t *testing.T) {
+	t.Run("request body records Content-Encoding", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		req := httptest.NewRequest("POST", "/test", strings.NewReader("payload"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Encoding", "gzip")
+
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-enc", req)
+		require.NotNil(t, capturedBody)
+
+		_, err := io.ReadAll(wrappedBody)
+		require.NoError(t, err)
+		require.NoError(t, wrappedBody.Close())
+
+		assert.Equal(t, "gzip", capturedBody.ContentEncoding)
+	})
+
+	t.Run("response body records Content-Encoding", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		w := httptest.NewRecorder()
+		crw := newCapturingResponseWriter(w, constants.DefaultCaptureMaxBodySize)
+		crw.Header().Set("Content-Type", "application/json")
+		crw.Header().Set("Content-Encoding", "gzip")
+		crw.Write([]byte("compressed-ish"))
+
+		body, _ := cm.CaptureResponse("res-enc", crw)
+		require.NotNil(t, body)
+		assert.Equal(t, "gzip", body.ContentEncoding)
+	})
+
+	t.Run("absent Content-Encoding stays empty", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+
+		req := httptest.NewRequest("POST", "/test", strings.NewReader("payload"))
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-noenc", req)
+		require.NotNil(t, capturedBody)
+		_, err := io.ReadAll(wrappedBody)
+		require.NoError(t, err)
+		require.NoError(t, wrappedBody.Close())
+
+		assert.Empty(t, capturedBody.ContentEncoding)
+	})
 }

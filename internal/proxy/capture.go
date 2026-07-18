@@ -109,7 +109,8 @@ func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*Ca
 
 	// We return a placeholder body info; the actual data will be filled after reading completes
 	body := &CapturedBody{
-		ContentType: contentType,
+		ContentType:     contentType,
+		ContentEncoding: r.Header.Get("Content-Encoding"),
 	}
 
 	captured.body = body
@@ -128,10 +129,12 @@ func (cm *CaptureManager) CaptureResponse(requestID string, crw *capturingRespon
 	data := crw.CapturedBody()
 
 	body := &CapturedBody{
-		Size:        int64(len(data)),
-		Truncated:   crw.Truncated(),
-		ContentType: contentType,
-		IsBinary:    isBinaryContent(data, contentType),
+		Size:            crw.TotalSeen(),
+		CapturedSize:    int64(len(data)),
+		Truncated:       crw.Truncated(),
+		ContentType:     contentType,
+		ContentEncoding: crw.Header().Get("Content-Encoding"),
+		IsBinary:        isBinaryContent(data, contentType),
 	}
 
 	// Determine if we should store inline or on disk
@@ -198,6 +201,7 @@ type captureBuffer struct {
 	buf       bytes.Buffer
 	maxSize   int64
 	truncated bool
+	totalSeen int64 // total bytes observed across all writes, counting past truncation
 	requestID string
 	suffix    string
 	cm        *CaptureManager
@@ -208,7 +212,10 @@ func (cb *captureBuffer) Write(p []byte) (n int, err error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	if cb.truncated {
+	// Count every byte observed, including data discarded after truncation.
+	cb.totalSeen += int64(len(p))
+
+	if cb.truncated || len(p) == 0 {
 		return len(p), nil // Discard but pretend we wrote it
 	}
 
@@ -242,7 +249,8 @@ func (cb *captureBuffer) finalize() error {
 	}
 
 	data := cb.buf.Bytes()
-	cb.body.Size = int64(len(data))
+	cb.body.Size = cb.totalSeen
+	cb.body.CapturedSize = int64(len(data))
 	cb.body.Truncated = cb.truncated
 	cb.body.IsBinary = isBinaryContent(data, cb.body.ContentType)
 
@@ -301,6 +309,7 @@ type capturingResponseWriter struct {
 	maxBodySize int64
 	truncated   bool
 	wroteHeader bool
+	totalSeen   int64 // total bytes observed across all writes, counting past truncation
 }
 
 // newCapturingResponseWriter creates a new capturing response writer.
@@ -321,8 +330,11 @@ func (crw *capturingResponseWriter) WriteHeader(code int) {
 }
 
 func (crw *capturingResponseWriter) Write(p []byte) (int, error) {
+	// Count every byte observed, including data not retained after truncation.
+	crw.totalSeen += int64(len(p))
+
 	// Capture up to maxBodySize
-	if !crw.truncated {
+	if !crw.truncated && len(p) > 0 {
 		remaining := crw.maxBodySize - int64(crw.body.Len())
 		if remaining > 0 {
 			toCapture := p
@@ -352,6 +364,12 @@ func (crw *capturingResponseWriter) CapturedBody() []byte {
 // Truncated returns whether the body was truncated.
 func (crw *capturingResponseWriter) Truncated() bool {
 	return crw.truncated
+}
+
+// TotalSeen returns the total number of bytes observed by Write, counting
+// bytes that were not retained after truncation.
+func (crw *capturingResponseWriter) TotalSeen() int64 {
+	return crw.totalSeen
 }
 
 // Flush implements http.Flusher for streaming responses (SSE).
@@ -394,20 +412,18 @@ func cloneHeaders(h http.Header) http.Header {
 	return clone
 }
 
-// isBinaryContent determines if content appears to be binary based on data and content type.
+// isBinaryContent determines if content appears to be binary based on data and
+// content type.
+//
+// Integrity-first rule (D9): content is never classified as text unless the
+// COMPLETE retained data is valid UTF-8. Known-binary content types are always
+// binary; a text-y Content-Type never short-circuits to text — data validity
+// decides. The full-buffer scan (no 512-byte sampling) is bounded by the 1MB
+// capture cap.
 func isBinaryContent(data []byte, contentType string) bool {
-	// Check content type first
+	// Known-binary content types are binary regardless of the data.
 	if contentType != "" {
 		ct := strings.ToLower(contentType)
-		// Text types
-		if strings.HasPrefix(ct, "text/") ||
-			strings.Contains(ct, "json") ||
-			strings.Contains(ct, "xml") ||
-			strings.Contains(ct, "javascript") ||
-			strings.Contains(ct, "html") {
-			return false
-		}
-		// Known binary types
 		if strings.HasPrefix(ct, "image/") ||
 			strings.HasPrefix(ct, "audio/") ||
 			strings.HasPrefix(ct, "video/") ||
@@ -420,24 +436,19 @@ func isBinaryContent(data []byte, contentType string) bool {
 		}
 	}
 
-	// Check if the data is valid UTF-8 with no control characters (except common ones)
+	// Empty data is not binary.
 	if len(data) == 0 {
 		return false
 	}
 
-	// Sample the first 512 bytes
-	sample := data
-	if len(sample) > 512 {
-		sample = sample[:512]
-	}
-
-	if !utf8.Valid(sample) {
+	// The entire retained buffer must be valid UTF-8 to be considered text.
+	if !utf8.Valid(data) {
 		return true
 	}
 
-	// Check for binary indicators (non-printable characters)
-	for _, b := range sample {
-		// Allow common control characters: tab, newline, carriage return
+	// Scan the entire buffer for non-printable control characters.
+	// Allow common control characters: tab, newline, carriage return.
+	for _, b := range data {
 		if b < 32 && b != '\t' && b != '\n' && b != '\r' {
 			return true
 		}
