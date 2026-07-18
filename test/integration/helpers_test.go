@@ -215,17 +215,24 @@ func runProx(t *testing.T, binary string, args ...string) (string, int) {
 	return string(out), exitCode
 }
 
-// waitCmdExit waits for a started command to exit within timeout, killing it and
-// failing the test on timeout.
-func waitCmdExit(t *testing.T, cmd *exec.Cmd, timeout time.Duration) {
+// waitCmdExit waits for a started command to exit within timeout and returns the
+// exit error from Cmd.Wait (nil on a clean exit). On timeout it kills the process
+// directly (not via killProx, which would call Cmd.Wait a second time and race
+// this goroutine's Wait) and fails the test. Callers at clean-exit sites should
+// assert the returned error is nil.
+func waitCmdExit(t *testing.T, cmd *exec.Cmd, timeout time.Duration) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
-	case <-done:
+	case err := <-done:
+		return err
 	case <-time.After(timeout):
-		killProx(cmd)
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		t.Fatalf("process did not exit within %v", timeout)
+		return nil // unreachable; t.Fatalf stops the test
 	}
 }
 

@@ -355,6 +355,9 @@ func TestClient_Shutdown_WaitClean(t *testing.T) {
 
 func TestClient_Shutdown_WaitFailures(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("wait"); got != "true" {
+			t.Errorf("expected wait=true, got %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(api.ShutdownResponse{
 			Success: false,
@@ -387,6 +390,9 @@ func TestClient_Shutdown_WaitFailures(t *testing.T) {
 // pointer, so the CLI can distinguish it from a real waited response.
 func TestClient_Shutdown_WaitOldDaemon(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("wait"); got != "true" {
+			t.Errorf("expected wait=true, got %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(api.SuccessResponse{Success: true})
 	}))

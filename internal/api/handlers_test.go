@@ -1059,11 +1059,11 @@ func TestGetProxyRequest(t *testing.T) {
 // fakeShutdownController is a hand-driven ShutdownController for the shutdown
 // handler tests: complete() latches the outcome and closes Done().
 type fakeShutdownController struct {
-	mu        sync.Mutex
-	triggered int
-	done      chan struct{}
-	closeOnce sync.Once
-	outcome   *domain.ProcessStopError
+	mu           sync.Mutex
+	triggered    int
+	done         chan struct{}
+	completeOnce sync.Once
+	outcome      *domain.ProcessStopError
 }
 
 func newFakeShutdownController() *fakeShutdownController {
@@ -1086,9 +1086,14 @@ func (f *fakeShutdownController) Done() <-chan struct{} { return f.done }
 
 func (f *fakeShutdownController) Outcome() *domain.ProcessStopError { return f.outcome }
 
+// complete latches the outcome and closes Done() first-call-wins, matching the
+// production coordinator's contract: a later complete cannot overwrite the stored
+// outcome after Done() has closed.
 func (f *fakeShutdownController) complete(outcome *domain.ProcessStopError) {
-	f.outcome = outcome
-	f.closeOnce.Do(func() { close(f.done) })
+	f.completeOnce.Do(func() {
+		f.outcome = outcome
+		close(f.done)
+	})
 }
 
 func TestShutdownHandler_WaitClean(t *testing.T) {

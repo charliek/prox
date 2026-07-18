@@ -347,3 +347,58 @@ func TestPerformShutdown_RefusesLaunchesDuringDeregister(t *testing.T) {
 		t.Fatal("performShutdown did not finish after the deregister stage timed out")
 	}
 }
+
+// TestForwardShutdownSignal_TriggersOnSignal pins the forwarder wiring: a signal
+// delivered on the (fake) signal channel must request shutdown via the
+// coordinator. This is the regression guard for the pre-existing bug where a
+// --tui daemon queued an external SIGTERM forever because only the non-TUI branch
+// consumed sigCh. The full TUI+SIGTERM path stays untestable headless.
+func TestForwardShutdownSignal_TriggersOnSignal(t *testing.T) {
+	coordinator := newShutdownCoordinator()
+	sigCh := make(chan os.Signal, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var logged string
+	go forwardShutdownSignal(ctx, sigCh, coordinator, func(format string, args ...interface{}) {
+		logged = fmt.Sprintf(format, args...)
+	})
+
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case <-coordinator.TriggerCh():
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarder did not trigger shutdown on a signal")
+	}
+	assert.Contains(t, logged, "received")
+}
+
+// TestForwardShutdownSignal_ExitsOnContextCancel confirms the forwarder does not
+// leak: with no signal, canceling ctx returns it (and it must NOT trigger).
+func TestForwardShutdownSignal_ExitsOnContextCancel(t *testing.T) {
+	coordinator := newShutdownCoordinator()
+	sigCh := make(chan os.Signal, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		forwardShutdownSignal(ctx, sigCh, coordinator, nil)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarder did not exit on context cancel")
+	}
+
+	select {
+	case <-coordinator.TriggerCh():
+		t.Fatal("forwarder must not trigger shutdown when it exits on ctx cancel")
+	default:
+	}
+}

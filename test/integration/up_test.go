@@ -151,8 +151,10 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 		t.Errorf("expected a stopped summary, got:\n%s", out)
 	}
 
-	// The foreground daemon must have exited as part of the waited stop.
-	waitCmdExit(t, cmd, 10*time.Second)
+	// The foreground daemon must have exited cleanly as part of the waited stop.
+	if err := waitCmdExit(t, cmd, 10*time.Second); err != nil {
+		t.Errorf("foreground prox up should exit 0 on a clean stop, got %v", err)
+	}
 
 	// State + PID files must be cleaned up.
 	root := projectRoot(t)
@@ -184,7 +186,9 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 		t.Errorf("async POST /shutdown should return promptly, took %v", elapsed)
 	}
 
-	waitCmdExit(t, cmd, 15*time.Second)
+	if err := waitCmdExit(t, cmd, 15*time.Second); err != nil {
+		t.Errorf("foreground prox up should exit 0 after an async clean stop, got %v", err)
+	}
 }
 
 // TestStopCommand_DoubleStopNoPanic runs `prox stop` twice against the same
@@ -221,7 +225,11 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 		t.Fatal("first prox stop did not finish")
 	}
 
-	waitCmdExit(t, prox.cmd, 15*time.Second)
+	// The daemon does a clean stop (reapable processes), so the foreground exits 0
+	// regardless of how many stop clients connected.
+	if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+		t.Errorf("daemon should exit 0 on a clean double stop, got %v", err)
+	}
 
 	// The daemon must not have panicked.
 	if daemonOut := prox.Output(); strings.Contains(daemonOut, "panic:") {

@@ -340,6 +340,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Forward an external SIGINT/SIGTERM into the shutdown coordinator so BOTH the
+	// TUI and non-TUI daemons honor it. signal.Notify above disables Go's default
+	// signal handler, so without a consumer a --tui daemon would queue an external
+	// SIGTERM forever and never tear down. Routing the signal through Trigger()
+	// gives it the same path as POST /shutdown. The goroutine consumes sigCh
+	// exactly once, then exits on ctx cancellation (defer cancel at runUp return)
+	// so it never leaks.
+	go forwardShutdownSignal(ctx, sigCh, coordinator, sup.SystemLog)
+
 	// Start proxy — either via shared daemon or standalone fallback.
 	var proxyService *proxy.Service
 	var daemonClient *proxyd.Client
@@ -430,18 +439,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// Subscribe to logs and print to terminal
 		go printLogs(logMgr)
 
-		// Wait for shutdown signal
-		select {
-		case sig := <-sigCh:
-			fmt.Println() // Print newline after ^C
-			sup.SystemLog("%s received", sig)
-		case <-coordinator.TriggerCh():
-			fmt.Println() // Print newline
-			sup.SystemLog("shutdown requested via API")
-		}
+		// Wait for shutdown. Both a signal (via forwardShutdownSignal above, which
+		// also logs it) and an API/TUI-quit trigger arrive as a coordinator trigger,
+		// so this selects on the one channel.
+		<-coordinator.TriggerCh()
+		fmt.Println() // Print newline (past any echoed ^C)
 	}
 
-	// Stop signal handler to prevent additional signals during shutdown
+	// Stop signal handler to prevent additional signals during shutdown. The
+	// forwarder goroutine, if still blocked on sigCh, exits when ctx is canceled at
+	// runUp return.
 	signal.Stop(sigCh)
 
 	// Run the extracted shutdown sequence (same for the signal and API paths).
@@ -475,6 +482,22 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("shutdown incomplete: %w", outcome)
 	}
 	return nil
+}
+
+// forwardShutdownSignal blocks until an external SIGINT/SIGTERM arrives on sigCh
+// or ctx is canceled. On a signal it logs the receipt via logf and requests
+// shutdown through the coordinator (the same path as POST /shutdown), so a daemon
+// in either TUI or non-TUI mode honors the signal. It consumes at most one signal
+// and returns on ctx cancellation, so it never outlives runUp.
+func forwardShutdownSignal(ctx context.Context, sigCh <-chan os.Signal, coordinator *shutdownCoordinator, logf func(string, ...interface{})) {
+	select {
+	case sig := <-sigCh:
+		if sig != nil && logf != nil {
+			logf("%s received", sig)
+		}
+		coordinator.Trigger()
+	case <-ctx.Done():
+	}
 }
 
 // shutdownDeps bundles everything performShutdown needs. The supervisor is the
@@ -587,9 +610,17 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	var outcome *domain.ProcessStopError
 	if stopErr != nil {
 		if !errors.As(stopErr, &outcome) {
-			// Non-aggregate error (ctx expiry with nothing recorded, etc.): log it;
-			// there is no typed survivor list to publish.
+			// Invariant: today sup.Stop returns only *ProcessStopError or nil, so this
+			// branch is defensive. But an acknowledged non-aggregate error (e.g. a ctx
+			// expiry, or a future error type) must NOT read as a clean stop: leaving
+			// outcome nil here would Complete(nil), hand waited clients success, and
+			// exit the foreground 0 despite the failure. Synthesize a single-failure
+			// aggregate so the error latches, reaches waited clients, and fails the
+			// foreground exit contract.
 			deps.sup.SystemLog("supervisor stop error: %v", stopErr)
+			outcome = &domain.ProcessStopError{
+				Failures: []domain.ProcessStopFailure{{Name: "supervisor", Err: stopErr}},
+			}
 		}
 	}
 
