@@ -1277,3 +1277,127 @@ func TestRequestsSearch_SingleMatchNextPrevNoop(t *testing.T) {
 	assert.Equal(t, 2, m.cursorIdx, "N with a sole match is a no-op")
 	assert.Equal(t, "req-002", m.cursorID)
 }
+
+// newInFlightDetailModel opens the detail view (local mode) for a single
+// in-flight request, viewport sized so its content Height is viewportHeight,
+// and returns the model with the detail already rendered from the top.
+func newInFlightDetailModel(t *testing.T, id string, viewportHeight int) Model {
+	t.Helper()
+	inFlight := proxy.RequestRecord{
+		ID: id, Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
+	}
+	m := newSearchModel(viewportHeight, []proxy.RequestRecord{inFlight})
+	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	require.Equal(t, ViewModeRequestDetail, m.viewMode)
+	require.NotNil(t, m.requestDetail)
+	require.True(t, m.requestDetail.InFlight)
+	return m
+}
+
+// finalRecordFor builds the completed (non-in-flight) record that would
+// arrive as the matching final ProxyRequestMsg for an in-flight row with the
+// given id, carrying Details so the refresh has something visible to render.
+func finalRecordFor(id string) proxy.RequestRecord {
+	return proxy.RequestRecord{
+		ID:         id,
+		Timestamp:  time.Now(),
+		Method:     "GET",
+		URL:        "/x",
+		StatusCode: 200,
+		Duration:   42 * time.Millisecond,
+		InFlight:   false,
+		Details: &proxy.RequestDetails{
+			RequestHeaders: map[string][]string{"X-Test": {"yes"}},
+		},
+	}
+}
+
+// TestModel_DetailLiveRefresh_LocalMatchingFinalRefreshesInPlace pins D15:
+// completing an in-flight request whose detail is open refreshes the view in
+// place — Details render, the "(in flight)" note disappears, and the
+// reader's scroll position is preserved (detail content only grows on
+// completion, and SetContent never resets YOffset on growth).
+func TestModel_DetailLiveRefresh_LocalMatchingFinalRefreshesInPlace(t *testing.T) {
+	m := newInFlightDetailModel(t, "req-1", 5)
+	assert.Contains(t, strings.Join(m.formatRequestDetail(), "\n"), "in flight")
+
+	m.viewport.SetYOffset(2)
+	require.Equal(t, 2, m.viewport.YOffset, "precondition: reader scrolled mid-read")
+
+	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-1")))
+
+	require.NotNil(t, m.requestDetail)
+	assert.False(t, m.requestDetail.InFlight)
+	assert.Equal(t, int64(42), m.requestDetail.DurationMs)
+	assert.Equal(t, 2, m.viewport.YOffset, "reader's scroll position is preserved")
+	rendered := strings.Join(m.formatRequestDetail(), "\n")
+	assert.NotContains(t, rendered, "in flight")
+	assert.Contains(t, rendered, "X-Test", "Details render after the refresh")
+}
+
+// TestModel_DetailLiveRefresh_NonMatchingIDNoRefresh pins that a final record
+// for a DIFFERENT request than the one open in the detail view leaves the
+// displayed snapshot untouched (the list still updates independently).
+func TestModel_DetailLiveRefresh_NonMatchingIDNoRefresh(t *testing.T) {
+	m := newInFlightDetailModel(t, "req-1", 5)
+
+	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-other")))
+
+	assert.True(t, m.requestDetail.InFlight, "the open detail is unaffected by another row's completion")
+	assert.Len(t, m.proxyRequests, 2, "the list still gains the new row")
+}
+
+// TestModel_DetailLiveRefresh_StillInFlightNoRefresh pins that a duplicate
+// in-flight message for the OPEN request (record.InFlight still true) does
+// not trigger a refresh — only a final (!InFlight) record does.
+func TestModel_DetailLiveRefresh_StillInFlightNoRefresh(t *testing.T) {
+	m := newInFlightDetailModel(t, "req-1", 5)
+
+	stillInFlight := proxy.RequestRecord{
+		ID: "req-1", Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
+	}
+	m = updateModel(m, ProxyRequestMsg(stillInFlight))
+
+	assert.True(t, m.requestDetail.InFlight, "a still-in-flight duplicate must not be treated as the refresh")
+}
+
+// TestModel_DetailLiveRefresh_NotInDetailViewNoRefresh pins the list-only
+// path: a final ProxyRequestMsg arriving while the requests view (not the
+// detail view) is showing must not populate requestDetail — refresh only
+// applies to an OPEN detail view.
+func TestModel_DetailLiveRefresh_NotInDetailViewNoRefresh(t *testing.T) {
+	inFlight := proxy.RequestRecord{
+		ID: "req-1", Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
+	}
+	m := newSearchModel(5, []proxy.RequestRecord{inFlight})
+	require.Equal(t, ViewModeRequests, m.viewMode)
+	require.Nil(t, m.requestDetail)
+
+	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-1")))
+
+	assert.Equal(t, ViewModeRequests, m.viewMode)
+	assert.Nil(t, m.requestDetail, "no detail view is open, so nothing is populated")
+}
+
+func TestModel_DetailLiveRefresh_ShrinkingContentClamps(t *testing.T) {
+	// A capture-disabled final detail is SHORTER than the in-flight view it
+	// replaces (the two in-flight note lines vanish and no header/body
+	// sections take their place). A bottom-scrolled reader must be pulled
+	// back to the last valid offset, not left on blank overscroll.
+	m := newInFlightDetailModel(t, "req-1", 3)
+	m.viewport.GotoBottom()
+	require.Positive(t, m.viewport.YOffset, "test needs a scrolled-down detail view")
+
+	final := finalRecordFor("req-1")
+	final.Details = nil // capture disabled: no headers/bodies arrive
+	m = updateModel(m, ProxyRequestMsg(final))
+
+	require.NotNil(t, m.requestDetail)
+	assert.False(t, m.requestDetail.InFlight)
+	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	assert.LessOrEqual(t, m.viewport.YOffset, maxOffset,
+		"refresh onto shorter content must clamp the viewport offset")
+}

@@ -83,6 +83,13 @@ type BaseModel struct {
 	requestDetail     *RequestDetailData
 	detailLoading     bool
 	detailError       error
+	// detailRefreshFailed marks a live-refresh attempt (attach mode only —
+	// D16) that failed while a snapshot was already on screen: the snapshot
+	// is kept rather than replaced by the error view, and
+	// formatRequestDetail swaps the "(request in flight...)" note for a
+	// refresh-failed one instead. Cleared on any successful detail apply and
+	// on leaving the detail view (esc).
+	detailRefreshFailed bool
 
 	// Dimensions
 	width  int
@@ -401,6 +408,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.selectedRequestID = ""
 			b.requestDetail = nil
 			b.detailError = nil
+			b.detailRefreshFailed = false
 			b.updateViewport()
 			return true
 		}
@@ -699,6 +707,17 @@ func (b *BaseModel) ensureCursorVisible() {
 	}
 }
 
+// clampViewportToContent pulls the viewport back when a content replacement
+// left the scroll offset past the end — a capture-disabled final detail can be
+// SHORTER than the in-flight view it replaces (the in-flight note vanishes and
+// no body sections take its place), stranding a bottom-scrolled reader on
+// blank overscroll.
+func (b *BaseModel) clampViewportToContent() {
+	if maxOffset := b.viewport.TotalLineCount() - b.viewport.Height; b.viewport.YOffset > maxOffset {
+		b.viewport.SetYOffset(max(0, maxOffset))
+	}
+}
+
 // updateViewport updates the viewport content
 func (b *BaseModel) updateViewport() {
 	var lines []string
@@ -798,7 +817,14 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// rendering nothing.
 	if d.InFlight {
 		lines = append(lines, "")
-		lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
+		if b.detailRefreshFailed {
+			// A live-refresh attempt (attach mode — D16) failed while this
+			// in-flight snapshot was on screen: say so instead of silently
+			// re-promising details that may never arrive automatically.
+			lines = append(lines, dimStyle.Render("(live refresh failed — press esc and re-enter to reload)"))
+		} else {
+			lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
+		}
 	}
 
 	// Request headers

@@ -141,9 +141,14 @@ Request Body (35 bytes, application/json)
   (e.g. evicted from disk) show `(body no longer available)`.
 - A request still streaming its response shows `Duration: (in flight)` and,
   since headers/bodies haven't been captured yet, `(request in flight —
-  details arrive on completion)` instead of the usual body sections. Detail
-  views do not live-update — reopen the request after it completes to see
-  its final headers and bodies.
+  details arrive on completion)` instead of the usual body sections.
+- Detail views live-update: when the open request completes, the view
+  refreshes in place with its final duration, headers, and bodies, and your
+  scroll position is preserved. In local mode (`prox up`) this happens
+  instantly from the streamed record; in client mode (`prox attach`) it
+  re-fetches the request in the background, with no loading flicker. If that
+  background re-fetch fails, the last snapshot stays on screen and the note
+  changes to `(live refresh failed — press esc and re-enter to reload)`.
 
 ## Process Filter Mode
 
