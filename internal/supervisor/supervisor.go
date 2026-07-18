@@ -390,6 +390,23 @@ func stopEvent(err error) (EventType, bool) {
 	}
 }
 
+// RefuseLaunches closes the launch gate ahead of Stop. Daemon shutdown runs an
+// earlier teardown stage (proxyd deregister, up to a few seconds) BEFORE Stop
+// flips the gate itself, and the API keeps serving through that stage; without
+// this a StartProcess/RestartProcess arriving in that window would still launch a
+// process the shutdown is about to orphan. Calling this at the very top of the
+// shutdown sequence closes the gate immediately. It is just s.launchable.Store(
+// false) -- idempotent with the identical flip Stop performs, so calling both is
+// harmless, and it does NOT change supervisor state (still "running") so the
+// read-only API stays fully answerable during the drain.
+//
+// Accepted residual: a restart already past its pre-checks can still stop its
+// current process and is only refused at the start half -- fine, shutdown was
+// about to stop that process anyway (#36, D4).
+func (s *Supervisor) RefuseLaunches() {
+	s.launchable.Store(false)
+}
+
 // Stop stops all processes and the supervisor.
 //
 // The signature stays the idiomatic Stop(ctx) error, but the concrete failure

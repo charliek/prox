@@ -361,3 +361,44 @@ func TestSupervisorStop_SecondaryOutlivesFinalizationWindow(t *testing.T) {
 	assert.ErrorIs(t, serr, domain.ErrProcessGroupNotReaped,
 		"the secondary outlived the finalization tail and carried the true verdict")
 }
+
+// TestSupervisorStop_StatusReadableDuringDrain pins the property the C4 stage
+// reorder exists for -- the daemon can answer read-only status while a stop is
+// draining -- at the supervisor level (the full HTTP-level check lands in C5).
+// A process's stop is parked mid-drain (state Stopping, s.mu released, p.mu not
+// held at the "primary-installed" seam); Processes() and Status() must still
+// answer promptly rather than block behind the parked stop. Deterministic via
+// the stopBarrier seam (no sleeps).
+func TestSupervisorStop_StatusReadableDuringDrain(t *testing.T) {
+	sup := newStopSupervisor(t, map[string]*fakeProcess{
+		"web": newGracefulFake(11001),
+	}, "5s")
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+
+	mp := getManagedProcess(t, sup, "web")
+	gate := newStopGate()
+	mp.stopBarrier = gate.barrier
+
+	stopCh := make(chan error, 1)
+	go func() { stopCh <- sup.Stop(context.Background()) }()
+	gate.awaitPrimary(t) // parked mid-stop: state Stopping, drain in progress
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		procs := sup.Processes()
+		assert.Len(t, procs, 1, "Processes must still answer during the drain")
+		st := sup.Status()
+		assert.NotEmpty(t, st.State, "Status must still answer during the drain")
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Processes/Status blocked while a stop was parked mid-drain")
+	}
+
+	close(gate.releasePrimary)
+	require.NoError(t, recvErr(t, stopCh, "Supervisor.Stop"), "the parked clean stop must finish nil")
+}

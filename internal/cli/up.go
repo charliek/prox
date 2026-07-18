@@ -295,11 +295,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supConfig)
 
-	// Create shutdown channel
-	shutdownCh := make(chan struct{})
-	shutdownFn := func() {
-		close(shutdownCh)
-	}
+	// Create the shutdown coordinator. Its Trigger()/TriggerCh() replace the raw
+	// shutdownCh (a bare close was a latent double-close panic on a second POST
+	// /shutdown); its Done()/Outcome() latch the process-stop verdict for the
+	// foreground exit contract. For now the API handlers still receive the plain
+	// shutdownFn closure (= coordinator.Trigger) — C5 hands them the coordinator
+	// itself so wait=true handlers can read Done()/Outcome().
+	coordinator := newShutdownCoordinator()
+	shutdownFn := coordinator.Trigger
 
 	// Determine if authentication is required
 	authEnabled := isAuthRequired(cfg)
@@ -415,9 +418,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Handle TUI vs terminal output
 	if useTUI {
-		// Run TUI - it blocks until quit
+		// Run TUI - it blocks until quit. Passing the coordinator's trigger channel
+		// lets POST /shutdown quit the program (a goroutine inside tui.Run calls
+		// p.Quit() on trigger), so a TUI daemon honors the API shutdown and runs the
+		// same shutdown sequence + exit contract below. Quitting the TUI by hand
+		// still returns from tui.Run into that same sequence, unchanged.
 		reqMgr := localRequestManager(proxyService, handlers)
-		if err := tui.Run(sup, logMgr, reqMgr); err != nil {
+		if err := tui.Run(sup, logMgr, reqMgr, coordinator.TriggerCh()); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
@@ -429,7 +436,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		case sig := <-sigCh:
 			fmt.Println() // Print newline after ^C
 			sup.SystemLog("%s received", sig)
-		case <-shutdownCh:
+		case <-coordinator.TriggerCh():
 			fmt.Println() // Print newline
 			sup.SystemLog("shutdown requested via API")
 		}
@@ -438,74 +445,186 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Stop signal handler to prevent additional signals during shutdown
 	signal.Stop(sigCh)
 
-	// Graceful shutdown. Each stage gets its own deadline computed at shutdown
-	// time, rather than one shared deadline, so proxy/API teardown time can
-	// never eat into the supervisor's process-stop budget (#35, D2):
-	//   - proxy deregister/shutdown: teardownStageTimeout (fixed, short)
-	//   - API-server shutdown:       teardownStageTimeout (fixed, short;
-	//     force-closes any in-flight lifecycle request, whose process is then
-	//     stopped by sup.Stop immediately below)
-	//   - supervisor stop: MaxStopBudget()+margin, read live so hot-reloaded
-	//     per-process budgets are honored.
+	// Run the extracted shutdown sequence (same for the signal and API paths).
+	// It tears down proxy + supervisor + API server in order, latches the
+	// process-stop verdict on the coordinator, and flushes+closes the log manager
+	// (before the API stage — see performShutdown).
+	outcome := performShutdown(shutdownDeps{
+		sup:          sup,
+		daemonClient: daemonClient,
+		proxyService: proxyService,
+		apiServer:    apiServer,
+		coordinator:  coordinator,
+		logMgr:       logMgr,
+		cwd:          cwd,
+		stageTimeout: teardownStageTimeout,
+	})
+	// performShutdown already tore the standalone proxy down; nil the local so the
+	// early-error cleanup defer (registered above) stays a no-op.
+	proxyService = nil
 
-	// Deregister from shared daemon or stop standalone proxy
-	if daemonClient != nil {
-		if err := daemonClient.Deregister(proxyd.DeregisterRequest{
-			ProjectDir: cwd,
-			PID:        os.Getpid(),
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to deregister from proxy daemon: %v\n", err)
+	// Foreground exit contract: a surviving process group makes `prox up` exit
+	// non-zero (cobra maps a non-nil RunE error to exit 1). Intentional split:
+	// per-process detail already went to the log stream via SystemLog inside
+	// performShutdown (the only record in detached mode), so here we return ONE
+	// concise summary line rather than also letting cobra reprint every survivor —
+	// wrapping the aggregate with %w keeps errors.Is/errors.As intact on the
+	// returned error. Ctrl-C and API-triggered shutdowns behave identically.
+	// Breaking change: foreground `prox up` previously always exited 0 (CHANGELOG
+	// in C5).
+	if outcome != nil {
+		return fmt.Errorf("shutdown incomplete: %w", outcome)
+	}
+	return nil
+}
+
+// shutdownDeps bundles everything performShutdown needs. The supervisor is the
+// real concrete type (unit tests drive it through its fake-runner seams); the
+// proxy/API/logMgr deps are nil-able so a helper unit test needs no sockets or
+// daemon.
+type shutdownDeps struct {
+	sup          *supervisor.Supervisor
+	daemonClient *proxyd.Client
+	proxyService *proxy.Service
+	apiServer    *api.Server
+	coordinator  *shutdownCoordinator
+	logMgr       *logs.Manager
+	cwd          string
+	stageTimeout time.Duration
+}
+
+// performShutdown runs the daemon-side shutdown sequence and returns the
+// process-stop verdict (nil = clean). It is called from both the signal and API
+// paths (they already share the wait select) and is extracted from runUp so unit
+// tests can drive it with fakes.
+//
+// Stage order (each stage gets its own deadline so a slow stage never eats
+// another's budget, #35/D2):
+//
+//  0. RefuseLaunches — close the launch gate immediately (see below);
+//  1. proxy deregister (shared daemon) / standalone-proxy shutdown — stageTimeout;
+//  2. sup.Stop — StopWaitBound()+stageTimeout, sized from the live per-process
+//     budgets so hot-reloaded stop_timeouts are honored, and capturing the
+//     aggregate survivor verdict;
+//  3. coordinator.Complete(outcome) — publish the verdict to any waiter;
+//  4. flush + logMgr.Close() — closes SSE log subscribers so they stop holding the
+//     API open (see below);
+//  5. API-server shutdown — stageTimeout.
+//
+// The launch gate is closed FIRST (RefuseLaunches), before the deregister stage,
+// because the API keeps serving through deregister (which can take seconds) and
+// Stop's own gate flip only happens in stage 2 — without this, a StartProcess/
+// RestartProcess arriving during deregister would launch a process shutdown is
+// about to orphan.
+//
+// The API server is shut down AFTER the supervisor stage (not before, as it was
+// pre-C4) so it outlives sup.Stop: a future wait=true response (C5) must still be
+// deliverable when the verdict lands. http.Server.Shutdown never force-closes
+// in-flight requests — it stops accepting new connections, then waits for active
+// handlers to return and leaves anything still running when the deadline passes
+// for the client to see as a dropped connection. Lifecycle launches during this
+// window are refused (the #41 state gate + the C2 launch gate).
+//
+// Deviation from the plan's D4 stage order (API shutdown → flush): the log manager
+// is closed BEFORE the API stage. GET /logs/stream (SSE) handlers range over a log
+// subscription channel and would otherwise hold their connection until the 30s
+// route timeout, making apiServer.Shutdown sit out its full 5s stage on every
+// shutdown with a stream attached. Closing the manager closes those subscriber
+// channels so the handlers return at once; the API stage then only waits for any
+// small wait=true JSON write. This is safe because Write-after-Close is a no-op
+// (RingBuffer.Write always succeeds; Broadcast/Send short-circuit on a closed
+// subscription) and non-streaming GET /logs still reads the intact ring buffer, so
+// no handler panics.
+func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
+	// Stage 0: refuse new launches for the whole shutdown, including the deregister
+	// stage below (the API still serves there, before Stop's own gate flip).
+	if deps.sup != nil {
+		deps.sup.RefuseLaunches()
+	}
+
+	// Stage 1a: deregister from the shared proxy daemon. The proxyd client carries
+	// its own 30s HTTP timeout and takes no ctx, so bound it to the stage here:
+	// run it on a goroutine and proceed once the stage deadline passes, leaving the
+	// call to finish or fail in the background (harmless — the daemon is exiting).
+	if deps.daemonClient != nil {
+		derr := make(chan error, 1) // buffered so an abandoned goroutine never leaks
+		go func() {
+			derr <- deps.daemonClient.Deregister(proxyd.DeregisterRequest{
+				ProjectDir: deps.cwd,
+				PID:        os.Getpid(),
+			})
+		}()
+		timer := time.NewTimer(deps.stageTimeout)
+		select {
+		case err := <-derr:
+			timer.Stop()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to deregister from proxy daemon: %v\n", err)
+			}
+		case <-timer.C:
+			fmt.Fprintf(os.Stderr, "Warning: proxy daemon deregister exceeded %s; abandoning in background\n", deps.stageTimeout)
 		}
 	}
-	if proxyService != nil {
-		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), teardownStageTimeout)
-		if err := proxyService.Shutdown(proxyCtx); err != nil {
+
+	// Stage 1b: stop the standalone proxy (listeners only, never processes).
+	if deps.proxyService != nil {
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), deps.stageTimeout)
+		if err := deps.proxyService.Shutdown(proxyCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
 		}
 		proxyCancel()
-		proxyService = nil
 	}
 
-	// Stop API server
-	apiCtx, apiCancel := context.WithTimeout(context.Background(), teardownStageTimeout)
-	if err := apiServer.Shutdown(apiCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-	}
-	apiCancel()
-
-	// Stop supervisor with a deadline sized from the live per-process stop
-	// budgets, plus stopVerdictMargin (so a stop joining an in-flight primary
-	// outlives its finalization window) and a stage margin. StopWaitBound()
-	// folds in the per-process budget + verdict margin so this call site does not
-	// duplicate the constant (#36, D3).
-	supCtx, supCancel := context.WithTimeout(context.Background(), sup.StopWaitBound()+teardownStageTimeout)
-	stopErr := sup.Stop(supCtx)
+	// Stage 2: stop the supervisor and capture the aggregate verdict.
+	supCtx, supCancel := context.WithTimeout(context.Background(), deps.sup.StopWaitBound()+deps.stageTimeout)
+	stopErr := deps.sup.Stop(supCtx)
 	supCancel()
+
+	var outcome *domain.ProcessStopError
 	if stopErr != nil {
-		// Surface each survivor via the existing SystemLog pattern so operators see
-		// which process leaked a group. C4 wires this outcome into the shutdown
-		// coordinator (the blocking endpoint's failure body and the foreground exit
-		// contract); C3 only captures and logs it and does NOT change runUp's return.
-		var stopFail *domain.ProcessStopError
-		if errors.As(stopErr, &stopFail) {
-			for _, f := range stopFail.Failures {
-				sup.SystemLog("process %s did not stop cleanly: %v", f.Name, f.Err)
-			}
-		} else {
-			sup.SystemLog("supervisor stop error: %v", stopErr)
+		if !errors.As(stopErr, &outcome) {
+			// Non-aggregate error (ctx expiry with nothing recorded, etc.): log it;
+			// there is no typed survivor list to publish.
+			deps.sup.SystemLog("supervisor stop error: %v", stopErr)
 		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", stopErr)
 	}
 
-	// Log shutdown complete before closing the log manager
-	sup.SystemLog("shutdown complete")
+	// Stage 3: publish the verdict. A latched broadcast — waiters (zero today, C5's
+	// wait=true handlers next) read the same stored outcome after <-Done().
+	if deps.coordinator != nil {
+		deps.coordinator.Complete(outcome)
+	}
 
-	// Give a moment for the log to be printed
+	// Stage 4: log the final lines, then flush and close the log manager BEFORE the
+	// API stage. Per-survivor detail goes to the log stream here (the only record in
+	// detached mode); runUp returns a one-line summary for the exit code. Closing the
+	// manager closes every SSE subscriber channel so /logs/stream handlers return and
+	// do not pin the API server open through the next stage (see the doc comment).
+	if deps.sup != nil {
+		if outcome != nil {
+			for _, f := range outcome.Failures {
+				deps.sup.SystemLog("process %s did not stop cleanly: %v", f.Name, f.Err)
+			}
+		}
+		deps.sup.SystemLog("shutdown complete")
+	}
+	// Give the terminal log printer a moment to drain the final lines before Close.
 	time.Sleep(logFlushDelay)
+	if deps.logMgr != nil {
+		deps.logMgr.Close()
+	}
 
-	// Close log manager
-	logMgr.Close()
-	return nil
+	// Stage 5: stop the API server, now that the verdict is published, the log
+	// subscribers are released, and any waited response can drain.
+	if deps.apiServer != nil {
+		apiCtx, apiCancel := context.WithTimeout(context.Background(), deps.stageTimeout)
+		if err := deps.apiServer.Shutdown(apiCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		apiCancel()
+	}
+
+	return outcome
 }
 
 // proxDir returns the prox config directory path (~/.prox)

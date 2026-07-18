@@ -88,6 +88,31 @@ func TestLaunchGate_StartAndRestartRefusedAfterStop(t *testing.T) {
 		"RestartProcess must refuse after shutdown")
 }
 
+// TestLaunchGate_RefuseLaunchesClosesGate pins the pre-shutdown gate flip
+// (#36, D4): RefuseLaunches closes the launch gate WITHOUT moving the supervisor
+// out of "running" (so the #41 state pre-check does not fire and read-only status
+// stays answerable), and a subsequent launch is refused by the gate itself. It is
+// idempotent with the flip Stop performs. A restart is used so the start half
+// reaches the gate after its stop half leaves the running state (a StartProcess on
+// the still-running process would short-circuit on the already-running guard).
+func TestLaunchGate_RefuseLaunchesClosesGate(t *testing.T) {
+	runner := newFakeRunner(func(call int) *fakeProcess { return newGracefulFake(1000 + call) })
+	sup := newPlainSupervisor(t, runner)
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+
+	sup.RefuseLaunches()
+	assert.Equal(t, "running", sup.Status().State,
+		"RefuseLaunches must not change supervisor state (read-only API stays answerable)")
+
+	assert.ErrorIs(t, sup.RestartProcess(context.Background(), "web"), domain.ErrShutdownInProgress,
+		"a launch after RefuseLaunches must be refused by the gate")
+
+	// Idempotent with Stop's own flip: a following Stop still completes cleanly.
+	require.NoError(t, sup.Stop(context.Background()))
+}
+
 // TestLaunchGate_RestartRefusedAfterStopBeganNoSwap drives the gate path
 // specifically (past the #41 pre-check): a restart is parked in the unlocked gap
 // between its stop half and its start half while a full Supervisor.Stop flips the
