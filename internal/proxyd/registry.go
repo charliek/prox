@@ -24,15 +24,20 @@ type Route struct {
 	ProjectDir   string
 	PID          int
 	RegisteredAt time.Time
+	// CaptureEnabled is stamped from the owning project's registration so the
+	// dynamic proxy can gate body capture per project (a capture-disabled
+	// project's traffic is recorded as metadata only).
+	CaptureEnabled bool
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
 type ProjectRegistration struct {
-	Dir          string
-	PID          int
-	Domain       string
-	RouteKeys    []string // "hostname:port" keys into the routes map
-	RegisteredAt time.Time
+	Dir            string
+	PID            int
+	Domain         string
+	RouteKeys      []string // "hostname:port" keys into the routes map
+	RegisteredAt   time.Time
+	CaptureEnabled bool
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -143,13 +148,14 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	for _, p := range pending {
 		key := routeKey(p.hostname, p.port)
 		r.routes[key] = &Route{
-			Hostname:     p.hostname,
-			Port:         p.port,
-			Protocol:     p.protocol,
-			Target:       p.target,
-			ProjectDir:   req.ProjectDir,
-			PID:          req.PID,
-			RegisteredAt: now,
+			Hostname:       p.hostname,
+			Port:           p.port,
+			Protocol:       p.protocol,
+			Target:         p.target,
+			ProjectDir:     req.ProjectDir,
+			PID:            req.PID,
+			RegisteredAt:   now,
+			CaptureEnabled: req.CaptureEnabled,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -168,11 +174,12 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	r.projects[req.ProjectDir] = &ProjectRegistration{
-		Dir:          req.ProjectDir,
-		PID:          req.PID,
-		Domain:       req.Domain,
-		RouteKeys:    routeKeys,
-		RegisteredAt: now,
+		Dir:            req.ProjectDir,
+		PID:            req.PID,
+		Domain:         req.Domain,
+		RouteKeys:      routeKeys,
+		RegisteredAt:   now,
+		CaptureEnabled: req.CaptureEnabled,
 	}
 
 	for port, proto := range portsNeeded {

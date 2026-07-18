@@ -290,6 +290,51 @@ func TestRegistry_ListenerPorts(t *testing.T) {
 	}
 }
 
+func TestRegistry_StampsCaptureEnabled(t *testing.T) {
+	reg := NewRegistry()
+
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}},
+		80, 443,
+	)
+	req.CaptureEnabled = true
+	if _, _, err := reg.Register(req); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Every route the project registered carries the capture flag.
+	for _, port := range []int{80, 443} {
+		route, ok := reg.Lookup("api.local.dev", port)
+		if !ok {
+			t.Fatalf("Lookup(api.local.dev, %d) returned false", port)
+		}
+		if !route.CaptureEnabled {
+			t.Errorf("route on port %d: CaptureEnabled = false, want true", port)
+		}
+	}
+}
+
+func TestRegistry_CaptureDisabledByDefault(t *testing.T) {
+	reg := NewRegistry()
+
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}},
+		0, 443,
+	)
+	// CaptureEnabled left false.
+	if _, _, err := reg.Register(req); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	route, ok := reg.Lookup("api.local.dev", 443)
+	if !ok {
+		t.Fatal("Lookup returned false")
+	}
+	if route.CaptureEnabled {
+		t.Error("route CaptureEnabled = true, want false")
+	}
+}
+
 func TestRegistry_DifferentPorts(t *testing.T) {
 	reg := NewRegistry()
 

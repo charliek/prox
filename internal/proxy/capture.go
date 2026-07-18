@@ -230,6 +230,7 @@ type captureBuffer struct {
 	buf       bytes.Buffer
 	maxSize   int64
 	truncated bool
+	finalized bool
 	totalSeen int64 // total bytes observed across all writes, counting past truncation
 	requestID string
 	suffix    string
@@ -240,6 +241,13 @@ type captureBuffer struct {
 func (cb *captureBuffer) Write(p []byte) (n int, err error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+
+	// Once finalized, the CapturedBody snapshot is frozen: late writes from a
+	// transport goroutine still draining a canceled request must not mutate
+	// state that a recorded (and possibly already-serialized) body points at.
+	if cb.finalized {
+		return len(p), nil
+	}
 
 	// Count every byte observed, including data discarded after truncation.
 	cb.totalSeen += int64(len(p))
@@ -273,9 +281,10 @@ func (cb *captureBuffer) finalize() error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	if cb.body == nil {
+	if cb.body == nil || cb.finalized {
 		return nil
 	}
+	cb.finalized = true
 
 	data := cb.buf.Bytes()
 	cb.body.Size = cb.totalSeen
@@ -326,6 +335,22 @@ func (crc *captureReadCloser) Close() error {
 	return crc.Closer.Close()
 }
 
+// FinalizeRequestBody forces finalization of a request body previously wrapped
+// by CaptureRequest. Idempotent; a non-wrapped body is a no-op. Proxy handlers
+// call this after the reverse proxy returns and BEFORE recording, so the
+// CapturedBody snapshot is complete when the record is published (SSE
+// subscribers serialize records at notify time). Without it, a canceled
+// request's transport goroutine may still be draining the body, and its later
+// Close-triggered finalize would race the serialization; after this call that
+// finalize is a no-op and late writes are discarded.
+func FinalizeRequestBody(rc io.ReadCloser) {
+	if crc, ok := rc.(*captureReadCloser); ok && crc.captured != nil {
+		if err := crc.captured.finalize(); err != nil {
+			log.Printf("Warning: capture finalize failed: %v", err)
+		}
+	}
+}
+
 // CaptureResponseWriter wraps an http.ResponseWriter to capture the response body.
 // It intercepts writes to capture up to maxBodySize bytes while still forwarding
 // all data to the underlying ResponseWriter. It also implements http.Flusher,
@@ -338,6 +363,7 @@ type CaptureResponseWriter struct {
 	maxBodySize int64
 	truncated   bool
 	wroteHeader bool
+	hijacked    bool
 	totalSeen   int64 // total bytes observed across all writes, counting past truncation
 }
 
@@ -411,9 +437,22 @@ func (crw *CaptureResponseWriter) Flush() {
 // Hijack implements http.Hijacker for WebSocket support.
 func (crw *CaptureResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := crw.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
+		conn, rw, err := h.Hijack()
+		if err == nil {
+			crw.hijacked = true
+		}
+		return conn, rw, err
 	}
 	return nil, nil, errors.New("hijacking not supported")
+}
+
+// Hijacked reports whether the connection was taken over (WebSocket upgrade).
+// After a hijack all traffic bypasses this writer, so the captured status/body
+// do not describe the response — callers should record metadata only rather
+// than finalize garbage Details. Single-goroutine access per the
+// http.ResponseWriter contract.
+func (crw *CaptureResponseWriter) Hijacked() bool {
+	return crw.hijacked
 }
 
 // Push implements http.Pusher for HTTP/2 server push.

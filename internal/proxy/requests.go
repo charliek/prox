@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,11 +54,19 @@ type CapturedBody struct {
 	FilePath        string `json:"file_path"`                  // Disk path for large bodies (Data is nil when set)
 }
 
+// requestIDCounter disambiguates requests that share a timestamp/method/URL.
+// Without it, two simultaneous identical requests would hash to the same ID
+// and their capture files would overwrite (and cross-delete on eviction).
+var requestIDCounter atomic.Uint64
+
 // GenerateRequestID creates a short hash ID (7 chars, git-style) from request
-// data. Exported so the shared daemon can generate a request ID before proxying
+// data plus a per-process counter, so IDs are unique within a process even for
+// simultaneous identical requests. (Truncating the hash to 28 bits leaves a
+// negligible birthday-collision residual across the 1000-record ring.)
+// Exported so the shared daemon can generate a request ID before proxying
 // (needed for capture file naming).
 func GenerateRequestID(timestamp time.Time, method, url string) string {
-	data := fmt.Sprintf("%d:%s:%s", timestamp.UnixNano(), method, url)
+	data := fmt.Sprintf("%d:%d:%s:%s", timestamp.UnixNano(), requestIDCounter.Add(1), method, url)
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])[:7]
 }

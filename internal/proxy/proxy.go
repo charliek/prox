@@ -392,8 +392,15 @@ func (s *Service) createRouter() http.Handler {
 		// Build request details if capture is enabled
 		var details *RequestDetails
 		var statusCode int
-		if crw != nil {
+		if crw != nil && crw.Hijacked() {
+			// Post-upgrade traffic bypassed the capture writer; record metadata
+			// only rather than a garbage 200/empty-body capture.
 			statusCode = crw.StatusCode()
+		} else if crw != nil {
+			statusCode = crw.StatusCode()
+			// Freeze the request-body capture before the record is published
+			// (see FinalizeRequestBody).
+			FinalizeRequestBody(r.Body)
 			resBody, resHeaders := s.captureManager.FinalizeResponse(requestID, crw)
 			details = &RequestDetails{
 				RequestHeaders:  reqHeaders,

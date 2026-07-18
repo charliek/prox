@@ -161,10 +161,12 @@ func TestGenerateRequestID(t *testing.T) {
 		assert.Len(t, id, 7)
 	})
 
-	t.Run("same inputs produce same ID", func(t *testing.T) {
+	t.Run("same inputs produce different IDs", func(t *testing.T) {
+		// The per-process counter disambiguates simultaneous identical
+		// requests so capture files can never overwrite each other.
 		id1 := GenerateRequestID(timestamp, "GET", "/api/users")
 		id2 := GenerateRequestID(timestamp, "GET", "/api/users")
-		assert.Equal(t, id1, id2)
+		assert.NotEqual(t, id1, id2)
 	})
 
 	t.Run("different inputs produce different IDs", func(t *testing.T) {

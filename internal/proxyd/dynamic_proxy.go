@@ -36,16 +36,20 @@ type DynamicProxy struct {
 	transport      *http.Transport
 	certMgr        *MultiDomainCertManager
 	requestManager *proxy.RequestManager
+	captureManager *proxy.CaptureManager
 	logger         *slog.Logger
 }
 
-// NewDynamicProxy creates a new dynamic proxy.
-func NewDynamicProxy(registry *Registry, certMgr *MultiDomainCertManager, requestManager *proxy.RequestManager, logger *slog.Logger) *DynamicProxy {
+// NewDynamicProxy creates a new dynamic proxy. captureManager may be nil, in
+// which case no request/response bodies are captured (metadata-only records);
+// when non-nil, capture is further gated per route via Route.CaptureEnabled.
+func NewDynamicProxy(registry *Registry, certMgr *MultiDomainCertManager, requestManager *proxy.RequestManager, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
 	return &DynamicProxy{
 		listeners:      make(map[int]*managedListener),
 		registry:       registry,
 		certMgr:        certMgr,
 		requestManager: requestManager,
+		captureManager: captureManager,
 		logger:         logger,
 		transport: &http.Transport{
 			DialContext: (&net.Dialer{
@@ -166,6 +170,17 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			return
 		}
 
+		// Capture is gated per project: only when the matched route opted in and
+		// a capture manager is available and enabled.
+		captureEnabled := route.CaptureEnabled && dp.captureManager != nil && dp.captureManager.Enabled()
+
+		// Generate the request ID BEFORE proxying so capture files (written by
+		// FinalizeResponse) are named consistently with the recorded record.
+		requestID := ""
+		if captureEnabled {
+			requestID = proxy.GenerateRequestID(startTime, r.Method, r.URL.String())
+		}
+
 		target := &url.URL{
 			Scheme: "http",
 			Host:   fmt.Sprintf("%s:%d", route.Target.Host, route.Target.Port),
@@ -179,6 +194,15 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// Determine protocol from the listener
 		proto := route.Protocol
 
+		// Capture the request body and headers before the Director mutates them.
+		// CaptureRequest clones the headers, so reqHeaders is unaffected by the
+		// Director's later header sets (mirrors the in-process proxy path).
+		var reqBody *proxy.CapturedBody
+		var reqHeaders http.Header
+		if captureEnabled {
+			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequest(requestID, r)
+		}
+
 		originalDirector := rp.Director
 		rp.Director = func(req *http.Request) {
 			originalDirector(req)
@@ -187,8 +211,18 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			req.Header.Set("X-Real-IP", getClientIP(r))
 		}
 
-		// Wrap response writer to capture status code
-		rw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		// Choose the response writer: a capturing writer when enabled, otherwise
+		// the lightweight status-only writer used for metadata-only records.
+		var rw http.ResponseWriter
+		var crw *proxy.CaptureResponseWriter
+		var srw *statusResponseWriter
+		if captureEnabled {
+			crw = dp.captureManager.WrapResponseWriter(w)
+			rw = crw
+		} else {
+			srw = &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			rw = srw
+		}
 
 		rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			dp.logger.Error("proxy error",
@@ -196,7 +230,11 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				"target", target.String(),
 				"error", err,
 			)
-			rw.statusCode = http.StatusBadGateway
+			if crw != nil {
+				crw.WriteHeader(http.StatusBadGateway)
+			} else {
+				srw.statusCode = http.StatusBadGateway
+			}
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
 		}
 
@@ -209,16 +247,47 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			if idx := strings.Index(hostname, "."); idx != -1 {
 				subdomain = hostname[:idx]
 			}
+
+			// Finalize capture (if enabled) and derive the status code from the
+			// active writer.
+			var details *proxy.RequestDetails
+			var statusCode int
+			switch {
+			case crw != nil && crw.Hijacked():
+				// After a WebSocket upgrade all traffic bypassed the capture
+				// writer; finalizing would record garbage (status 200, empty
+				// body). Record metadata only, like a non-capture route.
+				statusCode = crw.StatusCode()
+			case crw != nil:
+				statusCode = crw.StatusCode()
+				// Freeze the request-body capture before publishing the record:
+				// a canceled request's transport goroutine may still be draining
+				// the wrapped body, and SSE subscribers serialize the record at
+				// notify time.
+				proxy.FinalizeRequestBody(r.Body)
+				resBody, resHeaders := dp.captureManager.FinalizeResponse(requestID, crw)
+				details = &proxy.RequestDetails{
+					RequestHeaders:  reqHeaders,
+					ResponseHeaders: resHeaders,
+					RequestBody:     reqBody,
+					ResponseBody:    resBody,
+				}
+			default:
+				statusCode = srw.statusCode
+			}
+
 			dp.requestManager.Record(proxy.RequestRecord{
+				ID:         requestID, // empty for non-capture routes; Record generates one
 				Timestamp:  startTime,
 				Method:     r.Method,
 				URL:        r.URL.String(),
 				Subdomain:  subdomain,
 				Hostname:   hostname,
 				ProjectDir: route.ProjectDir,
-				StatusCode: rw.statusCode,
+				StatusCode: statusCode,
 				Duration:   time.Since(startTime),
 				RemoteAddr: r.RemoteAddr,
+				Details:    details,
 			})
 		}
 	})

@@ -861,6 +861,68 @@ func TestCaptureBuffer_SizeSemantics(t *testing.T) {
 		assert.Equal(t, int64(10), body.CapturedSize)
 		assert.False(t, body.Truncated)
 	})
+
+	t.Run("writes after finalize are discarded and finalize is idempotent", func(t *testing.T) {
+		// A canceled request's transport goroutine can keep draining the body
+		// after the handler finalized and recorded; those late writes must not
+		// mutate the frozen CapturedBody snapshot.
+		body := &CapturedBody{}
+		cb := &captureBuffer{
+			maxSize: 100,
+			body:    body,
+			cm:      &CaptureManager{inlineThreshold: 1024},
+		}
+
+		cb.Write([]byte("early"))
+		require.NoError(t, cb.finalize())
+		assert.Equal(t, int64(5), body.Size)
+		assert.Equal(t, "early", string(body.Data))
+
+		cb.Write([]byte("late-bytes"))
+		require.NoError(t, cb.finalize()) // second finalize: no-op
+		assert.Equal(t, int64(5), body.Size, "late writes must not change the snapshot")
+		assert.Equal(t, "early", string(body.Data))
+	})
+}
+
+func TestFinalizeRequestBody(t *testing.T) {
+	t.Run("forces finalize on a wrapped body before Close", func(t *testing.T) {
+		cm := newEnabledCaptureManager(t)
+		req := httptest.NewRequest("POST", "/test", strings.NewReader("payload"))
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-force", req)
+
+		_, err := io.ReadAll(wrappedBody)
+		require.NoError(t, err)
+
+		FinalizeRequestBody(wrappedBody)
+		assert.Equal(t, int64(7), capturedBody.Size, "snapshot complete without Close")
+
+		// The transport's later Close must not re-finalize or error.
+		require.NoError(t, wrappedBody.Close())
+		assert.Equal(t, int64(7), capturedBody.Size)
+	})
+
+	t.Run("non-wrapped body is a no-op", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			FinalizeRequestBody(io.NopCloser(strings.NewReader("x")))
+			FinalizeRequestBody(nil)
+		})
+	})
+}
+
+func TestCaptureResponseWriter_Hijacked(t *testing.T) {
+	t.Run("not hijacked by default", func(t *testing.T) {
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		assert.False(t, crw.Hijacked())
+	})
+
+	t.Run("failed hijack does not mark hijacked", func(t *testing.T) {
+		// httptest.ResponseRecorder does not implement http.Hijacker.
+		crw := newCaptureResponseWriter(httptest.NewRecorder(), 1024)
+		_, _, err := crw.Hijack()
+		require.Error(t, err)
+		assert.False(t, crw.Hijacked())
+	})
 }
 
 func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
