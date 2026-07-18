@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -142,6 +141,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ProjectDir is the identity records are filtered and purged by; an empty
+	// one would produce records that no deregistration could ever clean up.
+	if req.ProjectDir == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "project_dir is required",
+			Code:  "BAD_REQUEST",
+		})
+		return
+	}
+
 	// Register routes
 	hostnames, newPorts, err := s.registry.Register(req)
 	if err != nil {
@@ -217,16 +226,7 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	removedHostnames, emptyPorts := s.registry.Deregister(req.ProjectDir)
-
-	// Close listeners for ports with no remaining routes
-	if s.proxy != nil {
-		for _, port := range emptyPorts {
-			if err := s.proxy.RemoveListener(port); err != nil {
-				s.logger.Warn("failed to remove listener", "port", port, "error", err)
-			}
-		}
-	}
+	removedHostnames, emptyPorts := s.removeProject(req.ProjectDir)
 
 	s.logger.Info("deregistered project",
 		"project", req.ProjectDir,
@@ -249,6 +249,55 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 				s.RequestShutdown()
 			}
 		}()
+	}
+}
+
+// removeProject is the single consolidated project-removal path: it removes the
+// project's routes, closes listeners for ports that now have no routes, and
+// purges the project's captured requests (firing eviction callbacks so on-disk
+// body files are cleaned up). It is called from explicit deregister and from
+// the stale-PID crash-recovery sweep so the crash path can't leak records or
+// body files. Returns the removed hostnames and now-empty ports for logging.
+func (s *Server) removeProject(projectDir string) (removedHostnames []string, emptyPorts []int) {
+	if s.registry == nil {
+		return nil, nil
+	}
+
+	removedHostnames, emptyPorts = s.registry.Deregister(projectDir)
+	s.finishRemoval(projectDir, emptyPorts)
+	return removedHostnames, emptyPorts
+}
+
+// removeStaleProject is removeProject for the crash-recovery sweep: removal is
+// guarded on the registration still carrying the detected dead PID, so a
+// project that re-registered between detection and removal is left alone.
+func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+	if s.registry == nil {
+		return false, nil, nil
+	}
+
+	removed, removedHostnames, emptyPorts = s.registry.DeregisterIfPID(projectDir, pid)
+	if !removed {
+		return false, nil, nil
+	}
+	s.finishRemoval(projectDir, emptyPorts)
+	return true, removedHostnames, emptyPorts
+}
+
+// finishRemoval closes listeners for now-empty ports and purges the project's
+// captured requests (firing eviction callbacks so on-disk body files are
+// cleaned up).
+func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
+	if s.proxy != nil {
+		for _, port := range emptyPorts {
+			if err := s.proxy.RemoveListener(port); err != nil {
+				s.logger.Warn("failed to remove listener", "port", port, "error", err)
+			}
+		}
+	}
+
+	if s.requestManager != nil {
+		s.requestManager.PurgeByProject(projectDir)
 	}
 }
 
@@ -326,13 +375,20 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse domain filter from query params
-	var hostnames []string
-	if domains := r.URL.Query().Get("domains"); domains != "" {
-		hostnames = strings.Split(domains, ",")
+	// Filter the stream by owning project (exact match). Scoping by project
+	// dir rather than hostname prevents cross-project record delivery when two
+	// projects own the same hostname on different ports. The param is
+	// mandatory: an empty ProjectDir filter would match ALL projects' records,
+	// so a caller that forgot the param would silently receive everything.
+	projectDir := r.URL.Query().Get("project")
+	if projectDir == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "project query parameter is required",
+			Code:  "BAD_REQUEST",
+		})
+		return
 	}
-
-	filter := proxy.RequestFilter{Hostnames: hostnames}
+	filter := proxy.RequestFilter{ProjectDir: projectDir}
 	sub := s.requestManager.Subscribe(filter)
 	defer s.requestManager.Unsubscribe(sub.ID)
 
@@ -374,15 +430,20 @@ func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var hostnames []string
-	if domains := r.URL.Query().Get("domains"); domains != "" {
-		hostnames = strings.Split(domains, ",")
+	// Mandatory for the same reason as the stream endpoint: an empty
+	// ProjectDir filter matches every project's records.
+	projectDir := r.URL.Query().Get("project")
+	if projectDir == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "project query parameter is required",
+			Code:  "BAD_REQUEST",
+		})
+		return
 	}
 
-	limit := 100
 	filter := proxy.RequestFilter{
-		Hostnames: hostnames,
-		Limit:     limit,
+		ProjectDir: projectDir,
+		Limit:      100,
 	}
 
 	records := s.requestManager.Recent(filter)

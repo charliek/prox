@@ -178,9 +178,20 @@ func RunDaemon(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				stale := registry.CleanStalePIDs()
-				for _, dir := range stale {
-					logger.Warn("cleaned stale project registration", "project", dir)
+				stale := registry.StalePIDs()
+				for _, sp := range stale {
+					removed, hostnames, emptyPorts := server.removeStaleProject(sp.Dir, sp.PID)
+					if !removed {
+						// Re-registered with a live PID between detection and
+						// removal — leave the new registration alone.
+						continue
+					}
+					logger.Warn("cleaned stale project registration",
+						"project", sp.Dir,
+						"pid", sp.PID,
+						"removed_hostnames", hostnames,
+						"closed_ports", emptyPorts,
+					)
 				}
 				if len(stale) > 0 && registry.IsEmpty() {
 					logger.Info("all routes cleaned up, shutting down")
@@ -221,6 +232,10 @@ func RunDaemon(ctx context.Context) error {
 	if err := dynamicProxy.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down proxy", "error", err)
 	}
+	// Close the request manager before the socket server so active SSE
+	// subscribers observe end-of-stream and release the server, rather than
+	// pinning it open through the shutdown grace period.
+	requestMgr.Close()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down server", "error", err)
 	}

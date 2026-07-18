@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,16 +15,18 @@ import (
 )
 
 // ForwardRequests subscribes to the daemon's SSE request stream and forwards
-// matching records into the local RequestManager. This bridges the daemon's
-// proxy request data into the project's TUI and API.
+// this project's records into the local RequestManager. This bridges the
+// daemon's proxy request data into the project's TUI and API.
+//
+// projectDir must be the same value sent as RegisterRequest.ProjectDir so the
+// daemon-side filter (which scopes records by owning project) matches.
 //
 // It runs until ctx is cancelled. On disconnect, it reconnects with backoff.
-func ForwardRequests(ctx context.Context, socketPath string, domains []string, localRM *proxy.RequestManager) {
-	domainsParam := strings.Join(domains, ",")
+func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager) {
 	backoff := 500 * time.Millisecond
 
 	for {
-		err := streamRequests(ctx, socketPath, domainsParam, localRM)
+		err := streamRequests(ctx, socketPath, projectDir, localRM)
 		if ctx.Err() != nil {
 			return // context cancelled, clean shutdown
 		}
@@ -42,7 +45,7 @@ func ForwardRequests(ctx context.Context, socketPath string, domains []string, l
 }
 
 // streamRequests opens an SSE connection to the daemon and processes events.
-func streamRequests(ctx context.Context, socketPath, domainsParam string, localRM *proxy.RequestManager) error {
+func streamRequests(ctx context.Context, socketPath, projectDir string, localRM *proxy.RequestManager) error {
 	// Create HTTP client that dials the Unix socket
 	dialer := &net.Dialer{}
 	client := &http.Client{
@@ -53,8 +56,8 @@ func streamRequests(ctx context.Context, socketPath, domainsParam string, localR
 		},
 	}
 
-	url := fmt.Sprintf("http://proxyd/api/v1/requests/stream?domains=%s", domainsParam)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	streamURL := fmt.Sprintf("http://proxyd/api/v1/requests/stream?project=%s", url.QueryEscape(projectDir))
+	req, err := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
 	if err != nil {
 		return fmt.Errorf("creating SSE request: %w", err)
 	}

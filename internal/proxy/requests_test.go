@@ -242,3 +242,74 @@ func TestRequestManager_SubscribeAfterClose(t *testing.T) {
 	m.Unsubscribe(sub.ID)
 	m.Close()
 }
+
+// TestRequestManager_FilterByProjectDir pins that a subscriber scoped to one
+// project receives only that project's records, even when two projects share a
+// hostname (differing only by owning port, which the daemon collapses to
+// project identity).
+func TestRequestManager_FilterByProjectDir(t *testing.T) {
+	m := NewRequestManager(10)
+
+	subA := m.Subscribe(RequestFilter{ProjectDir: "/projects/a"})
+	require.NotNil(t, subA)
+
+	// Record for project B (same hostname, different project) — must not reach A.
+	m.Record(RequestRecord{Method: "GET", URL: "/b", Hostname: "api.local.dev", ProjectDir: "/projects/b"})
+	// Record for project A — must reach A.
+	m.Record(RequestRecord{Method: "GET", URL: "/a", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
+
+	select {
+	case rec := <-subA.Ch:
+		assert.Equal(t, "/projects/a", rec.ProjectDir)
+		assert.Equal(t, "/a", rec.URL)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for project A record")
+	}
+
+	// No further records should be waiting for A (B's was filtered out).
+	select {
+	case rec := <-subA.Ch:
+		t.Fatalf("subscriber A received an unexpected record: %+v", rec)
+	default:
+	}
+
+	// Recent scoped to A returns only A's record.
+	recA := m.Recent(RequestFilter{ProjectDir: "/projects/a"})
+	require.Len(t, recA, 1)
+	assert.Equal(t, "/a", recA[0].URL)
+}
+
+// TestRequestManager_PurgeByProject pins that purge is scoped by project: two
+// projects sharing a hostname on different ports don't purge each other's
+// records, and the eviction callback fires only for the purged project's
+// records that carried captured Details.
+func TestRequestManager_PurgeByProject(t *testing.T) {
+	m := NewRequestManager(10)
+
+	var evicted []string
+	m.SetEvictionCallback(func(id string) {
+		evicted = append(evicted, id)
+	})
+
+	details := &RequestDetails{RequestHeaders: map[string][]string{"X": {"y"}}}
+
+	// A: one detailed record (evictable) and one metadata-only record.
+	m.Record(RequestRecord{ID: "a1", Method: "GET", URL: "/a1", Hostname: "api.local.dev", ProjectDir: "/projects/a", Details: details})
+	m.Record(RequestRecord{ID: "a2", Method: "GET", URL: "/a2", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
+	// B: one detailed record — must survive a purge of A.
+	m.Record(RequestRecord{ID: "b1", Method: "GET", URL: "/b1", Hostname: "api.local.dev", ProjectDir: "/projects/b", Details: details})
+
+	m.PurgeByProject("/projects/a")
+
+	// Only B's record remains.
+	remaining := m.Recent(RequestFilter{})
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "b1", remaining[0].ID)
+
+	// Eviction callback fired only for A's detailed record (a2 had no Details).
+	assert.Equal(t, []string{"a1"}, evicted)
+
+	// Purging an empty project dir is a no-op.
+	m.PurgeByProject("")
+	assert.Len(t, m.Recent(RequestFilter{}), 1)
+}

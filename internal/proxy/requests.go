@@ -21,6 +21,11 @@ type RequestRecord struct {
 	Duration   time.Duration `json:"duration"`
 	RemoteAddr string        `json:"remote_addr"`
 
+	// ProjectDir identifies the project that owns the route this request was
+	// proxied for. Set daemon-side so records/purges are scoped to a project
+	// even when two projects own the same hostname on different ports.
+	ProjectDir string `json:"project_dir,omitempty"`
+
 	// Details contains captured headers and bodies (nil when capture is disabled)
 	Details *RequestDetails `json:"details,omitempty"`
 }
@@ -59,13 +64,14 @@ func GenerateRequestID(timestamp time.Time, method, url string) string {
 
 // RequestFilter specifies criteria for filtering requests.
 type RequestFilter struct {
-	Subdomain string
-	Hostnames []string // match if record.Hostname is in this list (empty = match all)
-	Method    string
-	MinStatus int
-	MaxStatus int
-	Since     time.Time
-	Limit     int
+	Subdomain  string
+	Hostnames  []string // match if record.Hostname is in this list (empty = match all)
+	ProjectDir string   // match if record.ProjectDir equals this exactly (empty = match all)
+	Method     string
+	MinStatus  int
+	MaxStatus  int
+	Since      time.Time
+	Limit      int
 }
 
 // RequestSubscription represents a subscription to request updates.
@@ -283,6 +289,9 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 			return false
 		}
 	}
+	if filter.ProjectDir != "" && record.ProjectDir != filter.ProjectDir {
+		return false
+	}
 	if filter.Method != "" && record.Method != filter.Method {
 		return false
 	}
@@ -298,17 +307,15 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 	return true
 }
 
-// PurgeByHostnames removes all records matching any of the given hostnames
-// from the ring buffer and calls the eviction callback for each.
-// It compacts the buffer to preserve the contiguous ring invariant.
-func (m *RequestManager) PurgeByHostnames(hostnames []string) {
-	if len(hostnames) == 0 {
+// PurgeByProject removes all records owned by the given project from the ring
+// buffer and calls the eviction callback for each purged record that carried
+// captured Details (so its on-disk body files get cleaned up). It compacts the
+// buffer to preserve the contiguous ring invariant. Scoping by project (not
+// hostname) ensures two projects sharing a hostname on different ports don't
+// purge each other's records.
+func (m *RequestManager) PurgeByProject(projectDir string) {
+	if projectDir == "" {
 		return
-	}
-
-	hostSet := make(map[string]struct{}, len(hostnames))
-	for _, h := range hostnames {
-		hostSet[h] = struct{}{}
 	}
 
 	var evictIDs []string
@@ -325,7 +332,7 @@ func (m *RequestManager) PurgeByHostnames(hostnames []string) {
 		if rec.ID == "" {
 			continue
 		}
-		if _, match := hostSet[rec.Hostname]; match {
+		if rec.ProjectDir == projectDir {
 			if rec.Details != nil {
 				evictIDs = append(evictIDs, rec.ID)
 			}

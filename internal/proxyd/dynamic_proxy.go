@@ -215,6 +215,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				URL:        r.URL.String(),
 				Subdomain:  subdomain,
 				Hostname:   hostname,
+				ProjectDir: route.ProjectDir,
 				StatusCode: rw.statusCode,
 				Duration:   time.Since(startTime),
 				RemoteAddr: r.RemoteAddr,
