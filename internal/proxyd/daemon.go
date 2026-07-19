@@ -214,6 +214,7 @@ func RunDaemon(ctx context.Context) error {
 					logger.Warn("cleaned stale project registration",
 						"project", sp.Dir,
 						"pid", sp.PID,
+						"start_time", sp.StartTime,
 						"removed_hostnames", hostnames,
 						"closed_ports", emptyPorts,
 					)

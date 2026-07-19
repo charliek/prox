@@ -252,7 +252,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		// registration inline (PID-guarded; purges its records + body files and
 		// closes its listeners) and retry once. Under lifecycleMu the retry
 		// cannot lose a race, so a single retry is a correctness guarantee.
-		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID)
+		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
 		s.removeStaleProjectLocked(conflict.Dir, conflict.PID, conflict.StartTime)
 		hostnames, newPorts, err = s.registry.Register(req)
 		if err != nil {

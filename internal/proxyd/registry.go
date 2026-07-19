@@ -353,7 +353,7 @@ type StaleProject struct {
 // StalePIDs returns the registered projects whose owning process generation is
 // no longer running. Liveness is keyed on (PID, start token) so a reused PID
 // naming a different process reads as dead (see daemon.IsProcessAlive). It only
-// detects — removal goes through the consolidated removeProject path
+// detects — removal goes through the consolidated removeStaleProject path
 // (identity-guarded via DeregisterIfIdentity) so the crash path purges captured
 // records and body files the same way an explicit deregister does, without
 // racing a concurrent re-registration.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,11 +62,29 @@ func TestMultiDomainCertManager_SlowGenerateDoesNotBlockOtherDomain(t *testing.T
 	<-bStarted
 
 	// While B is provably still blocked, GetCertificate for an A host must return
-	// A's cert. This assertion completes BEFORE bRelease is closed below, so A's
-	// handshake path deterministically did not wait on B's generation.
-	gotA, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "x.a.test"})
-	require.NoError(t, err)
-	require.Same(t, certA, gotA, "A's host must serve A's cert while B is blocked")
+	// A's cert. Run it in a goroutine bounded by a generous deadline: a lock
+	// regression (generation holding m.mu across mkcert) would block this lookup,
+	// and we want it to FAIL PROMPTLY here instead of hanging until the
+	// suite-level timeout. The deadline is a deadlock guard, not a timing
+	// assertion — a correct impl returns in microseconds.
+	type aResult struct {
+		cert *tls.Certificate
+		err  error
+	}
+	aDone := make(chan aResult, 1)
+	go func() {
+		c, e := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "x.a.test"})
+		aDone <- aResult{c, e}
+	}()
+	select {
+	case got := <-aDone:
+		require.NoError(t, got.err)
+		require.Same(t, certA, got.cert, "A's host must serve A's cert while B is blocked")
+	case <-time.After(2 * time.Second):
+		close(bRelease) // unblock B so its goroutine can finish and not leak
+		<-bErr
+		t.Fatal("GetCertificate(A) blocked while B was generating — cert generation is holding the cache lock")
+	}
 
 	// Unblock B; its EnsureDomain must succeed and publish B's cert.
 	close(bRelease)
