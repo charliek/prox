@@ -252,8 +252,8 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		// registration inline (PID-guarded; purges its records + body files and
 		// closes its listeners) and retry once. Under lifecycleMu the retry
 		// cannot lose a race, so a single retry is a correctness guarantee.
-		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID)
-		s.removeStaleProjectLocked(conflict.Dir, conflict.PID)
+		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
+		s.removeStaleProjectLocked(conflict.Dir, conflict.PID, conflict.StartTime)
 		hostnames, newPorts, err = s.registry.Register(req)
 		if err != nil {
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
@@ -405,9 +405,10 @@ func (s *Server) removeProjectLocked(projectDir string) (removedHostnames []stri
 }
 
 // removeStaleProject is removeProject for the crash-recovery sweep: removal is
-// guarded on the registration still carrying the detected dead PID, so a
-// project that re-registered between detection and removal is left alone.
-func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+// guarded on the registration still carrying the detected dead PID AND start
+// token, so a restart that reused the crashed PID between detection and removal
+// is left alone.
+func (s *Server) removeStaleProject(projectDir string, pid int, startTime int64) (removed bool, removedHostnames []string, emptyPorts []int) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	// Once teardown has begun, physical cleanup is the exiting daemon's job:
@@ -417,16 +418,16 @@ func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, r
 	if s.isShuttingDown() {
 		return false, nil, nil
 	}
-	return s.removeStaleProjectLocked(projectDir, pid)
+	return s.removeStaleProjectLocked(projectDir, pid, startTime)
 }
 
 // removeStaleProjectLocked is removeStaleProject's body; lifecycleMu must be
 // held. register calls it to replace a crashed generation inline.
-func (s *Server) removeStaleProjectLocked(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+func (s *Server) removeStaleProjectLocked(projectDir string, pid int, startTime int64) (removed bool, removedHostnames []string, emptyPorts []int) {
 	if s.registry == nil {
 		return false, nil, nil
 	}
-	removed, removedHostnames, emptyPorts = s.registry.DeregisterIfPID(projectDir, pid)
+	removed, removedHostnames, emptyPorts = s.registry.DeregisterIfIdentity(projectDir, pid, startTime)
 	if !removed {
 		return false, nil, nil
 	}

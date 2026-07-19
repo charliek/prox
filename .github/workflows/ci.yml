@@ -8,7 +8,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Matrix over Linux + macOS so the darwin-tagged process code
+    # (internal/daemon/process_darwin.go) and the process-start-token liveness
+    # path are exercised in CI on every change, not just cross-built by the
+    # release pipeline. macos-latest (Apple Silicon) runs the full suite,
+    # including test/integration; fail-fast:false keeps the ubuntu leg's results
+    # visible if the macOS leg flakes.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
