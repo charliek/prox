@@ -805,6 +805,13 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		services[name] = proxyd.ServiceTarget{Host: svc.Host, Port: svc.Port}
 	}
 
+	// Read our own process start token so the daemon can tell a genuine
+	// same-dir conflict from a crashed generation whose PID has been reused.
+	startToken, ok := daemon.ProcessStartTime(os.Getpid())
+	if !ok {
+		fmt.Fprintln(os.Stderr, "Warning: could not read process start token; proxy PID-reuse protection is degraded to bare-PID")
+	}
+
 	req := proxyd.RegisterRequest{
 		ProjectDir:     cwd,
 		PID:            os.Getpid(),
@@ -814,6 +821,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		HTTPPort:       cfg.Proxy.HTTPPort,
 		HTTPSPort:      cfg.Proxy.HTTPSPort,
 		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
+		StartTime:      startToken,
 	}
 
 	resp, err := client.Register(req)

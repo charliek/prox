@@ -32,10 +32,14 @@ type Route struct {
 
 // ProjectRegistration tracks all routes belonging to a project.
 type ProjectRegistration struct {
-	Dir            string
-	PID            int
-	Domain         string
-	RouteKeys      []string // "hostname:port" keys into the routes map
+	Dir       string
+	PID       int
+	Domain    string
+	RouteKeys []string // "hostname:port" keys into the routes map
+	// StartTime is an opaque process start token (see daemon.ProcessStartTime):
+	// a generation discriminator, not a timestamp. 0 means the holder could not
+	// read it, so liveness falls back to bare-PID.
+	StartTime      int64
 	RegisteredAt   time.Time
 	CaptureEnabled bool
 }
@@ -78,6 +82,11 @@ func routeKey(hostname string, port int) string {
 type ProjectConflictError struct {
 	Dir string
 	PID int
+	// StartTime is the existing holder's opaque process start token (see
+	// daemon.ProcessStartTime): a generation discriminator, not a timestamp. It
+	// lets the self-heal liveness check distinguish a still-running holder from a
+	// crashed one whose PID has been reused. 0 means bare-PID fallback.
+	StartTime int64
 }
 
 func (e *ProjectConflictError) Error() string {
@@ -96,7 +105,11 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 
 	// Check if this project is already registered
 	if existing, exists := r.projects[req.ProjectDir]; exists {
-		return nil, nil, &ProjectConflictError{Dir: req.ProjectDir, PID: existing.PID}
+		return nil, nil, &ProjectConflictError{
+			Dir:       req.ProjectDir,
+			PID:       existing.PID,
+			StartTime: existing.StartTime,
+		}
 	}
 
 	// Reject same port for both HTTP and HTTPS
@@ -197,6 +210,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		PID:            req.PID,
 		Domain:         req.Domain,
 		RouteKeys:      routeKeys,
+		StartTime:      req.StartTime,
 		RegisteredAt:   now,
 		CaptureEnabled: req.CaptureEnabled,
 	}
@@ -324,18 +338,34 @@ type StaleProject struct {
 	PID int
 }
 
-// StalePIDs returns the registered projects whose PID is no longer running.
-// It only detects — removal goes through the consolidated removeProject path
+// StalePIDs returns the registered projects whose owning process generation is
+// no longer running. Liveness is keyed on (PID, start token) so a reused PID
+// naming a different process reads as dead (see daemon.IsProcessAlive). It only
+// detects — removal goes through the consolidated removeProject path
 // (PID-guarded via DeregisterIfPID) so the crash path purges captured records
 // and body files the same way an explicit deregister does, without racing a
 // concurrent re-registration.
+//
+// The candidate set is snapshotted under RLock and the lock is RELEASED before
+// any liveness check runs: daemon.IsProcessAlive does OS reads (procfs /
+// sysctl) that must not block registry writers.
 func (r *Registry) StalePIDs() []StaleProject {
+	type candidate struct {
+		dir   string
+		pid   int
+		token int64
+	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	var stale []StaleProject
+	candidates := make([]candidate, 0, len(r.projects))
 	for dir, proj := range r.projects {
-		if !daemon.ProcessExists(proj.PID) {
-			stale = append(stale, StaleProject{Dir: dir, PID: proj.PID})
+		candidates = append(candidates, candidate{dir: dir, pid: proj.PID, token: proj.StartTime})
+	}
+	r.mu.RUnlock()
+
+	var stale []StaleProject
+	for _, c := range candidates {
+		if !daemon.IsProcessAlive(c.pid, c.token) {
+			stale = append(stale, StaleProject{Dir: c.dir, PID: c.pid})
 		}
 	}
 	return stale

@@ -244,7 +244,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			// Route/validation conflict — a real error, never retried.
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
-		if daemon.ProcessExists(conflict.PID) {
+		if daemon.IsProcessAlive(conflict.PID, conflict.StartTime) {
 			// A second live prox up in the same dir is a genuine conflict.
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
