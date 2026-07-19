@@ -19,6 +19,13 @@ import (
 	"github.com/charliek/prox/internal/proxy"
 )
 
+// certManager is the cert capability the dynamic proxy and register flow need:
+// per-domain cert generation plus SNI cert selection.
+type certManager interface {
+	EnsureDomain(domain string) error
+	GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
+}
+
 // managedListener tracks a dynamically created port listener.
 type managedListener struct {
 	port     int
@@ -34,7 +41,7 @@ type DynamicProxy struct {
 	listeners      map[int]*managedListener
 	registry       *Registry
 	transport      *http.Transport
-	certMgr        *MultiDomainCertManager
+	certMgr        certManager
 	requestManager *proxy.RequestManager
 	captureManager *proxy.CaptureManager
 	logger         *slog.Logger
@@ -43,7 +50,12 @@ type DynamicProxy struct {
 // NewDynamicProxy creates a new dynamic proxy. captureManager may be nil, in
 // which case no request/response bodies are captured (metadata-only records);
 // when non-nil, capture is further gated per route via Route.CaptureEnabled.
-func NewDynamicProxy(registry *Registry, certMgr *MultiDomainCertManager, requestManager *proxy.RequestManager, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
+//
+// certMgr must be either a real *MultiDomainCertManager or the untyped nil
+// literal: the HTTPS bind path and the register flow gate on certMgr != nil, so
+// a typed nil such as (*MultiDomainCertManager)(nil) would slip past that guard
+// (a non-nil interface wrapping a nil pointer) and panic on the first HTTPS bind.
+func NewDynamicProxy(registry *Registry, certMgr certManager, requestManager *proxy.RequestManager, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
 	return &DynamicProxy{
 		listeners:      make(map[int]*managedListener),
 		registry:       registry,
@@ -79,6 +91,12 @@ func (dp *DynamicProxy) AddListener(port int, protocol string) error {
 	var err error
 
 	if protocol == "https" {
+		// Guard before dereferencing dp.certMgr: a nil interface here would
+		// otherwise produce a method-value panic when the TLS stack invokes
+		// GetCertificate on the first handshake.
+		if dp.certMgr == nil {
+			return fmt.Errorf("cannot start https listener on port %d: no certificate manager configured", port)
+		}
 		tlsCfg := &tls.Config{
 			GetCertificate: dp.certMgr.GetCertificate,
 			MinVersion:     tls.VersionTLS12,

@@ -243,18 +243,17 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		}
 	}
 
-	// Ensure certs exist for HTTPS domains before starting listeners
-	if s.proxy != nil && s.proxy.certMgr != nil {
-		for _, ps := range newPorts {
-			if ps.Protocol == "https" {
-				if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
-					s.rollbackRegistration(req.ProjectDir)
-					return http.StatusInternalServerError, ErrorResponse{
-						Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
-						Code:  "CERT_GENERATION_FAILED",
-					}
-				}
-				break // one EnsureDomain per domain is sufficient
+	// Ensure a cert exists for the registration's domain whenever it registers any
+	// HTTPS route. Gating on req.HTTPSPort > 0 (not on a NEW listener port) is the
+	// #58 fix: a domain joining an already-bound shared HTTPS port has no new port
+	// in newPorts, so the old loop skipped its cert and the SNI handshake failed.
+	// EnsureDomain is idempotent (one cert per base domain), so re-calls are cheap.
+	if s.proxy != nil && s.proxy.certMgr != nil && req.HTTPSPort > 0 {
+		if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
+			s.rollbackRegistration(req.ProjectDir)
+			return http.StatusInternalServerError, ErrorResponse{
+				Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
+				Code:  "CERT_GENERATION_FAILED",
 			}
 		}
 	}
