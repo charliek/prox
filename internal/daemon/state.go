@@ -13,6 +13,11 @@ const (
 	StateDirName = ".prox"
 	// StateFileName is the name of the state file
 	StateFileName = "prox.state"
+	// ChildrenFileName is the name of the supervised-child ownership ledger,
+	// recording the process GROUPS a running prox generation supervises so a
+	// later `prox up` can reap any that a SIGKILL'd generation orphaned (its
+	// graceful Stop never ran). See internal/supervisor/orphans.go.
+	ChildrenFileName = "prox.children"
 	// PIDFileName is the name of the PID file
 	PIDFileName = "prox.pid"
 	// LogFileName is the name of the daemon log file

@@ -147,6 +147,16 @@ type ManagedProcess struct {
 	// NewManagedProcess construction in tests) means "always allow".
 	launchGate func() error
 
+	// onLaunched, when set, is invoked by startWithConfig AFTER a successful launch
+	// and AFTER p.mu is released. It persists the supervisor's orphan-reaping
+	// ledger (see Supervisor.persistChildren / orphans.go). It is deliberately
+	// called outside the p.mu critical section: persistChildren takes s.mu, and the
+	// verified s.mu -> p.mu order would AB-BA if it ran while p.mu was held.
+	// supervisor.createManagedProcess injects it; nil (direct construction in
+	// tests) means "no persistence". Set once before publication, so it is read
+	// lock-free (like launchGate).
+	onLaunched func()
+
 	// stopBarrier is a test-only seam (nil in production). Stop invokes it,
 	// unlocked, at interleaving-sensitive points identified by phase:
 	//
@@ -264,24 +274,71 @@ func (p *ManagedProcess) StopTimeout() time.Duration {
 	return p.shutdownTimeout
 }
 
+// childRecord returns a ledger record for this process's currently-running
+// group, and ok=false when there is nothing live to record. Only a process in
+// the Running state with a live current instance is recorded: its leader is
+// still alive, so its start token is readable and the reap's up-front identity
+// check can positively match it on the next startup. A Stopping/Stopped/Crashed
+// process is deliberately excluded -- its leader has been (or is being) reaped,
+// so it could never be positively identified anyway.
+//
+// The start token comes from Process.StartToken (captured at spawn), so no
+// per-process syscall runs here and the recorded token cannot be a reused PID's.
+func (p *ManagedProcess) childRecord() (ChildRecord, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.state != domain.ProcessStateRunning || p.current == nil || p.current.proc == nil {
+		return ChildRecord{}, false
+	}
+	pid := p.current.proc.PID()
+	pgid := p.current.proc.PGID()
+	if pid <= 0 {
+		return ChildRecord{}, false
+	}
+	// The start token is the one CAPTURED AT SPAWN (Process.StartToken), not re-read
+	// here: the monitor's Wait() reaps the leader (freeing its PID) BEFORE it takes
+	// p.mu to leave Running, so state can be Running while the PID is already
+	// reusable. Re-reading daemon.ProcessStartTime(pid) here could therefore stamp
+	// an unrelated reused-PID process's token onto this record, which the reaper
+	// would later positively match and signal (codex review).
+	return ChildRecord{Name: p.name, PID: pid, PGID: pgid, StartToken: p.current.proc.StartToken()}, true
+}
+
 // Start starts the process with its currently-stored config.
 func (p *ManagedProcess) Start(ctx context.Context) error {
 	return p.startWithConfig(ctx, nil)
 }
 
-// startWithConfig starts the process, optionally swapping in a freshly-reloaded
-// config first. When pending is non-nil the swap (config, env loader, effective
-// stop budget) happens inside this locked critical section, AFTER both
-// early-return guards (already-running state check, surviving-previous-group
-// check) pass and BEFORE the runner launches -- so a concurrent Start that wins
-// the race starts the old config and the loser returns ErrProcessAlreadyRunning
-// WITHOUT applying the swap. The stored config therefore always matches the
-// running process (#33, D3).
+// startWithConfig starts the process (see startWithConfigLocked for the launch
+// semantics) and, on success, persists the orphan-reaping ledger via onLaunched.
+//
+// The persist is invoked HERE -- after startWithConfigLocked has returned and
+// fully released p.mu -- rather than inside the locked section, because
+// persistChildren takes s.mu and the verified s.mu -> p.mu order would AB-BA if
+// it ran while p.mu was held. Every launch path funnels through this wrapper
+// (Start, Restart, and the supervisor's direct startWithConfig calls), so no
+// path can forget to persist and a future path inherits it for free.
+func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingConfig) error {
+	err := p.startWithConfigLocked(ctx, pending)
+	if err == nil && p.onLaunched != nil {
+		p.onLaunched()
+	}
+	return err
+}
+
+// startWithConfigLocked starts the process, optionally swapping in a
+// freshly-reloaded config first. When pending is non-nil the swap (config, env
+// loader, effective stop budget) happens inside this locked critical section,
+// AFTER both early-return guards (already-running state check,
+// surviving-previous-group check) pass and BEFORE the runner launches -- so a
+// concurrent Start that wins the race starts the old config and the loser
+// returns ErrProcessAlreadyRunning WITHOUT applying the swap. The stored config
+// therefore always matches the running process (#33, D3).
 //
 // If the runner (or the post-swap env reload) fails AFTER the swap was applied,
 // the new config stays in place (state Crashed; the next start uses it) -- "the
 // file is the truth".
-func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingConfig) error {
+func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pendingConfig) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

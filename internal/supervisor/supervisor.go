@@ -35,6 +35,12 @@ type SupervisorConfig struct {
 	// reload entirely (tests that construct a Supervisor directly), preserving
 	// back-compat: the up-time config is used as-is.
 	ConfigPath string
+	// StateDir is the absolute path to this project's .prox state directory. When
+	// set, every successful launch persists the orphan-reaping ownership ledger
+	// (<StateDir>/prox.children) so a later `prox up` can reap groups a SIGKILL'd
+	// generation orphaned (plan 009 D11-D13, #59). Empty disables persistence
+	// (tests that construct a Supervisor directly), a clean no-op.
+	StateDir string
 }
 
 // DefaultSupervisorConfig returns default configuration
@@ -90,6 +96,14 @@ type Supervisor struct {
 	eventMu sync.RWMutex
 	// eventSubs holds channels for subscribers to supervisor events
 	eventSubs []chan SupervisorEvent
+
+	// childrenMu serializes writes to the orphan-reaping ownership ledger
+	// (<supConfig.StateDir>/prox.children). Holding it across BOTH the s.mu
+	// snapshot and the file write gives last-writer-correctness under the parallel
+	// launches: each serialized persist snapshots the CURRENT live set, so the
+	// final write reflects reality even when starts race. Lock order is
+	// childrenMu -> s.mu (persistChildren); no path takes them the other way.
+	childrenMu sync.Mutex
 }
 
 // SupervisorEvent represents a supervisor event
@@ -223,6 +237,12 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 		}
 		return nil
 	}
+	// Persist the orphan-reaping ledger after every successful launch (plan 009
+	// D11-D13, #59). startWithConfig invokes this AFTER releasing p.mu, so
+	// persistChildren's childrenMu -> s.mu ordering is safe. Wiring it here (on
+	// every managed process) means all launch paths persist and a future one
+	// cannot forget.
+	mp.onLaunched = s.persistChildren
 
 	return mp, nil
 }
@@ -373,6 +393,111 @@ func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 	wg.Wait()
 }
 
+// persistChildren rewrites the orphan-reaping ownership ledger to reflect every
+// currently-live child (plan 009 D11-D13, #59). It is invoked by every
+// successful startWithConfig (via ManagedProcess.onLaunched), OUTSIDE any p.mu
+// critical section.
+//
+// It holds childrenMu across BOTH the s.mu snapshot and the file write so the
+// serialized persists each capture the up-to-date live set -- the final write
+// therefore reflects reality even when launches race (last-writer-correctness).
+// The write itself is temp+rename (file-atomicity), so a concurrent LoadChildren
+// never sees a torn ledger.
+//
+// Persistence-failure policy (best-effort, loud): a write failure is logged
+// prominently and swallowed -- the just-started child is NOT failed or killed
+// over an unwritable ledger.
+func (s *Supervisor) persistChildren() {
+	if s.supConfig.StateDir == "" {
+		return
+	}
+
+	s.childrenMu.Lock()
+	defer s.childrenMu.Unlock()
+
+	recs := s.snapshotChildren()
+
+	// Gate AFTER the snapshot, not before. Once launches are refused, Stop owns the
+	// ledger (removes it after a clean reap, or RETAINS it on
+	// ErrProcessGroupNotReaped). A launch that got past the launch gate and reaches
+	// this callback late must NOT rewrite the ledger, or it could clobber a
+	// retained ledger (dropping a surviving group) or recreate one after removal
+	// (codex review). Stop flips launchable false BEFORE it stops any process, and
+	// the p.mu the snapshot takes to read a process's (Crashed) state
+	// synchronizes-with that flip -- so any snapshot that could OMIT a
+	// being-stopped survivor is guaranteed to observe launchable==false here and
+	// abort. Checking BEFORE the snapshot left a window where a callback read
+	// launchable==true, then Stop flipped it and Crashed the survivor, then the
+	// stale snapshot wrote an incomplete ledger.
+	//
+	// Accepted residual (plan §9, codex): this gate trades the clobber-a-retained-
+	// ledger bug for a narrower completeness gap. If a callback snapshots BEFORE a
+	// concurrent launch B, writes while launchable is still true, and B's own
+	// callback then aborts at this gate during shutdown, a B that SURVIVES Stop can
+	// be left out of the ledger. This is NOT a safety issue (it can only fail to
+	// reap, never signal an innocent group) and is ultra-narrow (needs a
+	// SIGKILL-surviving group AND an API launch landing exactly at shutdown); worst
+	// case the operator kills that one group manually, as before #59. Fully closing
+	// it (Stop authoritatively rewriting the survivor set) is a recommended
+	// follow-up, bounded anyway by the pre-existing launch/stop race (#36 D4).
+	if !s.launchable.Load() {
+		return
+	}
+
+	if err := WriteChildren(s.supConfig.StateDir, recs); err != nil {
+		s.systemErrorf("ERROR: failed to persist child ownership ledger: %v", err)
+	}
+}
+
+// systemErrorf writes an ERROR-level system log line to stderr. It is the stderr
+// sibling of SystemLog, used for the best-effort ledger-persistence failures that
+// are logged loudly but swallowed (see persistChildren / removeChildrenLedger).
+func (s *Supervisor) systemErrorf(format string, args ...interface{}) {
+	s.logManager.Write(domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "system",
+		Stream:    domain.StreamStderr,
+		Line:      fmt.Sprintf(format, args...),
+	})
+}
+
+// snapshotChildren returns a ledger record for every currently-live child. It
+// collects the managed-process pointers under s.mu (correct s.mu -> p.mu order),
+// then reads each record via childRecord (which takes its own p.mu and reads the
+// start token UNDER it, so the token matches the captured pid's generation), so
+// no per-process syscall runs while s.mu is held.
+func (s *Supervisor) snapshotChildren() []ChildRecord {
+	s.mu.RLock()
+	procs := make([]*ManagedProcess, 0, len(s.processes))
+	for _, mp := range s.processes {
+		procs = append(procs, mp)
+	}
+	s.mu.RUnlock()
+
+	recs := make([]ChildRecord, 0, len(procs))
+	for _, mp := range procs {
+		if rec, ok := mp.childRecord(); ok {
+			recs = append(recs, rec)
+		}
+	}
+	return recs
+}
+
+// removeChildrenLedger deletes the ownership ledger under childrenMu. It is
+// called from Stop ONLY when every group was confirmed reaped -- a clean
+// shutdown leaves no orphans to reap, so the ledger must not linger and drive a
+// spurious reap on the next startup. A no-op when persistence is disabled.
+func (s *Supervisor) removeChildrenLedger() {
+	if s.supConfig.StateDir == "" {
+		return
+	}
+	s.childrenMu.Lock()
+	defer s.childrenMu.Unlock()
+	if err := RemoveChildren(s.supConfig.StateDir); err != nil {
+		s.systemErrorf("ERROR: failed to remove child ownership ledger: %v", err)
+	}
+}
+
 // stopEvent maps a per-process Stop result to the event that Supervisor.Stop and
 // StopProcess both emit, so the event semantics stay uniform across the two paths
 // by construction (#36, D3): a clean stop (or already-not-running) is
@@ -501,6 +626,11 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	})
 
 	if len(failures) == 0 {
+		// Every group was confirmed reaped -- there are no orphans for a later
+		// `prox up` to reap, so drop the ownership ledger. It is RETAINED below
+		// when a group survived (ErrProcessGroupNotReaped), so the next startup can
+		// still reap whatever this stop could not.
+		s.removeChildrenLedger()
 		// Return a literal nil, never a typed-nil *ProcessStopError (which would be
 		// a non-nil error interface).
 		return nil
