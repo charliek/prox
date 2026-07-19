@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1158,20 +1159,318 @@ func TestRequestsSearch_EscClearsQuery(t *testing.T) {
 	assert.Empty(t, m.requestSearchQuery, "esc clears the requests-view search query")
 }
 
-func TestLogsSearch_SlashStillFilters(t *testing.T) {
-	m := newTestModel()
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
-	m.logEntries = []domain.LogEntry{
-		{Process: "p", Line: "keep me"},
-		{Process: "p", Line: "drop it"},
-		{Process: "p", Line: "keep this too"},
-	}
-	require.Equal(t, ViewModeLogs, m.viewMode)
+// --- Logs-view search navigation tests (C4 / D6-D10) ---
 
-	m = commitSearch(m, "keep")
-	assert.Equal(t, "keep", m.searchPattern, "logs-view / commits the substring filter (unchanged)")
+// newLogsModel builds a Model in the (default) logs view, viewport sized so its
+// content height is viewportHeight (handleWindowSize subtracts the 6-row
+// margin), then streams the given lines through handleLogEntry so each entry is
+// stamped with a unique non-zero Seq — the logs search cursor anchors by Seq, so
+// a zero Seq would break the anchor. followMode starts true (default), pinning
+// the cursor to the newest line until a jump or scroll disengages it.
+func newLogsModel(viewportHeight int, lines []string) Model {
+	m := newTestModel()
+	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	base := time.Unix(0, 0)
+	for i, line := range lines {
+		m = updateModel(m, LogEntryMsg(domain.LogEntry{
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Process:   "p",
+			Line:      line,
+		}))
+	}
+	return m
+}
+
+// logCursorLine returns the line the logs search cursor currently sits on
+// (resolved against the filtered list), for assertions that care about which
+// line was landed rather than its shifting index.
+func logCursorLine(t *testing.T, m Model) string {
+	t.Helper()
+	fe := m.filteredEntries()
+	require.GreaterOrEqual(t, m.logCursorIdx, 0)
+	require.Less(t, m.logCursorIdx, len(fe))
+	return fe[m.logCursorIdx].Line
+}
+
+// TestLogsSearch_SlashNavigates replaces the old TestLogsSearch_SlashStillFilters:
+// logs `/` no longer filters — it navigates (jumps the cursor) and leaves every
+// line visible, mirroring the requests view (D6).
+func TestLogsSearch_SlashNavigates(t *testing.T) {
+	m := newLogsModel(20, []string{"keep me", "drop it", "keep this too"})
+	require.Equal(t, ViewModeLogs, m.viewMode)
+	before := len(m.filteredEntries())
+
+	m = commitSearch(m, "drop")
+	assert.Equal(t, "drop", m.logSearchQuery, "logs-view / commits the navigation query")
+	assert.Empty(t, m.searchPattern, "logs-view / must not touch the `s` filter")
 	assert.Empty(t, m.requestSearchQuery, "logs-view / must not set the requests query")
-	assert.Len(t, m.filteredEntries(), 2, "logs-view / hides non-matching lines")
+	assert.Len(t, m.filteredEntries(), before, "logs-view / navigates; it must not hide lines")
+	assert.Equal(t, "drop it", logCursorLine(t, m), "the cursor lands on the matching line")
+}
+
+func TestLogsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
+	// "needle" matches rows 0 and 2; rows 1 and 3 do not.
+	m := newLogsModel(20, []string{"needle a", "x", "needle b", "z"})
+	m = updateModel(m, keyRune('g')) // top of viewport, follow off; origin -> row 0
+	require.False(t, m.followMode)
+
+	// At-or-after from the top: row 0 already matches, so the cursor stays put.
+	m = commitSearch(m, "needle")
+	assert.Equal(t, "needle", m.logSearchQuery)
+	assert.Equal(t, 0, m.logCursorIdx, "at-or-after stays on a matching origin")
+
+	// Park the cursor on the last row (row 3, no "needle") via a throwaway query,
+	// then a fresh "needle" at-or-after finds nothing to the end and WRAPS to row 0.
+	m = commitSearch(m, "z")
+	require.Equal(t, 3, m.logCursorIdx)
+	m = commitSearch(m, "needle")
+	assert.Equal(t, 0, m.logCursorIdx, "at-or-after wraps around to the first match")
+
+	// Park on row 1 (no match), then at-or-after jumps FORWARD to the next match (row 2).
+	m = commitSearch(m, "x")
+	require.Equal(t, 1, m.logCursorIdx)
+	m = commitSearch(m, "needle")
+	assert.Equal(t, 2, m.logCursorIdx, "at-or-after jumps forward to the next match")
+}
+
+func TestLogsSearch_NextPrevWrap(t *testing.T) {
+	m := newLogsModel(20, []string{"needle a", "x", "needle b", "z"})
+	m = updateModel(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, 0, m.logCursorIdx)
+
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 2, m.logCursorIdx, "n advances to the next match")
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, 0, m.logCursorIdx, "n wraps to the first match")
+
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, 2, m.logCursorIdx, "N wraps backward to the last match")
+	m = updateModel(m, keyRune('N'))
+	assert.Equal(t, 0, m.logCursorIdx, "N retreats to the previous match")
+}
+
+func TestLogsSearch_ComposesWithFilter(t *testing.T) {
+	// The `s` filter keeps only "keep" lines; search then navigates WITHIN that
+	// filtered set, never selecting a hidden "drop" row.
+	m := newLogsModel(20, []string{
+		"keep needle a", "drop needle b", "keep plain", "keep needle c", "drop needle d",
+	})
+	m.searchPattern = "keep" // active `s` filter -> rows 0,2,3 survive
+	m.followMode = false
+	m.updateViewport()
+	m = updateModel(m, keyRune('g')) // origin -> top of the filtered list
+
+	m = commitSearch(m, "needle")
+	assert.Equal(t, "keep needle a", logCursorLine(t, m), "search starts within the `s`-filtered set")
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "keep needle c", logCursorLine(t, m), "n skips the filtered-out drop rows")
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, "keep needle a", logCursorLine(t, m), "wraps over the filtered matches only")
+	assert.Equal(t, "keep", m.searchPattern, "the `s` filter is untouched")
+}
+
+func TestLogsSearch_NoMatch(t *testing.T) {
+	m := newLogsModel(20, []string{"aaa", "bbb", "ccc"})
+	m = updateModel(m, keyRune('g'))
+
+	m = commitSearch(m, "zzz")
+	assert.Equal(t, "zzz", m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx, "a query with no match leaves no cursor")
+
+	// n/N are also no-ops when nothing matches.
+	m = updateModel(m, keyRune('n'))
+	assert.Equal(t, -1, m.logCursorIdx)
+
+	bar := m.statusBar("")
+	assert.Contains(t, bar, "/zzz (0 matches)", "status shows the 0-match form")
+}
+
+func TestLogsSearch_EscClears(t *testing.T) {
+	m := newLogsModel(20, []string{"aaa", "needle", "bbb"})
+	m = updateModel(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.logSearchQuery)
+	require.NotEqual(t, -1, m.logCursorIdx)
+
+	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.logSearchQuery, "esc clears the logs-view search query")
+	assert.Equal(t, int64(0), m.logCursorSeq, "esc resets the logs cursor anchor")
+	assert.Equal(t, -1, m.logCursorIdx, "esc resets the logs cursor index")
+}
+
+func TestLogsSearch_StatusIndicator(t *testing.T) {
+	m := newLogsModel(20, []string{"needle a", "x", "needle b"})
+	m = updateModel(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, 0, m.logCursorIdx)
+
+	assert.Contains(t, m.statusBar(""), "/needle (1/2)", "shows the cursor's match position of the total")
+	m = updateModel(m, keyRune('n'))
+	assert.Contains(t, m.statusBar(""), "/needle (2/2)", "advancing updates the position")
+}
+
+func TestLogsSearch_FollowPreservedOnNewestRowMatch(t *testing.T) {
+	// Follow on, cursor pinned to the newest line which matches: the jump lands
+	// where the cursor already is, so follow must stay engaged.
+	m := newLogsModel(20, []string{"a", "b", "c", "hit newest"})
+	require.True(t, m.followMode)
+	m = commitSearch(m, "hit")
+	assert.Equal(t, 3, m.logCursorIdx, "the newest line matches")
+	assert.True(t, m.followMode, "a jump landing on the newest line preserves follow")
+
+	// A jump that MOVES the cursor off the newest line must disengage follow, or
+	// resolveLogCursor's pin-to-newest would immediately undo the jump.
+	m2 := newLogsModel(20, []string{"a", "hit mid", "c", "d"})
+	require.True(t, m2.followMode)
+	m2 = commitSearch(m2, "hit")
+	assert.Equal(t, 1, m2.logCursorIdx, "the jump sticks off the newest line")
+	assert.False(t, m2.followMode, "jumping off the newest line disengages follow")
+}
+
+func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
+	// Regression (codex review): after a jump parks the cursor off the newest row
+	// (follow disengaged), a streaming log arrival must NOT silently re-engage
+	// follow and drag the ❯ marker off the match — even with a short/full viewport
+	// where the match is still "near bottom".
+	m := newLogsModel(20, []string{"a", "hit mid", "c", "d"})
+	m = commitSearch(m, "hit")
+	require.Equal(t, "hit mid", logCursorLine(t, m))
+	require.False(t, m.followMode)
+	require.Contains(t, m.statusBar(""), "/hit (1/1)")
+
+	// A new log line arrives while the search is parked off-newest.
+	m = updateModel(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Unix(10, 0),
+		Process:   "p",
+		Line:      "e newest",
+	}))
+
+	assert.False(t, m.followMode, "a streaming arrival must not re-engage follow while a search is parked")
+	assert.Equal(t, "hit mid", logCursorLine(t, m), "the cursor stays on the match, not yanked to the new newest row")
+	assert.Contains(t, m.statusBar(""), "/hit (1/1)", "match position is preserved across the arrival")
+}
+
+func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
+	m := newTestModel()
+	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	feed := func(line string) {
+		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
+	}
+
+	// Fill the ring with a lone match parked in the MIDDLE, so scrolling to it on
+	// commit does not leave the viewport near the bottom (which would re-engage
+	// follow on later arrivals and pin the cursor to the newest row instead).
+	for i := 0; i < 500; i++ {
+		feed(fmt.Sprintf("log %04d", i))
+	}
+	feed("NEEDLE row")
+	for i := 0; i < 500; i++ {
+		feed(fmt.Sprintf("log %04d", 500+i))
+	}
+	require.Len(t, m.logEntries, maxLogEntries, "the front-eviction ring is full")
+
+	// Search with follow off so the cursor stays Seq-anchored to NEEDLE as the
+	// ring shifts, rather than being pinned to the newest line.
+	m = updateModel(m, keyRune('g')) // GotoTop, follow off
+	m = commitSearch(m, "NEEDLE")
+	require.False(t, m.followMode)
+	require.Contains(t, m.logEntries[m.logCursorIdx].Line, "NEEDLE")
+	needleSeq := m.logCursorSeq
+	require.NotZero(t, needleSeq)
+	idxBefore := m.logCursorIdx
+
+	// Push more: front eviction shifts NEEDLE's index down, but its Seq survives,
+	// so resolveLogCursor re-resolves the cursor onto it (index changes, line same).
+	for i := 0; i < 10; i++ {
+		feed(fmt.Sprintf("extra %d", i))
+	}
+	assert.Equal(t, needleSeq, m.logCursorSeq, "the Seq anchor is unchanged by eviction")
+	assert.Contains(t, m.logEntries[m.logCursorIdx].Line, "NEEDLE", "cursor rides the Seq across the ring")
+	assert.Less(t, m.logCursorIdx, idxBefore, "the anchored index shifted down as the ring evicted")
+
+	// Now evict NEEDLE outright; the cursor must CLAMP into range, never go stale
+	// or panic.
+	for i := 0; i < 1100; i++ {
+		feed(fmt.Sprintf("flood %d", i))
+	}
+	for _, e := range m.logEntries {
+		require.NotEqual(t, needleSeq, e.Seq, "NEEDLE has been evicted")
+	}
+	assert.GreaterOrEqual(t, m.logCursorIdx, 0, "the evicted cursor clamps in range")
+	assert.Less(t, m.logCursorIdx, len(m.logEntries), "the evicted cursor clamps in range")
+}
+
+func TestLogsSearch_FirstSearchAfterManualScroll(t *testing.T) {
+	// A match sits both ABOVE the visible region (row 2) and inside/after it
+	// (row 20). A first search must seed from what the user is looking at (the
+	// top visible row), landing on row 20 rather than the earlier row 2.
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %02d", i)
+	}
+	lines[2] = "target above"
+	lines[20] = "target below"
+	m := newLogsModel(5, lines) // viewport height 5, follow on, parked at the bottom
+
+	m = updateModel(m, keyRune('k')) // disengage follow
+	require.False(t, m.followMode)
+	m.viewport.SetYOffset(15) // top visible row is now 15
+	require.Equal(t, 15, m.viewport.YOffset)
+
+	m = commitSearch(m, "target")
+	assert.Equal(t, 20, m.logCursorIdx, "first search starts from the visible region, not row 0")
+}
+
+func TestLogsSearch_HighlightGuard(t *testing.T) {
+	// The default test renderer is Ascii (no color), which would make a
+	// highlighted and an unhighlighted line byte-identical. Force a color profile
+	// so the inline highlight actually emits detectable ANSI, and restore it.
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(prev)
+
+	m := newLogsModel(20, []string{"plain"})
+
+	// ASCII line + ASCII query: the matched run is wrapped in searchHighlightStyle.
+	m.logSearchQuery = "match"
+	ascii := m.highlightLogLine("hello match world")
+	assert.NotEqual(t, "hello match world", ascii, "an ASCII match is inline-highlighted")
+	assert.Contains(t, ascii, searchHighlightStyle.Render("match"), "the matched run is styled")
+	assert.Contains(t, ascii, "hello ")
+	assert.Contains(t, ascii, " world")
+
+	// Unicode line: case-folding would shift byte offsets, so the guard trips and
+	// the line falls back to no inline highlight (row marker alone) — unchanged.
+	uni := "日本語 match テスト"
+	assert.Equal(t, uni, m.highlightLogLine(uni), "a unicode line falls back to no highlight")
+
+	// ESC-bearing line: a digit query can match inside the ANSI escape, so the
+	// guard trips and the escape is left intact rather than split.
+	m.logSearchQuery = "31"
+	ansiLine := "x \x1b[31mred\x1b[0m match"
+	assert.Equal(t, ansiLine, m.highlightLogLine(ansiLine), "an ESC-bearing line falls back, escape intact")
+}
+
+func TestLogsSearch_UnicodeAndAnsiRenderSafely(t *testing.T) {
+	// End-to-end: a unicode line and a line already carrying ANSI escapes. The
+	// search must not panic or split the escape, and the row marker still lands
+	// on the matched row.
+	m := newLogsModel(20, []string{"before", "cafe \x1b[31mMATCH\x1b[0m after", "café résumé MATCH"})
+	m = updateModel(m, keyRune('g'))
+	m = commitSearch(m, "MATCH")
+	require.Equal(t, 1, m.logCursorIdx, "the first match at/after the top is the ANSI row")
+
+	view := m.viewport.View()
+	assert.Contains(t, view, "❯", "the cursor marker renders on the matched row")
+	assert.Contains(t, view, "\x1b[31mMATCH\x1b[0m", "the source line's escape survives intact (not split by a highlight)")
+}
+
+func TestLogsSearch_IsASCIINoESC(t *testing.T) {
+	assert.True(t, isASCIINoESC("plain ascii 123"))
+	assert.True(t, isASCIINoESC(""))
+	assert.False(t, isASCIINoESC("café"), "non-ASCII bytes fail")
+	assert.False(t, isASCIINoESC("has\x1b[0mesc"), "an ESC byte fails even though it is ASCII")
 }
 
 func TestRequestsSearch_StatusPrecedence(t *testing.T) {

@@ -63,6 +63,30 @@ type BaseModel struct {
 	// the filtered list at keypress time (D12/D13).
 	requestSearchQuery string
 
+	// logSearchQuery is the logs-view `/` search term. Like requestSearchQuery
+	// (and unlike searchPattern, the `s` filter) it NAVIGATES rather than
+	// filters: `/` jumps the logs cursor to the first matching line and n/N
+	// cycle, leaving every line visible. Match state is never stored; the seek
+	// helpers rescan filteredEntries() at keypress time (D6-D8).
+	logSearchQuery string
+
+	// logSeq is a session-local monotonic counter stamped onto each ingested
+	// LogEntry.Seq. The logs cursor is anchored by Seq, not index, so it rides
+	// the 1000-entry front-eviction ring without drifting (a bare index would
+	// shift when old entries are dropped — see LogEntry.Seq) (D7).
+	logSeq int64
+
+	// Logs-view search cursor (Seq-anchored). logCursorSeq names the line the
+	// cursor sits on; logCursorIdx is its index in the filtered list. Both are
+	// mutated ONLY through setLogCursor so they can never disagree. logCursorSeq
+	// 0 is the explicit no-cursor sentinel (ingested Seqs are always >= 1), and
+	// logCursorIdx -1 pairs with it. Unlike the requests cursor, this one exists
+	// only while a `/`-search is active and is not scroll-coupled: j/k keep
+	// scrolling the viewport, and resolveLogCursor only re-derives the marker
+	// index — the scroll-to-match is a one-shot from the /,n,N handlers (D8/D9).
+	logCursorSeq int64
+	logCursorIdx int
+
 	// Auto-scroll
 	followMode bool // Auto-scroll to bottom on new logs
 
@@ -116,6 +140,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		viewMode:        ViewModeLogs,
 		filterProcesses: make(map[string]bool),
 		followMode:      true,
+		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
 	}
 }
@@ -149,6 +174,10 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	// Check if we're at/near bottom BEFORE adding new content
 	wasNearBottom := b.isNearBottom()
 
+	// Stamp a session-local monotonic Seq so the logs search cursor can anchor
+	// to this line's identity across the front-eviction ring below (D7).
+	b.logSeq++
+	entry.Seq = b.logSeq
 	b.logEntries = append(b.logEntries, entry)
 	// Keep only last entries - create new slice to release memory from old entries
 	if len(b.logEntries) > maxLogEntries {
@@ -158,8 +187,15 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	}
 	b.updateViewport()
 
-	// If user was at bottom, re-enable follow mode and stay at bottom
-	if wasNearBottom {
+	// If user was at bottom, re-enable follow mode and stay at bottom — UNLESS an
+	// active logs search has parked the cursor off the newest row. landLogSearchJump
+	// deliberately disengages follow on an off-newest match; with a short/full
+	// viewport that match is still "near bottom", so a streaming arrival would
+	// otherwise silently flip follow back on and let resolveLogCursor drag the ❯
+	// marker off the match (search position lost mid-stream). While a search is
+	// parked (query set, follow off), leave follow disengaged.
+	searchParked := b.logSearchQuery != "" && !b.followMode
+	if wasNearBottom && !searchParked {
 		b.followMode = true
 		b.viewport.GotoBottom()
 	} else if b.followMode {
@@ -279,9 +315,17 @@ func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.updateViewport()
 			return true, nil
 		}
-		// Logs view: `/` is a substring filter committed on Enter (D14).
-		b.searchPattern = b.textInput.Value()
+		// Logs view: `/` is navigation, not filtration (D6/D8) — it mirrors the
+		// requests view. Commit the query to logSearchQuery (searchPattern — the
+		// `s` filter — is untouched) and jump the cursor to the first match
+		// at-or-after the current position, wrapping. The scroll-to-match is a
+		// one-shot here rather than wired into updateViewport, which also runs on
+		// streaming arrivals and free j/k scroll where re-scrolling would fight
+		// the reader.
+		b.logSearchQuery = b.textInput.Value()
+		b.seekLogSearchMatch(0)
 		b.updateViewport()
+		b.ensureLogCursorVisible()
 		return true, nil
 	}
 
@@ -370,16 +414,25 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		return true
 
 	case "n", "N":
-		// Requests-view search navigation only: n jumps to the next match
-		// strictly after the cursor, N to the previous, both wrapping (D13).
-		// No-op (and unhandled elsewhere) outside the requests view.
-		if b.viewMode == ViewModeRequests {
-			dir := 1
-			if msg.String() == "N" {
-				dir = -1
-			}
+		// Search navigation: n jumps to the next match strictly after the
+		// cursor, N to the previous, both wrapping. Handled in the requests view
+		// (D13) and the logs view (D8); a no-op query in either view leaves the
+		// cursor put. Unhandled in the detail view.
+		dir := 1
+		if msg.String() == "N" {
+			dir = -1
+		}
+		switch b.viewMode {
+		case ViewModeRequests:
 			b.cycleRequestSearchMatch(dir)
 			b.updateViewport()
+			return true
+		case ViewModeLogs:
+			// One-shot scroll to the landed match, after the re-render (updateViewport
+			// deliberately never scrolls the logs viewport — see seekLogSearchMatch).
+			b.seekLogSearchMatch(dir)
+			b.updateViewport()
+			b.ensureLogCursorVisible()
 			return true
 		}
 		return false
@@ -412,10 +465,15 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.updateViewport()
 			return true
 		}
-		// Clear filters (and the requests-view search query — D13).
+		// Clear filters and both views' search queries (D13/D8). Resetting the
+		// logs cursor to the no-cursor sentinel makes the next `/` seed its
+		// origin from the viewport again rather than the stale prior match.
 		b.soloProcess = ""
 		b.searchPattern = ""
 		b.requestSearchQuery = ""
+		b.logSearchQuery = ""
+		b.logCursorSeq = 0
+		b.logCursorIdx = -1
 		b.updateViewport()
 		return true
 
@@ -624,6 +682,189 @@ func (b *BaseModel) requestSearchMatchInfo(requests []proxy.RequestRecord) (posi
 	return position, total
 }
 
+// logMatchesSearch reports whether a log line matches the logs-view `/` query:
+// a case-insensitive substring over the line text (D8).
+func logMatchesSearch(entry domain.LogEntry, query string) bool {
+	return containsIgnoreCase(entry.Line, query)
+}
+
+// seekLogSearchMatch scans the filtered log entries for a matching line and
+// moves the logs cursor to it. dir 0 = at-or-after the origin (the `/`-commit
+// jump, includes the origin row); dir +1/-1 = strictly next/previous (n/N),
+// wrapping. Mirrors seekRequestSearchMatch: derived at keypress time, no match
+// list is ever stored (D8).
+func (b *BaseModel) seekLogSearchMatch(dir int) {
+	if b.logSearchQuery == "" {
+		return
+	}
+	entries := b.filteredEntries()
+	n := len(entries)
+	if n == 0 {
+		return
+	}
+	start := b.logSearchOriginIdx(entries)
+	if dir == 0 {
+		// At-or-after: offsets 0..n-1 forward, origin row first.
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			if logMatchesSearch(entries[idx], b.logSearchQuery) {
+				b.landLogSearchJump(entries, idx, n)
+				return
+			}
+		}
+		return
+	}
+	// Strictly past the cursor: offsets 1..n-1 in dir, wrapping. The origin row
+	// is never revisited, so n/N are no-ops when it is the sole match.
+	for i := 1; i < n; i++ {
+		idx := ((start+dir*i)%n + n) % n
+		if logMatchesSearch(entries[idx], b.logSearchQuery) {
+			b.landLogSearchJump(entries, idx, n)
+			return
+		}
+	}
+}
+
+// logSearchOriginIdx returns the index in entries from which a seek should
+// begin. With a cursor already anchored (logCursorSeq set), it re-resolves that
+// Seq to its current index — surviving the eviction ring — and clamps the
+// last-known index when the anchored line has been evicted. On the FIRST search
+// (no cursor yet), it seeds from what the user is looking at: the newest row
+// under follow, else the top visible row derived from the viewport offset, so
+// `/` searches from the region on screen (D8).
+func (b *BaseModel) logSearchOriginIdx(entries []domain.LogEntry) int {
+	n := len(entries)
+	if b.logCursorSeq != 0 {
+		for i, e := range entries {
+			if e.Seq == b.logCursorSeq {
+				return i
+			}
+		}
+		// Anchored line evicted: fall back to the clamped last-known index.
+		return clampIndex(b.logCursorIdx, n)
+	}
+	if b.followMode {
+		return n - 1
+	}
+	return clampIndex(b.viewport.YOffset, n)
+}
+
+// clampIndex clamps idx into [0, n-1] for a non-empty n (callers guard n > 0).
+func clampIndex(idx, n int) int {
+	if idx < 0 {
+		return 0
+	}
+	if idx > n-1 {
+		return n - 1
+	}
+	return idx
+}
+
+// landLogSearchJump places the logs cursor on a search match. Mirrors
+// landSearchJump: follow is disengaged only when the jump moves the cursor off
+// the newest row — a jump must stick against resolveLogCursor's pin-to-newest
+// and handleLogEntry's auto-GotoBottom, but a match landing ON the newest row
+// leaves follow untouched (never re-engaged; a search jump is positioning, not
+// scrolling intent).
+func (b *BaseModel) landLogSearchJump(entries []domain.LogEntry, idx, n int) {
+	if idx != n-1 {
+		b.followMode = false
+	}
+	b.setLogCursor(entries, idx)
+}
+
+// setLogCursor is the SOLE mutator of the logs-view search cursor. It clamps
+// idx into [0, len(entries)-1] and updates logCursorIdx and logCursorSeq
+// together so the pair can never disagree; an empty list resets to the
+// no-cursor sentinel (logCursorIdx -1, logCursorSeq 0). Mirrors setRequestCursor.
+func (b *BaseModel) setLogCursor(entries []domain.LogEntry, idx int) {
+	if len(entries) == 0 {
+		b.logCursorIdx = -1
+		b.logCursorSeq = 0
+		return
+	}
+	idx = clampIndex(idx, len(entries))
+	b.logCursorIdx = idx
+	b.logCursorSeq = entries[idx].Seq
+}
+
+// resolveLogCursor re-anchors the logs search cursor against the current
+// filtered list at render time (called from updateViewport only while a search
+// is active), so the row marker stays on the searched-to line as entries stream
+// in and the eviction ring shifts indices. Mirrors resolveRequestCursor but
+// anchors by Seq (logs have no ID) and NEVER scrolls — the logs viewport scroll
+// stays owned by j/k, follow, and the one-shot ensureLogCursorVisible.
+//
+// Unlike the requests cursor (which always exists), the logs cursor is
+// search-scoped: logCursorSeq 0 means no jump has landed (fresh search with no
+// match, or a cleared one), so there is NO marker — we return the sentinel
+// rather than manufacturing a row-0 cursor. Precedence when a cursor DOES exist:
+//   - follow mode pins the cursor to the newest (last) row;
+//   - else if logCursorSeq is still present, its current index;
+//   - else the stale logCursorIdx is clamped and re-anchored (line evicted).
+func (b *BaseModel) resolveLogCursor(entries []domain.LogEntry) {
+	if b.logCursorSeq == 0 {
+		b.logCursorIdx = -1 // no active cursor: sentinel, no marker
+		return
+	}
+	if len(entries) == 0 {
+		b.setLogCursor(entries, 0) // resets to the no-cursor sentinel
+		return
+	}
+	if b.followMode {
+		b.setLogCursor(entries, len(entries)-1)
+		return
+	}
+	for i, e := range entries {
+		if e.Seq == b.logCursorSeq {
+			b.setLogCursor(entries, i)
+			return
+		}
+	}
+	// Anchored line evicted: clamp the last-known index and re-anchor.
+	b.setLogCursor(entries, b.logCursorIdx)
+}
+
+// ensureLogCursorVisible scrolls the logs viewport the minimum amount needed to
+// bring the cursor row on-screen. Called ONLY from the /,n,N handlers as a
+// one-shot (mirrors ensureCursorVisible but is deliberately NOT wired into
+// updateViewport, so streaming re-renders and free j/k scroll are never yanked).
+func (b *BaseModel) ensureLogCursorVisible() {
+	if b.logCursorIdx < 0 {
+		return // no-cursor sentinel (empty list or no active search)
+	}
+	// A grown viewport (or shrunk list) can leave YOffset past the last valid
+	// offset. Reclamp before the minimal-scroll branches.
+	if maxOffset := b.viewport.TotalLineCount() - b.viewport.Height; b.viewport.YOffset > maxOffset {
+		b.viewport.SetYOffset(max(0, maxOffset))
+	}
+	if b.logCursorIdx < b.viewport.YOffset {
+		b.viewport.SetYOffset(b.logCursorIdx)
+	} else if b.logCursorIdx >= b.viewport.YOffset+b.viewport.Height {
+		b.viewport.SetYOffset(b.logCursorIdx - b.viewport.Height + 1)
+	}
+}
+
+// logSearchMatchInfo derives the status-bar match indicator for the current
+// logSearchQuery over entries (the filtered list): total match count and the
+// cursor's 1-based position among matches (0 when the cursor is off any match).
+// Mirrors requestSearchMatchInfo; entries is passed in so statusBar shares one
+// filteredEntries() scan with the visible/total count (D10).
+func (b *BaseModel) logSearchMatchInfo(entries []domain.LogEntry) (position, total int) {
+	if b.logSearchQuery == "" {
+		return 0, 0
+	}
+	for i, entry := range entries {
+		if logMatchesSearch(entry, b.logSearchQuery) {
+			total++
+			if i == b.logCursorIdx {
+				position = total
+			}
+		}
+	}
+	return position, total
+}
+
 // isNearBottom checks if the viewport is at or near the bottom
 func (b *BaseModel) isNearBottom() bool {
 	if b.viewport.AtBottom() {
@@ -742,8 +983,24 @@ func (b *BaseModel) updateViewport() {
 		}
 	default: // ViewModeLogs
 		entries := b.filteredEntries()
-		for _, entry := range entries {
+		// A `/`-search adds a cursor row marker (mirroring the requests block).
+		// Resolve the Seq-anchored cursor against the just-computed list BEFORE
+		// formatting so the marker index and formatLogEntry's inline highlight
+		// agree within this single render. No cursor/marker without a search:
+		// the marker prefix would otherwise shift every log line for no reason.
+		searching := b.logSearchQuery != ""
+		if searching {
+			b.resolveLogCursor(entries)
+		}
+		for i, entry := range entries {
 			line := b.formatLogEntry(entry)
+			if searching {
+				marker := "  "
+				if i == b.logCursorIdx {
+					marker = cursorStyle.Render("❯ ")
+				}
+				line = marker + line
+			}
 			lines = append(lines, line)
 		}
 	}
@@ -1088,7 +1345,47 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 		streamIndicator = errorStyle.Render(" ERR ")
 	}
 
-	return fmt.Sprintf("%s %s%s %s", timestamp, prefix, streamIndicator, entry.Line)
+	return fmt.Sprintf("%s %s%s %s", timestamp, prefix, streamIndicator, b.highlightLogLine(entry.Line))
+}
+
+// highlightLogLine wraps the first case-insensitive match of the active
+// logSearchQuery in line with searchHighlightStyle (D9). It highlights only
+// when BOTH the query and the WHOLE line are plain ASCII with no ESC byte:
+// case-folding an ASCII line preserves byte offsets (so the styled run lands
+// exactly on the match), and excluding ESC keeps a digit query from matching
+// inside an ANSI escape sequence. Any other line (unicode, or one already
+// carrying escape codes) falls back to the unstyled text — the row marker alone
+// signals the match. Returns line unchanged when no search is active or nothing
+// matches.
+func (b *BaseModel) highlightLogLine(line string) string {
+	q := b.logSearchQuery
+	if q == "" {
+		return line
+	}
+	if !isASCIINoESC(q) || !isASCIINoESC(line) {
+		return line
+	}
+	// Both sides are ASCII, so ToLower does not shift byte offsets: the index
+	// found in the lowered line is valid in the original.
+	idx := strings.Index(strings.ToLower(line), strings.ToLower(q))
+	if idx < 0 {
+		return line
+	}
+	end := idx + len(q)
+	return line[:idx] + searchHighlightStyle.Render(line[idx:end]) + line[end:]
+}
+
+// isASCIINoESC reports whether s is pure ASCII (every byte < 0x80) and contains
+// no ESC byte (0x1b). It gates the inline search highlight: non-ASCII text
+// breaks the byte-offset-preserving case fold, and an embedded ESC means a
+// match could split an ANSI escape sequence (see highlightLogLine).
+func isASCIINoESC(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 || s[i] == 0x1b {
+			return false
+		}
+	}
+	return true
 }
 
 // processPanel renders the process status header
@@ -1127,9 +1424,12 @@ func (b *BaseModel) processPanel() string {
 //     the cursor is on a match, else "/<query> (k matches)" (0 included) — with
 //     "| filter: <pattern>" appended when the `s` filter is also active. soloProcess
 //     is a logs-view concept and is never shown here.
-//   - Logs view: today's precedence — solo wins, then the `s` filter.
+//   - Logs view: the `/` search indicator wins when a query is set —
+//     "/<query> (i/k)" (cursor on match i of k) or "/<query> (k matches)" when
+//     the cursor is off any match — then solo, then the `s` filter (D10). The
+//     `s` filter and search compose (search navigates within the filtered set).
 //   - Otherwise (either view): the `s` filter line, then the default hint.
-func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.RequestRecord) string {
+func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.RequestRecord, entries []domain.LogEntry) string {
 	if b.viewMode == ViewModeRequests && b.requestSearchQuery != "" {
 		position, total := b.requestSearchMatchInfo(requests)
 		var indicator string
@@ -1142,6 +1442,13 @@ func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.Request
 			indicator += fmt.Sprintf(" | filter: %s", b.searchPattern)
 		}
 		return indicator
+	}
+	if b.viewMode == ViewModeLogs && b.logSearchQuery != "" {
+		position, total := b.logSearchMatchInfo(entries)
+		if position > 0 {
+			return fmt.Sprintf("/%s (%d/%d)", b.logSearchQuery, position, total)
+		}
+		return fmt.Sprintf("/%s (%d matches)", b.logSearchQuery, total)
 	}
 	if b.viewMode != ViewModeRequests && b.soloProcess != "" {
 		return fmt.Sprintf("Showing: %s (ESC to clear)", b.soloProcess)
@@ -1175,12 +1482,15 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		viewIndicator = "[Request Detail]"
 	}
 
-	// Requests-view filtered list, computed once and shared below between the
-	// left-side search indicator and the right-side visible count so a single
-	// render doesn't rescan b.proxyRequests twice.
+	// Filtered lists, each computed once and shared below between the left-side
+	// search indicator and the right-side visible count so a single render never
+	// rescans the underlying slice twice. Only the active view's list is built.
 	var requests []proxy.RequestRecord
+	var entries []domain.LogEntry
 	if b.viewMode == ViewModeRequests {
 		requests = b.filteredProxyRequests()
+	} else {
+		entries = b.filteredEntries()
 	}
 
 	// Left side: mode/filter info
@@ -1192,7 +1502,7 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 	case ModeStringFilter:
 		left = "String filter: " + b.textInput.View()
 	default:
-		left = b.statusLeftDefault(extraInfo, requests)
+		left = b.statusLeftDefault(extraInfo, requests, entries)
 	}
 
 	// Right side: follow mode and count
@@ -1203,7 +1513,7 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		total = len(b.proxyRequests)
 		label = "requests"
 	} else {
-		visible = len(b.filteredEntries())
+		visible = len(entries)
 		total = len(b.logEntries)
 		label = "lines"
 	}
@@ -1280,12 +1590,15 @@ Navigation:
   PgUp/PgDn  Page up/down
   F          Toggle auto-follow mode
 
+Search (jumps the cursor, does NOT filter):
+  /          Search lines (jump to match at/after the current position)
+  n/N        Jump to next/previous match (wraps)
+
 Filtering:
   1-9        Solo process (toggle)
   f          Filter mode (process selection)
-  /          Substring filter (hide non-matching, commit on Enter)
   s          Substring filter (hide non-matching, applied live)
-  ESC        Clear filters
+  ESC        Clear filters and search
 
 Other:
   r          Restart selected process (1-9 to select)

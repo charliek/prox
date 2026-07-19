@@ -21,6 +21,14 @@ type LogEntry struct {
 	Process   string    `json:"process"`
 	Stream    Stream    `json:"stream"`
 	Line      string    `json:"line"`
+	// Seq is a TUI-session-local monotonic sequence number assigned on ingest
+	// (BaseModel.handleLogEntry). It anchors the logs-view `/`-search cursor
+	// across the 1000-entry front-eviction ring, where a bare slice index would
+	// drift as old entries are dropped. It is deliberately json:"-": session-
+	// local UI state that must NOT ride the socket wire to the attach client
+	// (which stamps its own on ingest). The wire itself carries LogEntry only
+	// via api.LogEntryResponse, which has no Seq field.
+	Seq int64 `json:"-"`
 }
 
 // LogFilter defines criteria for filtering log entries

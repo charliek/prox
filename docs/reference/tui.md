@@ -81,7 +81,8 @@ A request whose response is still streaming shows its real header-time status bu
 | --- | ------ |
 | `1-9` | Solo process (press again for all) |
 | `f` | Open process filter (multi-select) |
-| `/` | Substring filter, committed on `Enter` (hides non-matching) |
+| `/` | Search lines — jumps the cursor to a match (does not filter) |
+| `n` / `N` | Jump the cursor to the next/previous match (wraps) |
 | `s` | Substring filter, applied live (hides non-matching) |
 | `r` | Restart the soloed process (select with `1`-`9` first) |
 
@@ -180,10 +181,13 @@ Press `f` to open the multi-select process filter:
 Press `/` to enter search mode. An input field appears at the bottom; the
 behavior depends on the active view:
 
-- **Logs view:** `/` is a case-insensitive substring filter committed on
-  `Enter` — matching lines are kept and non-matching ones hidden (the same
-  effect as `s`, which applies live instead of on `Enter`). There is no match
-  highlighting and no `n`/`N` navigation in the logs view.
+- **Logs view:** `/` is case-insensitive substring *navigation* over the log
+  line text. On `Enter` the cursor jumps to the first match at-or-after its
+  current position (wrapping); `n`/`N` then jump to the next and previous
+  matches (wrapping). No lines are hidden, so search composes with an active
+  `s` filter — the cursor row is marked with `❯` and the matched substring is
+  highlighted, and the status bar shows the match indicator (`/<query> (i/k)`
+  or `/<query> (k matches)`). Use `s` — not `/` — to hide non-matching lines.
 - **Requests view:** `/` is case-insensitive substring *navigation* over
   URL/method/subdomain. On `Enter` the cursor jumps to the first match
   at-or-after its current row (wrapping); `n`/`N` then jump to the next and

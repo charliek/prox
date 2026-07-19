@@ -111,6 +111,18 @@ var (
 			Foreground(lipgloss.Color("13")).
 			Bold(true)
 
+	// Search highlight style for the matched substring of a logs-view line
+	// during `/`-search (D9). An accent background (yellow) with black text so
+	// the hit stands out against the line's own coloring. Applied only to the
+	// exact matched run, and only when the query and the whole line are plain
+	// ASCII with no ESC byte — otherwise case-folding could shift byte offsets
+	// or the run could land inside an ANSI escape, so formatLogEntry falls back
+	// to the row marker alone (see isASCIINoESC).
+	searchHighlightStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("0")).
+				Background(lipgloss.Color("11")).
+				Bold(true)
+
 	// Process colors for log lines
 	processColors []lipgloss.Style
 )
