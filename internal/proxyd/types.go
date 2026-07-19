@@ -23,6 +23,10 @@ type RegisterRequest struct {
 	HTTPPort       int                      `json:"http_port,omitempty"`
 	HTTPSPort      int                      `json:"https_port,omitempty"`
 	CaptureEnabled bool                     `json:"capture_enabled,omitempty"`
+	// StartTime is an opaque process start token (see daemon.ProcessStartTime):
+	// a generation discriminator, not a timestamp. 0 means the client could not
+	// read it, so the daemon falls back to bare-PID liveness for this holder.
+	StartTime int64 `json:"start_time,omitempty"`
 }
 
 // RegisterResponse is returned after a successful registration.

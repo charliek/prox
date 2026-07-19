@@ -240,12 +240,13 @@ func TestRegistry_DuplicateProject(t *testing.T) {
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}},
 		0, 443,
 	)
+	req.StartTime = 987654321 // opaque start token; the conflict must echo it back
 	if _, _, err := reg.Register(req); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
 	// Try to register the same project again — a typed conflict carrying the
-	// existing registration's dir and PID.
+	// existing registration's dir, PID, and start token.
 	_, _, err := reg.Register(req)
 	if err == nil {
 		t.Fatal("expected duplicate project error, got nil")
@@ -259,6 +260,9 @@ func TestRegistry_DuplicateProject(t *testing.T) {
 	}
 	if conflict.PID != req.PID {
 		t.Errorf("conflict.PID = %d, want %d", conflict.PID, req.PID)
+	}
+	if conflict.StartTime != req.StartTime {
+		t.Errorf("conflict.StartTime = %d, want %d", conflict.StartTime, req.StartTime)
 	}
 	if !strings.Contains(err.Error(), "already registered by a running prox up") ||
 		!strings.Contains(err.Error(), "prox proxy stop --force") {

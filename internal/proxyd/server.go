@@ -125,6 +125,23 @@ func (s *Server) RequestShutdown() {
 	}
 }
 
+// quiesceForTeardown makes daemon teardown mutually exclusive with lifecycle
+// transactions. It sets the shutdown flag FIRST (so every later register,
+// deregister, and stale-removal self-gates on isShuttingDown()), then takes
+// lifecycleMu once as a barrier so the single transaction that was already in
+// flight when the flag was set completes atomically before the caller tears down
+// listeners and records. Flag-before-lock is the contract; do not reorder.
+//
+// Lock ordering: RequestShutdown takes shutdownMu and releases it before this
+// method acquires lifecycleMu, so there is no shutdownMu<->lifecycleMu cycle with
+// the scheduleShutdownWhenEmpty timer (which takes lifecycleMu, then shutdownMu
+// via RequestShutdown, with no overlapping hold).
+func (s *Server) quiesceForTeardown() {
+	s.RequestShutdown()
+	s.lifecycleMu.Lock()
+	s.lifecycleMu.Unlock() //nolint:staticcheck // SA2001: intentional lifecycle barrier
+}
+
 func (s *Server) registerRoutes() {
 	// Health check — no prefix, lightweight
 	s.router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +244,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			// Route/validation conflict — a real error, never retried.
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
-		if daemon.ProcessExists(conflict.PID) {
+		if daemon.IsProcessAlive(conflict.PID, conflict.StartTime) {
 			// A second live prox up in the same dir is a genuine conflict.
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
@@ -243,18 +260,17 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		}
 	}
 
-	// Ensure certs exist for HTTPS domains before starting listeners
-	if s.proxy != nil && s.proxy.certMgr != nil {
-		for _, ps := range newPorts {
-			if ps.Protocol == "https" {
-				if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
-					s.rollbackRegistration(req.ProjectDir)
-					return http.StatusInternalServerError, ErrorResponse{
-						Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
-						Code:  "CERT_GENERATION_FAILED",
-					}
-				}
-				break // one EnsureDomain per domain is sufficient
+	// Ensure a cert exists for the registration's domain whenever it registers any
+	// HTTPS route. Gating on req.HTTPSPort > 0 (not on a NEW listener port) is the
+	// #58 fix: a domain joining an already-bound shared HTTPS port has no new port
+	// in newPorts, so the old loop skipped its cert and the SNI handshake failed.
+	// EnsureDomain is idempotent (one cert per base domain), so re-calls are cheap.
+	if s.proxy != nil && s.proxy.certMgr != nil && req.HTTPSPort > 0 {
+		if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
+			s.rollbackRegistration(req.ProjectDir)
+			return http.StatusInternalServerError, ErrorResponse{
+				Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
+				Code:  "CERT_GENERATION_FAILED",
 			}
 		}
 	}
@@ -366,6 +382,13 @@ func (s *Server) scheduleShutdownWhenEmpty() {
 func (s *Server) removeProject(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Once teardown has begun, physical cleanup is the exiting daemon's job:
+	// dynamicProxy.Shutdown closes every listener and captureMgr.Cleanup removes
+	// all body files on exit. A deregister here would race that teardown for the
+	// listeners and the closing RequestManager, so no-op under the flag.
+	if s.isShuttingDown() {
+		return nil, nil
+	}
 	return s.removeProjectLocked(projectDir)
 }
 
@@ -387,6 +410,13 @@ func (s *Server) removeProjectLocked(projectDir string) (removedHostnames []stri
 func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Once teardown has begun, physical cleanup is the exiting daemon's job:
+	// dynamicProxy.Shutdown closes every listener and captureMgr.Cleanup removes
+	// all body files on exit. A sweep removal here would race that teardown for
+	// the listeners and the closing RequestManager, so no-op under the flag.
+	if s.isShuttingDown() {
+		return false, nil, nil
+	}
 	return s.removeStaleProjectLocked(projectDir, pid)
 }
 
@@ -511,9 +541,12 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("shutdown requested", "force", force)
+	// Set the flag synchronously BEFORE the response so the 200 is the shutdown
+	// linearization point: a register arriving after it observes isShuttingDown()
+	// and gets 503. server.Shutdown is graceful (it waits for this active handler),
+	// so the response still flushes.
+	s.RequestShutdown()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
-
-	go s.RequestShutdown()
 }
 
 func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {

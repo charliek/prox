@@ -5,8 +5,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -433,6 +435,126 @@ func TestRegister_WhileShuttingDown_Returns503(t *testing.T) {
 	require.True(t, ok, "expected ErrorResponse, got %T", body)
 	assert.Equal(t, "SHUTTING_DOWN", er.Code)
 	assert.True(t, s.registry.IsEmpty(), "no registration may land after shutdown")
+}
+
+// TestQuiesceForTeardown_DrainsInFlightTransaction pins the teardown barrier
+// (#60): quiesceForTeardown sets the shutdown flag FIRST, then blocks on
+// lifecycleMu until the single transaction that was already in flight when the
+// flag was set completes. Modeling the in-flight transaction by holding
+// lifecycleMu directly lets the test assert the flag-before-lock half
+// deterministically (the flag closes while the lock is held) and the
+// barrier-waits half robustly (the return cannot happen until the lock frees).
+func TestQuiesceForTeardown_DrainsInFlightTransaction(t *testing.T) {
+	s := newLifecycleServer()
+
+	// Simulate a lifecycle transaction already in flight by holding the mutex.
+	s.lifecycleMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		s.quiesceForTeardown()
+		close(done)
+	}()
+
+	// Flag-before-lock: the shutdown flag closes even while the in-flight
+	// transaction still holds lifecycleMu.
+	select {
+	case <-s.ShutdownCh():
+		// correct — flag set first
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiesceForTeardown must set the shutdown flag before taking the barrier lock")
+	}
+
+	// The barrier must not return while the in-flight holder still owns
+	// lifecycleMu. "A goroutine is blocked on a mutex" is not directly
+	// observable in Go, so give the quiesce goroutine ample opportunity to run
+	// to completion: if the barrier lock were absent, quiesceForTeardown would be
+	// nothing but RequestShutdown and `done` would close within this window. With
+	// the barrier present, `done` stays open for as long as we hold the lock — no
+	// matter how slow the machine — so this assertion is robust in the correct
+	// direction and reliably fails a regression that drops the barrier.
+	for i := 0; i < 50; i++ {
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+		select {
+		case <-done:
+			t.Fatal("quiesceForTeardown returned before the in-flight transaction released lifecycleMu")
+		default:
+		}
+	}
+
+	// Release the in-flight transaction; the barrier now completes.
+	s.lifecycleMu.Unlock()
+	select {
+	case <-done:
+		// correct — barrier drained the in-flight holder and returned
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiesceForTeardown must return once the in-flight transaction releases lifecycleMu")
+	}
+}
+
+// TestRemoveProject_NoOpsWhileShuttingDown pins that once the shutdown flag is
+// set, the public removal entries no-op instead of racing the exiting daemon's
+// physical teardown (dynamicProxy.Shutdown / captureMgr.Cleanup). The route and
+// its records must be left intact for the exiting daemon to reap. The
+// register-after-flag → 503 counterpart is covered by
+// TestRegister_WhileShuttingDown_Returns503.
+func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
+	t.Run("removeProject", func(t *testing.T) {
+		s := newLifecycleServer()
+		req := newTestRequest("/projects/a", "local.dev",
+			map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+		req.PID = os.Getpid()
+		_, _, err := s.registry.Register(req)
+		require.NoError(t, err)
+		s.requestManager.Record(proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
+
+		s.RequestShutdown()
+
+		removed, emptyPorts := s.removeProject("/projects/a")
+		assert.Nil(t, removed, "removeProject must no-op while shutting down")
+		assert.Nil(t, emptyPorts)
+
+		_, ok := s.registry.Lookup("api.local.dev", 443)
+		assert.True(t, ok, "route must survive for the exiting daemon to reap")
+		assert.Equal(t, 1, s.requestManager.Count(), "records must not be purged mid-teardown")
+	})
+
+	t.Run("removeStaleProject", func(t *testing.T) {
+		s := newLifecycleServer()
+		req := newTestRequest("/projects/a", "local.dev",
+			map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+		req.PID = os.Getpid()
+		_, _, err := s.registry.Register(req)
+		require.NoError(t, err)
+		s.requestManager.Record(proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
+
+		s.RequestShutdown()
+
+		removed, hostnames, emptyPorts := s.removeStaleProject("/projects/a", os.Getpid())
+		assert.False(t, removed, "removeStaleProject must no-op while shutting down")
+		assert.Nil(t, hostnames)
+		assert.Nil(t, emptyPorts)
+
+		_, ok := s.registry.Lookup("api.local.dev", 443)
+		assert.True(t, ok, "route must survive for the exiting daemon to reap")
+		assert.Equal(t, 1, s.requestManager.Count(), "records must not be purged mid-teardown")
+	})
+}
+
+// TestHandleShutdown_SetsFlagBeforeResponse pins that handleShutdown sets the
+// shutdown flag synchronously (before the response), so the 200 is the shutdown
+// linearization point rather than a later goroutine. A register racing the 200
+// then reliably observes isShuttingDown().
+func TestHandleShutdown_SetsFlagBeforeResponse(t *testing.T) {
+	s := newLifecycleServer() // empty registry — no ACTIVE_ROUTES gate
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shutdown", nil)
+	rec := httptest.NewRecorder()
+	s.handleShutdown(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, s.isShuttingDown(), "flag must be set synchronously by the time handleShutdown returns")
 }
 
 // TestServer_RemoveProject_NilRequestManager guards the daemon-startup window
