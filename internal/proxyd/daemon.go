@@ -238,7 +238,11 @@ func RunDaemon(ctx context.Context) error {
 		close(serverErr)
 	}()
 
-	// Wait for shutdown signal
+	// Wait for shutdown signal. Every branch falls THROUGH to the unconditional
+	// teardown below; a socket-server error records runErr and still tears down
+	// (an early return here used to skip dynamicProxy.Shutdown/requestMgr.Close/
+	// server.Shutdown entirely, leaking listeners and body files).
+	var runErr error
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal", "signal", sig)
@@ -247,11 +251,17 @@ func RunDaemon(ctx context.Context) error {
 	case err := <-serverErr:
 		if err != nil {
 			logger.Error("server error", "error", err)
-			return err
+			runErr = err
 		}
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown. quiesceForTeardown sets the shutdown flag and takes
+	// lifecycleMu as a barrier, so teardown is serialized against any in-flight
+	// register/deregister/stale-removal: the one transaction already running when
+	// the flag was set completes atomically, and every later one self-gates to a
+	// no-op before we start closing listeners and records.
+	server.quiesceForTeardown()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
@@ -269,5 +279,5 @@ func RunDaemon(ctx context.Context) error {
 	}
 
 	logger.Info("proxy daemon stopped")
-	return nil
+	return runErr
 }

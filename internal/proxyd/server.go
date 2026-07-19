@@ -125,6 +125,23 @@ func (s *Server) RequestShutdown() {
 	}
 }
 
+// quiesceForTeardown makes daemon teardown mutually exclusive with lifecycle
+// transactions. It sets the shutdown flag FIRST (so every later register,
+// deregister, and stale-removal self-gates on isShuttingDown()), then takes
+// lifecycleMu once as a barrier so the single transaction that was already in
+// flight when the flag was set completes atomically before the caller tears down
+// listeners and records. Flag-before-lock is the contract; do not reorder.
+//
+// Lock ordering: RequestShutdown takes shutdownMu and releases it before this
+// method acquires lifecycleMu, so there is no shutdownMu<->lifecycleMu cycle with
+// the scheduleShutdownWhenEmpty timer (which takes lifecycleMu, then shutdownMu
+// via RequestShutdown, with no overlapping hold).
+func (s *Server) quiesceForTeardown() {
+	s.RequestShutdown()
+	s.lifecycleMu.Lock()
+	s.lifecycleMu.Unlock() //nolint:staticcheck // SA2001: intentional lifecycle barrier
+}
+
 func (s *Server) registerRoutes() {
 	// Health check — no prefix, lightweight
 	s.router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +382,13 @@ func (s *Server) scheduleShutdownWhenEmpty() {
 func (s *Server) removeProject(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Once teardown has begun, physical cleanup is the exiting daemon's job:
+	// dynamicProxy.Shutdown closes every listener and captureMgr.Cleanup removes
+	// all body files on exit. A deregister here would race that teardown for the
+	// listeners and the closing RequestManager, so no-op under the flag.
+	if s.isShuttingDown() {
+		return nil, nil
+	}
 	return s.removeProjectLocked(projectDir)
 }
 
@@ -386,6 +410,13 @@ func (s *Server) removeProjectLocked(projectDir string) (removedHostnames []stri
 func (s *Server) removeStaleProject(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Once teardown has begun, physical cleanup is the exiting daemon's job:
+	// dynamicProxy.Shutdown closes every listener and captureMgr.Cleanup removes
+	// all body files on exit. A sweep removal here would race that teardown for
+	// the listeners and the closing RequestManager, so no-op under the flag.
+	if s.isShuttingDown() {
+		return false, nil, nil
+	}
 	return s.removeStaleProjectLocked(projectDir, pid)
 }
 
@@ -510,9 +541,12 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("shutdown requested", "force", force)
+	// Set the flag synchronously BEFORE the response so the 200 is the shutdown
+	// linearization point: a register arriving after it observes isShuttingDown()
+	// and gets 503. server.Shutdown is graceful (it waits for this active handler),
+	// so the response still flushes.
+	s.RequestShutdown()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
-
-	go s.RequestShutdown()
 }
 
 func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
