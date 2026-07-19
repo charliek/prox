@@ -1286,6 +1286,21 @@ func TestLogsSearch_NoMatch(t *testing.T) {
 	assert.Contains(t, bar, "/zzz (0 matches)", "status shows the 0-match form")
 }
 
+func TestLogsSearch_NoMatchAfterPriorMatchClearsCursor(t *testing.T) {
+	// Regression (CodeRabbit): a `/`-search with NO match must clear a cursor left
+	// by a PRIOR match, so no stale ❯ marker lingers on a non-matching row while
+	// the status shows "(0 matches)".
+	m := newLogsModel(20, []string{"alpha", "hit here", "gamma"})
+	m = commitSearch(m, "hit")
+	require.Equal(t, "hit here", logCursorLine(t, m))
+
+	m = commitSearch(m, "zzz") // no match — must clear the prior cursor
+	assert.Equal(t, "zzz", m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx, "a no-match search clears the prior cursor index")
+	assert.Equal(t, int64(0), m.logCursorSeq, "and its Seq anchor")
+	assert.Contains(t, m.statusBar(""), "/zzz (0 matches)")
+}
+
 func TestLogsSearch_EscClears(t *testing.T) {
 	m := newLogsModel(20, []string{"aaa", "needle", "bbb"})
 	m = updateModel(m, keyRune('g'))

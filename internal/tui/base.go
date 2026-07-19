@@ -712,6 +712,10 @@ func (b *BaseModel) seekLogSearchMatch(dir int) {
 				return
 			}
 		}
+		// No match: clear any cursor a PRIOR search left, so a stale ❯ marker
+		// doesn't linger on a non-matching row while the status shows "(0 matches)"
+		// (CodeRabbit). setLogCursor(nil, ...) resets to the no-cursor sentinel.
+		b.setLogCursor(nil, 0)
 		return
 	}
 	// Strictly past the cursor: offsets 1..n-1 in dir, wrapping. The origin row
