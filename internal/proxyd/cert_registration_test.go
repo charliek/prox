@@ -306,8 +306,8 @@ func TestCertRegistration_NilCertMgr_HTTPSNoPanic(t *testing.T) {
 	}, "an HTTPS register with no cert manager must not panic")
 
 	require.NotEqual(t, http.StatusOK, status, "HTTPS register with no cert manager must fail: %v", body)
-	if errResp, ok := body.(ErrorResponse); ok {
-		assert.Equal(t, "PORT_BIND_FAILED", errResp.Code)
-		assert.Contains(t, errResp.Error, "no certificate manager")
-	}
+	errResp, ok := body.(ErrorResponse)
+	require.True(t, ok, "failure body should be an ErrorResponse, got %T", body)
+	assert.Equal(t, "PORT_BIND_FAILED", errResp.Code)
+	assert.Contains(t, errResp.Error, "no certificate manager")
 }

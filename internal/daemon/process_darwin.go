@@ -2,13 +2,20 @@
 
 package daemon
 
-import "golang.org/x/sys/unix"
+import (
+	"math"
+
+	"golang.org/x/sys/unix"
+)
 
 // ProcessStartTime returns an opaque, host-and-boot-local generation token for
 // pid (Darwin: kinfo_proc P_starttime, process creation time in microseconds).
 // ok=false when unreadable. See IsProcessAlive for how it is used.
 func ProcessStartTime(pid int) (int64, bool) {
-	if pid <= 0 {
+	// SysctlKinfoProc and the P_pid guard below narrow pid to int32; a value
+	// outside the signed 32-bit range would wrap and could alias a different
+	// process. Reject it up front (real PIDs are well within range).
+	if pid <= 0 || pid > math.MaxInt32 {
 		return 0, false
 	}
 	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
