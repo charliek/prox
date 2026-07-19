@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"syscall"
 
+	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
 )
 
@@ -29,6 +30,20 @@ type ProcessRunner interface {
 // Process represents a running process
 type Process interface {
 	PID() int
+	// PGID returns the process group ID captured at launch (== leader PID by
+	// construction, since the runner Setpgid's without an explicit Pgid). A value
+	// <= 0 means the group is unknown. It is used to persist the orphan-reaping
+	// ledger (see orphans.go) so a later `prox up` can reap a group left behind by
+	// a SIGKILL'd generation whose graceful Stop never ran.
+	PGID() int
+	// StartToken returns the leader's opaque process start token
+	// (daemon.ProcessStartTime), CAPTURED AT LAUNCH when the PID is definitively
+	// this process. The orphan-reaping ledger records it so the next `prox up` can
+	// verify a leftover group still names the same generation. It is captured at
+	// spawn (not re-read later) because re-reading a PID after Wait() reaps the
+	// leader could stamp an unrelated reused-PID process's token. 0 means the token
+	// was unreadable at launch (the reaper then never reaps that record).
+	StartToken() int64
 	Wait() error
 	Signal(sig os.Signal) error
 	// GroupAlive reports whether any member of the process group is still
@@ -114,20 +129,28 @@ func (r *ExecRunner) Start(ctx context.Context, config domain.ProcessConfig, env
 	// leader). We record the leader PID directly rather than calling
 	// syscall.Getpgid: the leader PID is authoritative and this avoids a race
 	// where the leader has already exited by the time we'd query it.
+	//
+	// Capture the start token here too, while cmd.Process.Pid is DEFINITIVELY this
+	// freshly-forked child: we have not Wait()ed it, so even an immediate exit only
+	// zombifies it (we hold the reap), keeping the PID un-reusable. Reading the
+	// token later (after Wait reaps the leader) could stamp a reused PID's token.
+	startToken, _ := daemon.ProcessStartTime(cmd.Process.Pid)
 	return &execProcess{
-		cmd:    cmd,
-		pgid:   cmd.Process.Pid,
-		stdout: stdoutR,
-		stderr: stderrR,
+		cmd:        cmd,
+		pgid:       cmd.Process.Pid,
+		startToken: startToken,
+		stdout:     stdoutR,
+		stderr:     stderrR,
 	}, nil
 }
 
 // execProcess wraps exec.Cmd to implement Process interface
 type execProcess struct {
-	cmd    *exec.Cmd
-	pgid   int // process group ID captured at launch (== leader PID); <= 0 means unknown
-	stdout io.Reader
-	stderr io.Reader
+	cmd        *exec.Cmd
+	pgid       int   // process group ID captured at launch (== leader PID); <= 0 means unknown
+	startToken int64 // leader start token captured at launch; 0 means unreadable
+	stdout     io.Reader
+	stderr     io.Reader
 }
 
 func (p *execProcess) PID() int {
@@ -135,6 +158,18 @@ func (p *execProcess) PID() int {
 		return 0
 	}
 	return p.cmd.Process.Pid
+}
+
+// PGID returns the process group ID captured at launch (== leader PID). See the
+// Process interface for how it is used by the orphan-reaping ledger.
+func (p *execProcess) PGID() int {
+	return p.pgid
+}
+
+// StartToken returns the leader's start token captured at launch. See the Process
+// interface for why it is captured at spawn rather than re-read later.
+func (p *execProcess) StartToken() int64 {
+	return p.startToken
 }
 
 func (p *execProcess) Wait() error {

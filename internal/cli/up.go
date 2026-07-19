@@ -261,6 +261,19 @@ func runUp(cmd *cobra.Command, args []string) error {
 		_ = pidFile.Release()
 	}()
 
+	// Reap any orphaned backend process GROUPS left by a previous generation that
+	// was killed with SIGKILL: its graceful shutdown never ran, so its supervised
+	// child groups outlived it and may still hold ports (#59). The per-project
+	// PID-file lock acquired above serializes this across concurrent `prox up`
+	// invocations. Only groups positively identified as belonging to the prior
+	// generation are signaled; unverifiable leftovers are left for the operator.
+	reapLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if reaped, skipped, rerr := supervisor.ReapOrphans(daemon.StateDir(cwd), reapLogger); rerr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to reap orphaned child groups: %v\n", rerr)
+	} else if len(reaped) > 0 || len(skipped) > 0 {
+		fmt.Fprintf(os.Stderr, "Reaped %d orphaned child group(s) from a previous run; skipped %d (unverifiable or not confirmed gone)\n", len(reaped), len(skipped))
+	}
+
 	// Create log manager
 	logMgr := logs.NewManager(logs.ManagerConfig{
 		BufferSize:         1000,
@@ -282,6 +295,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// The absolute config path lets an API-driven (re)start re-read prox.yaml and
 	// apply the target process's current config (#33, D3).
 	supConfig.ConfigPath = absConfigPath
+	// The state dir lets the supervisor persist the orphan-reaping ownership
+	// ledger on every launch, so a later `prox up` can reap groups a SIGKILL'd
+	// generation orphaned (#59). ReapOrphans (above) reads it from the same path.
+	supConfig.StateDir = daemon.StateDir(cwd)
 	// cfg.ShutdownTimeout was already validated by config.Load above, so this
 	// only errors for a hand-built Config bypassing Load/Validate.
 	// ShutdownTimeoutDuration's error is already field-prefixed

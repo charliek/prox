@@ -26,6 +26,14 @@ import (
 // (c) an unreapable group whose leader dies but whose group never does.
 type fakeProcess struct {
 	pid int
+	// pgid overrides the value PGID() reports. Zero (the default) means PGID()
+	// returns pid, mirroring the real runner where the group leader's PID IS the
+	// PGID. A test that needs a PID/PGID mismatch (e.g. to exercise the reaper's
+	// corrupt-record guard) sets this explicitly.
+	pgid int
+	// startToken overrides StartToken(). Zero (the default) means StartToken()
+	// returns int64(pid), a non-zero stand-in for the launch-captured token.
+	startToken int64
 
 	mu         sync.Mutex
 	alive      bool
@@ -69,6 +77,20 @@ func newFakeProcess(pid int) *fakeProcess {
 }
 
 func (fp *fakeProcess) PID() int { return fp.pid }
+
+func (fp *fakeProcess) PGID() int {
+	if fp.pgid != 0 {
+		return fp.pgid
+	}
+	return fp.pid
+}
+
+func (fp *fakeProcess) StartToken() int64 {
+	if fp.startToken != 0 {
+		return fp.startToken
+	}
+	return int64(fp.pid) // non-zero fake token by default (mirrors a captured token)
+}
 
 func (fp *fakeProcess) Wait() error {
 	<-fp.waitCh

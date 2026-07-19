@@ -49,6 +49,9 @@ func newFakeStopProcess(pid int, survivor bool) *fakeStopProcess {
 
 func (p *fakeStopProcess) PID() int { return p.pid }
 
+func (p *fakeStopProcess) PGID() int         { return p.pid }
+func (p *fakeStopProcess) StartToken() int64 { return int64(p.pid) }
+
 func (p *fakeStopProcess) Wait() error {
 	<-p.waitCh
 	return nil
