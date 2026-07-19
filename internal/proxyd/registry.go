@@ -69,6 +69,25 @@ func routeKey(hostname string, port int) string {
 	return fmt.Sprintf("%s:%d", hostname, port)
 }
 
+// ProjectConflictError is returned by Register when the target project dir is
+// already registered. It carries the existing registration's PID, captured
+// under the same lock acquisition that detected the conflict, so callers can
+// decide (via a liveness check) whether the holder is a running prox up or a
+// crashed one whose registration can be replaced. It is matched with
+// errors.As; every other Register error stays plain and is never retried.
+type ProjectConflictError struct {
+	Dir string
+	PID int
+}
+
+func (e *ProjectConflictError) Error() string {
+	return fmt.Sprintf(
+		"project %s is already registered by a running prox up (PID %d); "+
+			"stop it or run 'prox proxy stop --force'",
+		e.Dir, e.PID,
+	)
+}
+
 // Register adds a project's routes to the registry.
 // Returns the registered hostnames, any new ports that need listeners, or an error on conflict.
 func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts []PortSpec, err error) {
@@ -76,8 +95,8 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	defer r.mu.Unlock()
 
 	// Check if this project is already registered
-	if _, exists := r.projects[req.ProjectDir]; exists {
-		return nil, nil, fmt.Errorf("project %s is already registered; deregister first", req.ProjectDir)
+	if existing, exists := r.projects[req.ProjectDir]; exists {
+		return nil, nil, &ProjectConflictError{Dir: req.ProjectDir, PID: existing.PID}
 	}
 
 	// Reject same port for both HTTP and HTTPS

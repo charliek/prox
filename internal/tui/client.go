@@ -17,6 +17,16 @@ type ClientModel struct {
 
 	// Connection state
 	connectionError error // Last API connection error, nil if connected
+
+	// detailFetchSeq counts every fetchRequestDetail call (Enter and D16's
+	// background live-refresh alike); each call's closure captures its own
+	// seq. RequestDetailMsg/RequestDetailErrorMsg carry the seq they were
+	// produced for, and the handlers only apply a result whose seq equals
+	// the current value — a stale or superseded (overlapping) fetch can
+	// never clobber a newer one. Attach-mode-only concept (local mode never
+	// fetches), so it lives here rather than on BaseModel, matching
+	// connectionError above.
+	detailFetchSeq int
 }
 
 // NewClientModel creates a new TUI model for client mode
@@ -86,7 +96,17 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleLogEntry(domain.LogEntry(msg))
 
 	case ProxyRequestMsg:
-		m.handleProxyRequest(proxy.RequestRecord(msg))
+		record := proxy.RequestRecord(msg)
+		m.handleProxyRequest(record)
+		// Live-refresh an open detail view once its request completes (D16).
+		// Streamed attach records never carry Details (§2), so — unlike
+		// local mode — a re-fetch is required. detailLoading is deliberately
+		// left alone: the existing (in-flight) snapshot stays on screen with
+		// no loading flicker while the fetch runs in the background.
+		if m.viewMode == ViewModeRequestDetail && m.selectedRequestID == record.ID && !record.InFlight {
+			m.detailFetchSeq++
+			cmds = append(cmds, m.fetchRequestDetail(record.ID, m.detailFetchSeq))
+		}
 
 	case ProcessesMsg:
 		m.processes = []domain.ProcessInfo(msg)
@@ -114,17 +134,40 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastRestartError = nil
 
 	case RequestDetailMsg:
-		m.detailLoading = false
-		if msg.ID == m.selectedRequestID {
-			m.requestDetail = msg.Details
-			m.detailError = nil
-			m.updateViewport()
+		// Every mutation — including detailLoading, previously cleared
+		// before this guard for ALL results including stale ones — lives
+		// inside the ID+seq guard: a stale-ID or superseded-seq result
+		// (an overlapping fetch this one was not the last to start) is
+		// dropped entirely, so it can never clear the loading state or
+		// content owned by the current selection/fetch (D16).
+		if msg.ID == m.selectedRequestID && msg.Seq == m.detailFetchSeq {
+			// Belt-and-braces content guard: a payload that is itself still
+			// in-flight can't supersede an already-displayed final
+			// snapshot (e.g. a server-side race in GetProxyRequest) — drop
+			// it rather than regress the view.
+			supersededByFinal := msg.Details != nil && msg.Details.InFlight &&
+				m.requestDetail != nil && !m.requestDetail.InFlight
+			if !supersededByFinal {
+				m.detailLoading = false
+				m.requestDetail = msg.Details
+				m.detailError = nil
+				m.detailRefreshFailed = false
+				m.updateViewport()
+				m.clampViewportToContent()
+			}
 		}
 
 	case RequestDetailErrorMsg:
-		m.detailLoading = false
-		if msg.ID == m.selectedRequestID {
-			m.detailError = msg.Err
+		if msg.ID == m.selectedRequestID && msg.Seq == m.detailFetchSeq {
+			m.detailLoading = false
+			if m.requestDetail != nil {
+				// A background live-refresh failed: keep the snapshot on
+				// screen and surface the failure instead of replacing a
+				// useful view with the error screen (D16).
+				m.detailRefreshFailed = true
+			} else {
+				m.detailError = msg.Err
+			}
 			m.updateViewport()
 		}
 
@@ -191,8 +234,10 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detailLoading = true
 				m.requestDetail = nil
 				m.detailError = nil
-				m.updateViewport()
-				return m, m.fetchRequestDetail(requestID)
+				m.detailRefreshFailed = false
+				m.renderDetailFromTop()
+				m.detailFetchSeq++
+				return m, m.fetchRequestDetail(requestID, m.detailFetchSeq)
 			}
 		}
 		return m, nil
@@ -206,12 +251,15 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// fetchRequestDetail returns a command to fetch request details from the API
-func (m ClientModel) fetchRequestDetail(id string) tea.Cmd {
+// fetchRequestDetail returns a command to fetch request details from the API,
+// tagged with seq (the caller's just-incremented m.detailFetchSeq at the time
+// of the call) so the Update handler can tell this result apart from any
+// other overlapping fetch for the same or a different request (D16).
+func (m ClientModel) fetchRequestDetail(id string, seq int) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := m.client.GetProxyRequest(id, true) // Include body
 		if err != nil {
-			return RequestDetailErrorMsg{ID: id, Err: err}
+			return RequestDetailErrorMsg{ID: id, Seq: seq, Err: err}
 		}
 
 		// Convert API response to RequestDetailData
@@ -240,7 +288,7 @@ func (m ClientModel) fetchRequestDetail(id string) tea.Cmd {
 			}
 		}
 
-		return RequestDetailMsg{ID: id, Details: detail}
+		return RequestDetailMsg{ID: id, Seq: seq, Details: detail}
 	}
 }
 

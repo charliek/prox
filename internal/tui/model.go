@@ -93,15 +93,22 @@ type RestartResultMsg struct {
 // RestartResultClearMsg is sent to clear the restart result after a delay
 type RestartResultClearMsg struct{}
 
-// RequestDetailMsg is sent when request details are loaded
+// RequestDetailMsg is sent when request details are loaded. Seq is the
+// fetchRequestDetail call's sequence number (ClientModel.detailFetchSeq at
+// dispatch time) — the handler drops any msg whose Seq doesn't match the
+// current value, so a stale or superseded fetch can never clobber a newer
+// one (D16).
 type RequestDetailMsg struct {
 	ID      string
+	Seq     int
 	Details *RequestDetailData
 }
 
-// RequestDetailErrorMsg is sent when loading request details fails
+// RequestDetailErrorMsg is sent when loading request details fails. Seq is
+// the fetchRequestDetail call's sequence number (see RequestDetailMsg).
 type RequestDetailErrorMsg struct {
 	ID  string
+	Seq int
 	Err error
 }
 

@@ -1,6 +1,8 @@
 package proxyd
 
 import (
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -242,10 +244,85 @@ func TestRegistry_DuplicateProject(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	// Try to register the same project again
+	// Try to register the same project again — a typed conflict carrying the
+	// existing registration's dir and PID.
 	_, _, err := reg.Register(req)
 	if err == nil {
 		t.Fatal("expected duplicate project error, got nil")
+	}
+	var conflict *ProjectConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want *ProjectConflictError", err)
+	}
+	if conflict.Dir != "/projects/a" {
+		t.Errorf("conflict.Dir = %q, want /projects/a", conflict.Dir)
+	}
+	if conflict.PID != req.PID {
+		t.Errorf("conflict.PID = %d, want %d", conflict.PID, req.PID)
+	}
+	if !strings.Contains(err.Error(), "already registered by a running prox up") ||
+		!strings.Contains(err.Error(), "prox proxy stop --force") {
+		t.Errorf("error message = %q, want the upgraded holder-naming message", err.Error())
+	}
+}
+
+// TestRegistry_ConflictCarriesNewPIDAfterReRegister pins that the typed
+// conflict reflects the CURRENT registration: after a project deregisters and
+// re-registers under a different PID, the conflict names the new PID, not the
+// original one.
+func TestRegistry_ConflictCarriesNewPIDAfterReRegister(t *testing.T) {
+	reg := NewRegistry()
+
+	req := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}},
+		0, 443,
+	)
+	req.PID = 111
+	if _, _, err := reg.Register(req); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	reg.Deregister("/projects/a")
+	req.PID = 222
+	if _, _, err := reg.Register(req); err != nil {
+		t.Fatalf("re-Register: %v", err)
+	}
+
+	_, _, err := reg.Register(req)
+	var conflict *ProjectConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want *ProjectConflictError", err)
+	}
+	if conflict.PID != 222 {
+		t.Errorf("conflict.PID = %d, want 222 (the current registration's PID)", conflict.PID)
+	}
+}
+
+// TestRegistry_RouteConflictIsUntyped pins that a non-same-dir conflict (another
+// project owning the hostname:port) stays a plain error — it must never be
+// mistaken for a replaceable stale registration.
+func TestRegistry_RouteConflictIsUntyped(t *testing.T) {
+	reg := NewRegistry()
+
+	reqA := newTestRequest("/projects/a", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}},
+		0, 443,
+	)
+	if _, _, err := reg.Register(reqA); err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
+
+	reqB := newTestRequest("/projects/b", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 4000}},
+		0, 443,
+	)
+	_, _, err := reg.Register(reqB)
+	if err == nil {
+		t.Fatal("expected route conflict error, got nil")
+	}
+	var conflict *ProjectConflictError
+	if errors.As(err, &conflict) {
+		t.Errorf("route conflict should be untyped, got *ProjectConflictError: %v", err)
 	}
 }
 

@@ -102,7 +102,7 @@ Like Option A, but the daemon auto-starts when the first `prox up` needs a proxy
 | Opt-in vs default | Shared proxy behavior is automatic for any project with a configured proxy. There is no `shared` config field. |
 | Domain conflicts | Duplicate `hostname:port` registrations fail. |
 | Certificate management | HTTPS certificates are managed by the shared daemon as routes are registered. |
-| Stale route cleanup | The daemon tracks project PIDs and removes stale registrations for dead processes. |
+| Stale route cleanup | The daemon tracks project PIDs and removes stale registrations for dead processes, both on a periodic sweep and inline: restarting `prox up` in the same directory after a crash (e.g. `kill -9`) detects the dead registration and replaces it immediately, without waiting for the sweep. A second registration whose owning process is still alive is still rejected. |
 | Visibility and debugging | `prox proxy status` and `prox proxy routes` expose daemon state. |
 | Registration protocol | Projects communicate with the daemon over the Unix socket at `~/.prox/proxy.sock`. |
 

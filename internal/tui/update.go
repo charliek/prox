@@ -33,7 +33,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleLogEntry(domain.LogEntry(msg))
 
 	case ProxyRequestMsg:
-		m.handleProxyRequest(proxy.RequestRecord(msg))
+		record := proxy.RequestRecord(msg)
+		m.handleProxyRequest(record)
+		// Live-refresh an open detail view once its request completes (D15).
+		// Local records carry full Details already (no fetch needed, unlike
+		// attach mode); Upsert's monotonic in-flight->final state machine
+		// guarantees at most one matching final message per ID, so this
+		// fires once. updateViewport never resets YOffset on its own, so the
+		// reader's scroll position is preserved; the clamp covers the one
+		// case where the final content is SHORTER than the in-flight view
+		// (capture disabled: the note lines vanish, nothing replaces them).
+		if m.viewMode == ViewModeRequestDetail && m.selectedRequestID == record.ID && !record.InFlight {
+			m.requestDetail = convertRequestRecordToDetail(record)
+			m.updateViewport()
+			m.clampViewportToContent()
+		}
 
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()
@@ -118,7 +132,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						break
 					}
 				}
-				m.updateViewport()
+				m.renderDetailFromTop()
 			}
 		}
 		return m, nil

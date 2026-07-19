@@ -101,6 +101,16 @@ var (
 	httpErrorStyle = lipgloss.NewStyle().
 			Foreground(errorColor)
 
+	// Cursor marker style for the selected row in the requests view. Bold +
+	// magenta accent (from the process palette, and distinct from the HTTP
+	// status colors) so the "❯ " marker reads clearly against the row's own
+	// dim/colored segments. Only the marker is styled, never the whole row:
+	// each row is a concatenation of individually styled segments whose ANSI
+	// resets would terminate an outer attribute mid-line (see D10).
+	cursorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("13")).
+			Bold(true)
+
 	// Process colors for log lines
 	processColors []lipgloss.Style
 )
