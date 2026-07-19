@@ -233,6 +233,71 @@ func TestRegistry_DeregisterLeavesOtherProjects(t *testing.T) {
 	}
 }
 
+// TestRegistry_DeregisterIfIdentity pins the reused-PID teardown guard (#61):
+// removal happens only when the CURRENT registration matches BOTH the pid and
+// the start token, so a restart that reused a crashed PID under a new token is
+// never torn down.
+func TestRegistry_DeregisterIfIdentity(t *testing.T) {
+	t.Run("pid and token match removes", func(t *testing.T) {
+		reg := NewRegistry()
+		req := newTestRequest("/projects/a", "local.dev",
+			map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+		req.PID = 111
+		req.StartTime = 424242
+		if _, _, err := reg.Register(req); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+
+		removed, hostnames, emptyPorts := reg.DeregisterIfIdentity("/projects/a", 111, 424242)
+		if !removed {
+			t.Fatal("removed = false, want true when pid and token match")
+		}
+		if len(hostnames) != 1 || hostnames[0] != "api.local.dev" {
+			t.Errorf("hostnames = %v, want [api.local.dev]", hostnames)
+		}
+		if len(emptyPorts) != 1 || emptyPorts[0] != 443 {
+			t.Errorf("emptyPorts = %v, want [443]", emptyPorts)
+		}
+		if !reg.IsEmpty() {
+			t.Error("registry should be empty after a matching identity removal")
+		}
+	})
+
+	t.Run("token mismatch leaves registration intact", func(t *testing.T) {
+		reg := NewRegistry()
+		req := newTestRequest("/projects/a", "local.dev",
+			map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+		req.PID = 111
+		req.StartTime = 424242
+		if _, _, err := reg.Register(req); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+
+		// Same PID reused by a restart under a different token — must not remove.
+		removed, hostnames, emptyPorts := reg.DeregisterIfIdentity("/projects/a", 111, 424243)
+		if removed {
+			t.Fatal("removed = true, want false when the start token differs")
+		}
+		if hostnames != nil || emptyPorts != nil {
+			t.Errorf("expected nil results on skip, got hostnames=%v emptyPorts=%v", hostnames, emptyPorts)
+		}
+		if _, ok := reg.Lookup("api.local.dev", 443); !ok {
+			t.Error("registration must survive a token mismatch")
+		}
+	})
+
+	t.Run("missing project is a no-op", func(t *testing.T) {
+		reg := NewRegistry()
+		removed, hostnames, emptyPorts := reg.DeregisterIfIdentity("/projects/missing", 111, 424242)
+		if removed {
+			t.Fatal("removed = true, want false for a missing project")
+		}
+		if hostnames != nil || emptyPorts != nil {
+			t.Errorf("expected nil results, got hostnames=%v emptyPorts=%v", hostnames, emptyPorts)
+		}
+	})
+}
+
 func TestRegistry_DuplicateProject(t *testing.T) {
 	reg := NewRegistry()
 

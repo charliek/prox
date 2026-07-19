@@ -230,18 +230,25 @@ func (r *Registry) Deregister(projectDir string) (removedHostnames []string, emp
 	return r.deregisterLocked(projectDir)
 }
 
-// DeregisterIfPID removes a project's routes only if its CURRENT registration
-// still carries pid. The check and removal happen under one lock acquisition,
-// closing the race where the stale-PID sweep detects a dead generation, the
-// project re-registers with a live PID, and the sweep would otherwise tear
-// down the new live registration. Returns removed=false when the project is
-// gone or has re-registered under a different PID.
-func (r *Registry) DeregisterIfPID(projectDir string, pid int) (removed bool, removedHostnames []string, emptyPorts []int) {
+// DeregisterIfIdentity removes a project's routes only if its CURRENT
+// registration matches BOTH pid and startTime. The check and removal happen
+// under one lock acquisition, closing the reused-PID teardown race: the
+// stale-PID sweep detects a dead generation, the project re-registers with a
+// live process that reused the crashed PID, and a PID-only guard would tear
+// down that new live registration. Keying on the start token as well as the PID
+// makes the reused-PID restart read as a different identity, so it survives.
+// Returns removed=false when the project is gone or has re-registered under a
+// different pid or start token.
+//
+// When startTime is 0 (the holder could not read its start token) the guard
+// degrades to PID-only, so exact-PID reuse can still reap a live restart — the
+// accepted bare-PID fallback (see daemon.IsProcessAlive).
+func (r *Registry) DeregisterIfIdentity(projectDir string, pid int, startTime int64) (removed bool, removedHostnames []string, emptyPorts []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	proj, ok := r.projects[projectDir]
-	if !ok || proj.PID != pid {
+	if !ok || proj.PID != pid || proj.StartTime != startTime {
 		return false, nil, nil
 	}
 	removedHostnames, emptyPorts = r.deregisterLocked(projectDir)
@@ -336,15 +343,20 @@ func (r *Registry) IsEmpty() bool {
 type StaleProject struct {
 	Dir string
 	PID int
+	// StartTime is the dead generation's opaque process start token (see
+	// daemon.ProcessStartTime), carried through to the removal guard so a
+	// restart that reused the crashed PID is not torn down. 0 means the holder
+	// could not read it, so the guard degrades to bare-PID.
+	StartTime int64
 }
 
 // StalePIDs returns the registered projects whose owning process generation is
 // no longer running. Liveness is keyed on (PID, start token) so a reused PID
 // naming a different process reads as dead (see daemon.IsProcessAlive). It only
 // detects — removal goes through the consolidated removeProject path
-// (PID-guarded via DeregisterIfPID) so the crash path purges captured records
-// and body files the same way an explicit deregister does, without racing a
-// concurrent re-registration.
+// (identity-guarded via DeregisterIfIdentity) so the crash path purges captured
+// records and body files the same way an explicit deregister does, without
+// racing a concurrent re-registration.
 //
 // The candidate set is snapshotted under RLock and the lock is RELEASED before
 // any liveness check runs: daemon.IsProcessAlive does OS reads (procfs /
@@ -365,7 +377,7 @@ func (r *Registry) StalePIDs() []StaleProject {
 	var stale []StaleProject
 	for _, c := range candidates {
 		if !daemon.IsProcessAlive(c.pid, c.token) {
-			stale = append(stale, StaleProject{Dir: c.dir, PID: c.pid})
+			stale = append(stale, StaleProject{Dir: c.dir, PID: c.pid, StartTime: c.token})
 		}
 	}
 	return stale

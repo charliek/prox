@@ -205,7 +205,7 @@ func RunDaemon(ctx context.Context) error {
 			case <-ticker.C:
 				stale := registry.StalePIDs()
 				for _, sp := range stale {
-					removed, hostnames, emptyPorts := server.removeStaleProject(sp.Dir, sp.PID)
+					removed, hostnames, emptyPorts := server.removeStaleProject(sp.Dir, sp.PID, sp.StartTime)
 					if !removed {
 						// Re-registered with a live PID between detection and
 						// removal — leave the new registration alone.

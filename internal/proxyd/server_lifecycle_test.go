@@ -85,7 +85,7 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 	stale := s.registry.StalePIDs()
 	require.Equal(t, []StaleProject{{Dir: "/projects/dead", PID: dead}}, stale)
 	for _, sp := range stale {
-		removed, _, _ := s.removeStaleProject(sp.Dir, sp.PID)
+		removed, _, _ := s.removeStaleProject(sp.Dir, sp.PID, sp.StartTime)
 		assert.True(t, removed)
 	}
 
@@ -119,11 +119,61 @@ func TestServer_RemoveStaleProject_SkipsReRegistered(t *testing.T) {
 	require.NoError(t, err)
 	s.requestManager.Record(proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
 
-	removed, _, _ := s.removeStaleProject(stale[0].Dir, stale[0].PID)
+	removed, _, _ := s.removeStaleProject(stale[0].Dir, stale[0].PID, stale[0].StartTime)
 	assert.False(t, removed, "guarded removal must skip the re-registered project")
 	_, ok := s.registry.Lookup("api.local.dev", 443)
 	assert.True(t, ok, "live registration's route must survive")
 	assert.Equal(t, 1, s.requestManager.Count(), "live registration's records must survive")
+}
+
+// TestServer_RemoveStaleProject_SkipsReusedPID pins the reused-PID teardown fix
+// (#61): the sweep snapshots a dead generation's identity (PID + start token),
+// but a restart reuses the crashed PID under a NEW start token before removal.
+// The identity guard must key on the token too, so the delayed sweep removal
+// leaves the live restart — same PID, different token — alone.
+func TestServer_RemoveStaleProject_SkipsReusedPID(t *testing.T) {
+	s := newLifecycleServer()
+
+	const (
+		t1 int64 = 424242 // dead generation's start token
+		t2       = t1 + 1 // restart's start token (same PID, new generation)
+	)
+
+	// Dead generation {D, deadP, T1}: a non-zero token so the guard does not
+	// degrade to bare-PID. The dead PID makes StalePIDs detect it.
+	deadP := deadPID(t)
+	req := newTestRequest("/projects/x", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	req.PID = deadP
+	req.StartTime = t1
+	_, _, err := s.registry.Register(req)
+	require.NoError(t, err)
+
+	// Token-propagation half: the snapshot carries the dead generation's token.
+	stale := s.registry.StalePIDs()
+	require.Len(t, stale, 1)
+	assert.Equal(t, deadP, stale[0].PID)
+	assert.Equal(t, t1, stale[0].StartTime, "snapshot must carry the dead generation's start token")
+
+	// Restart reuses the crashed PID under a new start token before the sweep
+	// removal fires.
+	s.registry.Deregister("/projects/x")
+	reReq := newTestRequest("/projects/x", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	reReq.PID = deadP // same PID reused by the restart
+	reReq.StartTime = t2
+	_, _, err = s.registry.Register(reReq)
+	require.NoError(t, err)
+	s.requestManager.Record(proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
+
+	// Guard half: the delayed sweep removal targets the dead generation's
+	// identity (deadP, T1), but the current registration carries T2 — the
+	// identity guard must skip it regardless of the shared PID.
+	removed, _, _ := s.removeStaleProject(stale[0].Dir, stale[0].PID, stale[0].StartTime)
+	assert.False(t, removed, "reused-PID restart under a new token must survive the sweep")
+	_, ok := s.registry.Lookup("api.local.dev", 443)
+	assert.True(t, ok, "live restart's route must survive")
+	assert.Equal(t, 1, s.requestManager.Count(), "live restart's records must survive")
 }
 
 // TestHandleRegister_RejectsEmptyProjectDir pins the identity requirement:
@@ -531,7 +581,7 @@ func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
 
 		s.RequestShutdown()
 
-		removed, hostnames, emptyPorts := s.removeStaleProject("/projects/a", os.Getpid())
+		removed, hostnames, emptyPorts := s.removeStaleProject("/projects/a", os.Getpid(), 0)
 		assert.False(t, removed, "removeStaleProject must no-op while shutting down")
 		assert.Nil(t, hostnames)
 		assert.Nil(t, emptyPorts)

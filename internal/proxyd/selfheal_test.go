@@ -158,7 +158,10 @@ func TestSelfHeal_Concurrency_RegisterVsSweep(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			s.removeStaleProject("/projects/dead", dead)
+			// The dead fixture registers without a start token, so the sweep
+			// guard degrades to bare-PID; reReq below uses os.Getpid() != dead,
+			// so the identity guard skips the live restart exactly as before.
+			s.removeStaleProject("/projects/dead", dead, 0)
 		}()
 		wg.Wait()
 
@@ -180,7 +183,7 @@ func TestSelfHeal_Concurrency_RegisterVsSweep(t *testing.T) {
 			// generation's route or records.
 			recID := fmt.Sprintf("newgen-%d", i)
 			s.requestManager.Record(proxy.RequestRecord{ID: recID, ProjectDir: "/projects/dead", Method: "GET", URL: "/n", Details: &proxy.RequestDetails{}})
-			removed, _, _ := s.removeStaleProject("/projects/dead", dead)
+			removed, _, _ := s.removeStaleProject("/projects/dead", dead, 0)
 			assert.False(t, removed, "iteration %d: late sweep must skip the live generation", i)
 			_, ok = s.registry.Lookup("api.local.dev", port)
 			assert.True(t, ok, "iteration %d: live route must survive a late sweep", i)
