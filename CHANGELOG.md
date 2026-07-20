@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.0
+
+The requests/capture overhaul: the shared proxy daemon now captures request and
+response bodies per project, `prox requests` becomes an ngrok-style inspector,
+crashed generations self-heal, and the TUI gains request/log search. Plus a set
+of registration/lifecycle hardening fixes and supervisor orphan cleanup.
+
+> **Upgrading:** the daemon requires an exact version match with its clients, so
+> after installing this release, stop the old daemon and restart every project:
+> `prox proxy stop --force`, then `prox up` in each project (the version gate
+> makes a mismatch loud).
+
+### Features
+
+- **Body capture in the shared proxy daemon** (#40, plan 005). Daemon mode now
+  captures request/response bodies per project under `~/.prox/capture`, gated by
+  a per-project `proxy.capture` config (`enabled`, `max_body_size`). Records are
+  scoped by project directory (not hostname), gzip/deflate bodies are decoded for
+  display rather than corrupted, `content_encoding`/`captured_size` are recorded,
+  binary bodies are detected integrity-first, and captured bodies are delivered to
+  each project over the SSE bridge. Request IDs are now 12 hex chars.
+- **`prox requests` as an inspector** (plan 005). New agent- and human-friendly
+  filters: `--url <substr>`, `--since <5m|RFC3339>`, `--min-status`/`--max-status`,
+  `--method`, `--subdomain`, `--json`, and `prox requests <id> --body` to view
+  captured bodies. Responses expose `hostname`, `content_type`, `content_encoding`,
+  and `unavailable_reason`. Body titles show the content type and pretty-print JSON.
+- **In-flight request visibility** (#48, plan 006). Requests are recorded at
+  response-header time with `in_flight: true` and completed via a defer, so a
+  request is visible while it streams and an aborted stream still records instead
+  of vanishing. Backed by a monotonic in-flight → final state machine
+  (`RequestManager.Upsert`).
+- **Snapshot backfill on (re)connect** (#51, plan 006). A project's forwarder
+  fetches the daemon's existing records concurrently with the live stream on every
+  (re)connect, so reconnecting no longer loses history.
+- **TUI requests view: explicit cursor + search** (#47, plan 007). The requests
+  view gains an ID-anchored cursor and `/`-search that jumps the cursor to matches
+  with `n`/`N` navigation (wrapping), composing with the `s` filter rather than
+  replacing it.
+- **TUI detail live-refresh** (#54, plan 007). An open request-detail view
+  refreshes in place when the request completes, instead of going stale.
+- **TUI logs view: search-match navigation** (#56, plan 009). The logs view gains
+  `/`-search that jumps the cursor to matching lines with `n`/`N` (wrapping) and
+  match highlighting, mirroring the requests view. Note: logs `/` now **navigates**
+  (non-matching lines stay visible) rather than filtering — use `s` for the live
+  substring filter.
+
+### Fixes
+
+- **Crash-restart registration self-heal** (#55, plan 007). When a `prox up`
+  crashes without deregistering, a restart of the same project now detects the
+  dead registration and replaces it inline instead of failing with a 409, so a
+  crashed generation recovers without `prox proxy stop --force`. Lifecycle
+  transactions are serialized end-to-end, with a brief bind retry on every
+  registration bind and an epoch-guarded graced shutdown check.
+- **HTTPS certs for domains joining an existing listener** (#58, plan 008).
+  A project whose HTTPS port is already bound by another project now gets its
+  domain's certificate generated, so the shared TLS listener's SNI callback can
+  serve it (previously the joining domain's handshakes failed).
+- **Forced-stop teardown serialized with lifecycle transactions** (#60, plan 008).
+  `prox proxy stop --force` now sets the shutdown flag before responding and
+  drains any in-flight register/deregister under a barrier, so a concurrent
+  registration can't interleave with physical teardown.
+- **PID-reuse can no longer defeat liveness checks** (#61, plans 008/009).
+  Registrations carry an opaque per-host process start token; the stale-PID sweep
+  and crash-restart self-heal key liveness on `(pid, token)` so a reused PID
+  naming a different process reads as dead, and the sweep's removal guard is
+  token-aware so it can't tear down a live restart that reused a crashed PID.
+- **Supervisor: reap orphaned child groups after `kill -9`** (#59, plan 009).
+  When a `prox up` is killed with `kill -9`, the backend process groups it
+  supervised are orphaned and keep holding their ports. The supervisor now
+  persists an ownership ledger and, on the next `prox up`, reaps any leftover
+  group it can positively identify (strict start-token match) — so the restarted
+  generation rebinds its ports instead of 502'ing on a wedged orphan.
+
+### Internal
+
+- **Cert generation runs outside the cache lock** (plan 009). `EnsureDomain` no
+  longer holds the certificate cache lock across the mkcert subprocess and key
+  load, so a joining domain's first-time generation no longer stalls TLS
+  handshakes for other domains on the shared listener.
+- **CI runs on macOS as well as Linux** (plan 009). The `test` job now runs on
+  both `ubuntu-latest` and `macos-latest`, exercising the darwin process
+  start-token path on every change.
+
 ## v0.1.4
 
 ### Breaking
