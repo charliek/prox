@@ -270,6 +270,12 @@ type ProxyRequestsResponse struct {
 	Requests      []ProxyRequestResponse `json:"requests"`
 	FilteredCount int                    `json:"filtered_count"`
 	TotalCount    int                    `json:"total_count"`
+	// NextBeforeID is the before_id to pass for the next older page
+	// (ring-position cursor pagination, D12/#50). Populated whenever the
+	// scan didn't reach the ring's oldest record — including on a plain
+	// first page (no before_id given), so pollers can start cursoring
+	// immediately. Omitted on the last page (scan reached the ring tail).
+	NextBeforeID string `json:"next_before_id,omitempty"`
 }
 
 // ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse.

@@ -394,13 +394,25 @@ func (h *Handlers) GetProxyRequests(w http.ResponseWriter, r *http.Request) {
 
 	filter := parseProxyRequestParams(r)
 
-	requests := h.requestManager.Recent(filter)
+	requests, nextBeforeID, anchorFound := h.requestManager.RecentPage(filter)
+	if !anchorFound {
+		// filter.BeforeID named a record that's unknown, evicted, or out of
+		// scope. 410 (not 404): the cursor once pointed at a real ring
+		// position that has since aged out — the caller should restart
+		// pagination without a cursor rather than retry this one (D12, #50).
+		writeJSON(w, http.StatusGone, ErrorResponse{
+			Error: "cursor is gone: the before_id record is unknown, evicted, or out of scope",
+			Code:  domain.ErrCodeCursorGone,
+		})
+		return
+	}
 	total := h.requestManager.Count()
 
 	resp := ProxyRequestsResponse{
 		Requests:      make([]ProxyRequestResponse, len(requests)),
 		FilteredCount: len(requests),
 		TotalCount:    total,
+		NextBeforeID:  nextBeforeID,
 	}
 
 	for i, req := range requests {
@@ -610,6 +622,7 @@ func parseProxyRequestParams(r *http.Request) proxy.RequestFilter {
 	filter.Subdomain = r.URL.Query().Get("subdomain")
 	filter.Method = r.URL.Query().Get("method")
 	filter.URLContains = r.URL.Query().Get("url_contains")
+	filter.BeforeID = r.URL.Query().Get("before_id")
 
 	if minStatus := r.URL.Query().Get("min_status"); minStatus != "" {
 		if v, err := strconv.Atoi(minStatus); err == nil {

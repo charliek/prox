@@ -110,6 +110,18 @@ type RequestFilter struct {
 	MaxStatus   int
 	Since       time.Time
 	Limit       int
+
+	// BeforeID anchors RecentPage (and, transitively, Recent) at the ring
+	// position of the record with this ID: only records strictly OLDER than
+	// the anchor, BY RING POSITION, are considered (D12, #50). This is
+	// arrival order, not time order. Backfill interleavings and
+	// completion-after-eviction re-appends (see Upsert: an in-flight record
+	// whose original slot was evicted re-enters the ring at the newest
+	// position when its completion arrives) mean a record's ring position
+	// can diverge from its Timestamp — a page can legitimately contain a
+	// record with a newer Timestamp than the anchor. Empty = no anchor
+	// (start at the newest record, i.e. today's Recent behavior).
+	BeforeID string
 }
 
 // RequestSubscription represents a subscription to request updates.
@@ -279,8 +291,35 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	}
 }
 
-// Recent returns the most recent requests matching the filter.
+// Recent returns the most recent requests matching the filter. It is
+// RecentPage without the cursor metadata, kept as the simple signature for
+// the many callers (CLI, daemon-internal endpoints, tests) that don't page.
 func (m *RequestManager) Recent(filter RequestFilter) []RequestRecord {
+	records, _, _ := m.RecentPage(filter)
+	return records
+}
+
+// RecentPage returns up to filter.Limit matching records, newest first,
+// optionally anchored at filter.BeforeID (ring-position cursor pagination,
+// D12/#50). It is the shared scan behind Recent.
+//
+// nextBeforeID is the ID of the OLDEST SCANNED record in this call's scan
+// window — not the oldest RETURNED record. The scan continues past
+// non-matching records (up to the ring's oldest record) until it collects
+// filter.Limit matches, so a page whose filter excludes everything
+// remaining still advances all the way through the ring and reports where
+// it stopped, rather than stalling a poller that keeps re-requesting the
+// same cursor. nextBeforeID is empty when the scan reached the ring's
+// oldest record (no older records remain: this is the last page).
+//
+// anchorFound is true when filter.BeforeID is empty (no anchor requested)
+// or names a record that both exists in the ring and matches the rest of
+// filter. An anchor that is unknown, evicted, or excluded by scope (e.g. a
+// different filter.ProjectDir than the anchor's) reports anchorFound=false
+// with no records — callers must treat both cases identically (410 Gone)
+// so an out-of-scope anchor can't be distinguished from a nonexistent one
+// and leak the other scope's record existence.
+func (m *RequestManager) RecentPage(filter RequestFilter) (records []RequestRecord, nextBeforeID string, anchorFound bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -289,19 +328,53 @@ func (m *RequestManager) Recent(filter RequestFilter) []RequestRecord {
 		limit = m.count
 	}
 
-	result := make([]RequestRecord, 0, limit)
+	// startOffset is how many newest-to-oldest steps to skip before scanning
+	// begins: 0 with no anchor (start at the newest record), or the
+	// anchor's position + 1 (strictly older) when filter.BeforeID is set.
+	startOffset := 0
+	if filter.BeforeID != "" {
+		anchorPos := -1
+		for i := 0; i < m.count; i++ {
+			idx := (m.head - 1 - i + m.capacity) % m.capacity
+			if m.buffer[idx].ID == filter.BeforeID {
+				anchorPos = i
+				break
+			}
+		}
+		if anchorPos == -1 {
+			return nil, "", false
+		}
+		anchorIdx := (m.head - 1 - anchorPos + m.capacity) % m.capacity
+		if !m.matchesFilter(m.buffer[anchorIdx], filter) {
+			// Anchor exists but is out of the requested scope (e.g. another
+			// project). Same signal as "not found" — see doc comment.
+			return nil, "", false
+		}
+		startOffset = anchorPos + 1
+	}
 
-	// Iterate from newest to oldest
-	for i := 0; i < m.count && len(result) < limit; i++ {
+	result := make([]RequestRecord, 0, limit)
+	lastScanned := startOffset - 1
+
+	for i := startOffset; i < m.count; i++ {
 		idx := (m.head - 1 - i + m.capacity) % m.capacity
 		record := m.buffer[idx]
+		lastScanned = i
 
 		if m.matchesFilter(record, filter) {
 			result = append(result, record)
 		}
+		if len(result) >= limit {
+			break
+		}
 	}
 
-	return result
+	if lastScanned >= startOffset && lastScanned != m.count-1 {
+		lastIdx := (m.head - 1 - lastScanned + m.capacity) % m.capacity
+		nextBeforeID = m.buffer[lastIdx].ID
+	}
+
+	return result, nextBeforeID, true
 }
 
 // GetByID returns a request record by its ID.

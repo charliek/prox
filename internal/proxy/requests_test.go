@@ -660,3 +660,167 @@ func TestRequestRecord_InFlightOmittedWhenFinal(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"in_flight":true`)
 }
+
+// --- D12 (#50): RecentPage ring-position cursor pagination ---
+
+func TestRequestManager_RecentPage_AnchorMidRing(t *testing.T) {
+	m := NewRequestManager(10)
+	for _, id := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		m.Record(RequestRecord{ID: id, Method: "GET", URL: "/x"})
+	}
+	// Ring newest->oldest: r5, r4, r3, r2, r1.
+
+	page, next, found := m.RecentPage(RequestFilter{BeforeID: "r3", Limit: 10})
+	require.True(t, found)
+	require.Len(t, page, 2)
+	assert.Equal(t, "r2", page[0].ID)
+	assert.Equal(t, "r1", page[1].ID)
+	assert.Empty(t, next, "scan reached the ring's oldest record")
+}
+
+func TestRequestManager_RecentPage_AnchorEvicted(t *testing.T) {
+	m := NewRequestManager(3)
+	for _, id := range []string{"r1", "r2", "r3", "r4"} {
+		m.Record(RequestRecord{ID: id})
+	}
+	// Capacity 3: r1 has been evicted; ring holds r2, r3, r4.
+	_, ok := m.GetByID("r1")
+	require.False(t, ok, "precondition: r1 must be evicted")
+
+	page, next, found := m.RecentPage(RequestFilter{BeforeID: "r1"})
+	assert.False(t, found)
+	assert.Empty(t, page)
+	assert.Empty(t, next)
+
+	// A never-existed ID reports the same anchorFound=false shape.
+	page2, next2, found2 := m.RecentPage(RequestFilter{BeforeID: "does-not-exist"})
+	assert.False(t, found2)
+	assert.Empty(t, page2)
+	assert.Empty(t, next2)
+}
+
+func TestRequestManager_RecentPage_FilterWithCursor(t *testing.T) {
+	m := NewRequestManager(10)
+	m.Record(RequestRecord{ID: "a1", Method: "GET"})
+	m.Record(RequestRecord{ID: "b1", Method: "POST"})
+	m.Record(RequestRecord{ID: "a2", Method: "GET"})
+	m.Record(RequestRecord{ID: "b2", Method: "POST"})
+	m.Record(RequestRecord{ID: "a3", Method: "GET"})
+	// Ring newest->oldest: a3, b2, a2, b1, a1.
+
+	page, next, found := m.RecentPage(RequestFilter{Method: "GET", BeforeID: "a3", Limit: 10})
+	require.True(t, found)
+	require.Len(t, page, 2)
+	assert.Equal(t, "a2", page[0].ID)
+	assert.Equal(t, "a1", page[1].ID)
+	assert.Empty(t, next, "scan reached the ring's oldest record")
+}
+
+func TestRequestManager_RecentPage_FullyFilteredPageAdvancesCursor(t *testing.T) {
+	m := NewRequestManager(10)
+	for i := 0; i < 5; i++ {
+		m.Record(RequestRecord{ID: fmt.Sprintf("old%d", i), Method: "POST"})
+	}
+	m.Record(RequestRecord{ID: "anchor", Method: "GET"})
+	// Ring newest->oldest: anchor, old4, old3, old2, old1, old0.
+
+	page, next, found := m.RecentPage(RequestFilter{Method: "GET", BeforeID: "anchor", Limit: 10})
+	require.True(t, found)
+	// None of the POST records match the GET filter: a page that returned
+	// nothing must still report that the scan reached the ring's oldest
+	// record (next empty) instead of stalling on an unadvanced cursor.
+	assert.Empty(t, page)
+	assert.Empty(t, next)
+}
+
+func TestRequestManager_RecentPage_CrossProjectScope(t *testing.T) {
+	m := NewRequestManager(10)
+	m.Record(RequestRecord{ID: "p1", ProjectDir: "/projects/a"})
+	m.Record(RequestRecord{ID: "p2", ProjectDir: "/projects/b"})
+
+	// p1 exists in the ring but belongs to a different project than the
+	// filter's scope. It must report the same anchorFound=false shape as an
+	// unknown ID so an out-of-scope anchor can't leak its existence (D12).
+	page, next, found := m.RecentPage(RequestFilter{ProjectDir: "/projects/b", BeforeID: "p1"})
+	assert.False(t, found)
+	assert.Empty(t, page)
+	assert.Empty(t, next)
+}
+
+// TestRequestManager_RecentPage_ReappendOrdering pins the central D12
+// invariant: RecentPage orders and pages by RING POSITION (arrival order),
+// not by Timestamp. An in-flight record whose original slot is evicted
+// while its response is still in flight re-enters the ring at the newest
+// position once its completion arrives (Upsert's absent-ID append path) —
+// even though it carries the oldest Timestamp of any surviving record.
+func TestRequestManager_RecentPage_ReappendOrdering(t *testing.T) {
+	m := NewRequestManager(3)
+	base := time.Now()
+
+	// s1 starts in-flight: earliest arrival, earliest timestamp.
+	m.Upsert(RequestRecord{ID: "s1", Method: "GET", URL: "/stream", InFlight: true, Timestamp: base})
+	m.Upsert(RequestRecord{ID: "b", Method: "GET", URL: "/b", Timestamp: base.Add(1 * time.Second)})
+	m.Upsert(RequestRecord{ID: "c", Method: "GET", URL: "/c", Timestamp: base.Add(2 * time.Second)})
+	// "d" wraps the capacity-3 ring, evicting s1's original slot.
+	m.Upsert(RequestRecord{ID: "d", Method: "GET", URL: "/d", Timestamp: base.Add(3 * time.Second)})
+
+	_, ok := m.GetByID("s1")
+	require.False(t, ok, "precondition: s1's original slot must be evicted")
+
+	// s1's completion arrives after eviction. Its ID is no longer in the
+	// ring, so Upsert treats it as a brand-new arrival at the newest
+	// position (evicting "b"), despite carrying the oldest Timestamp here.
+	m.Upsert(RequestRecord{ID: "s1", Method: "GET", URL: "/stream", Timestamp: base, Duration: time.Second})
+
+	page, next, found := m.RecentPage(RequestFilter{Limit: 10})
+	require.True(t, found)
+	require.Len(t, page, 3)
+	got := []string{page[0].ID, page[1].ID, page[2].ID}
+	assert.Equal(t, []string{"s1", "d", "c"}, got, "ring (arrival) order, not time order")
+	assert.Empty(t, next)
+
+	// s1's Timestamp is the OLDEST of the three surviving records even
+	// though it paginates as the newest — the divergence this test pins.
+	assert.True(t, page[0].Timestamp.Before(page[1].Timestamp))
+	assert.True(t, page[0].Timestamp.Before(page[2].Timestamp))
+
+	// Paginating with before_id=s1 must return strictly-older-by-POSITION
+	// records (d, c) — not records reordered by Timestamp.
+	older, next2, found2 := m.RecentPage(RequestFilter{BeforeID: "s1", Limit: 10})
+	require.True(t, found2)
+	require.Len(t, older, 2)
+	assert.Equal(t, "d", older[0].ID)
+	assert.Equal(t, "c", older[1].ID)
+	assert.Empty(t, next2)
+}
+
+func TestRequestManager_RecentPage_PaginationCarriesAndOmitsCursor(t *testing.T) {
+	m := NewRequestManager(10)
+	for _, id := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		m.Record(RequestRecord{ID: id})
+	}
+	// Ring newest->oldest: r5, r4, r3, r2, r1.
+
+	// Plain first page (no before_id): next_before_id must still be
+	// populated when older records remain, so a poller can start cursoring
+	// from an unqualified first call.
+	page1, next1, found1 := m.RecentPage(RequestFilter{Limit: 2})
+	require.True(t, found1)
+	require.Len(t, page1, 2)
+	assert.Equal(t, []string{"r5", "r4"}, []string{page1[0].ID, page1[1].ID})
+	require.Equal(t, "r4", next1, "next_before_id is the oldest SCANNED record")
+
+	page2, next2, found2 := m.RecentPage(RequestFilter{Limit: 2, BeforeID: next1})
+	require.True(t, found2)
+	require.Len(t, page2, 2)
+	assert.Equal(t, []string{"r3", "r2"}, []string{page2[0].ID, page2[1].ID})
+	require.Equal(t, "r2", next2)
+
+	page3, next3, found3 := m.RecentPage(RequestFilter{Limit: 2, BeforeID: next2})
+	require.True(t, found3)
+	require.Len(t, page3, 1)
+	assert.Equal(t, "r1", page3[0].ID)
+	// Last page: the scan reached the ring's oldest record, so the cursor is
+	// omitted (no more pages) instead of pointing back at r1.
+	assert.Empty(t, next3)
+}
