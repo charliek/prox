@@ -51,6 +51,8 @@ prox proxy stop --force      # Stop anyway, disconnecting all projects
 
 If a proxied request returns a connection error or an unexpected 404, check `prox proxy routes` first to confirm the target hostname is actually registered.
 
+**Green `prox status` does not mean the proxy is up.** `prox status` reports only the *project* daemon and its processes — it does not check the shared proxy. If a proxied request is connection-refused (or `:443` is dead) while `prox status` still shows everything "running", run **`prox proxy status`**: the shared daemon can be down (killed by a reboot/logout, or `prox proxy stop --force`) while every project daemon keeps reporting healthy. If it's down, `prox up` re-starts it. (See prox#66.)
+
 ## Viewing Logs
 
 prox aggregates output from all processes. When debugging, check logs first.
