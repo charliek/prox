@@ -125,7 +125,12 @@ type RequestDetailData struct {
 	// InFlight marks a request whose response is still streaming: Duration
 	// renders as "(in flight)" and a nil Details gets an explanatory note
 	// instead of being treated as "capture not enabled".
-	InFlight        bool
+	InFlight bool
+	// Stale marks an in-flight request that has been in-flight longer than
+	// constants.InFlightStaleAfter (D8, #53): the completion event may have
+	// been lost and the true outcome is unknown. Always false when InFlight
+	// is false.
+	Stale           bool
 	RequestHeaders  map[string][]string
 	ResponseHeaders map[string][]string
 	RequestBody     *BodyData

@@ -644,6 +644,56 @@ func TestRunRequests_TableRendersInFlightDuration(t *testing.T) {
 	}
 }
 
+// TestRunRequests_TableRendersStale verifies the list table's DURATION
+// column shows "stale?" instead of "..." for an in-flight row the server
+// reports as stale (D8, #53).
+func TestRunRequests_TableRendersStale(t *testing.T) {
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+			Requests: []api.ProxyRequestResponse{
+				{
+					ID:         "stale1",
+					Timestamp:  time.Now().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+					Method:     "GET",
+					URL:        "/stream",
+					StatusCode: 200,
+					DurationMs: 0,
+					InFlight:   true,
+					Stale:      true,
+				},
+			},
+			FilteredCount: 1,
+			TotalCount:    1,
+		})
+	}))
+	defer server.Close()
+	apiAddr = server.URL
+
+	requestsFollow = false
+	requestsJSON = false
+
+	stdout, _ := captureOutput(t, func() {
+		if err := runRequests(requestsCmd, []string{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "stale?") {
+		t.Errorf("expected DURATION column to render 'stale?' for a stale in-flight row, got:\n%s", stdout)
+	}
+}
+
 // TestPrintProxyRequest_InFlight verifies follow-mode prints "(in flight)"
 // instead of a fake "(0ms)" for an in-flight streamed record (D10).
 func TestPrintProxyRequest_InFlight(t *testing.T) {
@@ -706,6 +756,44 @@ func TestShowRequestDetail_InFlight(t *testing.T) {
 	}
 	if strings.Contains(stdout, "capture not enabled") {
 		t.Errorf("expected the misleading capture-not-enabled hint to be suppressed, got:\n%s", stdout)
+	}
+}
+
+// TestShowRequestDetail_Stale verifies the detail view indicates staleness
+// for a stale in-flight request (D8, #53): the Duration line and the
+// in-flight note both call out "stale?" instead of the ordinary in-flight
+// wording.
+func TestShowRequestDetail_Stale(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestDetailResponse{
+			ProxyRequestResponse: api.ProxyRequestResponse{
+				ID:         "stale1",
+				Timestamp:  time.Now().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+				Method:     "GET",
+				URL:        "/stream",
+				StatusCode: 200,
+				DurationMs: 0,
+				InFlight:   true,
+				Stale:      true,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+
+	stdout, _ := captureOutput(t, func() {
+		if err := showRequestDetail(client, "stale1", false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "Duration: (in flight, stale?)") {
+		t.Errorf("expected 'Duration: (in flight, stale?)', got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "stale?") {
+		t.Errorf("expected a stale note in the output, got:\n%s", stdout)
 	}
 }
 

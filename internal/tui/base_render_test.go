@@ -212,6 +212,28 @@ func TestFormatRequestDetail_InFlight_NoDetailsNote(t *testing.T) {
 	assert.Contains(t, out, "(request in flight — details arrive on completion)")
 }
 
+// TestFormatRequestDetail_Stale_ShowsStaleDurationAndNote verifies a stale
+// in-flight record (D8, #53) renders "stale?" on both the Duration line and
+// the in-flight note, distinct from an ordinary (fresh) in-flight record.
+func TestFormatRequestDetail_Stale_ShowsStaleDurationAndNote(t *testing.T) {
+	b := &BaseModel{
+		requestDetail: &RequestDetailData{
+			ID:         "req-1",
+			Timestamp:  "2026-07-18 00:00:00.000",
+			Method:     "GET",
+			URL:        "/api/v1/stream",
+			StatusCode: 200,
+			InFlight:   true,
+			Stale:      true,
+		},
+	}
+
+	out := strings.Join(b.formatRequestDetail(), "\n")
+	assert.Contains(t, out, "Duration: (in flight, stale?)")
+	assert.Contains(t, out, "stale? — the completion event may have been lost")
+	assert.NotContains(t, out, "Duration: (in flight)")
+}
+
 // TestFormatRequestDetail_Completed_NoInFlightNote verifies a completed
 // record with no captured Details (capture disabled) does NOT get the
 // in-flight note.

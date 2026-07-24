@@ -55,6 +55,32 @@ func TestConvertRequestRecordToDetail_FilePathBacked(t *testing.T) {
 	assert.Equal(t, string(payload), detail.ResponseBody.Data)
 }
 
+// TestConvertRequestRecordToDetail_Stale verifies local-mode conversion
+// (Model, which holds real proxy.RequestRecord values) computes Stale itself
+// via RequestRecord.StaleAt rather than needing it threaded in separately
+// (D8, #53), and that a fresh in-flight record is not marked stale.
+func TestConvertRequestRecordToDetail_Stale(t *testing.T) {
+	staleRec := proxy.RequestRecord{
+		ID:        "stale1",
+		Timestamp: time.Now().Add(-10 * time.Minute),
+		Method:    "GET",
+		URL:       "/stream",
+		InFlight:  true,
+	}
+	detail := convertRequestRecordToDetail(staleRec)
+	assert.True(t, detail.Stale)
+
+	freshRec := proxy.RequestRecord{
+		ID:        "fresh1",
+		Timestamp: time.Now(),
+		Method:    "GET",
+		URL:       "/stream",
+		InFlight:  true,
+	}
+	detail = convertRequestRecordToDetail(freshRec)
+	assert.False(t, detail.Stale)
+}
+
 // TestConvertCapturedBodyToBodyData_InvalidUTF8NotStringified pins the TUI's
 // defense-in-depth: bytes that are not valid UTF-8 are never string-converted
 // for rendering, even when the stored record claims IsBinary=false (e.g. a

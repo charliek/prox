@@ -257,6 +257,12 @@ type ProxyRequestResponse struct {
 	// replaces this record (same ID). Omitted for completed records so their
 	// JSON stays byte-identical to the pre-in-flight wire format.
 	InFlight bool `json:"in_flight,omitempty"`
+	// Stale marks an in-flight record that has been in-flight for longer than
+	// constants.InFlightStaleAfter as of conversion time (D8, #53). It means
+	// "completion unknown" (the completion event may have been lost), not
+	// "broken" — long-lived streams and large transfers can legitimately stay
+	// in-flight this long. Always false (and omitted) for completed records.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // ProxyRequestsResponse represents the response for GET /proxy/requests
@@ -266,7 +272,9 @@ type ProxyRequestsResponse struct {
 	TotalCount    int                    `json:"total_count"`
 }
 
-// ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse
+// ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse.
+// Staleness (D8) is computed here, at serve/conversion time, against the
+// current wall clock — there is no background reaper.
 func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 	return ProxyRequestResponse{
 		ID:         req.ID,
@@ -279,6 +287,7 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
 		InFlight:   req.InFlight,
+		Stale:      req.StaleAt(time.Now()),
 	}
 }
 

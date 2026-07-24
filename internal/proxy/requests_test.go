@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/charliek/prox/internal/constants"
 )
 
 func TestRequestManager_Record(t *testing.T) {
@@ -594,6 +596,58 @@ func TestRequestManager_Upsert_ConcurrentTransitions(t *testing.T) {
 		got, ok := m.GetByID(id)
 		require.True(t, ok, id)
 		assert.False(t, got.InFlight, id)
+	}
+}
+
+// TestRequestRecord_StaleAt is the truth table for D8 (#53) staleness: stale
+// iff InFlight && now.Sub(Timestamp) > constants.InFlightStaleAfter. Covers a
+// fresh in-flight row, the exact boundary (exclusive: equal to the threshold
+// is NOT stale), just past the boundary, well past it, and final records
+// (never stale regardless of age).
+func TestRequestRecord_StaleAt(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name   string
+		record RequestRecord
+		want   bool
+	}{
+		{
+			name:   "in-flight, fresh",
+			record: RequestRecord{InFlight: true, Timestamp: now.Add(-1 * time.Minute)},
+			want:   false,
+		},
+		{
+			name:   "in-flight, exactly at the threshold is not yet stale",
+			record: RequestRecord{InFlight: true, Timestamp: now.Add(-constants.InFlightStaleAfter)},
+			want:   false,
+		},
+		{
+			name:   "in-flight, one nanosecond past the threshold is stale",
+			record: RequestRecord{InFlight: true, Timestamp: now.Add(-constants.InFlightStaleAfter - time.Nanosecond)},
+			want:   true,
+		},
+		{
+			name:   "in-flight, well past the threshold",
+			record: RequestRecord{InFlight: true, Timestamp: now.Add(-1 * time.Hour)},
+			want:   true,
+		},
+		{
+			name:   "final record with an old timestamp is never stale",
+			record: RequestRecord{InFlight: false, Timestamp: now.Add(-1 * time.Hour)},
+			want:   false,
+		},
+		{
+			name:   "final record with a fresh timestamp is never stale",
+			record: RequestRecord{InFlight: false, Timestamp: now},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.record.StaleAt(now))
+		})
 	}
 }
 

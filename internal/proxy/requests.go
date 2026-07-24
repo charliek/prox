@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/charliek/prox/internal/constants"
 )
 
 // RequestRecord represents a single proxied request.
@@ -38,6 +40,17 @@ type RequestRecord struct {
 
 	// Details contains captured headers and bodies (nil when capture is disabled)
 	Details *RequestDetails `json:"details,omitempty"`
+}
+
+// StaleAt reports whether this record is stale as of now (D8, #53): still
+// marked in-flight, but running longer than constants.InFlightStaleAfter.
+// "Stale" means completion-unknown, not broken — see the constant's doc
+// comment. Final (non-in-flight) records are never stale: their completion,
+// whatever it was, is already known. This is the single staleness check;
+// every consumer (API response conversion, CLI rendering, TUI rendering)
+// calls it rather than re-deriving the condition.
+func (r RequestRecord) StaleAt(now time.Time) bool {
+	return r.InFlight && now.Sub(r.Timestamp) > constants.InFlightStaleAfter
 }
 
 // RequestDetails contains captured request/response headers and bodies.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -1064,9 +1065,12 @@ func (b *BaseModel) formatRequestDetail() []string {
 	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
 	lines = append(lines, fmt.Sprintf("  URL:      %s", d.URL))
 	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
-	if d.InFlight {
+	switch {
+	case d.InFlight && d.Stale:
+		lines = append(lines, "  Duration: (in flight, stale?)")
+	case d.InFlight:
 		lines = append(lines, "  Duration: (in flight)")
-	} else {
+	default:
 		lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
 	}
 	lines = append(lines, fmt.Sprintf("  Remote:   %s", d.RemoteAddr))
@@ -1078,12 +1082,18 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// rendering nothing.
 	if d.InFlight {
 		lines = append(lines, "")
-		if b.detailRefreshFailed {
+		switch {
+		case b.detailRefreshFailed:
 			// A live-refresh attempt (attach mode — D16) failed while this
 			// in-flight snapshot was on screen: say so instead of silently
 			// re-promising details that may never arrive automatically.
 			lines = append(lines, dimStyle.Render("(live refresh failed — press esc and re-enter to reload)"))
-		} else {
+		case d.Stale:
+			// D8, #53: the completion event may have been lost — the true
+			// outcome is unknown, not necessarily broken (long-lived
+			// streams/transfers can legitimately still be live here).
+			lines = append(lines, dimStyle.Render("(request in flight, stale? — the completion event may have been lost; true outcome unknown)"))
+		default:
 			lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
 		}
 	}
@@ -1304,21 +1314,26 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	}
 	status := statusStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
 
-	// Format duration with overflow handling. In-flight rows have no
-	// duration yet (the response is still streaming) — render dots in place
-	// of digits, padded to the same 5-char width so columns stay aligned.
+	// Format the duration column, including its "ms" unit, in one piece: the
+	// normal/in-flight/overflow cases share a digits-or-filler value plus
+	// "ms". A stale in-flight row (D8, #53: the completion event may have
+	// been lost, true outcome unknown — not necessarily broken, long-lived
+	// streams/transfers can legitimately still be live here) renders
+	// "stale?" instead, which isn't a duration so it carries no "ms" suffix.
 	durationMs := req.Duration.Milliseconds()
 	var duration string
 	switch {
+	case req.StaleAt(time.Now()):
+		duration = "stale?"
 	case req.InFlight:
-		duration = "  ..."
+		duration = "  ...ms"
 	case durationMs > 9999:
-		duration = "9999+"
+		duration = "9999+ms"
 	default:
-		duration = fmt.Sprintf("%5d", durationMs)
+		duration = fmt.Sprintf("%5dms", durationMs)
 	}
 
-	return fmt.Sprintf("%s  %s  %s %s %sms  %s",
+	return fmt.Sprintf("%s  %s  %s %s %s  %s",
 		dimStyle.Render(ts),
 		dimStyle.Render(subdomain),
 		method,
@@ -1702,6 +1717,7 @@ func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs [
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
 		InFlight:   req.InFlight,
+		Stale:      req.StaleAt(time.Now()),
 	}
 
 	if req.Details != nil {

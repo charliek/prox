@@ -91,6 +91,18 @@ const (
 	// ForwarderHealMinInterval is the minimum spacing between forwarder heal
 	// attempts, damping churn against a flapping daemon (D6b). Injectable in tests.
 	ForwarderHealMinInterval = 30 * time.Second
+
+	// InFlightStaleAfter is how long a request record may sit in-flight before
+	// it is reported as stale (D8, #53). Stale does NOT mean broken: SSE
+	// streams, WebSocket upgrades, and large transfers can legitimately stay
+	// in-flight this long while completely healthy. It means "completion
+	// unknown" — the record's completion event (published when the response
+	// body finishes) may have been lost (subscriber channel overrun, process
+	// crash mid-request, etc.), so the true outcome can no longer be inferred
+	// from this record alone. 5 minutes comfortably outlasts ordinary
+	// request/response cycles while still surfacing genuinely stuck rows in a
+	// timely way.
+	InFlightStaleAfter = 5 * time.Minute
 )
 
 // Log configuration

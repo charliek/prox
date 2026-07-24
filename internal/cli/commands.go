@@ -585,6 +585,12 @@ func runRequests(cmd *cobra.Command, args []string) error {
 				duration := fmt.Sprintf("%dms", req.DurationMs)
 				if req.InFlight {
 					duration = "..."
+					if req.Stale {
+						// Completion event may have been lost; true outcome
+						// unknown (D8, #53). Long-lived streams/transfers can
+						// legitimately still be live past this point.
+						duration = "stale?"
+					}
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
 					req.ID, timeStr, req.Method, req.StatusCode, duration, req.URL)
@@ -621,9 +627,12 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 	fmt.Printf("Method:  %s\n", resp.Method)
 	fmt.Printf("URL:     %s\n", resp.URL)
 	fmt.Printf("Status:  %d\n", resp.StatusCode)
-	if resp.InFlight {
+	switch {
+	case resp.InFlight && resp.Stale:
+		fmt.Printf("Duration: (in flight, stale?)\n")
+	case resp.InFlight:
 		fmt.Printf("Duration: (in flight)\n")
-	} else {
+	default:
 		fmt.Printf("Duration: %dms\n", resp.DurationMs)
 	}
 	fmt.Printf("Remote:  %s\n", resp.RemoteAddr)
@@ -650,6 +659,8 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 		if resp.Details.ResponseBody != nil {
 			printCapturedBody("Response Body", resp.Details.ResponseBody, includeBody)
 		}
+	} else if resp.InFlight && resp.Stale {
+		fmt.Println("\n(request in flight, stale? — the completion event may have been lost; true outcome unknown)")
 	} else if resp.InFlight {
 		fmt.Println("\n(request in flight — details arrive on completion)")
 	} else {
@@ -754,6 +765,9 @@ func printProxyRequest(req api.ProxyRequestResponse) {
 	duration := fmt.Sprintf("(%dms)", req.DurationMs)
 	if req.InFlight {
 		duration = "(in flight)"
+		if req.Stale {
+			duration = "(in flight, stale?)"
+		}
 	}
 	fmt.Printf("%s %s %s%d%s %s %s\n",
 		req.ID, timeStr, statusColor, req.StatusCode, resetColor, req.Method, duration)

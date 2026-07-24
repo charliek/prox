@@ -150,6 +150,26 @@ func inFlightDetailFor(id string) *RequestDetailData {
 	return &RequestDetailData{ID: id, Method: "GET", URL: "/x", InFlight: true}
 }
 
+// TestClientModel_FetchRequestDetail_MapsStale verifies fetchRequestDetail
+// (attach mode) carries the API response's Stale field through to
+// RequestDetailData (D8, #53) — the only place where the server's
+// serve-time-computed staleness reaches the TUI in attach mode, since
+// RequestDetailData.Timestamp is a display string, not a time.Time the TUI
+// could re-derive staleness from itself.
+func TestClientModel_FetchRequestDetail_MapsStale(t *testing.T) {
+	stub := &stubTUIClient{detailResp: &api.ProxyRequestDetailResponse{
+		ProxyRequestResponse: api.ProxyRequestResponse{ID: "req-000", InFlight: true, Stale: true},
+	}}
+	m := NewClientModel(stub)
+
+	msg := m.fetchRequestDetail("req-000", 1)()
+	detailMsg, ok := msg.(RequestDetailMsg)
+	require.True(t, ok, "fetch command should produce a RequestDetailMsg")
+	require.NotNil(t, detailMsg.Details)
+	assert.True(t, detailMsg.Details.InFlight)
+	assert.True(t, detailMsg.Details.Stale)
+}
+
 // TestClientModel_DetailLiveRefresh_MatchingFinalReturnsFetchCmd pins the
 // live half of D16 end to end: opening the detail on an in-flight request via
 // Enter, then feeding the matching final ProxyRequestMsg, returns a re-fetch
