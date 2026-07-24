@@ -371,6 +371,15 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		Token:       token,
 	}, handlers)
 
+	// Bind the API listener BEFORE the supervisor starts any processes: a
+	// bind failure (port taken) must fail the daemon while nothing is running
+	// yet — binding later would leak an already-started supervisor on the
+	// early error return (CodeRabbit PR #68). Serve starts further down.
+	apiListener, err := apiServer.Listen()
+	if err != nil {
+		return err
+	}
+
 	// Set up signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -453,14 +462,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 
-	// Bind the API listener synchronously: a bind failure (port taken) must
-	// fail the daemon rather than leave it running with no control surface —
-	// and, in detach mode, must surface through the parent's early-death path
-	// instead of letting a stranger on the port answer the readiness probe.
-	apiListener, err := apiServer.Listen()
-	if err != nil {
-		return err
-	}
+	// Serve on the listener bound before supervisor startup (see above).
 	go func() {
 		if err := apiServer.Serve(apiListener); err != nil {
 			// Server closed is expected on shutdown

@@ -208,6 +208,15 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 	var onEvict EvictionCallback
 
 	m.mu.Lock()
+	// Re-check the latch under mu: Close does not hold the ring lock, so a
+	// writer that passed the pre-lock check can otherwise commit after the
+	// destroy path's final purge (CodeRabbit PR #68). Under mu the store is
+	// either visible here (rejected) or this write commits before the purge's
+	// own mu acquisition (covered by the purge).
+	if m.writesClosed.Load() {
+		m.mu.Unlock()
+		return false
+	}
 	// Check if we're about to overwrite an existing record
 	if m.count == m.capacity {
 		evicted := m.buffer[m.head]
@@ -269,6 +278,11 @@ func (m *RequestManager) Upsert(record RequestRecord) bool {
 	var onEvict EvictionCallback
 
 	m.mu.Lock()
+	// Re-check the latch under mu (same reasoning as Record).
+	if m.writesClosed.Load() {
+		m.mu.Unlock()
+		return false
+	}
 	// Scan newest→oldest: in-flight records live in the newest slots.
 	idx := -1
 	for i := 0; i < m.count; i++ {

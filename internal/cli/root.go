@@ -52,10 +52,11 @@ processes for local development. It supports:
 // outside the allowlist (version, up, proxy, completion, __complete, help)
 // never call discoverAPIAddress and so are unaffected by missing state.
 func rootPersistentPreRunE(cmd *cobra.Command, args []string) error {
-	// Check if --addr was explicitly provided
-	if cmd.Flags().Changed("addr") {
-		apiAddrExplicitlySet = true
-	}
+	// Recompute (assign, don't just latch) on every invocation: the global is
+	// also read by commands.go, and a stale true from a prior in-process
+	// invocation (tests drive the hook repeatedly) would permanently suppress
+	// discovery and its error (CodeRabbit PR #68).
+	apiAddrExplicitlySet = cmd.Flags().Changed("addr")
 
 	// For client commands, try to discover API address if not explicitly set.
 	if needsAPIDiscovery(cmd) && !apiAddrExplicitlySet {

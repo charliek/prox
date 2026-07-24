@@ -3,6 +3,7 @@ package proxyd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -206,4 +207,76 @@ func TestForwardRequests_HealDampingAcrossOutages(t *testing.T) {
 		"second heal must not fire before healMinInterval after the first (got %v, first %v)", healTimes[1], healTimes[0])
 	assert.Equal(t, t0.Add(51*time.Second), healTimes[1],
 		"second heal fires only once >=healMinInterval has elapsed since the first, not at the new outage's healAfterDown")
+}
+
+// TestForwardRequests_ImmediateEOFIsNotRecovery pins the flap guard
+// (CodeRabbit PR #68): a stream that connects (HTTP 200) but dies within
+// flapThreshold must NOT clear the outage clock — a crash-looping daemon
+// that accepts and instantly EOFs would otherwise suppress healing forever.
+// Scripted: failures past healAfterDown, then an instant 200-EOF flap, then
+// another failure — the heal must still fire (the flap did not reset
+// downSince).
+func TestForwardRequests_ImmediateEOFIsNotRecovery(t *testing.T) {
+	errNoDaemon := fmt.Errorf("connect: no such file or directory")
+	base := time.Unix(1000, 0)
+	clock := base
+	healCalls := 0
+
+	// Script: attempt 0 fails at t=0; attempt 1 fails at t=16s (past the 15s
+	// threshold BUT we want the flap first, so): attempt 1 = instant
+	// connected flap at t=8s; attempt 2 fails at t=16s → downSince must
+	// still be t=0 → heal fires. If the flap had reset the clock, the next
+	// outage would start at 16s and no heal could fire until 31s.
+	step := 0
+	cfg := forwarderConfig{
+		socketPath: "/nonexistent",
+		projectDir: "/p",
+		localRM:    proxy.NewRequestManager(10),
+		now:        func() time.Time { return clock },
+		// Each backoff advances the scripted clock 8s; the streams themselves
+		// never advance it, so a "connected" return has zero duration — the
+		// flap the guard exists to catch.
+		after: func(time.Duration) <-chan time.Time {
+			clock = clock.Add(8 * time.Second)
+			ch := make(chan time.Time, 1)
+			ch <- clock
+			return ch
+		},
+		healAfterDown:   15 * time.Second,
+		healMinInterval: 30 * time.Second,
+		flapThreshold:   time.Second,
+		heal: func() bool {
+			healCalls++
+			return false
+		},
+		stream: func(ctx context.Context, _ string, _ *Client, _ string, _ *proxy.RequestManager, _ ForwarderStatusSink) (bool, error) {
+			switch step {
+			case 0:
+				step++ // fail at t=0 → downSince=t0
+				return false, errNoDaemon
+			case 1:
+				step++ // instant 200-EOF at t=8s: zero duration → flap
+				return true, nil
+			case 2:
+				step++ // fail at t=16s → heal must fire (downSince still t0)
+				return false, errNoDaemon
+			default:
+				<-ctx.Done()
+				return false, ctx.Err()
+			}
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		// Give the loop a few scripted iterations then stop it.
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	forwardRequests(ctx, cfg)
+
+	if healCalls == 0 {
+		t.Fatal("heal must fire at t=16s: the instant 200-EOF flap at t=8s must not reset the outage clock")
+	}
 }

@@ -47,6 +47,10 @@ type ForwarderStatusSink interface {
 // the same socket. It no-ops (returns false) once shutdown has been latched.
 type HealFunc func() bool
 
+// streamFlapThreshold is the minimum time a connected SSE stream must survive
+// to count as a real recovery in the reconnect loop (see the flap guard).
+const streamFlapThreshold = time.Second
+
 // ForwardRequests subscribes to the daemon's SSE request stream and forwards
 // this project's records into the local RequestManager. This bridges the
 // daemon's proxy request data into the project's TUI and API.
@@ -79,6 +83,7 @@ func ForwardRequests(ctx context.Context, socketPath string, projectDir string, 
 		after:           time.After,
 		healAfterDown:   constants.ForwarderHealAfterDown,
 		healMinInterval: constants.ForwarderHealMinInterval,
+		flapThreshold:   streamFlapThreshold,
 	})
 }
 
@@ -96,6 +101,10 @@ type forwarderConfig struct {
 	after           func(time.Duration) <-chan time.Time // backoff timer
 	healAfterDown   time.Duration
 	healMinInterval time.Duration
+	// flapThreshold is the minimum lifetime for a connected stream to count
+	// as a recovery (streamFlapThreshold in production; tests with instant
+	// scripted streams set 0 to opt out, and the flap test pins the guard).
+	flapThreshold time.Duration
 	// stream is the single connect-and-forward attempt (nil → the production
 	// streamRequests). Injectable so heal-timing tests can script a deterministic
 	// connect/drop/outage sequence without real sockets (FIX 4).
@@ -140,9 +149,27 @@ func forwardRequests(ctx context.Context, cfg forwarderConfig) {
 	var lastHeal time.Time  // zero until the first heal attempt of an outage
 
 	for {
+		// attemptStart feeds the flap guard below; only sample the clock when
+		// the guard is enabled (scripted-clock tests with flapThreshold 0
+		// must not consume extra instants).
+		var attemptStart time.Time
+		if cfg.flapThreshold > 0 {
+			attemptStart = cfg.now()
+		}
 		connected, err := stream(ctx, cfg.socketPath, snapClient, cfg.projectDir, cfg.localRM, cfg.sink)
 		if ctx.Err() != nil {
 			return // context cancelled, clean shutdown
+		}
+		// A 200 that dies immediately is a FLAP, not a recovery: a
+		// crash-looping daemon that accepts and instantly EOFs would
+		// otherwise clear the outage clock on every cycle and permanently
+		// suppress healing (CodeRabbit PR #68). Only a stream that lived
+		// past the flap threshold counts as connected for reset purposes.
+		if connected && cfg.flapThreshold > 0 && cfg.now().Sub(attemptStart) < cfg.flapThreshold {
+			connected = false
+			if err == nil {
+				err = fmt.Errorf("stream ended within %s of connecting (flapping daemon)", cfg.flapThreshold)
+			}
 		}
 		if connected {
 			// The previous attempt reached a live stream: the daemon is (or was

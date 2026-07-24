@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxyd"
 )
 
@@ -31,7 +32,7 @@ func startDaemonServer(t *testing.T) (*proxyd.Client, func()) {
 		Version:    "test",
 	})
 	server.SetRegistry(registry)
-	server.SetManagers(proxyd.NewManagers(100, nil))
+	server.SetManagers(proxyd.NewManagers(constants.DefaultProxyRequestBufferSize, nil))
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Start() }()

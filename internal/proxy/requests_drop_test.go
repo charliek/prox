@@ -37,8 +37,9 @@ func (b *syncBuffer) String() string {
 // once (not per-drop).
 func TestRequestManager_DroppedEventsUnderBurst(t *testing.T) {
 	logBuf := &syncBuffer{}
+	prev := log.Writer()
 	log.SetOutput(logBuf)
-	t.Cleanup(func() { log.SetOutput(nil) })
+	t.Cleanup(func() { log.SetOutput(prev) })
 
 	m := NewRequestManager(1000)
 	// Subscribe with the default 100-slot channel and never read it, so a burst

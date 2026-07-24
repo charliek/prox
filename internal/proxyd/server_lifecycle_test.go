@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,7 +26,7 @@ func newLifecycleServer() *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 	s := NewServer(ServerConfig{SocketPath: "", Logger: logger, Version: "test"})
 	s.SetRegistry(NewRegistry())
-	s.SetManagers(NewManagers(100, nil))
+	s.SetManagers(NewManagers(constants.DefaultProxyRequestBufferSize, nil))
 	return s
 }
 
