@@ -124,12 +124,91 @@ workflow). Each block must print the expected repo name.
 | `git push` rejected: `Required status check ...` | Pusher not in ruleset bypass | Confirm both the App and the admin role are in `main`'s ruleset `bypass_actors` |
 | GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_APP_ID` unset OR App not installed on `homebrew-tap` | Confirm via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap if missing |
 | `Trigger apt-charliek publish` step fails | App not installed on `apt-charliek` OR rate-limited | Confirm via `sanity-check-app.yml`'s apt-charliek block; install the App if missing. The dispatch step retries 3× internally; persistent failures usually mean install state, not network |
+| `Run GoReleaser` red with `503`/`502 ... policy` from `uploads.github.com`, and the apt steps show as **skipped** | Transient GitHub upload/API outage — GoReleaser aborted the publish phase before the `brews` push and the `if: success()` apt dispatch (so tap + apt both missed, and the Release may be a draft) | See Break-glass → **GoReleaser aborted mid-upload** |
 | `release` job's `go test` fails on the tagged commit | Real test failure | Fix on a branch, merge, cut a fresh patch tag (don't force-update the failed tag) |
 | Formula push succeeded but `brew install` finds old version | Homebrew tap cache | `brew untap charliek/tap && brew tap charliek/tap` |
 | `release` job fails at `Verify plugin.json matches tag` | The tagged commit's plugin.json doesn't match the tag — either `update-version.sh` didn't run, or it ran but the bump didn't land (silent sed no-op on a malformed manifest) | Re-bump locally with `./scripts/release/update-version.sh <ver>` (it now grep-verifies the bump), commit, push to main, cut a fresh patch tag. The buggy tag stays as an audit trail; don't force-update it. |
 | Claude Code installs old plugin version after the release | `plugin.json` wasn't bumped before the tag (and the Verify step missed it, or the Verify step was bypassed) | `/release-workflows:release` should have bumped it via `update-version.sh`; if not, bump manually with `scripts/release/update-version.sh <ver>` + commit + push to main, then redirect Claude Code users to reinstall |
 
 ## Break-glass recovery
+
+### GoReleaser aborted mid-upload (transient GitHub outage)
+
+The compound failure hit on v0.2.0. `Run GoReleaser` goes red with a storm
+of `503 No server is currently available` / `502 Error updating/creating
+policy` from `uploads.github.com`, and the two apt steps (`Mint an
+apt-charliek App token`, `Trigger apt-charliek publish`) show as
+**skipped**. GoReleaser built every artifact fine but died during the
+asset-upload phase — *before* it reached the `brews` formula push and
+before the `if: success()`-gated apt dispatch. Net effect: the GitHub
+Release may be a half-uploaded draft, the homebrew tap is left at the old
+version, and the apt channel never fired. Nothing self-heals within the run.
+
+Root cause is GitHub infra, not config — GoReleaser's retries all hit the
+outage. Don't "fix" the workflow in response; the re-run + manual steps
+below are the intended recovery. (If only *one* channel is affected — the
+Release and everything else uploaded fine — use the narrower **Homebrew
+formula push failed** / **apt-charliek dispatch failed** entries below
+instead.)
+
+**Preferred fix — re-run the whole run (idempotent).** Once GitHub
+recovers, re-run the failed run. `mode: replace` reuses the existing
+Release, re-uploads only what's missing, retries the formula push, and
+re-fires the apt dispatch — all three channels reconcile in one shot. The
+`concurrency` group serializes it safely against the tag.
+
+```bash
+RUN_ID=$(gh run list -R charliek/prox --workflow release.yaml \
+                     --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run rerun "${RUN_ID}" -R charliek/prox --failed
+```
+
+**If you can't wait (or the re-run keeps hitting the outage)**, finish the
+three channels by hand — every step is idempotent, so a later canonical
+re-run just overwrites with identical bytes:
+
+1. **GitHub Release.** Verify each asset's checksum against the release's
+   `checksums.txt`, then publish the draft:
+
+   ```bash
+   gh release edit vX.Y.Z -R charliek/prox --draft=false --latest
+   ```
+
+2. **Homebrew tap.** GoReleaser never pushed the formula, so
+   `charliek/homebrew-tap`'s `Formula/prox.rb` is stale. Regenerate it: bump
+   `version`, point all four `url`s at `vX.Y.Z`, and set the four `sha256`s
+   from the release `checksums.txt` (darwin/linux × amd64/arm64). Then PUT
+   it (needs the current blob `.sha`):
+
+   ```bash
+   gh api -X PUT repos/charliek/homebrew-tap/contents/Formula/prox.rb \
+     -f message="Brew formula update for prox version vX.Y.Z" \
+     -f content="$(base64 -i prox.rb)" \
+     -f sha="$(gh api repos/charliek/homebrew-tap/contents/Formula/prox.rb --jq .sha)"
+   ```
+
+   Then `brew update && brew upgrade prox`.
+
+3. **apt.** The dispatch was skipped, so trigger `apt-charliek`'s publish
+   directly — its `publish.yml` accepts `workflow_dispatch`, and its
+   `collect-debs.sh` re-scans every tracked package's latest Release, so it
+   picks up the new `.deb`s idempotently (payload is ignored):
+
+   ```bash
+   gh workflow run publish.yml -R charliek/apt-charliek
+   ```
+
+   Verify: the Packages index keeps ALL historical versions (one
+   `apt-ftparchive` stanza per pooled `.deb`), so check EVERY prox stanza —
+   not just the first — and confirm the new version is the max on both
+   `binary-amd64` and `binary-arm64`, at both the storage origin
+   (`https://storage.googleapis.com/apt.stridelabs.ai`) and the Cloudflare
+   edge (`https://apt.stridelabs.ai`):
+
+   ```bash
+   curl -fsSL https://apt.stridelabs.ai/dists/noble/main/binary-amd64/Packages \
+     | awk '/^Package: /{p=$2} /^Version: /{if(p=="prox")print $2}' | sort -V | tail -1
+   ```
 
 ### Homebrew formula push failed
 
