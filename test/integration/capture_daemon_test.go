@@ -133,8 +133,8 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	localRMB := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go proxyd.ForwardRequests(ctx, socketPath, "/projects/a", localRMA, nil)
-	go proxyd.ForwardRequests(ctx, socketPath, "/projects/b", localRMB, nil)
+	go proxyd.ForwardRequests(ctx, socketPath, "/projects/a", localRMA, nil, nil)
+	go proxyd.ForwardRequests(ctx, socketPath, "/projects/b", localRMB, nil, nil)
 
 	// Confirm both bridges are live by pinging until each side observes a record.
 	// (Guards against subscribing after the real traffic was already published.)

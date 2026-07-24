@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,15 @@ const (
 	proxyModeShared     = "shared"
 	proxyModeStandalone = "standalone"
 	proxyModeDisabled   = "disabled"
+)
+
+// heal_state values reported in the `prox status` proxy block. C5 reported only
+// healthy/""; C6 (D6b) refines the unreachable case to distinguish an in-progress
+// heal from a busy different-version daemon.
+const (
+	healStateHealthy         = "healthy"
+	healStateHealing         = "healing"
+	healStateVersionMismatch = "version_mismatch"
 )
 
 // proxyRuntime is the single source of truth for this project's proxy path,
@@ -46,8 +56,30 @@ type proxyRuntime struct {
 
 	// shutdownLatch is set (via MarkShuttingDown) before the deregister stage of
 	// performShutdown. C6's heal callback consumes it to no-op once teardown has
-	// begun; C5 only sets it.
+	// begun.
 	shutdownLatch atomic.Bool
+
+	// healMu serializes a heal against shutdown's client read (FIX 3). heal holds
+	// it for its whole body; performShutdown acquires it (clientAfterHealBarrier)
+	// AFTER latching, so a heal that began before the latch finishes its client
+	// swap before shutdown reads the client — the deregister then goes through the
+	// HEALED client. A heal that starts after the latch no-ops (its first action
+	// under healMu re-checks IsShuttingDown). It never nests inside mu.
+	healMu sync.Mutex
+
+	// forwarderCancel cancels the SSE forwarder's context. performShutdown calls
+	// it (via CancelForwarder) BEFORE deregister (D6c) so the forwarder loop stops
+	// and cannot fire a heal that re-registers the project mid-teardown. It lives
+	// on a context derived from runUp's — separate so cancelling the forwarder
+	// never disturbs the supervisor. nil until the shared-mode forwarder launches.
+	forwarderCancel context.CancelFunc
+
+	// healState overrides the derived heal_state while the shared daemon is
+	// unreachable (D6b): "" (down, no heal attempted yet), "healing" (heal
+	// attempts failing), or "version_mismatch" (a busy different-version daemon).
+	// Guarded by mu. When the daemon is reachable, ProxyStatus reports "healthy"
+	// regardless of this field.
+	healState string
 
 	// Forwarder state atomics (D5).
 	consecutiveFailures atomic.Int64
@@ -115,6 +147,17 @@ func (r *proxyRuntime) Client() *proxyd.Client {
 	return r.client
 }
 
+// clientAfterHealBarrier blocks until any in-flight heal completes (its client
+// swap has landed), then returns the current client. performShutdown calls it
+// AFTER MarkShuttingDown()+CancelForwarder() so a heal that began before the latch
+// finishes fully and the deregister goes through the HEALED client; a heal that
+// starts after the latch no-ops under the same mutex (FIX 3).
+func (r *proxyRuntime) clientAfterHealBarrier() *proxyd.Client {
+	r.healMu.Lock()
+	defer r.healMu.Unlock()
+	return r.Client()
+}
+
 // SetRegisterRequest stores the original registration request (C6 re-registers
 // with it after a heal).
 func (r *proxyRuntime) SetRegisterRequest(req proxyd.RegisterRequest) {
@@ -152,6 +195,38 @@ func (r *proxyRuntime) MarkShuttingDown() {
 // IsShuttingDown reports whether teardown has begun.
 func (r *proxyRuntime) IsShuttingDown() bool {
 	return r.shutdownLatch.Load()
+}
+
+// SetForwarderCancel records the SSE forwarder's cancel func so performShutdown
+// can stop the forwarder before deregister (D6c).
+func (r *proxyRuntime) SetForwarderCancel(cancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.forwarderCancel = cancel
+}
+
+// CancelForwarder cancels the forwarder's context if one was launched (no-op
+// otherwise). Called before deregister so no heal can fire mid-teardown (D6c).
+func (r *proxyRuntime) CancelForwarder() {
+	r.mu.Lock()
+	cancel := r.forwarderCancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// setHealState records the heal state machine's current view (D6b).
+func (r *proxyRuntime) setHealState(state string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.healState = state
+}
+
+func (r *proxyRuntime) getHealState() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.healState
 }
 
 // --- proxyd.ForwarderStatusSink ---
@@ -206,7 +281,11 @@ func (r *proxyRuntime) ProxyStatus() *api.ProxyStatusResponse {
 		resp.DaemonReachable = reachable
 		resp.DaemonVersion = version
 		if reachable {
-			resp.HealState = "healthy"
+			resp.HealState = healStateHealthy
+		} else {
+			// Unreachable: surface the heal state machine's current view — ""
+			// until the first heal attempt, then "healing"/"version_mismatch" (D6b).
+			resp.HealState = r.getHealState()
 		}
 	}
 
@@ -229,6 +308,100 @@ func (r *proxyRuntime) probeDaemon() (bool, string) {
 	r.probeCache = proxyProbeResult{reachable: reachable, version: version}
 	r.probeValidUntil = r.now().Add(r.probeTTL)
 	return reachable, version
+}
+
+// invalidateProbeCache forces the next ProxyStatus to re-probe rather than reuse
+// a cached result. Called after a heal swaps in a fresh client so status reflects
+// the new daemon immediately instead of waiting out the cache TTL.
+func (r *proxyRuntime) invalidateProbeCache() {
+	r.probeMu.Lock()
+	defer r.probeMu.Unlock()
+	r.probeValidUntil = time.Time{}
+}
+
+// --- D6b self-heal ---
+
+// healOps bundles the injectable operations proxyRuntime.heal needs so it can be
+// unit-tested against a fake daemon without real sockets or wall-clock waits
+// (mirrors skewOps / registerRetryOps). defaultHealOps wires the production impls.
+type healOps struct {
+	// ensureRunning starts/connects a daemon of this process's version (the heal
+	// wraps it in ensureRunningWithRetry for the socket-removed-before-PID-lock
+	// window).
+	ensureRunning func() (*proxyd.Client, error)
+	sleep         func(time.Duration)
+	retryDelay    time.Duration
+}
+
+func defaultHealOps() healOps {
+	return healOps{
+		ensureRunning: proxyd.EnsureRunning,
+		sleep:         time.Sleep,
+		retryDelay:    1 * time.Second,
+	}
+}
+
+// heal is the forwarder's self-heal callback (D6b), invoked INLINE from the
+// forwarder reconnect loop after the shared daemon has been unreachable past the
+// heal threshold. It re-ensures a daemon of this version and re-registers this
+// project's stored request against it, swapping in the fresh client on success so
+// performShutdown later deregisters through the healed client (D6c). It returns
+// true only when the project is registered on a healthy daemon — the forwarder
+// then reconnects to it on the same socket.
+//
+// Behavior:
+//   - shutting down (latch set): no-op, return false — never re-register a project
+//     that is tearing down (D6c);
+//   - VersionMismatchError from EnsureRunning: a live daemon of another version is
+//     holding the ports; NEVER restart a busy daemon — set heal_state
+//     "version_mismatch" and keep waiting (heal retried after healMinInterval);
+//   - any other ensure/register error: set heal_state "healing", count the attempt
+//     (the forwarder keeps retrying forever);
+//   - success: swap the client, reset failure state, set heal_state "healthy",
+//     invalidate the probe cache, log one prominent line.
+func (r *proxyRuntime) heal(ops healOps) bool {
+	// Hold healMu for the WHOLE body so shutdown's client read (clientAfterHealBarrier)
+	// blocks until an in-flight heal's client swap has landed (FIX 3).
+	r.healMu.Lock()
+	defer r.healMu.Unlock()
+
+	// First action under the lock: a shutdown that latched before we acquired healMu
+	// owns teardown now — no-op. A shutdown latching AFTER this check is blocked on
+	// healMu until we return, so its client read observes our swap.
+	if r.IsShuttingDown() {
+		return false
+	}
+
+	client, err := ensureRunningWithRetry(ops.ensureRunning, ops.sleep, ops.retryDelay)
+	if err != nil {
+		var vme *proxyd.VersionMismatchError
+		if errors.As(err, &vme) {
+			r.setHealState(healStateVersionMismatch)
+			return false
+		}
+		r.setHealState(healStateHealing)
+		return false
+	}
+
+	resp, err := client.Register(r.RegisterRequest())
+	if err != nil {
+		// A busy different-version daemon holding the ports re-checks versions at
+		// register time and returns VERSION_MISMATCH: surface it as version_mismatch
+		// (like the EnsureRunning VersionMismatchError path), NOT healing (FIX 5).
+		if isVersionMismatchError(err) {
+			r.setHealState(healStateVersionMismatch)
+			return false
+		}
+		r.setHealState(healStateHealing)
+		return false
+	}
+
+	r.SetClient(client)
+	r.consecutiveFailures.Store(0)
+	r.setHealState(healStateHealthy)
+	r.invalidateProbeCache()
+	log.Printf("prox: shared proxy daemon healed — re-registered %d domain(s) with a fresh daemon", len(resp.Registered))
+	return true
 }
 
 // defaultProber issues a live /health probe against the active daemon client

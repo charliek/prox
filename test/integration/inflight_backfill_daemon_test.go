@@ -87,7 +87,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go proxyd.ForwardRequests(ctx, topo.socketPath, projectDir, localRM, nil)
+	go proxyd.ForwardRequests(ctx, topo.socketPath, projectDir, localRM, nil, nil)
 	waitBridgeLive(t, proxyPort, hostname, localRM)
 
 	// Drive the slow request in a background goroutine — it stays open until we
@@ -228,7 +228,7 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan struct{})
 	go func() {
-		proxyd.ForwardRequests(ctx1, topo.socketPath, projectDir, localRM, nil)
+		proxyd.ForwardRequests(ctx1, topo.socketPath, projectDir, localRM, nil, nil)
 		close(done1)
 	}()
 	waitBridgeLive(t, proxyPort, hostname, localRM)
@@ -271,7 +271,7 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	// --- Restart the bridge with a fresh ctx and the SAME local manager ---
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	go proxyd.ForwardRequests(ctx2, topo.socketPath, projectDir, localRM, nil)
+	go proxyd.ForwardRequests(ctx2, topo.socketPath, projectDir, localRM, nil, nil)
 
 	// Gap records appear locally via backfill.
 	gap1 := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {

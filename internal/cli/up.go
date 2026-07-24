@@ -615,14 +615,18 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 		deps.sup.RefuseLaunches()
 	}
 
-	// Latch the shutdown flag BEFORE deregister (D6c) so a C6 heal cannot
-	// re-register the project mid-teardown, and resolve the daemon client through
-	// the runtime so a healed client (not the startup-captured one) is used for
-	// deregister. daemonClient is the fallback for helper tests with no runtime.
+	// D6c shutdown ordering. Latch the shutdown flag FIRST so an in-flight or next
+	// heal no-ops, then cancel the forwarder BEFORE deregister so its reconnect
+	// loop cannot fire a heal that re-registers the project mid-teardown. Resolve
+	// the daemon client through clientAfterHealBarrier AFTER both: it blocks on the
+	// heal mutex until any heal that began before the latch has finished swapping
+	// the client, so we deregister through the HEALED client, never the one captured
+	// at startup (FIX 3). daemonClient is the fallback for helper tests with no runtime.
 	daemonClient := deps.daemonClient
 	if deps.runtime != nil {
 		deps.runtime.MarkShuttingDown()
-		daemonClient = deps.runtime.Client()
+		deps.runtime.CancelForwarder()
+		daemonClient = deps.runtime.clientAfterHealBarrier()
 	}
 
 	// Stage 1a: deregister from the shared proxy daemon. The proxyd client carries
@@ -940,7 +944,17 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	rt.SetClient(client)
 	rt.SetRegisterRequest(req)
 	rt.SetLocalRequestManager(localRM)
-	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), cwd, localRM, rt)
+
+	// Run the forwarder on a context derived from ctx but cancellable on its own,
+	// so performShutdown can stop it BEFORE deregister (D6c) without disturbing the
+	// supervisor (which shares ctx). Its heal callback (D6b) re-ensures and
+	// re-registers against a fresh daemon after a prolonged outage; it no-ops once
+	// shutdown is latched. Deriving from ctx guarantees the forwarder still stops
+	// on any runUp return even if performShutdown never runs.
+	fwdCtx, fwdCancel := context.WithCancel(ctx)
+	rt.SetForwarderCancel(fwdCancel)
+	heal := func() bool { return rt.heal(defaultHealOps()) }
+	go proxyd.ForwardRequests(fwdCtx, proxyd.SocketPath(), cwd, localRM, rt, heal)
 
 	return client, true, nil
 }

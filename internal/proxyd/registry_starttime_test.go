@@ -63,10 +63,14 @@ func TestStalePIDs_TokenMismatchIsStale(t *testing.T) {
 	assert.Equal(t, os.Getpid(), stale[0].PID)
 }
 
-// TestSelfHeal_TokenMatchStillConflicts pins that a same-dir conflict whose
-// stored holder is (PID=self, StartTime=realToken) — a genuinely live, matching
-// generation — still 409s rather than being silently replaced.
-func TestSelfHeal_TokenMatchStillConflicts(t *testing.T) {
+// TestReRegister_SameIdentityIsIdempotent pins D6a (supersedes the pre-C6 hard
+// 409): a same-dir register whose live holder is the SAME generation (PID=self,
+// StartTime=realToken) is an idempotent re-register — it returns 200 with the
+// registered hostnames instead of conflicting, so a heal against a live daemon
+// whose SSE stream broke can re-register instead of looping on
+// REGISTRATION_CONFLICT forever. Only the same process (a heal or a retry) can
+// present the same PID+token; two distinct `prox up` invocations always differ.
+func TestReRegister_SameIdentityIsIdempotent(t *testing.T) {
 	realToken := mustSelfToken(t)
 
 	s := newLifecycleServer()
@@ -75,10 +79,11 @@ func TestSelfHeal_TokenMatchStillConflicts(t *testing.T) {
 	require.NoError(t, err)
 
 	status, body := s.register(req)
-	require.Equal(t, http.StatusConflict, status, "live, token-matching holder must still conflict: %v", body)
-	errResp, ok := body.(ErrorResponse)
-	require.True(t, ok, "conflict body should be an ErrorResponse")
-	assert.Equal(t, "REGISTRATION_CONFLICT", errResp.Code)
+	require.Equal(t, http.StatusOK, status, "live, same-identity holder must re-register idempotently: %v", body)
+	resp, ok := body.(RegisterResponse)
+	require.True(t, ok, "idempotent re-register body should be a RegisterResponse")
+	assert.Contains(t, resp.Registered, "api.local.dev")
+	assert.Equal(t, 1, s.registry.ProjectCount(), "idempotent re-register must not duplicate the project")
 }
 
 // TestSelfHeal_TokenMismatchIsReplaced pins the #61 self-heal path: a same-dir

@@ -237,6 +237,12 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		}
 	}
 
+	// restoreSnap, when non-nil, is the pre-removal snapshot of a same-identity
+	// holder whose config CHANGED (the D6a DIFFERENT arm): every failure point
+	// after its removal must restore it rather than leave the project
+	// unregistered. It stays nil for the crash-replace and fresh-register paths.
+	var restoreSnap *projectSnapshot
+
 	hostnames, newPorts, err := s.registry.Register(req)
 	if err != nil {
 		var conflict *ProjectConflictError
@@ -245,17 +251,58 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
 		if daemon.IsProcessAlive(conflict.PID, conflict.StartTime) {
-			// A second live prox up in the same dir is a genuine conflict.
-			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
+			// The same-dir holder is still live. Sub-cases:
+			//   - SAME generation as the requester (same PID AND matching non-zero
+			//     start token): an idempotent re-register (D6a) — the heal path
+			//     (D6b) re-registering against a live daemon whose SSE stream broke,
+			//     or a client retrying a register it already won.
+			//   - A DIFFERENT generation (different PID, or an unreadable token on
+			//     either side that can't be proven identical): a genuine second
+			//     `prox up` in the same dir — stays a hard 409.
+			if !sameRegistrationIdentity(conflict.PID, conflict.StartTime, req.PID, req.StartTime) {
+				return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
+			}
+			// FIX 1: when the re-registering process's config is UNCHANGED (the
+			// common heal case), take a true no-op refresh — echo the current
+			// hostnames without any remove+add, so no listeners churn and, crucially,
+			// no daemon-side records are purged. This is what a heal against a live
+			// daemon whose SSE stream merely broke actually needs.
+			if s.registry.registrationMatches(req) {
+				s.logger.Info("idempotent re-register: config unchanged, no-op refresh",
+					"project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
+				return http.StatusOK, RegisterResponse{Registered: s.registry.ProjectHostnames(conflict.Dir)}
+			}
+			// FIX 2: the same process re-registers with a CHANGED config (rare).
+			// Keep the remove+add, but make it failure-atomic: snapshot the current
+			// registration first so any failure in the retry Register / cert /
+			// listener phases below can restore it — a failed re-register must never
+			// leave the project unregistered.
+			if snap, ok := s.registry.snapshotProject(conflict.Dir); ok {
+				restoreSnap = &snap
+			}
+			s.logger.Info("idempotent re-register: config changed, replacing registration",
+				"project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
+			// removeProjectLocked drops the holder's routes and refcounts (closing
+			// now-empty listeners) and purges its records; the shared re-register
+			// below rebinds the ports and refcounts them back to one, so N
+			// re-registers followed by ONE deregister still close the port.
+			s.removeProjectLocked(conflict.Dir)
+		} else {
+			// The holder crashed without deregistering. Replace its stale
+			// registration inline (PID-guarded; purges its records + body files and
+			// closes its listeners) and retry once. Under lifecycleMu the retry
+			// cannot lose a race, so a single retry is a correctness guarantee.
+			s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
+			s.removeStaleProjectLocked(conflict.Dir, conflict.PID, conflict.StartTime)
 		}
-		// The holder crashed without deregistering. Replace its stale
-		// registration inline (PID-guarded; purges its records + body files and
-		// closes its listeners) and retry once. Under lifecycleMu the retry
-		// cannot lose a race, so a single retry is a correctness guarantee.
-		s.logger.Warn("replacing stale registration", "project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
-		s.removeStaleProjectLocked(conflict.Dir, conflict.PID, conflict.StartTime)
+		// Shared retry tail: whichever removal ran above freed the same-dir holder,
+		// so rebind under the still-held lifecycleMu. A single retry cannot lose a
+		// race, so this is a correctness guarantee, not a hopeful retry.
 		hostnames, newPorts, err = s.registry.Register(req)
 		if err != nil {
+			if restoreSnap != nil {
+				s.restoreSnapshotLocked(*restoreSnap)
+			}
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
 	}
@@ -268,6 +315,9 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 	if s.proxy != nil && s.proxy.certMgr != nil && req.HTTPSPort > 0 {
 		if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
 			s.rollbackRegistration(req.ProjectDir)
+			if restoreSnap != nil {
+				s.restoreSnapshotLocked(*restoreSnap)
+			}
 			return http.StatusInternalServerError, ErrorResponse{
 				Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
 				Code:  "CERT_GENERATION_FAILED",
@@ -291,6 +341,9 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 					_ = s.proxy.RemoveListener(p)
 				}
 				s.rollbackRegistration(req.ProjectDir)
+				if restoreSnap != nil {
+					s.restoreSnapshotLocked(*restoreSnap)
+				}
 				return http.StatusInternalServerError, ErrorResponse{
 					Error: fmt.Sprintf("failed to bind port %d: %v", ps.Port, err),
 					Code:  "PORT_BIND_FAILED",
@@ -466,6 +519,28 @@ func (s *Server) rollbackRegistration(projectDir string) {
 	}
 	s.lifecycleEpoch.Add(1)
 	s.scheduleShutdownWhenEmpty()
+}
+
+// restoreSnapshotLocked re-injects a project snapshot into the registry and
+// re-opens any physical listener the removal closed, then bumps the lifecycle
+// epoch. lifecycleMu must be held. It is register's failure-atomic recovery for
+// the same-identity DIFFERENT arm (D6a): when a config-changed remove+add fails
+// partway, the original registration is restored so the project is never left
+// unregistered. A listener that cannot be re-opened is logged (best-effort): the
+// alternative — returning without restoring — would strand the project entirely.
+func (s *Server) restoreSnapshotLocked(snap projectSnapshot) {
+	reopen := s.registry.restoreProject(snap)
+	if s.proxy != nil {
+		for _, ps := range reopen {
+			if err := s.addListenerWithBriefRetry(ps.Port, ps.Protocol); err != nil {
+				s.logger.Error("failed to re-open listener while restoring a registration after a failed re-register",
+					"project", snap.proj.Dir, "port", ps.Port, "protocol", ps.Protocol, "error", err)
+			}
+		}
+	}
+	s.lifecycleEpoch.Add(1)
+	s.logger.Info("restored prior registration after a failed re-register",
+		"project", snap.proj.Dir, "pid", snap.proj.PID)
 }
 
 // addListenerWithBriefRetry binds a listener, retrying briefly on a transient

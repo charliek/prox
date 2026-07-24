@@ -37,6 +37,16 @@ type ForwarderStatusSink interface {
 	ForwarderBackfillFailed()
 }
 
+// HealFunc is the forwarder's self-heal callback (D6b). It is a plain func passed
+// in from internal/cli (keeping proxyd free of a cli import): when the shared
+// daemon has been unreachable past the heal threshold, the forwarder invokes it
+// INLINE in the reconnect loop (never concurrent with a connect attempt). The
+// implementation re-ensures a daemon of this version and re-registers the
+// project against it, returning true only when the project is registered on a
+// healthy daemon — the forwarder then reconnects eagerly to the fresh daemon on
+// the same socket. It no-ops (returns false) once shutdown has been latched.
+type HealFunc func() bool
+
 // ForwardRequests subscribes to the daemon's SSE request stream and forwards
 // this project's records into the local RequestManager. This bridges the
 // daemon's proxy request data into the project's TUI and API.
@@ -54,41 +64,128 @@ type ForwarderStatusSink interface {
 // report shared-proxy health; it replaces the old silent `_ = err` reconnect
 // loop with state that surfaces in `prox status`.
 //
+// heal (may be nil) is invoked inline after a prolonged outage to re-ensure and
+// re-register against a fresh daemon (D6b).
+//
 // It runs until ctx is cancelled. On disconnect, it reconnects with backoff.
-func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink) {
+func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink, heal HealFunc) {
+	forwardRequests(ctx, forwarderConfig{
+		socketPath:      socketPath,
+		projectDir:      projectDir,
+		localRM:         localRM,
+		sink:            sink,
+		heal:            heal,
+		now:             time.Now,
+		after:           time.After,
+		healAfterDown:   constants.ForwarderHealAfterDown,
+		healMinInterval: constants.ForwarderHealMinInterval,
+	})
+}
+
+// forwarderConfig bundles the forwarder loop's inputs plus the injectable clock,
+// timer, and heal thresholds so C6's heal timing can be unit-tested with no
+// wall-clock waits (mirrors the injectable-ops pattern used by the cli's
+// skewOps/registerRetryOps). ForwardRequests wires the production values.
+type forwarderConfig struct {
+	socketPath      string
+	projectDir      string
+	localRM         *proxy.RequestManager
+	sink            ForwarderStatusSink
+	heal            HealFunc                             // may be nil
+	now             func() time.Time                     // heal-timing clock
+	after           func(time.Duration) <-chan time.Time // backoff timer
+	healAfterDown   time.Duration
+	healMinInterval time.Duration
+	// stream is the single connect-and-forward attempt (nil → the production
+	// streamRequests). Injectable so heal-timing tests can script a deterministic
+	// connect/drop/outage sequence without real sockets (FIX 4).
+	stream func(ctx context.Context, socketPath string, snapClient *Client, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink) (connected bool, err error)
+}
+
+// shouldHeal reports whether a heal should fire now, given when the current
+// outage started (downSince, zero when connected), when the last heal was
+// attempted (lastHeal, zero when none yet), and the D6b thresholds: the outage
+// must have lasted at least healAfterDown AND at least healMinInterval must have
+// elapsed since the last heal attempt (damping a flapping daemon). The first
+// heal of an outage is gated only by healAfterDown.
+func shouldHeal(now, downSince, lastHeal time.Time, healAfterDown, healMinInterval time.Duration) bool {
+	if downSince.IsZero() {
+		return false
+	}
+	if now.Sub(downSince) < healAfterDown {
+		return false
+	}
+	if !lastHeal.IsZero() && now.Sub(lastHeal) < healMinInterval {
+		return false
+	}
+	return true
+}
+
+func forwardRequests(ctx context.Context, cfg forwarderConfig) {
 	// One snapshot client for the whole forwarder lifetime: its transport pools
 	// the idle unix connection across reconnect attempts, rather than leaking a
 	// fresh idle conn per attempt (the daemon only reaps idle conns after 60s, so
 	// a reconnect storm would otherwise accumulate them).
-	snapClient := NewClient(socketPath)
+	snapClient := NewClient(cfg.socketPath)
+
+	stream := cfg.stream
+	if stream == nil {
+		stream = streamRequests
+	}
 
 	backoff := 500 * time.Millisecond
+	// Heal-timing state, tracked locally so it is single-threaded with the connect
+	// attempts (the heal runs inline in this loop, never concurrently).
+	var downSince time.Time // zero while connected; set on the first failed reconnect of an outage
+	var lastHeal time.Time  // zero until the first heal attempt of an outage
 
 	for {
-		connected, err := streamRequests(ctx, socketPath, snapClient, projectDir, localRM, sink)
+		connected, err := stream(ctx, cfg.socketPath, snapClient, cfg.projectDir, cfg.localRM, cfg.sink)
 		if ctx.Err() != nil {
 			return // context cancelled, clean shutdown
 		}
-		// A connect that never reached a live stream is a reconnect failure: the
-		// sink counts it (and logs the connected→down transition once). A stream
-		// that connected and then dropped is not itself a failure — the NEXT
-		// failed reconnect, if any, records the outage. streamRequests already
-		// signalled ForwarderConnected on a successful connect.
-		if !connected && sink != nil {
-			sink.ForwarderConnectFailed(err)
-		}
 		if connected {
-			// The previous attempt reached a live stream: the daemon is (or
-			// was just) healthy, so reconnect eagerly instead of carrying a
-			// stale outage-sized backoff into the recovery.
+			// The previous attempt reached a live stream: the daemon is (or was
+			// just) healthy. Clear the outage clock and reconnect eagerly instead
+			// of carrying a stale outage-sized backoff into the recovery.
+			//
+			// lastHeal is deliberately NOT reset here (FIX 4): the ≥healMinInterval
+			// heal spacing must hold ACROSS a brief reconnect, so a daemon that
+			// flaps (heal, reconnect, drop, new outage) cannot fire a second heal
+			// sooner than healMinInterval after the first. Resetting it would let a
+			// new outage's healAfterDown alone re-trigger a heal within seconds.
+			downSince = time.Time{}
 			backoff = 500 * time.Millisecond
+		} else {
+			// A connect that never reached a live stream is a reconnect failure:
+			// the sink counts it (and logs the connected→down transition once). A
+			// stream that connected and then dropped is not itself a failure — the
+			// NEXT failed reconnect, if any, records the outage.
+			if cfg.sink != nil {
+				cfg.sink.ForwarderConnectFailed(err)
+			}
+			now := cfg.now()
+			if downSince.IsZero() {
+				downSince = now
+			}
+			// Self-heal (D6b), inline so it cannot race the next connect attempt.
+			if cfg.heal != nil && shouldHeal(now, downSince, lastHeal, cfg.healAfterDown, cfg.healMinInterval) {
+				lastHeal = now
+				if cfg.heal() {
+					// Fresh daemon on the same socket: restart the outage clock and
+					// reconnect eagerly so a momentary miss doesn't immediately
+					// re-heal, and so the next attempt binds the healthy daemon.
+					downSince = time.Time{}
+					backoff = 500 * time.Millisecond
+				}
+			}
 		}
 
-		// Backoff before reconnecting
+		// Backoff before reconnecting.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-cfg.after(backoff):
 		}
 		if backoff < 5*time.Second {
 			backoff *= 2

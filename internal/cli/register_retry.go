@@ -61,6 +61,17 @@ func isShuttingDownError(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.Code == "SHUTTING_DOWN"
 }
 
+// isVersionMismatchError reports whether err is the daemon's VERSION_MISMATCH
+// register response (409, ErrorResponse.Code == "VERSION_MISMATCH"): a busy
+// different-version daemon holds the ports and re-checked versions at register
+// time. Mirrors isShuttingDownError; the heal path (D6b) uses it to set
+// heal_state version_mismatch rather than healing (FIX 5), matching the
+// EnsureRunning VersionMismatchError treatment.
+func isVersionMismatchError(err error) bool {
+	var apiErr *proxyd.DaemonAPIError
+	return errors.As(err, &apiErr) && apiErr.Code == "VERSION_MISMATCH"
+}
+
 // retryRegisterAfterShutdown implements D4: when Register fails with the
 // daemon's SHUTTING_DOWN code, the daemon is mid graceful-shutdown (its 5s
 // empty-shutdown grace — server.go), not genuinely refusing the project. It
