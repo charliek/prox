@@ -529,12 +529,24 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force") == "true"
 
+	// The emptiness check and the shutdown decision must be one atomic step
+	// with respect to lifecycle transactions: an unserialized IsEmpty() could
+	// read "empty" while a register handler (holding lifecycleMu, having
+	// passed its isShuttingDown gate) is about to commit — the register would
+	// return 200 and the daemon would exit anyway, stranding that project.
+	// Under lifecycleMu, a register either committed first (refused here with
+	// ACTIVE_ROUTES) or arrives after the flag is set (503 SHUTTING_DOWN).
+	// Lock ordering (lifecycleMu → shutdownMu via RequestShutdown) matches
+	// the scheduleShutdownWhenEmpty timer path.
+	s.lifecycleMu.Lock()
 	if s.registry != nil && !s.registry.IsEmpty() && !force {
-		routes := s.registry.AllRoutes()
+		routeCount := len(s.registry.AllRoutes())
+		projectCount := s.registry.ProjectCount()
+		s.lifecycleMu.Unlock()
 		writeJSON(w, http.StatusConflict, ErrorResponse{
 			Error: fmt.Sprintf(
 				"proxy has %d active route(s) from %d project(s). Use --force to stop anyway.",
-				len(routes), s.registry.ProjectCount(),
+				routeCount, projectCount,
 			),
 			Code: "ACTIVE_ROUTES",
 		})
@@ -547,6 +559,7 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	// and gets 503. server.Shutdown is graceful (it waits for this active handler),
 	// so the response still flushes.
 	s.RequestShutdown()
+	s.lifecycleMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
 }
 

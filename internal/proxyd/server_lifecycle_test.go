@@ -620,3 +620,55 @@ func TestServer_RemoveProject_NilRequestManager(t *testing.T) {
 	require.NotPanics(t, func() { s.removeProject("/projects/a") })
 	assert.True(t, s.registry.IsEmpty())
 }
+
+// TestHandleShutdown_SerializesWithRegister pins that the non-force shutdown
+// decision is atomic with lifecycle transactions: while a register transaction
+// holds lifecycleMu, handleShutdown must block rather than read a stale
+// IsEmpty(); once the register has committed, the queued shutdown must refuse
+// with ACTIVE_ROUTES instead of stranding the just-registered project. Without
+// the lifecycleMu serialization in handleShutdown, this test fails fast: the
+// handler responds 200 while the "in-flight" register still holds the lock.
+func TestHandleShutdown_SerializesWithRegister(t *testing.T) {
+	s := newLifecycleServer()
+
+	// Simulate an in-flight register transaction: hold lifecycleMu, exactly as
+	// server.register does around its registry commit.
+	s.lifecycleMu.Lock()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shutdown", nil)
+	done := make(chan struct{})
+	go func() {
+		s.handleShutdown(rec, req)
+		close(done)
+	}()
+
+	// The shutdown decision must not be made while the transaction is open.
+	select {
+	case <-done:
+		t.Fatalf("handleShutdown decided while a lifecycle transaction was in flight (status %d)", rec.Code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The in-flight transaction commits a registration (registry has its own
+	// lock — this is the exact interleaving the serialization exists for).
+	regReq := newTestRequest("/projects/race", "local.dev",
+		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
+	regReq.PID = os.Getpid()
+	_, _, err := s.registry.Register(regReq)
+	require.NoError(t, err)
+	s.lifecycleMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleShutdown never completed after the transaction released")
+	}
+
+	// The queued shutdown observed the committed registration and refused.
+	require.Equal(t, http.StatusConflict, rec.Code)
+	var er ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &er))
+	assert.Equal(t, "ACTIVE_ROUTES", er.Code)
+	assert.False(t, s.isShuttingDown(), "a refused shutdown must not set the flag")
+}

@@ -39,7 +39,14 @@ func NewClient(socketPath string) *Client {
 
 // Health checks if the daemon is alive and returns its version.
 func (c *Client) Health() (string, error) {
-	resp, err := c.get("/health")
+	return c.HealthWithContext(context.Background())
+}
+
+// HealthWithContext is Health bounded by ctx, so a caller can probe a possibly
+// unresponsive daemon with a short timeout instead of waiting out the client's
+// 30s default (used by the version-skew drain poll in D1).
+func (c *Client) HealthWithContext(ctx context.Context) (string, error) {
+	resp, err := c.getWithContext(ctx, "/health")
 	if err != nil {
 		return "", err
 	}
@@ -91,7 +98,14 @@ func (c *Client) Deregister(req DeregisterRequest) error {
 
 // Status returns the daemon's current status.
 func (c *Client) Status() (*DaemonStatusResponse, error) {
-	resp, err := c.get("/api/v1/status")
+	return c.StatusWithContext(context.Background())
+}
+
+// StatusWithContext is Status bounded by ctx. The version-skew recovery path
+// probes a possibly-draining old daemon with a short timeout (D1) rather than
+// the client's 30s default.
+func (c *Client) StatusWithContext(ctx context.Context) (*DaemonStatusResponse, error) {
+	resp, err := c.getWithContext(ctx, "/api/v1/status")
 	if err != nil {
 		return nil, err
 	}

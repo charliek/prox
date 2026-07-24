@@ -776,7 +776,7 @@ func proxyStartError(err error) error {
 	if errors.As(err, &portErr) {
 		return fmt.Errorf("%w\n\nAnother process is listening on this port. To identify it:\n  lsof -i :%d\n\nTo start without the proxy:\n  prox up --no-proxy", portErr, portErr.Port)
 	}
-	return fmt.Errorf("proxy failed to start: %w", err)
+	return fmt.Errorf("proxy failed to start: %w\n\nTo start without the proxy:\n  prox up --no-proxy", err)
 }
 
 // startProxy attempts to register with the shared proxy daemon. If the daemon
@@ -794,8 +794,15 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 		return nil, nil, fatalErr
 	}
 
-	// Fallback to standalone proxy (daemon unavailable or sandboxed)
-	return nil, startStandaloneProxy(cfg, cwd, ctx, handlers), nil
+	// Fallback to standalone proxy (daemon unavailable or sandboxed). A proxy is
+	// configured, so a create/start failure here is fatal (D1): `prox up` must
+	// never start a project with the proxy silently disabled. --no-proxy is the
+	// escape hatch (named in the returned error).
+	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, svc, nil
 }
 
 // tryDaemonProxy attempts to register with the shared proxy daemon.
@@ -812,8 +819,21 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	// Ensure daemon is running
 	client, err := proxyd.EnsureRunning()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
-		return nil, false, nil
+		var vme *proxyd.VersionMismatchError
+		if !errors.As(err, &vme) {
+			// Connection-refused / no socket (e.g. a sandboxed environment that
+			// legitimately cannot reach the daemon): fall back to standalone.
+			fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
+			return nil, false, nil
+		}
+		// Version skew: the shared daemon runs a different version. Never fall
+		// back to standalone (its ports are daemon-held, and a silent
+		// proxy-less start is exactly what D1 closes). Recover or fail fatally.
+		healed, ferr := recoverFromVersionSkew(vme, defaultSkewOps())
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		client = healed
 	}
 
 	// Build registration request
@@ -870,8 +890,12 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	return client, true, nil
 }
 
-// startStandaloneProxy creates and starts a standalone proxy (current behavior).
-func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) *proxy.Service {
+// startStandaloneProxy creates and starts a standalone proxy. When a proxy is
+// configured, create/start failures are fatal (D1): they return an error so
+// `prox up` exits non-zero rather than continuing with the proxy silently
+// disabled. The returned error carries the proxyStartError hint (port-conflict
+// detail plus the --no-proxy escape hatch).
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxy.Service, error) {
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
@@ -880,12 +904,10 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 
 	proxyService, err := proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to create proxy: %v\n", err)
-		return nil
+		return nil, proxyStartError(err)
 	}
 	if err := proxyService.Start(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: %v\n", proxyStartError(err))
-		return nil
+		return nil, proxyStartError(err)
 	}
 
 	var proxyAddrs []string
@@ -901,7 +923,7 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 	handlers.SetRequestManager(proxyService.RequestManager())
 	handlers.SetCaptureManager(proxyService.CaptureManager())
 
-	return proxyService
+	return proxyService, nil
 }
 
 // localRequestManager returns the RequestManager for use by the TUI.

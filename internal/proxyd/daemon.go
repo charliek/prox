@@ -38,6 +38,32 @@ func IsDaemonProcess() bool {
 	return os.Getenv(ProxyDaemonEnvVar) == "1"
 }
 
+// VersionMismatchError is returned by EnsureRunning when a running daemon — or a
+// freshly started one — reports a version different from this process. It is
+// matched with errors.As so the caller (tryDaemonProxy) can drive version-skew
+// recovery (D1) rather than silently falling back to a standalone proxy, which
+// used to leave a project running with the proxy disabled.
+type VersionMismatchError struct {
+	DaemonVersion string
+	ClientVersion string
+}
+
+func (e *VersionMismatchError) Error() string {
+	return fmt.Sprintf(
+		"proxy daemon is running version %s, but this process is version %s",
+		e.DaemonVersion, e.ClientVersion,
+	)
+}
+
+// ErrDaemonNotReady is returned by EnsureRunning when a freshly started daemon
+// did not answer /health within the startup window. During a version-skew heal
+// this also covers the socket-removed-before-PID-lock-released race: the old
+// daemon removes its socket (server.Shutdown) before its deferred PID-lock
+// release (RunDaemon), so a replacement start can briefly lose the lock and
+// report not-ready. The skew recovery retries once after a short delay on this.
+// Matched with errors.Is.
+var ErrDaemonNotReady = errors.New("proxy daemon did not become ready")
+
 // EnsureRunning ensures the proxy daemon is running and returns a connected client.
 // If the daemon is not running, it starts one. Verifies version compatibility.
 func EnsureRunning() (*Client, error) {
@@ -49,11 +75,7 @@ func EnsureRunning() (*Client, error) {
 	if err == nil {
 		// Daemon is running — check version
 		if daemonVersion != version.Version {
-			return nil, fmt.Errorf(
-				"proxy daemon is running version %s, but this process is version %s; "+
-					"stop all projects and restart, or run 'prox proxy stop --force' to reset",
-				daemonVersion, version.Version,
-			)
+			return nil, &VersionMismatchError{DaemonVersion: daemonVersion, ClientVersion: version.Version}
 		}
 		return client, nil
 	}
@@ -69,14 +91,14 @@ func EnsureRunning() (*Client, error) {
 		daemonVersion, err = client.Health()
 		if err == nil {
 			if daemonVersion != version.Version {
-				return nil, fmt.Errorf("started daemon has version %s, expected %s", daemonVersion, version.Version)
+				return nil, &VersionMismatchError{DaemonVersion: daemonVersion, ClientVersion: version.Version}
 			}
 			return client, nil
 		}
 		time.Sleep(startupRetryInterval)
 	}
 
-	return nil, fmt.Errorf("proxy daemon did not become ready within %s", startupTimeout)
+	return nil, fmt.Errorf("%w within %s", ErrDaemonNotReady, startupTimeout)
 }
 
 // startDaemon forks the proxy daemon as a background process.

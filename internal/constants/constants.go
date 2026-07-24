@@ -62,6 +62,15 @@ const (
 	// route timeout, the CLI lifecycle http.Client timeout, and the TUI restart
 	// timeout (#35, D2).
 	LifecycleTimeoutCeiling = MaxStopTimeout + time.Minute
+
+	// DaemonStatusProbeTimeout bounds the /status probe against a possibly
+	// draining old daemon during version-skew recovery (D1). The proxyd client's
+	// 30s default is far too long for an interactive `prox up`.
+	DaemonStatusProbeTimeout = 2 * time.Second
+
+	// DaemonHealthProbeTimeout bounds a single /health probe used while polling
+	// for an old daemon's socket to stop answering during a version-skew heal.
+	DaemonHealthProbeTimeout = 1 * time.Second
 )
 
 // Log configuration
