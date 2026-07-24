@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -104,6 +106,12 @@ type Supervisor struct {
 	// final write reflects reality even when starts race. Lock order is
 	// childrenMu -> s.mu (persistChildren); no path takes them the other way.
 	childrenMu sync.Mutex
+
+	// bootMarker is this host's boot identity (plan 010 D7, #67), read ONCE at
+	// construction and stamped into every ledger write so the next generation can
+	// detect and safely discard a cross-boot ledger. Empty on Darwin/others (not
+	// needed) and on a Linux boot_id read failure (degrades to markerless).
+	bootMarker string
 }
 
 // SupervisorEvent represents a supervisor event
@@ -139,8 +147,37 @@ func New(cfg *config.Config, logManager *logs.Manager, runner ProcessRunner, sup
 		logManager: logManager,
 		state:      "stopped",
 	}
+	s.bootMarker = s.readBootMarker()
 
 	return s
+}
+
+// readBootMarker reads this host's boot marker once at construction (plan 010 D7,
+// #67). A Linux boot_id read failure is logged once and degrades to markerless
+// behavior (an empty marker); Darwin/others never read and return "".
+func (s *Supervisor) readBootMarker() string {
+	marker, err := bootMarkerFor(runtime.GOOS, os.ReadFile)
+	if err != nil {
+		s.systemErrorf("WARNING: could not read boot marker (%v); orphan-reap ledger falls back to markerless behavior", err)
+	}
+	return marker
+}
+
+// ledgerBootMarker returns the marker persistChildren stamps on the ledger.
+// If the construction-time read failed (empty marker on Linux), it retries
+// the read here: a markerless ledger on Linux is DISCARDED unsignaled by the
+// next generation (ledgerDisposition), so letting one transient init-time
+// /proc read failure poison every ledger this generation writes would
+// silently disable same-boot orphan reaping for the whole run. Called under
+// childrenMu, so the lazy backfill of s.bootMarker does not race.
+func (s *Supervisor) ledgerBootMarker() string {
+	if s.bootMarker == "" && runtime.GOOS == "linux" {
+		if marker, err := bootMarkerFor(runtime.GOOS, os.ReadFile); err == nil && marker != "" {
+			s.bootMarker = marker
+			s.systemErrorf("boot marker became readable; orphan-reap ledger is marker-guarded again")
+		}
+	}
+	return s.bootMarker
 }
 
 // Start starts the supervisor and all configured processes
@@ -444,7 +481,7 @@ func (s *Supervisor) persistChildren() {
 		return
 	}
 
-	if err := WriteChildren(s.supConfig.StateDir, recs); err != nil {
+	if err := WriteChildren(s.supConfig.StateDir, s.ledgerBootMarker(), recs); err != nil {
 		s.systemErrorf("ERROR: failed to persist child ownership ledger: %v", err)
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,6 +43,55 @@ const (
 	reapPollInterval = 50 * time.Millisecond
 )
 
+// linuxBootIDPath is the kernel-provided per-boot UUID. It changes on every
+// reboot, so it is the boot marker used to detect a cross-boot orphan ledger
+// (plan 010 D7, #67).
+const linuxBootIDPath = "/proc/sys/kernel/random/boot_id"
+
+// bootMarkerFor reads this host's boot marker with the platform and file reader
+// injected, matching the sameGenerationWith seam so tests can drive both
+// platforms without touching the real /proc.
+//
+//   - Linux: the trimmed contents of /proc/sys/kernel/random/boot_id, which
+//     changes on every reboot. A read failure (minimal containers lacking that
+//     file) returns ("", err) so the caller can log once and degrade to today's
+//     markerless behavior.
+//   - Darwin (and anything else): "". ProcessStartTime tokens there are
+//     wall-clock microseconds and so are already cross-boot-unique; no marker is
+//     needed and none is a positive signal.
+func bootMarkerFor(goos string, readFile func(string) ([]byte, error)) (string, error) {
+	if goos != "linux" {
+		return "", nil
+	}
+	data, err := readFile(linuxBootIDPath)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// currentBootMarker returns this host's boot marker for the running platform,
+// logging one line via logger (may be nil) if the Linux boot_id is unreadable.
+// It is used by ReapOrphans to compare against the recorded marker.
+func currentBootMarker(logger *slog.Logger) string {
+	marker, err := bootMarkerFor(runtime.GOOS, os.ReadFile)
+	if err != nil && logger != nil {
+		logger.Warn("could not read boot marker; orphan ledger uses markerless behavior",
+			"path", linuxBootIDPath, "err", err)
+	}
+	return marker
+}
+
+// childrenLedger is the on-disk envelope for the ownership ledger (plan 010 D7,
+// #67). The boot marker lets the next generation detect a cross-boot ledger whose
+// boot-relative start tokens (Linux) can no longer be trusted and discard it
+// without signaling. An empty marker means "unknown": a legacy bare-array ledger,
+// a marker that could not be read, or Darwin (where it is deliberately unused).
+type childrenLedger struct {
+	BootMarker string        `json:"boot_marker"`
+	Children   []ChildRecord `json:"children"`
+}
+
 // ChildRecord is one entry in the ownership ledger: a process GROUP the running
 // generation supervises.
 type ChildRecord struct {
@@ -50,16 +101,17 @@ type ChildRecord struct {
 	StartToken int64  `json:"start_token"` // daemon.ProcessStartTime(PID)
 }
 
-// WriteChildren marshals recs to JSON and writes them to
-// <stateDir>/prox.children via a temp file + atomic rename (0600). The rename
-// is atomic so a torn ledger read at the next startup can never mis-drive the
-// reap.
-func WriteChildren(stateDir string, recs []ChildRecord) error {
+// WriteChildren marshals recs into the {boot_marker,children} envelope and writes
+// it to <stateDir>/prox.children via a temp file + atomic rename (0600). The
+// rename is atomic so a torn ledger read at the next startup can never mis-drive
+// the reap. bootMarker is threaded in from the supervisor (read once at init) so
+// the next generation can detect and safely discard a cross-boot ledger (D7, #67).
+func WriteChildren(stateDir, bootMarker string, recs []ChildRecord) error {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("creating state directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(recs, "", "  ")
+	data, err := json.MarshalIndent(childrenLedger{BootMarker: bootMarker, Children: recs}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling children ledger: %w", err)
 	}
@@ -95,22 +147,54 @@ func WriteChildren(stateDir string, recs []ChildRecord) error {
 	return nil
 }
 
-// LoadChildren reads the ownership ledger from <stateDir>/prox.children. A
-// missing ledger is not an error: it returns (nil, nil).
-func LoadChildren(stateDir string) ([]ChildRecord, error) {
-	data, err := os.ReadFile(filepath.Join(stateDir, daemon.ChildrenFileName))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+// loadLedger reads the ownership ledger from <stateDir>/prox.children, accepting
+// BOTH the current envelope ({"boot_marker":...,"children":[...]}) and the legacy
+// bare JSON array written by pre-D7 generations. For a legacy array (or any
+// envelope with no marker) the boot marker is unknown and returned as "". A
+// missing ledger is not an error: it returns ("", nil, nil).
+//
+// Downgrade safety (D7): the inverse holds for a pre-D7 binary. Its LoadChildren
+// unmarshaled straight into []ChildRecord; handed a D7 envelope (a JSON OBJECT)
+// that fails ("cannot unmarshal object into Go value of type []ChildRecord"), so
+// its ReapOrphans returns the error and SKIPS the reap entirely -- never a
+// mis-signal. The envelope is therefore forward-incompatible with downgrades but
+// never unsafe.
+//
+// A syntactically-valid object missing both fields parses as an empty markerless
+// ledger. That cannot mis-signal, and losing records that way would require a
+// hand-edited file: prox itself only ever writes complete envelopes atomically
+// (temp + rename), so no partial write can surface here.
+func loadLedger(stateDir string) (bootMarker string, recs []ChildRecord, err error) {
+	data, rerr := os.ReadFile(filepath.Join(stateDir, daemon.ChildrenFileName))
+	if rerr != nil {
+		if errors.Is(rerr, os.ErrNotExist) {
+			return "", nil, nil
 		}
-		return nil, fmt.Errorf("reading children ledger: %w", err)
+		return "", nil, fmt.Errorf("reading children ledger: %w", rerr)
 	}
 
-	var recs []ChildRecord
-	if err := json.Unmarshal(data, &recs); err != nil {
-		return nil, fmt.Errorf("unmarshaling children ledger: %w", err)
+	// Try the envelope first (a JSON object); an array fails to unmarshal into a
+	// struct, so fall back to the legacy bare array. Only if BOTH fail is the
+	// ledger genuinely corrupt.
+	var env childrenLedger
+	if err := json.Unmarshal(data, &env); err == nil {
+		return env.BootMarker, env.Children, nil
 	}
-	return recs, nil
+	var arr []ChildRecord
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return "", nil, fmt.Errorf("unmarshaling children ledger: %w", err)
+	}
+	return "", arr, nil
+}
+
+// LoadChildren reads the ownership ledger and returns its records, accepting both
+// the current envelope and the legacy bare array (see loadLedger). A missing
+// ledger is not an error: it returns (nil, nil). It exists for callers that only
+// need the records; ReapOrphans uses loadLedger to also obtain the boot marker
+// for the cross-boot guard.
+func LoadChildren(stateDir string) ([]ChildRecord, error) {
+	_, recs, err := loadLedger(stateDir)
+	return recs, err
 }
 
 // RemoveChildren deletes the ownership ledger. A missing ledger is tolerated.
@@ -128,14 +212,15 @@ func RemoveChildren(stateDir string) error {
 // return false. This is the single gate that decides whether the reaper is
 // allowed to signal a group at all.
 //
-// Accepted residual (plan §9), Linux-only: daemon.ProcessStartTime is boot-scoped
-// on Linux (clock ticks since boot), while the ledger can survive a reboot. After
-// a reboot the recorded orphans are already dead (nothing survives a reboot), so
-// the reap has no upside; but an unrelated process that reused both the PID AND
-// the same boot-relative start tick would collide here and be signaled. Darwin
-// tokens are wall-clock microseconds (P_starttime) and so are cross-boot-unique --
-// no collision. Persisting a boot marker to discard a cross-boot ledger is a
-// recommended follow-up.
+// Cross-boot collision (#67), Linux-only: daemon.ProcessStartTime is boot-scoped
+// on Linux (clock ticks since boot), while the ledger can survive a reboot, so an
+// unrelated process that reused both the PID AND the same boot-relative start tick
+// could collide here and be signaled. This gate does NOT defend against that on
+// its own; the boot-marker envelope (plan 010 D7, ledgerDisposition) does, by
+// discarding a cross-boot or legacy-markerless Linux ledger BEFORE any record
+// reaches sameGeneration. Darwin tokens are wall-clock microseconds (P_starttime)
+// and so are cross-boot-unique -- no collision, so Darwin keeps reaping markerless
+// ledgers.
 func sameGeneration(pid int, token int64) bool {
 	return sameGenerationWith(daemon.ProcessStartTime, pid, token)
 }
@@ -305,29 +390,93 @@ func (r *reaper) waitGroupGone(pgid int) bool {
 	}
 }
 
+// ledgerAction is the disposition ReapOrphans applies to a loaded ledger.
+type ledgerAction int
+
+const (
+	// ledgerReap runs the identity-checked reap over the records (same boot on
+	// Linux; any boot on Darwin, where tokens are cross-boot-unique).
+	ledgerReap ledgerAction = iota
+	// ledgerDiscard signals NOTHING and just removes the ledger file: the recorded
+	// boot-relative tokens can no longer be trusted, so the safety bias forbids
+	// signaling any of them.
+	ledgerDiscard
+)
+
+// ledgerDisposition decides how ReapOrphans treats a loaded ledger from the
+// recorded boot marker, the current boot marker, and the platform (plan 010 D7,
+// #67). It is the whole cross-boot decision matrix in one pure function:
+//
+//   - recorded marker non-empty and != current   -> discard (cross-boot ledger).
+//   - recorded marker empty/legacy AND on Linux   -> discard (a pre-D7 or
+//     markerless ledger's boot-relative tokens are unsafe through the upgrade;
+//     the panel accepted one missed reap of pre-upgrade orphans, recovered by the
+//     port-conflict UX, over leaving #67's collision alive).
+//   - recorded marker empty/legacy on Darwin      -> reap (no collision exists;
+//     P_starttime tokens are cross-boot-unique).
+//   - markers match                               -> reap (same boot, unchanged).
+//
+// Note recorded!="" && current=="" (e.g. an unreadable current marker on Linux)
+// falls to the cross-boot discard branch: unable to confirm same-boot, the safety
+// bias discards rather than signals.
+func ledgerDisposition(recorded, current string, isLinux bool) (action ledgerAction, reason string) {
+	if recorded == "" {
+		if isLinux {
+			return ledgerDiscard, "legacy/markerless ledger on Linux; boot-relative start tokens are unsafe across the upgrade (#67)"
+		}
+		return ledgerReap, ""
+	}
+	if recorded == current {
+		return ledgerReap, ""
+	}
+	return ledgerDiscard, "boot marker changed since the ledger was written (cross-boot)"
+}
+
 // ReapOrphans loads the ownership ledger written by the previous prox generation
 // and reaps any process group still positively identifiable as belonging to it
 // (see the package doc above). It returns the reaped and skipped records. The
 // ledger is removed after the pass regardless of outcome: it has served its
 // purpose, and the new generation rewrites it from its first successful launch.
 //
+// Before any reaping, the D7 boot-marker guard (ledgerDisposition) may discard a
+// cross-boot or legacy-markerless-on-Linux ledger unsignaled (#67): its recorded
+// records are surfaced as skipped so up.go still reports them, but NO signal is
+// ever sent.
+//
 // This must be called AFTER the per-project PID-file lock is held and BEFORE the
 // supervisor starts, so concurrent `prox up` invocations are serialized by that
 // lock.
 func ReapOrphans(stateDir string, logger *slog.Logger) (reaped, skipped []ChildRecord, err error) {
-	recs, err := LoadChildren(stateDir)
+	return reapOrphansWith(stateDir, newReaper(logger), currentBootMarker(logger), runtime.GOOS == "linux")
+}
+
+// reapOrphansWith is ReapOrphans with the reaper, current boot marker, and
+// platform flag injected so tests can drive the D7 decision matrix without a real
+// reboot and WITHOUT ever signaling the test runner's own process group.
+func reapOrphansWith(stateDir string, r *reaper, currentMarker string, isLinux bool) (reaped, skipped []ChildRecord, err error) {
+	recorded, recs, err := loadLedger(stateDir)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	r := newReaper(logger)
-	reaped, skipped = r.reap(recs)
+	switch action, reason := ledgerDisposition(recorded, currentMarker, isLinux); action {
+	case ledgerDiscard:
+		// Signal NOTHING. Surface the discarded records as skipped so up.go's count
+		// still reflects that a port-holding orphan may remain, but the reaper is
+		// never even constructed against them.
+		r.logger.Info("discarding children ledger without signaling",
+			"reason", reason, "recorded_marker", recorded, "current_marker", currentMarker,
+			"records", len(recs))
+		skipped = recs
+	default: // ledgerReap
+		reaped, skipped = r.reap(recs)
+	}
 
 	// Remove the old ledger after the pass (tolerates a missing file). A removal
 	// failure is RETURNED to the caller (up.go logs it non-fatally) rather than
 	// swallowed: a readable-but-unremovable ledger would otherwise drive a spurious
-	// reap pass on every subsequent startup with no signal (codex review). The
-	// reaped/skipped classification is still valid, so it is returned alongside.
+	// reap pass on every subsequent startup with no signal. The reaped/skipped
+	// classification is still valid, so it is returned alongside.
 	if rmErr := RemoveChildren(stateDir); rmErr != nil {
 		r.logger.Warn("failed to remove children ledger after reap", "err", rmErr)
 		return reaped, skipped, rmErr

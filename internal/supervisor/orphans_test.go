@@ -99,7 +99,7 @@ func TestWriteLoadChildren_RoundTrip(t *testing.T) {
 		{Name: "web", PID: 4321, PGID: 4321, StartToken: 111},
 		{Name: "worker", PID: 8765, PGID: 8765, StartToken: 222},
 	}
-	require.NoError(t, WriteChildren(dir, recs))
+	require.NoError(t, WriteChildren(dir, "", recs))
 
 	// The ledger is written 0600.
 	info, err := os.Stat(filepath.Join(dir, daemon.ChildrenFileName))
@@ -270,7 +270,10 @@ func TestReapOrphans_StaleLedger_SkipsAndRemoves(t *testing.T) {
 	// never be positively identified and ReapOrphans (real syscalls) never signals
 	// anything -- a clean no-op with NO SIGKILL.
 	dp := deadPID(t)
-	require.NoError(t, WriteChildren(dir, []ChildRecord{
+	// Stamp the CURRENT boot marker so this stays a genuine same-boot reap on both
+	// platforms (Linux: recorded==current -> reap; Darwin: markerless -> reap),
+	// exercising the sameGeneration real-syscall path rather than the D7 discard.
+	require.NoError(t, WriteChildren(dir, currentBootMarker(discardLogger()), []ChildRecord{
 		{Name: "gone", PID: dp, PGID: dp, StartToken: 123456789},
 	}))
 
@@ -282,6 +285,156 @@ func TestReapOrphans_StaleLedger_SkipsAndRemoves(t *testing.T) {
 	// The old ledger is removed after the pass.
 	_, statErr := os.Stat(filepath.Join(dir, daemon.ChildrenFileName))
 	assert.True(t, os.IsNotExist(statErr), "the ledger must be removed after the reap pass")
+}
+
+// --- D7 boot-marker envelope + cross-boot guard (#67) ------------------------
+
+func TestLoadLedger_EnvelopeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	recs := []ChildRecord{
+		{Name: "web", PID: 4321, PGID: 4321, StartToken: 111},
+		{Name: "worker", PID: 8765, PGID: 8765, StartToken: 222},
+	}
+	require.NoError(t, WriteChildren(dir, "boot-abc", recs))
+
+	marker, loaded, err := loadLedger(dir)
+	require.NoError(t, err)
+	assert.Equal(t, "boot-abc", marker, "the envelope must round-trip the boot marker")
+	assert.Equal(t, recs, loaded, "the envelope must round-trip every record")
+
+	// The compatibility wrapper still returns just the records.
+	viaLoad, err := LoadChildren(dir)
+	require.NoError(t, err)
+	assert.Equal(t, recs, viaLoad)
+}
+
+func TestLoadLedger_LegacyBareArray(t *testing.T) {
+	dir := t.TempDir()
+	// A pre-D7 ledger: a bare JSON array with no envelope, hence no marker.
+	legacy := `[{"name":"web","pid":4321,"pgid":4321,"start_token":111}]`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, daemon.ChildrenFileName), []byte(legacy), 0600))
+
+	marker, loaded, err := loadLedger(dir)
+	require.NoError(t, err)
+	assert.Equal(t, "", marker, "a legacy bare-array ledger has an unknown (empty) marker")
+	assert.Equal(t, []ChildRecord{{Name: "web", PID: 4321, PGID: 4321, StartToken: 111}}, loaded,
+		"the legacy bare array must still load its records")
+}
+
+func TestBootMarkerFor(t *testing.T) {
+	t.Run("linux trims boot_id", func(t *testing.T) {
+		read := func(string) ([]byte, error) { return []byte("  abc-123-uuid\n"), nil }
+		marker, err := bootMarkerFor("linux", read)
+		require.NoError(t, err)
+		assert.Equal(t, "abc-123-uuid", marker)
+	})
+	t.Run("linux read failure returns error", func(t *testing.T) {
+		read := func(string) ([]byte, error) { return nil, os.ErrNotExist }
+		marker, err := bootMarkerFor("linux", read)
+		require.Error(t, err, "an unreadable boot_id must surface so the caller can log + degrade")
+		assert.Equal(t, "", marker)
+	})
+	t.Run("darwin never reads and returns empty", func(t *testing.T) {
+		read := func(string) ([]byte, error) {
+			t.Fatal("darwin must not read the boot_id file")
+			return nil, nil
+		}
+		marker, err := bootMarkerFor("darwin", read)
+		require.NoError(t, err)
+		assert.Equal(t, "", marker)
+	})
+}
+
+func TestLedgerDisposition(t *testing.T) {
+	cases := []struct {
+		name          string
+		recorded, cur string
+		isLinux       bool
+		wantAction    ledgerAction
+	}{
+		{"same boot linux -> reap", "boot-A", "boot-A", true, ledgerReap},
+		{"same boot darwin (both empty) -> reap", "", "", false, ledgerReap},
+		{"cross boot linux -> discard", "boot-A", "boot-B", true, ledgerDiscard},
+		{"cross boot: recorded set, current unreadable -> discard", "boot-A", "", true, ledgerDiscard},
+		{"legacy markerless linux -> discard", "", "boot-B", true, ledgerDiscard},
+		{"legacy markerless darwin -> reap", "", "", false, ledgerReap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			action, reason := ledgerDisposition(tc.recorded, tc.cur, tc.isLinux)
+			assert.Equal(t, tc.wantAction, action)
+			if action == ledgerDiscard {
+				assert.NotEmpty(t, reason, "a discard must carry a log-friendly reason")
+			}
+		})
+	}
+}
+
+// TestReapOrphans_CrossBootDiscard_NoSignal writes an envelope whose record WOULD
+// be positively identified and reaped, then reaps under a DIFFERENT current
+// marker. The cross-boot guard must discard it: NO signal, ledger removed, record
+// surfaced as skipped.
+func TestReapOrphans_CrossBootDiscard_NoSignal(t *testing.T) {
+	dir := t.TempDir()
+	rec := ChildRecord{Name: "web", PID: 4321, PGID: 4321, StartToken: 111}
+	require.NoError(t, WriteChildren(dir, "boot-OLD", []ChildRecord{rec}))
+
+	rk := &killpgRecorder{}
+	// startTime WOULD positively identify rec, and groupAlive=false WOULD confirm a
+	// reap -- proving the discard, not an identity miss, is what suppresses signals.
+	r := newTestReaper(rk.killpg, func(int) bool { return false }, alwaysStartTime(rec.PID, rec.StartToken))
+
+	reaped, skipped, err := reapOrphansWith(dir, r, "boot-NEW", true /*isLinux*/)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a cross-boot ledger must reap nothing")
+	assert.Equal(t, []ChildRecord{rec}, skipped, "discarded records are surfaced as skipped")
+	assert.Empty(t, rk.signals(), "a cross-boot ledger must NEVER be signaled")
+
+	_, statErr := os.Stat(filepath.Join(dir, daemon.ChildrenFileName))
+	assert.True(t, os.IsNotExist(statErr), "the discarded ledger must be removed")
+}
+
+// TestReapOrphans_LinuxMarkerlessDiscard_NoSignal: a legacy bare-array (markerless)
+// ledger on Linux is discarded without signaling (#67 panel decision).
+func TestReapOrphans_LinuxMarkerlessDiscard_NoSignal(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `[{"name":"web","pid":4321,"pgid":4321,"start_token":111}]`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, daemon.ChildrenFileName), []byte(legacy), 0600))
+
+	rk := &killpgRecorder{}
+	r := newTestReaper(rk.killpg, func(int) bool { return false }, alwaysStartTime(4321, 111))
+
+	reaped, skipped, err := reapOrphansWith(dir, r, "boot-NEW", true /*isLinux*/)
+	require.NoError(t, err)
+	assert.Empty(t, reaped)
+	assert.Len(t, skipped, 1, "the legacy record is surfaced as skipped")
+	assert.Empty(t, rk.signals(), "a legacy markerless ledger on Linux must NEVER be signaled")
+
+	_, statErr := os.Stat(filepath.Join(dir, daemon.ChildrenFileName))
+	assert.True(t, os.IsNotExist(statErr), "the discarded ledger must be removed")
+}
+
+// TestReapOrphans_DarwinMarkerlessKeepsReaping: on Darwin, a markerless ledger has
+// no cross-boot collision (P_starttime tokens are cross-boot-unique), so the full
+// sameGeneration reap still runs and signals a positively-identified group.
+func TestReapOrphans_DarwinMarkerlessKeepsReaping(t *testing.T) {
+	dir := t.TempDir()
+	rec := ChildRecord{Name: "web", PID: 4321, PGID: 4321, StartToken: 111}
+	require.NoError(t, WriteChildren(dir, "", []ChildRecord{rec}))
+
+	rk := &killpgRecorder{}
+	// Positively identified, and gone after SIGTERM -> a clean reap.
+	r := newTestReaper(rk.killpg, func(int) bool { return false }, alwaysStartTime(rec.PID, rec.StartToken))
+
+	reaped, skipped, err := reapOrphansWith(dir, r, "" /*currentMarker*/, false /*isLinux*/)
+	require.NoError(t, err)
+	assert.Equal(t, []ChildRecord{rec}, reaped, "Darwin markerless ledgers are still reaped")
+	assert.Empty(t, skipped)
+	assert.Equal(t, []syscall.Signal{syscall.SIGTERM}, rk.signals(),
+		"a positively-identified group is signaled on Darwin")
+
+	_, statErr := os.Stat(filepath.Join(dir, daemon.ChildrenFileName))
+	assert.True(t, os.IsNotExist(statErr), "the ledger is removed after the reap pass")
 }
 
 // --- persistence concurrency -------------------------------------------------
@@ -362,7 +515,7 @@ func TestPersistChildren_SkippedAfterRefuseLaunches(t *testing.T) {
 	// Positive control: with launches OPEN, persistChildren rewrites the ledger
 	// (no child is running yet, so it writes an empty set). This proves the no-op
 	// below is due to the gate, not some other reason.
-	require.NoError(t, WriteChildren(stateDir, retained))
+	require.NoError(t, WriteChildren(stateDir, "", retained))
 	sup.launchable.Store(true)
 	sup.persistChildren()
 	open, err := LoadChildren(stateDir)
@@ -371,7 +524,7 @@ func TestPersistChildren_SkippedAfterRefuseLaunches(t *testing.T) {
 
 	// Shutdown has begun: launches refused, Stop owns the ledger. A late callback
 	// must NOT touch the retained ledger.
-	require.NoError(t, WriteChildren(stateDir, retained))
+	require.NoError(t, WriteChildren(stateDir, "", retained))
 	sup.RefuseLaunches()
 	sup.persistChildren()
 	got, err := LoadChildren(stateDir)
