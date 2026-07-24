@@ -290,7 +290,10 @@ Examples:
 // stopStateWaitTimeout bounds how long `prox stop` waits, after a clean
 // process-stop verdict, for the daemon's own exit (state + PID files gone). The
 // verdict already confirms the processes stopped; this only confirms the daemon
-// process finished tearing down. A timeout here is a warning, not an error.
+// process finished tearing down. A timeout here now returns a non-zero error
+// (exit 1): an unconfirmed daemon teardown joins the survivors-branch
+// "shutdown incomplete" error family for exit-code consistency (v0.1.4, #36;
+// plan 011 D2, #73).
 const stopStateWaitTimeout = 15 * time.Second
 
 func runStop(cmd *cobra.Command, args []string) error {
@@ -315,15 +318,19 @@ func runStop(cmd *cobra.Command, args []string) error {
 }
 
 // runFullStop performs a waited full daemon stop and maps the outcome to the CLI
-// exit contract (#36, D4):
+// exit contract (#36, D4; timeout branch revised by plan 011 D2, #73):
 //   - transport failure: the outcome is unknown daemon-side → error (exit 1);
 //   - old daemon (Waited nil): legacy "Shutdown initiated" → exit 0;
 //   - survivors present: print each, return a one-line summary error → exit 1;
-//   - clean verdict: bounded-wait (stateWaitTimeout) for the daemon's state/PID
-//     files to vanish, print a stopped summary → exit 0 (a wait timeout prints a
-//     Warning to stderr but stays exit 0 — the process-stop verdict already
-//     succeeded). stateWaitTimeout is a parameter so tests can inject a short
-//     bound and exercise the poll-timeout branch.
+//   - clean verdict, daemon confirmed gone: bounded-wait (stateWaitTimeout) for
+//     the daemon's state/PID files to vanish succeeds, print a stopped summary
+//     → exit 0;
+//   - clean verdict, wait times out: print the stopped summary plus a stderr
+//     Warning, but still return a "shutdown incomplete" error → exit 1 — the
+//     daemon's own teardown was never confirmed, so this joins the
+//     survivors-branch error family instead of the exit-0 old-daemon branch.
+//     stateWaitTimeout is a parameter so tests can inject a short bound and
+//     exercise the poll-timeout branch.
 func runFullStop(client *Client, cwd string, stateWaitTimeout time.Duration) error {
 	result, err := client.Shutdown(true)
 	if err != nil {
@@ -351,13 +358,16 @@ func runFullStop(client *Client, cwd string, stateWaitTimeout time.Duration) err
 	// (bounded) for the state + PID files to disappear.
 	if waitForDaemonExit(cwd, stateWaitTimeout) {
 		fmt.Println("Stopped prox")
-	} else {
-		// Verdict was clean, so exit stays 0; the daemon just hasn't finished its
-		// own teardown within the bounded wait. Surface it as a stderr warning.
-		fmt.Println("Stopped processes")
-		fmt.Fprintln(os.Stderr, "Warning: the daemon is still finishing shutdown")
+		return nil
 	}
-	return nil
+	// Verdict was clean, but the daemon hasn't finished its own teardown within
+	// the bounded wait: the process-stop succeeded, yet the daemon's exit is
+	// unconfirmed, so this is no longer a clean stop. Surface the stderr warning
+	// as before and return a non-zero error joining the survivors-branch
+	// "shutdown incomplete" family (v0.1.4, #36; plan 011 D2, #73).
+	fmt.Println("Stopped processes")
+	fmt.Fprintln(os.Stderr, "Warning: the daemon is still finishing shutdown")
+	return fmt.Errorf("shutdown incomplete: daemon still finishing after %s", stateWaitTimeout)
 }
 
 // waitForDaemonExit polls until the daemon's state and PID files are both gone

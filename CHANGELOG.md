@@ -28,6 +28,20 @@ All notable changes to this project will be documented in this file.
   errors and an unreachable supervisor. This consolidates the status
   exit-code churn started in v0.2.1 (proxy-down → exit 1, #66) into one
   adoption window.
+- **`prox stop`/`prox down` exit 1 when the daemon teardown wait times out**
+  (#73). Previously, once the process-stop verdict was clean, a `prox stop`
+  (or `prox down`) that then timed out waiting (up to ~15s) for the daemon's
+  own state/PID files to disappear still printed `Stopped processes` plus a
+  `Warning: the daemon is still finishing shutdown` to stderr and exited `0`.
+  It now returns a `shutdown incomplete: daemon still finishing after 15s`
+  error and exits `1`, joining the same `shutdown incomplete` family as the
+  existing survivors contract (v0.1.4, #36) — an unconfirmed daemon teardown
+  is no longer treated as a clean stop. The existing stdout/stderr messages
+  are unchanged, but stderr gains the CLI's standard
+  `Error: shutdown incomplete: …` line. Scripts that assumed `prox stop`/`prox down` always exit `0`
+  once processes are reported stopped must check the exit code (or parse
+  stderr for the `Warning:` line) if they need to distinguish a fully torn
+  down daemon from one still finishing up.
 
 ## v0.2.1
 

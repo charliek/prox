@@ -34,6 +34,8 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 
 **Never kill processes directly** (e.g., `kill <pid>`). Use prox commands so it can track state and handle restarts correctly.
 
+**`prox stop`/`prox down` exit non-zero if the daemon's own teardown doesn't finish.** They wait (up to ~15s) for the daemon to confirm it has fully exited; if that wait times out they still print the stopped summary but exit `1` with a `Warning: the daemon is still finishing shutdown` line on stderr — trust the exit code, not just the summary text. Exit `0` means the daemon is fully torn down.
+
 **Run client commands (`status`, `logs`, `requests`, etc.) from the project directory.** They auto-discover the instance via `.prox/prox.state`; outside a project directory they now error instead of silently falling back to `:5555` — pass `--addr host:port` if running from elsewhere.
 
 ## Shared Proxy and Multiple Projects

@@ -1017,9 +1017,10 @@ func TestRunFullStop_TransportFailure(t *testing.T) {
 
 // TestRunFullStop_CleanVerdictPollTimeout: a clean verdict but the daemon's
 // state/PID files never disappear within the bounded wait -> the CLI prints a
-// Warning to stderr yet stays exit 0 (the process-stop verdict already
-// succeeded). The state + PID files are pre-created so the poll actually times
-// out under a short injected bound.
+// Warning to stderr AND returns a non-zero "shutdown incomplete" error (exit 1),
+// since the daemon's own teardown was never confirmed (plan 011 D2, #73). The
+// state + PID files are pre-created so the poll actually times out under a
+// short injected bound.
 func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 	server := shutdownStub(t, http.StatusOK, api.ShutdownResponse{
 		Success: true, Waited: true, Failures: []api.ShutdownFailureResponse{},
@@ -1043,8 +1044,11 @@ func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 	stdout, stderr := captureOutput(t, func() {
 		err = runFullStop(client, cwd, 150*time.Millisecond)
 	})
-	if err != nil {
-		t.Fatalf("poll timeout must keep exit 0, got %v", err)
+	if err == nil {
+		t.Fatal("expected a non-nil error on poll timeout (exit 1)")
+	}
+	if !strings.Contains(err.Error(), "shutdown incomplete") {
+		t.Errorf("expected a shutdown incomplete error, got %q", err.Error())
 	}
 	if !strings.Contains(stdout, "Stopped processes") {
 		t.Errorf("expected a stopped summary on stdout, got %q", stdout)
