@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.2.1
 
 A hardening pass on lifecycle signals and the requests pipeline: `prox up`/`prox status`/`prox stop` now give trustworthy exit codes and error messages instead of silently degrading, the shared proxy daemon self-heals and isolates projects from each other, and captured request/response bodies decode more content types. Plus a refreshed agent skill and docs.
 
