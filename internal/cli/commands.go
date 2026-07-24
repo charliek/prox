@@ -48,6 +48,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get processes: %w", err)
 	}
 
+	// A shared proxy that is down makes `prox status` exit non-zero even when
+	// every child process is healthy (D5, breaking change): the proxied routes
+	// are dead, so a green table alone would mislead. Computed here so both the
+	// JSON and table paths honor it.
+	proxyDown := sharedProxyDown(status.Proxy)
+
 	if statusJSON {
 		output := map[string]interface{}{
 			"status":    status,
@@ -55,6 +61,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to encode output: %v\n", err)
+		}
+		if proxyDown {
+			return errSharedProxyDown
 		}
 		return nil
 	}
@@ -76,7 +85,46 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			p.Name, p.Status, p.PID, uptime, p.Restarts, p.Health)
 	}
 	w.Flush()
+
+	// Proxy line (D5). Printed after the table so the process status is always
+	// visible even when the shared proxy is down (which then forces exit 1).
+	renderProxyStatus(status.Proxy)
+	if proxyDown {
+		return errSharedProxyDown
+	}
 	return nil
+}
+
+// errSharedProxyDown is returned by runStatus when the shared proxy daemon is
+// unreachable, so `prox status` exits non-zero (D5). The message has already
+// been printed to the user; rootCmd sets SilenceErrors, so cobra does not
+// reprint it — the error only drives the exit code.
+var errSharedProxyDown = fmt.Errorf("shared proxy daemon is unreachable")
+
+// sharedProxyDown is the single "down" predicate behind both the DOWN line and
+// the exit-1 contract (D5): a shared proxy whose daemon is unreachable. Sourcing
+// it once keeps the rendered message and the exit code from drifting apart. A
+// nil block (pre-D5 daemons, test handlers) is never down.
+func sharedProxyDown(p *api.ProxyStatusResponse) bool {
+	return p != nil && p.Mode == proxyModeShared && !p.DaemonReachable
+}
+
+// renderProxyStatus prints the Proxy line for `prox status` (D5). Disabled mode
+// (and an absent block, for pre-D5 daemons) prints nothing.
+func renderProxyStatus(p *api.ProxyStatusResponse) {
+	if p == nil {
+		return
+	}
+	switch p.Mode {
+	case proxyModeShared:
+		if sharedProxyDown(p) {
+			fmt.Println("\nProxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.")
+		} else {
+			fmt.Printf("\nProxy: shared (running, v%s)\n", p.DaemonVersion)
+		}
+	case proxyModeStandalone:
+		fmt.Println("\nProxy: standalone")
+	}
 }
 
 // Logs command flags

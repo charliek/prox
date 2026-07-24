@@ -114,7 +114,8 @@ func TestStreamRequests_LargeInlineBodies(t *testing.T) {
 
 	localRM := proxy.NewRequestManager(100)
 	// streamRequests returns nil once the server closes the stream (io.EOF).
-	require.NoError(t, streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM))
+	_, err = streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM, nil)
+	require.NoError(t, err)
 
 	require.Equal(t, 1, localRM.Count())
 	got := localRM.Recent(proxy.RequestFilter{})[0]
@@ -151,7 +152,8 @@ func TestStreamRequests_OversizeEventSkippedStreamContinues(t *testing.T) {
 	})
 
 	localRM := proxy.NewRequestManager(100)
-	require.NoError(t, streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM))
+	_, err = streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM, nil)
+	require.NoError(t, err)
 
 	require.Equal(t, 1, localRM.Count(), "oversize event skipped, following event delivered")
 	got := localRM.Recent(proxy.RequestFilter{})[0]
@@ -171,7 +173,7 @@ func TestForwardRequests_FiltersByProject(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go ForwardRequests(ctx, socketPath, "/projects/a", localRM)
+	go ForwardRequests(ctx, socketPath, "/projects/a", localRM, nil)
 
 	// The bridge backfills a snapshot on connect and then applies live events;
 	// this test exercises the live path, recording both projects on a tick until
@@ -243,7 +245,7 @@ func TestBackfill_AllRecordsDeliveredPinsLimit(t *testing.T) {
 	localRM := proxy.NewRequestManager(constants.MaxProxyRequests)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ForwardRequests(ctx, socketPath, "/p", localRM)
+	go ForwardRequests(ctx, socketPath, "/p", localRM, nil)
 
 	require.Eventually(t, func() bool { return localRM.Count() == n }, 3*time.Second, 10*time.Millisecond,
 		"all %d snapshot records must be delivered locally", n)
@@ -290,7 +292,7 @@ func TestBackfill_RecordsAddedDuringDisconnectAppearAfterReconnect(t *testing.T)
 	localRM := proxy.NewRequestManager(100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ForwardRequests(ctx, socketPath, "/p", localRM)
+	go ForwardRequests(ctx, socketPath, "/p", localRM, nil)
 
 	require.Eventually(t, func() bool {
 		return atomic.LoadInt32(&connects) >= 2 && localRM.Count() == 2
@@ -365,7 +367,7 @@ func TestBackfill_OverlapDedupe(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			go ForwardRequests(ctx, socketPath, "/p", localRM)
+			go ForwardRequests(ctx, socketPath, "/p", localRM, nil)
 
 			// Collect notifications for a fixed window; both the snapshot copy and
 			// the stream copy apply, but only the first notifies.
@@ -418,7 +420,7 @@ func TestBackfill_ConcurrentDrainDelayedSnapshot(t *testing.T) {
 	localRM := proxy.NewRequestManager(100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ForwardRequests(ctx, socketPath, "/p", localRM)
+	go ForwardRequests(ctx, socketPath, "/p", localRM, nil)
 
 	// The snapshot is still blocked (release not yet closed); the live event must
 	// nevertheless be delivered — proof the read loop drains concurrently.
@@ -464,7 +466,7 @@ func TestBackfill_SnapshotFailureStreamStillDelivers(t *testing.T) {
 			localRM := proxy.NewRequestManager(100)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			go ForwardRequests(ctx, socketPath, "/p", localRM)
+			go ForwardRequests(ctx, socketPath, "/p", localRM, nil)
 
 			require.Eventually(t, func() bool { return localRM.Count() == 1 }, 2*time.Second, 10*time.Millisecond)
 			// Let any erroneous snapshot apply race in, then confirm still just the
@@ -499,7 +501,7 @@ func TestBackfillSnapshot_CtxCancelExitsCleanly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		backfillSnapshot(ctx, NewClient(socketPath), "/p", localRM)
+		backfillSnapshot(ctx, NewClient(socketPath), "/p", localRM, nil)
 		close(done)
 	}()
 

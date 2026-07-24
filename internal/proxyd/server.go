@@ -511,6 +511,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if resp.ListenerPorts == nil {
 		resp.ListenerPorts = []int{}
 	}
+	if s.requestManager != nil {
+		resp.DroppedEvents = s.requestManager.DroppedEvents()
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }

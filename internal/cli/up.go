@@ -346,6 +346,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create API handlers and server. The handlers get the absolute config path
 	// so GET /status reports the same file the reload path re-reads (#33, D3).
 	handlers := api.NewHandlers(sup, logMgr, absConfigPath, coordinator)
+
+	// The proxy runtime is the single source of truth for the proxy path (D5):
+	// it feeds the `prox status` proxy block via the handlers, receives forwarder
+	// connection state, and (C6) holds the client swapped in on heal. Created
+	// here (mode defaults to disabled) and resolved to shared/standalone below.
+	runtime := newProxyRuntime()
+	handlers.SetProxyStatusProvider(runtime)
+
 	apiServer := api.NewServer(api.ServerConfig{
 		Host:        cfg.API.Host,
 		Port:        cfg.API.Port,
@@ -375,7 +383,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
 		var proxyErr error
-		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers)
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime)
 		if proxyErr != nil {
 			return proxyErr
 		}
@@ -485,6 +493,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// (before the API stage — see performShutdown).
 	outcome := performShutdown(shutdownDeps{
 		sup:          sup,
+		runtime:      runtime,
 		daemonClient: daemonClient,
 		proxyService: proxyService,
 		apiServer:    apiServer,
@@ -534,7 +543,12 @@ func forwardShutdownSignal(ctx context.Context, sigCh <-chan os.Signal, coordina
 // proxy/API/logMgr deps are nil-able so a helper unit test needs no sockets or
 // daemon.
 type shutdownDeps struct {
-	sup          *supervisor.Supervisor
+	sup *supervisor.Supervisor
+	// runtime is the proxy runtime (D5/D6). When set, performShutdown latches its
+	// shutdown flag before deregister and reads the CURRENT daemon client through
+	// it (a C6-healed client, not the one captured at startup). daemonClient is
+	// the legacy fallback used only when runtime is nil (helper unit tests).
+	runtime      *proxyRuntime
 	daemonClient *proxyd.Client
 	proxyService *proxy.Service
 	apiServer    *api.Server
@@ -601,14 +615,24 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 		deps.sup.RefuseLaunches()
 	}
 
+	// Latch the shutdown flag BEFORE deregister (D6c) so a C6 heal cannot
+	// re-register the project mid-teardown, and resolve the daemon client through
+	// the runtime so a healed client (not the startup-captured one) is used for
+	// deregister. daemonClient is the fallback for helper tests with no runtime.
+	daemonClient := deps.daemonClient
+	if deps.runtime != nil {
+		deps.runtime.MarkShuttingDown()
+		daemonClient = deps.runtime.Client()
+	}
+
 	// Stage 1a: deregister from the shared proxy daemon. The proxyd client carries
 	// its own 30s HTTP timeout and takes no ctx, so bound it to the stage here:
 	// run it on a goroutine and proceed once the stage deadline passes, leaving the
 	// call to finish or fail in the background (harmless — the daemon is exiting).
-	if deps.daemonClient != nil {
+	if daemonClient != nil {
 		derr := make(chan error, 1) // buffered so an abandoned goroutine never leaks
 		go func() {
-			derr <- deps.daemonClient.Deregister(proxyd.DeregisterRequest{
+			derr <- daemonClient.Deregister(proxyd.DeregisterRequest{
 				ProjectDir: deps.cwd,
 				PID:        os.Getpid(),
 			})
@@ -794,9 +818,9 @@ func proxyStartError(err error) error {
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, *proxy.Service, error) {
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
-	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers)
+	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt)
 	if ok {
 		return client, nil, nil
 	}
@@ -813,6 +837,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	if err != nil {
 		return nil, nil, err
 	}
+	rt.SetMode(proxyModeStandalone)
 	return nil, svc, nil
 }
 
@@ -820,7 +845,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 // Returns (client, true, nil) on success, (nil, false, nil) when daemon is
 // unavailable (fall back to standalone), (nil, false, error) when daemon is
 // running but registration failed (don't fall back, fail the command).
-func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, bool, error) {
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, bool, error) {
 	// Check if we can access the daemon directory
 	if err := proxyd.EnsureDaemonDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
@@ -905,10 +930,17 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	}
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
-	// daemon proxy requests into this project's TUI and API.
+	// daemon proxy requests into this project's TUI and API. The runtime records
+	// the shared mode, the active client, the original register request (C6
+	// re-registers with it), and the local manager (source of the dropped-events
+	// count), and receives forwarder connection state as the status sink (D5).
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	handlers.SetRequestManager(localRM)
-	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), cwd, localRM)
+	rt.SetMode(proxyModeShared)
+	rt.SetClient(client)
+	rt.SetRegisterRequest(req)
+	rt.SetLocalRequestManager(localRM)
+	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), cwd, localRM, rt)
 
 	return client, true, nil
 }

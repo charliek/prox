@@ -965,3 +965,106 @@ func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 		t.Errorf("expected a Warning about the daemon still finishing, got stderr %q", stderr)
 	}
 }
+
+// statusServerWithProxy starts a fake API server that returns a status response
+// carrying the given proxy block (nil = no block) plus a minimal process list,
+// and points apiAddr at it for the duration of the test.
+func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse) {
+	t.Helper()
+	originalApiAddr := apiAddr
+	t.Cleanup(func() { apiAddr = originalApiAddr })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/status":
+			_ = json.NewEncoder(w).Encode(api.StatusResponse{
+				Status:        "running",
+				UptimeSeconds: 10,
+				ConfigFile:    "prox.yaml",
+				APIVersion:    "v1",
+				Proxy:         proxy,
+			})
+		case "/api/v1/processes":
+			_ = json.NewEncoder(w).Encode(api.ProcessListResponse{
+				Processes: []api.ProcessResponse{
+					{Name: "web", Status: "running", PID: 1234, UptimeSeconds: 5, Health: "healthy"},
+				},
+			})
+		}
+	}))
+	t.Cleanup(server.Close)
+	apiAddr = server.URL
+}
+
+// TestRunStatus_SharedProxyDownExits1 pins D5: when the status block reports a
+// shared proxy that is unreachable, runStatus prints the DOWN line and returns a
+// non-nil error (exit 1) even though the child process is healthy.
+func TestRunStatus_SharedProxyDownExits1(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	})
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus returned nil, want a non-nil error (exit 1) when the shared proxy is down")
+	}
+	if !strings.Contains(stdout, "Proxy: DOWN") {
+		t.Errorf("stdout missing the DOWN line; got:\n%s", stdout)
+	}
+	// The process table must still have printed first.
+	if !strings.Contains(stdout, "web") {
+		t.Errorf("stdout missing the process table; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_SharedProxyUpNoError pins that a reachable shared proxy renders
+// the running line and returns nil (exit 0).
+func TestRunStatus_SharedProxyUpNoError(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: true,
+		DaemonVersion:   "1.2.3",
+	})
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil when the shared proxy is up", runErr)
+	}
+	if !strings.Contains(stdout, "Proxy: shared (running, v1.2.3)") {
+		t.Errorf("stdout missing the running proxy line; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_SharedProxyDownJSONExits1 pins that JSON mode also exits 1 when
+// the shared proxy is down (the block is emitted verbatim; scripts parsing JSON
+// still get the failure signal).
+func TestRunStatus_SharedProxyDownJSONExits1(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	})
+	statusJSON = true
+	t.Cleanup(func() { statusJSON = false })
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus (JSON) returned nil, want a non-nil error when the shared proxy is down")
+	}
+	if !strings.Contains(stdout, "\"daemon_reachable\":false") {
+		t.Errorf("JSON output missing the proxy block; got:\n%s", stdout)
+	}
+}

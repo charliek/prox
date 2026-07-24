@@ -71,6 +71,16 @@ const (
 	// DaemonHealthProbeTimeout bounds a single /health probe used while polling
 	// for an old daemon's socket to stop answering during a version-skew heal.
 	DaemonHealthProbeTimeout = 1 * time.Second
+
+	// DaemonProxyProbeTimeout bounds the live /health probe `prox status` issues
+	// against the shared daemon to report proxy health (D5). Short so a downed
+	// daemon never makes `prox status` sit out a long timeout.
+	DaemonProxyProbeTimeout = 500 * time.Millisecond
+
+	// ProxyStatusProbeCacheTTL caches the shared-proxy health probe result so a
+	// polled `prox status` (TUIs/agents) does not pay the probe timeout on every
+	// call; a downed daemon is re-probed at most once per TTL (D5).
+	ProxyStatusProbeCacheTTL = 2 * time.Second
 )
 
 // Log configuration

@@ -45,6 +45,7 @@ type Handlers struct {
 	captureManager *proxy.CaptureManager
 	configFile     string
 	shutdown       ShutdownController
+	proxyStatus    ProxyStatusProvider
 }
 
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
@@ -76,6 +77,14 @@ func (h *Handlers) SetCaptureManager(cm *proxy.CaptureManager) {
 	h.captureManager = cm
 }
 
+// SetProxyStatusProvider injects the shared-proxy health provider (D5). A setter
+// (not a constructor arg) mirrors SetRequestManager: the proxy path resolves
+// after the handlers are built, and the provider (the cli's proxyRuntime) is
+// wired in then. When unset, GET /status omits the proxy block.
+func (h *Handlers) SetProxyStatusProvider(p ProxyStatusProvider) {
+	h.proxyStatus = p
+}
+
 // GetStatus handles GET /api/v1/status
 func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.supervisor.Status()
@@ -85,6 +94,9 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: status.UptimeSeconds(),
 		ConfigFile:    h.configFile,
 		APIVersion:    "v1",
+	}
+	if h.proxyStatus != nil {
+		resp.Proxy = h.proxyStatus.ProxyStatus()
 	}
 
 	writeJSON(w, http.StatusOK, resp)

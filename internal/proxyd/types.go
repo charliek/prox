@@ -61,6 +61,10 @@ type DaemonStatusResponse struct {
 	ListenerPorts []int       `json:"listener_ports"`
 	ProjectCount  int         `json:"project_count"`
 	RouteCount    int         `json:"route_count"`
+	// DroppedEvents is the daemon-wide count of SSE-subscriber notifications
+	// dropped because a subscriber's channel was full (D9). It surfaces the
+	// request-stream degradation the forwarder would otherwise absorb silently.
+	DroppedEvents int64 `json:"dropped_events"`
 }
 
 // ErrorResponse is the standard error format for daemon API responses.

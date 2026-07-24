@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,10 +100,16 @@ type RequestFilter struct {
 }
 
 // RequestSubscription represents a subscription to request updates.
+//
+// dropped counts events this subscription lost because its channel was full
+// when notifySubscribers tried to deliver (D9). It is an atomic so
+// notifySubscribers can bump it under the manager's read lock; the first drop
+// (0→1 transition) logs once so a slow subscriber is visible without spamming.
 type RequestSubscription struct {
-	ID     string
-	Filter RequestFilter
-	Ch     chan RequestRecord
+	ID      string
+	Filter  RequestFilter
+	Ch      chan RequestRecord
+	dropped atomic.Int64
 }
 
 // EvictionCallback is called when a request is evicted from the ring buffer.
@@ -123,6 +130,12 @@ type RequestManager struct {
 	// closed latches after Close: new Subscribe calls get an already-closed
 	// channel so post-shutdown streams end immediately.
 	closed bool
+
+	// droppedTotal is the manager-wide count of notifications dropped because a
+	// subscriber's channel was full (D9). Exposed via DroppedEvents(); surfaced
+	// daemon-side in DaemonStatusResponse and project-side (via the forwarder's
+	// local manager) in the `prox status` proxy block.
+	droppedTotal atomic.Int64
 
 	// onEvict is called when a request is evicted from the buffer
 	onEvict EvictionCallback
@@ -361,10 +374,28 @@ func (m *RequestManager) notifySubscribers(record RequestRecord) {
 			select {
 			case sub.Ch <- record:
 			default:
-				// Channel full, drop the message
+				// Channel full: drop the message and count it (D9). The
+				// manager-wide total feeds DroppedEvents(); the per-subscription
+				// count logs once on the first drop so a persistently slow
+				// subscriber is visible without a per-drop log flood. The log
+				// itself runs on a goroutine: notifySubscribers is called with
+				// the ring mutex held on the Upsert path (ordering guarantee),
+				// and logger I/O must not stall the SSE hot path under that
+				// lock.
+				m.droppedTotal.Add(1)
+				if sub.dropped.Add(1) == 1 {
+					go log.Printf("prox: request subscription %s is dropping events (subscriber not keeping up)", sub.ID)
+				}
 			}
 		}
 	}
+}
+
+// DroppedEvents returns the manager-wide number of subscriber notifications
+// dropped because a subscription's channel was full (D9). It is monotonic for
+// the life of the manager.
+func (m *RequestManager) DroppedEvents() int64 {
+	return m.droppedTotal.Load()
 }
 
 func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilter) bool {

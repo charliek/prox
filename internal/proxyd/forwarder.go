@@ -17,6 +17,26 @@ import (
 	"github.com/charliek/prox/internal/proxy"
 )
 
+// ForwarderStatusSink receives connection-state and backfill signals from the
+// SSE forwarder so the CLI can surface shared-proxy health in `prox status`
+// (D5/D9). It is defined here — not in internal/cli — so proxyd stays free of a
+// cli import; the cli's proxyRuntime implements it. All methods must be safe to
+// call from the forwarder goroutine and are no-ops when the sink is nil.
+type ForwarderStatusSink interface {
+	// ForwarderConnected is called each time the bridge establishes an SSE
+	// connection (HTTP 200). Implementations reset the consecutive-failure
+	// counter and record the connect time.
+	ForwarderConnected()
+	// ForwarderConnectFailed is called each time a connection attempt fails
+	// before reaching a live stream. Implementations increment the
+	// consecutive-failure counter.
+	ForwarderConnectFailed(err error)
+	// ForwarderBackfillFailed is called when a post-connect ring snapshot fetch
+	// fails (the stream continues degraded). Implementations increment the
+	// backfill-failure counter.
+	ForwarderBackfillFailed()
+}
+
 // ForwardRequests subscribes to the daemon's SSE request stream and forwards
 // this project's records into the local RequestManager. This bridges the
 // daemon's proxy request data into the project's TUI and API.
@@ -30,8 +50,12 @@ import (
 // lossy (bounded, non-blocking channels), so the guarantee is bounded gap
 // closure, not losslessness.
 //
+// sink (may be nil) receives connect/disconnect/backfill signals so the CLI can
+// report shared-proxy health; it replaces the old silent `_ = err` reconnect
+// loop with state that surfaces in `prox status`.
+//
 // It runs until ctx is cancelled. On disconnect, it reconnects with backoff.
-func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager) {
+func ForwardRequests(ctx context.Context, socketPath string, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink) {
 	// One snapshot client for the whole forwarder lifetime: its transport pools
 	// the idle unix connection across reconnect attempts, rather than leaking a
 	// fresh idle conn per attempt (the daemon only reaps idle conns after 60s, so
@@ -41,11 +65,24 @@ func ForwardRequests(ctx context.Context, socketPath string, projectDir string, 
 	backoff := 500 * time.Millisecond
 
 	for {
-		err := streamRequests(ctx, socketPath, snapClient, projectDir, localRM)
+		connected, err := streamRequests(ctx, socketPath, snapClient, projectDir, localRM, sink)
 		if ctx.Err() != nil {
 			return // context cancelled, clean shutdown
 		}
-		_ = err // reconnect silently
+		// A connect that never reached a live stream is a reconnect failure: the
+		// sink counts it (and logs the connected→down transition once). A stream
+		// that connected and then dropped is not itself a failure — the NEXT
+		// failed reconnect, if any, records the outage. streamRequests already
+		// signalled ForwarderConnected on a successful connect.
+		if !connected && sink != nil {
+			sink.ForwarderConnectFailed(err)
+		}
+		if connected {
+			// The previous attempt reached a live stream: the daemon is (or
+			// was just) healthy, so reconnect eagerly instead of carrying a
+			// stale outage-sized backoff into the recovery.
+			backoff = 500 * time.Millisecond
+		}
 
 		// Backoff before reconnecting
 		select {
@@ -60,8 +97,14 @@ func ForwardRequests(ctx context.Context, socketPath string, projectDir string, 
 }
 
 // streamRequests opens an SSE connection to the daemon and processes events.
-// snapClient is the shared daemon client used for the backfill snapshot.
-func streamRequests(ctx context.Context, socketPath string, snapClient *Client, projectDir string, localRM *proxy.RequestManager) error {
+// snapClient is the shared daemon client used for the backfill snapshot; sink
+// (may be nil) receives connect/backfill signals.
+//
+// It returns connected=true once the SSE connection reached a live stream (HTTP
+// 200), regardless of how the stream later ended, so the caller can distinguish
+// a failed reconnect (connected=false, count it) from a dropped live stream
+// (connected=true, do not count it).
+func streamRequests(ctx context.Context, socketPath string, snapClient *Client, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink) (connected bool, err error) {
 	// Create HTTP client that dials the Unix socket
 	dialer := &net.Dialer{}
 	client := &http.Client{
@@ -75,17 +118,25 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 	streamURL := fmt.Sprintf("http://proxyd/api/v1/requests/stream?project=%s", url.QueryEscape(projectDir))
 	req, err := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
 	if err != nil {
-		return fmt.Errorf("creating SSE request: %w", err)
+		return false, fmt.Errorf("creating SSE request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connecting to daemon SSE: %w", err)
+		return false, fmt.Errorf("connecting to daemon SSE: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("daemon SSE returned %d", resp.StatusCode)
+		return false, fmt.Errorf("daemon SSE returned %d", resp.StatusCode)
+	}
+
+	// The subscription is live once the daemon returned 200. Signal the sink so
+	// it resets the failure counter and records the connect time (D5); a
+	// down→connected transition logs one line there.
+	connected = true
+	if sink != nil {
+		sink.ForwarderConnected()
 	}
 
 	// The daemon Subscribes before it writes response headers, so once Do
@@ -105,7 +156,7 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 	// so it never leaks; it writes only to localRM, which outlives the stream.
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go backfillSnapshot(attemptCtx, snapClient, projectDir, localRM)
+	go backfillSnapshot(attemptCtx, snapClient, projectDir, localRM, sink)
 
 	// Read SSE events line by line. bufio.Scanner is NOT used: its token size is
 	// capped (and even a raised cap would kill the subscription on the first
@@ -147,9 +198,9 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 
 		if readErr != nil {
 			if readErr == io.EOF {
-				return nil
+				return connected, nil
 			}
-			return readErr
+			return connected, readErr
 		}
 	}
 }
@@ -173,9 +224,12 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 //
 // ctx is the per-attempt context, so a stream error/return cancels an in-flight
 // fetch; client is the forwarder's shared snapshot client (pooled unix conn).
-func backfillSnapshot(ctx context.Context, client *Client, projectDir string, localRM *proxy.RequestManager) {
+func backfillSnapshot(ctx context.Context, client *Client, projectDir string, localRM *proxy.RequestManager, sink ForwarderStatusSink) {
 	records, err := client.Requests(ctx, projectDir, constants.MaxProxyRequests)
 	if err != nil {
+		if sink != nil {
+			sink.ForwarderBackfillFailed()
+		}
 		log.Printf("prox: request snapshot backfill failed: %v", err)
 		return
 	}
