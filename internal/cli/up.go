@@ -108,11 +108,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// Daemonize - this will re-exec and exit the parent
-		if err := daemon.Daemonize(); err != nil {
+		// Re-exec ourselves detached; the parent no longer blindly exits 0.
+		child, err := daemon.Daemonize()
+		if err != nil {
 			return fmt.Errorf("failed to daemonize: %w", err)
 		}
-		// Parent exits in Daemonize(), this is unreachable for parent
+		// The parent owns wait-and-report (D2): it never runs the supervisor
+		// itself. It returns here — nil (exit 0) once the child is confirmed
+		// ready, or an error (exit 1) on early death / never-ready timeout.
+		return awaitDaemonStartup(&execChild{cmd: child}, cwd, defaultDaemonStartupOps())
 	}
 
 	// If we're the daemon child, set up logging
@@ -431,9 +435,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Start API server in background
+	// Bind the API listener synchronously: a bind failure (port taken) must
+	// fail the daemon rather than leave it running with no control surface —
+	// and, in detach mode, must surface through the parent's early-death path
+	// instead of letting a stranger on the port answer the readiness probe.
+	apiListener, err := apiServer.Listen()
+	if err != nil {
+		return err
+	}
 	go func() {
-		if err := apiServer.Start(); err != nil {
+		if err := apiServer.Serve(apiListener); err != nil {
 			// Server closed is expected on shutdown
 			if !errors.Is(err, http.ErrServerClosed) {
 				fmt.Fprintf(os.Stderr, "API server error: %v\n", err)

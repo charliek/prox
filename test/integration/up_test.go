@@ -2,8 +2,10 @@ package integration
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -353,5 +355,38 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 		if !strings.Contains(output, marker) {
 			t.Errorf("expected output to contain %q, but it didn't.\nOutput:\n%s", marker, output)
 		}
+	}
+}
+
+// TestUpDetach_EarlyDeathReportsFailure exercises the real D2 parent
+// wait-and-report path end to end: `prox up -d` with an unreadable config makes
+// the detached child exit before it becomes ready, so the parent must block,
+// detect the early death, print a failure with the child's log tail, and exit
+// non-zero — no lingering daemon. This is the cheap, self-cleaning half of D2
+// (the never-ready/timeout half is covered by unit-level fakes with injectable
+// timings in internal/cli).
+func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+
+	// Isolated working dir so the child's .prox state never touches the repo
+	// root and is auto-removed with the temp dir.
+	dir := t.TempDir()
+	badCfg := filepath.Join(dir, "does-not-exist.yaml")
+
+	cmd := exec.Command(binary, "up", "-d", "-c", badCfg)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", err, out)
+	}
+	if ee.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d\nOutput:\n%s", ee.ExitCode(), out)
+	}
+	if !strings.Contains(string(out), "failed to start") {
+		t.Errorf("expected failure diagnostics mentioning 'failed to start', got:\n%s", out)
 	}
 }
