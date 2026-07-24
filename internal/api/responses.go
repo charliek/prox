@@ -29,6 +29,45 @@ type StatusResponse struct {
 	UptimeSeconds int64  `json:"uptime_seconds"`
 	ConfigFile    string `json:"config_file,omitempty"`
 	APIVersion    string `json:"api_version"`
+	// Proxy reports shared-proxy health (D5). Present whenever a
+	// ProxyStatusProvider was injected (the normal `prox up` path); omitted only
+	// where none is set (e.g. unit-test handlers), so those consumers see no
+	// change. The CLI omits the rendered line when Mode is "disabled".
+	Proxy *ProxyStatusResponse `json:"proxy,omitempty"`
+}
+
+// ProxyStatusResponse reports the health of this project's proxy path (D5),
+// surfaced under StatusResponse.proxy. It is the single source of truth `prox
+// status` renders for shared-proxy reachability and request-stream health.
+type ProxyStatusResponse struct {
+	// Mode is "shared", "standalone", or "disabled".
+	Mode string `json:"mode"`
+	// DaemonReachable is the result of a live /health probe against the shared
+	// daemon (shared mode only; always false otherwise).
+	DaemonReachable bool `json:"daemon_reachable"`
+	// DaemonVersion is the shared daemon's reported version when reachable.
+	DaemonVersion string `json:"daemon_version,omitempty"`
+	// ConsecutiveFailures is the forwarder's current run of failed reconnects.
+	ConsecutiveFailures int64 `json:"consecutive_failures"`
+	// LastConnectedAt is the last time the forwarder established an SSE stream.
+	LastConnectedAt *time.Time `json:"last_connected_at,omitempty"`
+	// DroppedEvents is the number of request-stream events lost to a full
+	// subscriber channel (D9), read from the project's local request manager.
+	DroppedEvents int64 `json:"dropped_events"`
+	// BackfillFailures counts post-connect ring snapshot fetch failures.
+	BackfillFailures int64 `json:"backfill_failures"`
+	// HealState is "healthy" when the shared daemon is reachable, "" otherwise
+	// (C5). C6 refines it to "healing"/"version_mismatch".
+	HealState string `json:"heal_state,omitempty"`
+}
+
+// ProxyStatusProvider supplies the proxy block for GET /status. The daemon
+// injects an implementation (the cli's proxyRuntime); it is defined here as a
+// narrow interface — following the ShutdownController precedent — so the api
+// package does not depend on internal/cli or internal/proxyd and tests can
+// drive GetStatus with a fake.
+type ProxyStatusProvider interface {
+	ProxyStatus() *ProxyStatusResponse
 }
 
 // ProcessListResponse represents the response for GET /processes
@@ -218,6 +257,12 @@ type ProxyRequestResponse struct {
 	// replaces this record (same ID). Omitted for completed records so their
 	// JSON stays byte-identical to the pre-in-flight wire format.
 	InFlight bool `json:"in_flight,omitempty"`
+	// Stale marks an in-flight record that has been in-flight for longer than
+	// constants.InFlightStaleAfter as of conversion time (D8, #53). It means
+	// "completion unknown" (the completion event may have been lost), not
+	// "broken" — long-lived streams and large transfers can legitimately stay
+	// in-flight this long. Always false (and omitted) for completed records.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // ProxyRequestsResponse represents the response for GET /proxy/requests
@@ -225,9 +270,17 @@ type ProxyRequestsResponse struct {
 	Requests      []ProxyRequestResponse `json:"requests"`
 	FilteredCount int                    `json:"filtered_count"`
 	TotalCount    int                    `json:"total_count"`
+	// NextBeforeID is the before_id to pass for the next older page
+	// (ring-position cursor pagination, D12/#50). Populated whenever the
+	// scan didn't reach the ring's oldest record — including on a plain
+	// first page (no before_id given), so pollers can start cursoring
+	// immediately. Omitted on the last page (scan reached the ring tail).
+	NextBeforeID string `json:"next_before_id,omitempty"`
 }
 
-// ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse
+// ToProxyRequestResponse converts proxy.RequestRecord to ProxyRequestResponse.
+// Staleness (D8) is computed here, at serve/conversion time, against the
+// current wall clock — there is no background reaper.
 func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 	return ProxyRequestResponse{
 		ID:         req.ID,
@@ -240,6 +293,7 @@ func ToProxyRequestResponse(req proxy.RequestRecord) ProxyRequestResponse {
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
 		InFlight:   req.InFlight,
+		Stale:      req.StaleAt(time.Now()),
 	}
 }
 

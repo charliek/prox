@@ -28,6 +28,10 @@ type Route struct {
 	// dynamic proxy can gate body capture per project (a capture-disabled
 	// project's traffic is recorded as metadata only).
 	CaptureEnabled bool
+	// MaxBodySize is the project's per-request/response capture cap in bytes
+	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
+	// proxy passes it as the per-call capture limit; 0 means the daemon default.
+	MaxBodySize int64
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -42,6 +46,9 @@ type ProjectRegistration struct {
 	StartTime      int64
 	RegisteredAt   time.Time
 	CaptureEnabled bool
+	// MaxBodySize is the project's per-request/response capture cap in bytes
+	// (D13, #49); 0 means the daemon default. Stamped onto each Route.
+	MaxBodySize int64
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -188,6 +195,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			PID:            req.PID,
 			RegisteredAt:   now,
 			CaptureEnabled: req.CaptureEnabled,
+			MaxBodySize:    req.MaxBodySize,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -213,6 +221,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		StartTime:      req.StartTime,
 		RegisteredAt:   now,
 		CaptureEnabled: req.CaptureEnabled,
+		MaxBodySize:    req.MaxBodySize,
 	}
 
 	for port, proto := range portsNeeded {
@@ -253,6 +262,158 @@ func (r *Registry) DeregisterIfIdentity(projectDir string, pid int, startTime in
 	}
 	removedHostnames, emptyPorts = r.deregisterLocked(projectDir)
 	return true, removedHostnames, emptyPorts
+}
+
+// routeDescriptor builds a canonical key for a single route's full identity
+// (hostname, port, protocol, and backend target) so two route sets can be
+// compared as sets regardless of iteration order. Used by registrationMatches.
+func routeDescriptor(hostname string, port int, protocol string, target ServiceTarget) string {
+	return fmt.Sprintf("%s:%d|%s|%s:%d", hostname, port, protocol, target.Host, target.Port)
+}
+
+// registrationMatches reports whether projectDir's CURRENT registration would be
+// reproduced byte-for-byte by req: the same route set (hostname + port + protocol
+// + backend target for every route) AND the same capture flag. It is the D6a
+// no-op-refresh discriminator — server.register's same-identity arm uses it to
+// take a true no-op path (no remove+add, no listener churn, no record purge) when
+// the re-registering process's config is unchanged, which is the common heal case.
+// r.mu is taken for read.
+func (r *Registry) registrationMatches(req RegisterRequest) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	proj, ok := r.projects[req.ProjectDir]
+	if !ok {
+		return false
+	}
+	if proj.CaptureEnabled != req.CaptureEnabled {
+		return false
+	}
+	// A changed capture cap must NOT take the no-op refresh path — the new cap
+	// has to reach the routes so subsequent captures honor it (D13).
+	if proj.MaxBodySize != req.MaxBodySize {
+		return false
+	}
+
+	// Build the descriptor set the request would register (mirrors Register's
+	// pending-route construction).
+	desired := make(map[string]struct{})
+	for svcName, target := range req.Services {
+		hostname := fmt.Sprintf("%s.%s", svcName, req.Domain)
+		if req.HTTPSPort > 0 {
+			desired[routeDescriptor(hostname, req.HTTPSPort, "https", target)] = struct{}{}
+		}
+		if req.HTTPPort > 0 {
+			desired[routeDescriptor(hostname, req.HTTPPort, "http", target)] = struct{}{}
+		}
+	}
+
+	// The existing route set must be exactly the desired set: same cardinality
+	// AND every current route present in desired.
+	if len(desired) != len(proj.RouteKeys) {
+		return false
+	}
+	for _, key := range proj.RouteKeys {
+		route, ok := r.routes[key]
+		if !ok {
+			return false
+		}
+		if _, want := desired[routeDescriptor(route.Hostname, route.Port, route.Protocol, route.Target)]; !want {
+			return false
+		}
+	}
+	return true
+}
+
+// ProjectHostnames returns the hostnames currently registered for projectDir in
+// route-key order, or nil when it isn't registered. server.register's no-op
+// idempotent-refresh arm (D6a) echoes this unchanged set instead of running a
+// remove+add.
+func (r *Registry) ProjectHostnames(projectDir string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	proj, ok := r.projects[projectDir]
+	if !ok {
+		return nil
+	}
+	hostnames := make([]string, 0, len(proj.RouteKeys))
+	for _, key := range proj.RouteKeys {
+		if route, ok := r.routes[key]; ok {
+			hostnames = append(hostnames, route.Hostname)
+		}
+	}
+	return hostnames
+}
+
+// projectSnapshot captures a project's full registry footprint (its
+// ProjectRegistration plus a deep copy of every Route it owns) so
+// server.register's same-identity DIFFERENT arm can restore it verbatim when a
+// config-changed remove+add fails — a failed re-register must NEVER leave the
+// project unregistered (D6a failure-atomicity).
+type projectSnapshot struct {
+	proj   *ProjectRegistration
+	routes []*Route
+}
+
+// snapshotProject deep-copies projectDir's registration and routes under RLock.
+// ok is false when the project isn't registered.
+func (r *Registry) snapshotProject(projectDir string) (projectSnapshot, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	proj, ok := r.projects[projectDir]
+	if !ok {
+		return projectSnapshot{}, false
+	}
+	projCopy := *proj
+	projCopy.RouteKeys = append([]string(nil), proj.RouteKeys...)
+	routes := make([]*Route, 0, len(proj.RouteKeys))
+	for _, key := range proj.RouteKeys {
+		if route, ok := r.routes[key]; ok {
+			rc := *route
+			routes = append(routes, &rc)
+		}
+	}
+	return projectSnapshot{proj: &projCopy, routes: routes}, true
+}
+
+// restoreProject re-inserts a snapshot taken by snapshotProject, rebuilding the
+// project's route entries and listener refcounts. It returns the ports whose
+// listener entry did NOT exist before restore (their physical listener was closed
+// by the removal and must be re-opened by the caller). Used only by
+// server.register's failure-atomic DIFFERENT arm.
+func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, route := range snap.routes {
+		rc := *route
+		r.routes[routeKey(rc.Hostname, rc.Port)] = &rc
+		if li, ok := r.listeners[rc.Port]; ok {
+			li.RouteCount++
+		} else {
+			r.listeners[rc.Port] = &ListenerInfo{Port: rc.Port, Protocol: rc.Protocol, RouteCount: 1}
+			reopenPorts = append(reopenPorts, PortSpec{Port: rc.Port, Protocol: rc.Protocol})
+		}
+	}
+	projCopy := *snap.proj
+	projCopy.RouteKeys = append([]string(nil), snap.proj.RouteKeys...)
+	r.projects[projCopy.Dir] = &projCopy
+	return reopenPorts
+}
+
+// sameRegistrationIdentity reports whether a same-dir conflict holder is the
+// SAME process generation as the requester, making the register an idempotent
+// re-register (D6a) rather than a genuine second `prox up`. It requires an exact
+// PID match AND matching NON-ZERO start tokens: a zero token on either side means
+// the generation cannot be distinguished from a reused PID, so it is treated as a
+// genuine conflict (a hard 409) — deliberately stricter than DeregisterIfIdentity,
+// which lets a zero token match for the crash-recovery teardown guard, because
+// here we would otherwise silently REPLACE a possibly-different live holder.
+func sameRegistrationIdentity(holderPID int, holderToken int64, reqPID int, reqToken int64) bool {
+	if holderToken == 0 || reqToken == 0 {
+		return false
+	}
+	return holderPID == reqPID && holderToken == reqToken
 }
 
 // deregisterLocked is the shared removal body; r.mu must be held.

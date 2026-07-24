@@ -87,7 +87,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go proxyd.ForwardRequests(ctx, topo.socketPath, projectDir, localRM)
+	go proxyd.ForwardRequests(ctx, topo.socketPath, projectDir, localRM, nil, nil)
 	waitBridgeLive(t, proxyPort, hostname, localRM)
 
 	// Drive the slow request in a background goroutine — it stays open until we
@@ -228,7 +228,7 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan struct{})
 	go func() {
-		proxyd.ForwardRequests(ctx1, topo.socketPath, projectDir, localRM)
+		proxyd.ForwardRequests(ctx1, topo.socketPath, projectDir, localRM, nil, nil)
 		close(done1)
 	}()
 	waitBridgeLive(t, proxyPort, hostname, localRM)
@@ -271,7 +271,7 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	// --- Restart the bridge with a fresh ctx and the SAME local manager ---
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	go proxyd.ForwardRequests(ctx2, topo.socketPath, projectDir, localRM)
+	go proxyd.ForwardRequests(ctx2, topo.socketPath, projectDir, localRM, nil, nil)
 
 	// Gap records appear locally via backfill.
 	gap1 := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
@@ -358,16 +358,17 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 	socketPath := shortSocketPath(t)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	registry := proxyd.NewRegistry()
-	requestMgr := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 
 	captureMgr, err := proxy.NewCaptureManagerAt(daemonCaptureDir, constants.DefaultCaptureMaxBodySize)
 	if err != nil {
 		t.Fatalf("NewCaptureManagerAt: %v", err)
 	}
 	t.Cleanup(func() { captureMgr.Cleanup() })
-	requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
 
-	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, requestMgr, captureMgr, logger)
+	// Per-project rings, wired like RunDaemon: each project's ring is created at
+	// register time with the capture eviction callback.
+	managers := proxyd.NewManagers(constants.DefaultProxyRequestBufferSize, captureMgr.CleanupRequest)
+	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, managers, captureMgr, logger)
 
 	server := proxyd.NewServer(proxyd.ServerConfig{
 		SocketPath: socketPath,
@@ -376,7 +377,7 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 	})
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
-	server.SetRequestManager(requestMgr)
+	server.SetManagers(managers)
 
 	go func() { _ = server.Start() }()
 	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })

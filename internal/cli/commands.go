@@ -48,6 +48,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get processes: %w", err)
 	}
 
+	// A shared proxy that is down makes `prox status` exit non-zero even when
+	// every child process is healthy (D5, breaking change): the proxied routes
+	// are dead, so a green table alone would mislead. Computed here so both the
+	// JSON and table paths honor it.
+	proxyDown := sharedProxyDown(status.Proxy)
+
 	if statusJSON {
 		output := map[string]interface{}{
 			"status":    status,
@@ -55,6 +61,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to encode output: %v\n", err)
+		}
+		if proxyDown {
+			return errSharedProxyDown
 		}
 		return nil
 	}
@@ -76,7 +85,46 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			p.Name, p.Status, p.PID, uptime, p.Restarts, p.Health)
 	}
 	w.Flush()
+
+	// Proxy line (D5). Printed after the table so the process status is always
+	// visible even when the shared proxy is down (which then forces exit 1).
+	renderProxyStatus(status.Proxy)
+	if proxyDown {
+		return errSharedProxyDown
+	}
 	return nil
+}
+
+// errSharedProxyDown is returned by runStatus when the shared proxy daemon is
+// unreachable, so `prox status` exits non-zero (D5). The message has already
+// been printed to the user; rootCmd sets SilenceErrors, so cobra does not
+// reprint it — the error only drives the exit code.
+var errSharedProxyDown = fmt.Errorf("shared proxy daemon is unreachable")
+
+// sharedProxyDown is the single "down" predicate behind both the DOWN line and
+// the exit-1 contract (D5): a shared proxy whose daemon is unreachable. Sourcing
+// it once keeps the rendered message and the exit code from drifting apart. A
+// nil block (pre-D5 daemons, test handlers) is never down.
+func sharedProxyDown(p *api.ProxyStatusResponse) bool {
+	return p != nil && p.Mode == proxyModeShared && !p.DaemonReachable
+}
+
+// renderProxyStatus prints the Proxy line for `prox status` (D5). Disabled mode
+// (and an absent block, for pre-D5 daemons) prints nothing.
+func renderProxyStatus(p *api.ProxyStatusResponse) {
+	if p == nil {
+		return
+	}
+	switch p.Mode {
+	case proxyModeShared:
+		if sharedProxyDown(p) {
+			fmt.Println("\nProxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.")
+		} else {
+			fmt.Printf("\nProxy: shared (running, v%s)\n", p.DaemonVersion)
+		}
+	case proxyModeStandalone:
+		fmt.Println("\nProxy: standalone")
+	}
 }
 
 // Logs command flags
@@ -537,6 +585,12 @@ func runRequests(cmd *cobra.Command, args []string) error {
 				duration := fmt.Sprintf("%dms", req.DurationMs)
 				if req.InFlight {
 					duration = "..."
+					if req.Stale {
+						// Completion event may have been lost; true outcome
+						// unknown (D8, #53). Long-lived streams/transfers can
+						// legitimately still be live past this point.
+						duration = "stale?"
+					}
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
 					req.ID, timeStr, req.Method, req.StatusCode, duration, req.URL)
@@ -573,9 +627,12 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 	fmt.Printf("Method:  %s\n", resp.Method)
 	fmt.Printf("URL:     %s\n", resp.URL)
 	fmt.Printf("Status:  %d\n", resp.StatusCode)
-	if resp.InFlight {
+	switch {
+	case resp.InFlight && resp.Stale:
+		fmt.Printf("Duration: (in flight, stale?)\n")
+	case resp.InFlight:
 		fmt.Printf("Duration: (in flight)\n")
-	} else {
+	default:
 		fmt.Printf("Duration: %dms\n", resp.DurationMs)
 	}
 	fmt.Printf("Remote:  %s\n", resp.RemoteAddr)
@@ -602,6 +659,8 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 		if resp.Details.ResponseBody != nil {
 			printCapturedBody("Response Body", resp.Details.ResponseBody, includeBody)
 		}
+	} else if resp.InFlight && resp.Stale {
+		fmt.Println("\n(request in flight, stale? — the completion event may have been lost; true outcome unknown)")
 	} else if resp.InFlight {
 		fmt.Println("\n(request in flight — details arrive on completion)")
 	} else {
@@ -706,6 +765,9 @@ func printProxyRequest(req api.ProxyRequestResponse) {
 	duration := fmt.Sprintf("(%dms)", req.DurationMs)
 	if req.InFlight {
 		duration = "(in flight)"
+		if req.Stale {
+			duration = "(in flight, stale?)"
+		}
 	}
 	fmt.Printf("%s %s %s%d%s %s %s\n",
 		req.ID, timeStr, statusColor, req.StatusCode, resetColor, req.Method, duration)

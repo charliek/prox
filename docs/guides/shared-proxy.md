@@ -79,6 +79,12 @@ auth.local.example.dev      443   https     localhost:3000  /projects/auth      
 app.local.example.dev       443   https     localhost:5173  /projects/app        12391
 ```
 
+## Health and Self-Healing
+
+`prox status` in each project reports the shared daemon's health, not just its own process health — see the `Proxy:` line in [`prox status`](../reference/cli.md#status). If the shared daemon dies (crash, `kill -9`, a bad upgrade), every project registered with it prints `Proxy: DOWN` and exits `1` from `prox status`, even though their own processes are still running.
+
+No operator action is required to recover: each project's forwarder detects the prolonged failure and re-registers with a fresh or recovered daemon automatically, worst case within about 45 seconds. Once healed, `prox status` goes back to `Proxy: shared (running, vX.Y.Z)` and exits `0`. Treat a brief `DOWN` reading as transient rather than something to page on.
+
 ## Constraints
 
 | Constraint | Behavior |
@@ -86,7 +92,7 @@ app.local.example.dev       443   https     localhost:5173  /projects/app       
 | Scope | The daemon is per-user and per-machine. State lives in `~/.prox/`. |
 | Hostname ownership | The same `hostname:port` cannot be registered by two projects. The second registration fails. |
 | Protocol ownership | A listener port is HTTP or HTTPS. Mixing protocols on the same port is rejected. |
-| Version matching | A project can join only when its `prox` version matches the running daemon. Use `prox proxy stop --force` to reset a stale daemon after upgrading. |
+| Version matching | A project can join only when its `prox` version matches the running daemon. After upgrading `prox`, the next `prox up` against an idle daemon of the old version replaces it automatically with a one-line notice. If the old daemon still has projects registered, `prox up` fails hard instead — run `prox proxy stop --force`, then `prox up` (or `prox restart`) in every project listed in the error. |
 | Fallback | If `~/.prox/` is unavailable, prox runs a standalone per-project proxy. Port sharing is not available in fallback mode. |
 
 ## Files

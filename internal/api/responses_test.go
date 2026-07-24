@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
@@ -466,5 +467,73 @@ func TestToProxyRequestResponse_InFlightPresentInJSONWhenTrue(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"in_flight":true`) {
 		t.Errorf("expected in_flight:true in JSON, got %s", data)
+	}
+}
+
+// TestToProxyRequestResponse_StaleInFlight verifies D8 (#53): an in-flight
+// record older than constants.InFlightStaleAfter converts with Stale true,
+// and the field is present in the JSON wire format.
+func TestToProxyRequestResponse_StaleInFlight(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:        "abc1234",
+		URL:       "/api/stream",
+		InFlight:  true,
+		Timestamp: time.Now().Add(-constants.InFlightStaleAfter - time.Minute),
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if !resp.Stale {
+		t.Error("expected Stale to be true for an in-flight record past the staleness threshold")
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+	if !strings.Contains(string(data), `"stale":true`) {
+		t.Errorf("expected stale:true in JSON, got %s", data)
+	}
+}
+
+// TestToProxyRequestResponse_FreshInFlightNotStale verifies a recently
+// started in-flight record does not convert as stale (D8, #53).
+func TestToProxyRequestResponse_FreshInFlightNotStale(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:        "abc1234",
+		URL:       "/api/stream",
+		InFlight:  true,
+		Timestamp: time.Now(),
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if resp.Stale {
+		t.Error("expected Stale to be false for a fresh in-flight record")
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+	if strings.Contains(string(data), "stale") {
+		t.Errorf("expected stale to be omitted from JSON when false, got %s", data)
+	}
+}
+
+// TestToProxyRequestResponse_FinalRecordNeverStale verifies a completed
+// (non-in-flight) record is never reported stale regardless of age (D8, #53).
+func TestToProxyRequestResponse_FinalRecordNeverStale(t *testing.T) {
+	rec := proxy.RequestRecord{
+		ID:         "abc1234",
+		URL:        "/api/users",
+		StatusCode: 200,
+		Timestamp:  time.Now().Add(-24 * time.Hour),
+	}
+
+	resp := ToProxyRequestResponse(rec)
+
+	if resp.Stale {
+		t.Error("expected Stale to be false for a completed record")
 	}
 }

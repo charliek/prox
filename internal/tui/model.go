@@ -125,7 +125,12 @@ type RequestDetailData struct {
 	// InFlight marks a request whose response is still streaming: Duration
 	// renders as "(in flight)" and a nil Details gets an explanatory note
 	// instead of being treated as "capture not enabled".
-	InFlight        bool
+	InFlight bool
+	// Stale marks an in-flight request that has been in-flight longer than
+	// constants.InFlightStaleAfter (D8, #53): the completion event may have
+	// been lost and the true outcome is unknown. Always false when InFlight
+	// is false.
+	Stale           bool
 	RequestHeaders  map[string][]string
 	ResponseHeaders map[string][]string
 	RequestBody     *BodyData
@@ -140,6 +145,11 @@ type BodyData struct {
 	ContentEncoding string
 	IsBinary        bool
 	Data            string
+	// DataBase64 marks Data as base64-encoded (the attach-mode wire format:
+	// the API base64-encodes binary bodies). Local mode stores raw bytes and
+	// leaves this false, so the hex preview never has to guess — raw bytes
+	// that merely LOOK like base64 must not be decoded.
+	DataBase64 bool
 	// Unavailable is true when the body existed but could no longer be loaded
 	// (e.g. its disk file was evicted); UnavailableReason explains why.
 	Unavailable       bool

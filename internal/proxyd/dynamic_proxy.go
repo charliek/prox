@@ -37,12 +37,17 @@ type managedListener struct {
 // DynamicProxy manages multiple HTTP/HTTPS listeners that can be added and
 // removed at runtime as projects register and deregister routes.
 type DynamicProxy struct {
-	mu             sync.RWMutex
-	listeners      map[int]*managedListener
-	registry       *Registry
-	transport      *http.Transport
-	certMgr        certManager
-	requestManager *proxy.RequestManager
+	mu        sync.RWMutex
+	listeners map[int]*managedListener
+	registry  *Registry
+	transport *http.Transport
+	certMgr   certManager
+	// managers holds the per-project request rings (D13, #49). The hot path
+	// resolves the matched route's ring via managers.get(route.ProjectDir): a nil
+	// result (a request completing after its project deregistered) drops the
+	// record safely. The set is shared with the Server so the data plane and the
+	// control-plane endpoints see the identical rings.
+	managers       *Managers
 	captureManager *proxy.CaptureManager
 	logger         *slog.Logger
 }
@@ -55,12 +60,12 @@ type DynamicProxy struct {
 // literal: the HTTPS bind path and the register flow gate on certMgr != nil, so
 // a typed nil such as (*MultiDomainCertManager)(nil) would slip past that guard
 // (a non-nil interface wrapping a nil pointer) and panic on the first HTTPS bind.
-func NewDynamicProxy(registry *Registry, certMgr certManager, requestManager *proxy.RequestManager, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
+func NewDynamicProxy(registry *Registry, certMgr certManager, managers *Managers, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
 	return &DynamicProxy{
 		listeners:      make(map[int]*managedListener),
 		registry:       registry,
 		certMgr:        certMgr,
-		requestManager: requestManager,
+		managers:       managers,
 		captureManager: captureManager,
 		logger:         logger,
 		transport: &http.Transport{
@@ -224,7 +229,9 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		var reqBody *proxy.CapturedBody
 		var reqHeaders http.Header
 		if captureEnabled {
-			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequest(requestID, r)
+			// Per-project capture cap (D13, #49): the matched route carries the
+			// owning project's configured MaxBodySize; 0 means the daemon default.
+			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequestWithLimit(requestID, r, route.MaxBodySize)
 		}
 
 		originalDirector := rp.Director
@@ -241,7 +248,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		var crw *proxy.CaptureResponseWriter
 		var srw *statusResponseWriter
 		if captureEnabled {
-			crw = dp.captureManager.WrapResponseWriter(w)
+			crw = dp.captureManager.WrapResponseWriterWithLimit(w, route.MaxBodySize)
 			rw = crw
 		} else {
 			srw = &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -289,10 +296,14 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// Phase 1 (in-flight): register a first-response hook that publishes a
 		// header-time record via Record (plain append — the fresh ID cannot
 		// already exist). buildRecord pins field parity with the completion
-		// record below.
-		if dp.requestManager != nil {
+		// record below. The hook re-resolves the project's ring at fire time
+		// (managers.get): if the project deregistered before the first response,
+		// the ring is gone and the in-flight record is dropped safely.
+		if dp.managers != nil {
 			onFirst := func(statusCode int) {
-				dp.requestManager.Record(buildRecord(statusCode, nil, true))
+				if mgr := dp.managers.get(route.ProjectDir); mgr != nil {
+					mgr.Record(buildRecord(statusCode, nil, true))
+				}
 			}
 			if crw != nil {
 				crw.SetFirstResponseCallback(onFirst)
@@ -308,7 +319,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// propagating; net/http suppresses ErrAbortHandler. Completion goes
 		// through Upsert (same ID as the in-flight record; final beats it).
 		defer func() {
-			if dp.requestManager == nil {
+			if dp.managers == nil {
 				return
 			}
 
@@ -353,7 +364,23 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				statusCode = srw.statusCode
 			}
 
-			dp.requestManager.Upsert(buildRecord(statusCode, details, false))
+			// Re-resolve the project's ring at completion time. A nil result
+			// means the project deregistered while this request was in flight
+			// (its route was resolved before the deregister, its completion
+			// arrives after): drop the completion safely — no record, no panic —
+			// and clean any capture files this request spilled to disk, since no
+			// PurgeByProject on the removed ring will ever reach them (D13).
+			// A nil manager (project deregistered mid-request) and a rejected
+			// Upsert (manager Closed between the get and the write) both mean
+			// this completion has no ring: clean the request's spilled capture
+			// files, since no purge on the destroyed ring will reach them (D13).
+			mgr := dp.managers.get(route.ProjectDir)
+			if mgr == nil || !mgr.Upsert(buildRecord(statusCode, details, false)) {
+				if captureEnabled {
+					dp.captureManager.CleanupRequest(requestID)
+				}
+				return
+			}
 		}()
 
 		rp.ServeHTTP(rw, r)

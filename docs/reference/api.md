@@ -52,6 +52,7 @@ All errors return JSON:
 | `STREAMING_NOT_SUPPORTED` | The server cannot provide an SSE stream for this request |
 | `REQUEST_NOT_FOUND` | Proxy request ID does not exist in the request buffer |
 | `MISSING_REQUEST_ID` | Request detail endpoint was called without an ID |
+| `CURSOR_GONE` | A `before_id` cursor's anchor record is unknown, evicted, or out of scope for the current filters; restart pagination without a cursor |
 
 ## Endpoints
 
@@ -76,9 +77,34 @@ Supervisor status.
   "status": "running",
   "uptime_seconds": 7200,
   "config_file": "/path/to/prox.yaml",
-  "api_version": "v1"
+  "api_version": "v1",
+  "proxy": {
+    "mode": "shared",
+    "daemon_reachable": true,
+    "daemon_version": "0.2.0",
+    "consecutive_failures": 0,
+    "last_connected_at": "2025-01-19T10:32:01.123Z",
+    "dropped_events": 0,
+    "backfill_failures": 0,
+    "heal_state": "healthy"
+  }
 }
 ```
+
+`proxy` reports this project's shared-proxy health and is present whenever a proxy is configured (`mode` is `disabled` and the rest of the block is zero-valued when no proxy is configured):
+
+| Field | Description |
+|-------|-------------|
+| `mode` | `shared` (registered with the shared proxy daemon), `standalone` (this process runs its own in-process proxy listener), or `disabled` |
+| `daemon_reachable` | Result of a live `/health` probe against the shared daemon (500ms timeout, cached 2s); always `false` outside `shared` mode |
+| `daemon_version` | The shared daemon's reported version, when reachable |
+| `consecutive_failures` | The forwarder's current run of failed reconnects to the shared daemon |
+| `last_connected_at` | Last time the forwarder established an SSE stream to the shared daemon |
+| `dropped_events` | Request-stream events lost to a full subscriber channel |
+| `backfill_failures` | Post-connect ring snapshot fetch failures |
+| `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
+
+`prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
 
 ### GET /processes
 
@@ -267,6 +293,7 @@ endpoint stays free of duplicates.
 | `max_status` | int | — | Maximum status code |
 | `since` | string | — | RFC3339 timestamp; only requests recorded at or after this time |
 | `url_contains` | string | — | Case-insensitive substring match against the request URL (path+query only — never scheme/host) |
+| `before_id` | string | — | Cursor: page strictly older than this request ID (see [Cursor pagination](#cursor-pagination) below) |
 | `limit` | int | 100 | Max requests to return (max 1000) |
 
 **Response:**
@@ -287,7 +314,8 @@ endpoint stays free of duplicates.
     }
   ],
   "filtered_count": 50,
-  "total_count": 250
+  "total_count": 250,
+  "next_before_id": "9f8e7d6c5b4a"
 }
 ```
 
@@ -298,7 +326,29 @@ daemon-side record that predates this field).
 `in_flight` is `true` on a request whose response is still streaming (the
 backend has sent headers but the body hasn't finished); it is omitted
 entirely once the request completes. `duration_ms` stays `0` while
-`in_flight` is `true` — read it only once the field is gone.
+`in_flight` is `true` — read it only once the field is gone. A request that
+has been `in_flight` for more than 5 minutes also carries `"stale": true` —
+this means the completion event may have been lost and the true outcome is
+unknown, **not** that the request is broken: long-lived streams (SSE,
+WebSocket-over-HTTP) and large transfers can legitimately sit at
+`stale: true` for a long time while still live. `stale` is omitted once the
+request completes.
+
+#### Cursor pagination
+
+Pass the previous page's `next_before_id` as `before_id` to fetch the next
+older page. `next_before_id` is the ID of the *oldest scanned* record, not
+the oldest *returned* one — a page that gets filtered down to zero results
+still advances the cursor instead of stalling. It is omitted when the scan
+reached the end of the ring (no more history).
+
+Ring order is arrival order, not strict timestamp order (backfill and a
+completion re-appending after its in-flight record was evicted can both put
+a newer-by-timestamp record after an older one). An unknown, evicted, or
+out-of-scope `before_id` — including a record from a different
+`?subdomain=`/project scope — returns **`410 Gone`** with code
+`CURSOR_GONE`; on that response, restart pagination without a cursor rather
+than retrying the same one.
 
 **Example:**
 
@@ -314,6 +364,9 @@ curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
 
 # Filter by URL substring (path+query, case-insensitive)
 curl "http://localhost:5555/api/v1/proxy/requests?url_contains=/api/users"
+
+# Page backward through history
+curl "http://localhost:5555/api/v1/proxy/requests?before_id=9f8e7d6c5b4a"
 ```
 
 ### GET /proxy/requests/{id}
@@ -368,7 +421,7 @@ Body data is available only when capture was enabled with `prox up --capture` or
 | `data` | Body content (only with `include=body`): plain text for text bodies, base64 for binary |
 | `unavailable_reason` | Set (e.g. `evicted`) when `include=body` was requested but the body could no longer be loaded; `data` is absent |
 
-**Decoded-body semantics:** captured bodies store the raw wire bytes and are decoded at serve time. When `content_encoding` is `gzip` or `x-gzip` and the body was not truncated, the decoded bytes are served and `is_binary` reflects the decoded content (readable JSON/text decodes to `is_binary: false`). Unsupported encodings (`deflate`, `br`, `zstd`, chained values like `gzip, br`), truncated bodies, corrupt streams, and payloads whose decoded size would exceed the 10MB cap are served as the raw bytes, base64-encoded, with `is_binary: true` and `content_encoding` preserved. The stored (raw) binary classification and the served `is_binary` may therefore legitimately differ. The on-disk path of a spilled body is never exposed.
+**Decoded-body semantics:** captured bodies store the raw wire bytes and are decoded at serve time. Supported `content_encoding` values are `gzip`/`x-gzip`, `deflate` (zlib-wrapped per RFC 9110, with a fallback to raw deflate for servers that send it unwrapped), `zstd`, and `br` (brotli) — decoded automatically, capped at 10MB decoded size (`MaxDecodedBodySize`). When the body was not truncated and decodes cleanly, `is_binary` reflects the decoded content (readable JSON/text decodes to `is_binary: false`). Chained encodings (e.g. `gzip, br`), unrecognized tokens, truncated bodies, corrupt streams, and payloads whose decoded size would exceed the cap are served as the raw bytes, base64-encoded, with `is_binary: true` and `content_encoding` preserved. The stored (raw) binary classification and the served `is_binary` may therefore legitimately differ. The on-disk path of a spilled body is never exposed.
 
 **Examples:**
 

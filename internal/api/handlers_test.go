@@ -629,6 +629,99 @@ func TestGetProxyRequests(t *testing.T) {
 
 		assert.Len(t, resp.Requests, 2)
 	})
+
+	t.Run("plain first page carries next_before_id", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?limit=1", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), `"next_before_id"`)
+
+		var resp ProxyRequestsResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+
+		require.Len(t, resp.Requests, 1)
+		assert.NotEmpty(t, resp.NextBeforeID)
+	})
+
+	t.Run("before_id pages strictly older records and last page omits cursor", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?limit=2", nil)
+		w := httptest.NewRecorder()
+		handlers.GetProxyRequests(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var first ProxyRequestsResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&first))
+		require.Len(t, first.Requests, 2)
+		require.NotEmpty(t, first.NextBeforeID, "partial page must carry a cursor")
+
+		req2 := httptest.NewRequest("GET", "/api/v1/proxy/requests?limit=2&before_id="+first.NextBeforeID, nil)
+		w2 := httptest.NewRecorder()
+		handlers.GetProxyRequests(w2, req2)
+		require.Equal(t, http.StatusOK, w2.Code)
+		assert.NotContains(t, w2.Body.String(), `"next_before_id"`, "last page omits the field entirely (omitempty)")
+
+		var second ProxyRequestsResponse
+		require.NoError(t, json.NewDecoder(w2.Body).Decode(&second))
+		require.Len(t, second.Requests, 1)
+		assert.Empty(t, second.NextBeforeID, "last page omits the cursor")
+
+		firstIDs := map[string]bool{}
+		for _, r := range first.Requests {
+			firstIDs[r.ID] = true
+		}
+		for _, r := range second.Requests {
+			assert.False(t, firstIDs[r.ID], "cursor page repeated a record already returned by the first page")
+		}
+	})
+}
+
+func TestGetProxyRequests_CursorGone(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	// Capacity 2: recording a third record evicts "r1" from the ring.
+	rm := proxy.NewRequestManager(2)
+	handlers.SetRequestManager(rm)
+	rm.Record(proxy.RequestRecord{ID: "r1", Method: "GET", URL: "/a"})
+	rm.Record(proxy.RequestRecord{ID: "r2", Method: "GET", URL: "/b"})
+	rm.Record(proxy.RequestRecord{ID: "r3", Method: "GET", URL: "/c"})
+
+	t.Run("evicted anchor", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?before_id=r1", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusGone, w.Code)
+		var resp ErrorResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Equal(t, domain.ErrCodeCursorGone, resp.Code)
+	})
+
+	t.Run("unknown anchor", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/proxy/requests?before_id=does-not-exist", nil)
+		w := httptest.NewRecorder()
+
+		handlers.GetProxyRequests(w, req)
+
+		assert.Equal(t, http.StatusGone, w.Code)
+		var resp ErrorResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Equal(t, domain.ErrCodeCursorGone, resp.Code)
+	})
 }
 
 func TestGetProxyRequests_ProxyNotEnabled(t *testing.T) {

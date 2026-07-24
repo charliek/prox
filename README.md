@@ -38,7 +38,7 @@ For one-off installs without configuring the apt repo (CI runners, locked-down h
 
 ```bash
 ARCH=$(dpkg --print-architecture)        # amd64 or arm64
-VERSION=0.1.3                            # check https://github.com/charliek/prox/releases for the latest
+VERSION=0.2.0                            # check https://github.com/charliek/prox/releases for the latest
 curl -fLO "https://github.com/charliek/prox/releases/download/v${VERSION}/prox_${VERSION}_${ARCH}.deb"
 sudo apt install -y "./prox_${VERSION}_${ARCH}.deb"
 ```
@@ -182,6 +182,9 @@ By default, the API binds to a dynamic (auto-assigned) localhost port. Discover 
 | `/processes/{name}/restart` | POST | Restart a process |
 | `/logs` | GET | Retrieve logs |
 | `/logs/stream` | GET | Stream logs (SSE) |
+| `/proxy/requests` | GET | List proxied requests |
+| `/proxy/requests/{id}` | GET | Get proxied request details |
+| `/proxy/requests/stream` | GET | Stream proxied requests (SSE) |
 | `/shutdown` | POST | Shutdown supervisor |
 
 ## Security

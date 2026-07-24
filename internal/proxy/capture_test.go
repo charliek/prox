@@ -1109,3 +1109,67 @@ func TestCaptureResponseWriter_FirstResponseHook(t *testing.T) {
 		assert.Equal(t, []int{http.StatusSwitchingProtocols}, calls, "hook must not re-fire after hijack")
 	})
 }
+
+// TestPerCallCaptureLimits pins the D13 per-call caps: CaptureRequestWithLimit
+// and WrapResponseWriterWithLimit honor a positive per-call byte limit, while a
+// 0 limit falls back to the manager's configured cap (which itself defaults to
+// DefaultCaptureMaxBodySize). This is what lets the daemon apply each project's
+// own MaxBodySize through the one shared capture manager, and what keeps the
+// standalone in-process proxy on its project's configured cap.
+func TestPerCallCaptureLimits(t *testing.T) {
+	// A manager whose configured cap is 50 bytes; positive per-call limits must
+	// override it in both directions.
+	cfg := &config.CaptureConfig{Enabled: true, MaxBodySize: "50"}
+	cm, err := NewCaptureManager(cfg, t.TempDir())
+	require.NoError(t, err)
+
+	payload := strings.Repeat("a", 200)
+
+	t.Run("request tighter per-call limit wins", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
+		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-tight", req, 10)
+		_, _ = io.ReadAll(wrapped)
+		require.NoError(t, wrapped.Close())
+		assert.Equal(t, int64(200), captured.Size, "total observed unchanged")
+		assert.Equal(t, int64(10), captured.CapturedSize, "per-call limit 10 caps retained bytes")
+		assert.True(t, captured.Truncated)
+	})
+
+	t.Run("request looser per-call limit wins", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
+		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-loose", req, 150)
+		_, _ = io.ReadAll(wrapped)
+		require.NoError(t, wrapped.Close())
+		assert.Equal(t, int64(150), captured.CapturedSize, "per-call limit 150 overrides the 50-byte manager cap")
+		assert.True(t, captured.Truncated)
+	})
+
+	t.Run("request zero per-call limit falls back to manager cap", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
+		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-zero", req, 0)
+		_, _ = io.ReadAll(wrapped)
+		require.NoError(t, wrapped.Close())
+		assert.Equal(t, int64(50), captured.CapturedSize, "0 limit uses the manager's configured 50-byte cap")
+		assert.True(t, captured.Truncated)
+	})
+
+	t.Run("response per-call limit and zero fallback", func(t *testing.T) {
+		body := []byte(payload)
+
+		tight := cm.WrapResponseWriterWithLimit(httptest.NewRecorder(), 10)
+		tight.WriteHeader(http.StatusOK)
+		_, _ = tight.Write(body)
+		assert.Len(t, tight.CapturedBody(), 10, "per-call limit 10 caps response capture")
+
+		fallback := cm.WrapResponseWriterWithLimit(httptest.NewRecorder(), 0)
+		fallback.WriteHeader(http.StatusOK)
+		_, _ = fallback.Write(body)
+		assert.Len(t, fallback.CapturedBody(), 50, "0 limit uses the manager's configured 50-byte cap")
+
+		// The no-limit convenience wrapper is exactly the 0-limit path.
+		def := cm.WrapResponseWriter(httptest.NewRecorder())
+		def.WriteHeader(http.StatusOK)
+		_, _ = def.Write(body)
+		assert.Len(t, def.CapturedBody(), 50, "WrapResponseWriter delegates to the manager cap")
+	})
+}

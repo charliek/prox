@@ -45,6 +45,7 @@ type Handlers struct {
 	captureManager *proxy.CaptureManager
 	configFile     string
 	shutdown       ShutdownController
+	proxyStatus    ProxyStatusProvider
 }
 
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
@@ -76,6 +77,14 @@ func (h *Handlers) SetCaptureManager(cm *proxy.CaptureManager) {
 	h.captureManager = cm
 }
 
+// SetProxyStatusProvider injects the shared-proxy health provider (D5). A setter
+// (not a constructor arg) mirrors SetRequestManager: the proxy path resolves
+// after the handlers are built, and the provider (the cli's proxyRuntime) is
+// wired in then. When unset, GET /status omits the proxy block.
+func (h *Handlers) SetProxyStatusProvider(p ProxyStatusProvider) {
+	h.proxyStatus = p
+}
+
 // GetStatus handles GET /api/v1/status
 func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.supervisor.Status()
@@ -85,6 +94,9 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: status.UptimeSeconds(),
 		ConfigFile:    h.configFile,
 		APIVersion:    "v1",
+	}
+	if h.proxyStatus != nil {
+		resp.Proxy = h.proxyStatus.ProxyStatus()
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -382,13 +394,25 @@ func (h *Handlers) GetProxyRequests(w http.ResponseWriter, r *http.Request) {
 
 	filter := parseProxyRequestParams(r)
 
-	requests := h.requestManager.Recent(filter)
+	requests, nextBeforeID, anchorFound := h.requestManager.RecentPage(filter)
+	if !anchorFound {
+		// filter.BeforeID named a record that's unknown, evicted, or out of
+		// scope. 410 (not 404): the cursor once pointed at a real ring
+		// position that has since aged out — the caller should restart
+		// pagination without a cursor rather than retry this one (D12, #50).
+		writeJSON(w, http.StatusGone, ErrorResponse{
+			Error: "cursor is gone: the before_id record is unknown, evicted, or out of scope",
+			Code:  domain.ErrCodeCursorGone,
+		})
+		return
+	}
 	total := h.requestManager.Count()
 
 	resp := ProxyRequestsResponse{
 		Requests:      make([]ProxyRequestResponse, len(requests)),
 		FilteredCount: len(requests),
 		TotalCount:    total,
+		NextBeforeID:  nextBeforeID,
 	}
 
 	for i, req := range requests {
@@ -598,6 +622,7 @@ func parseProxyRequestParams(r *http.Request) proxy.RequestFilter {
 	filter.Subdomain = r.URL.Query().Get("subdomain")
 	filter.Method = r.URL.Query().Get("method")
 	filter.URLContains = r.URL.Query().Get("url_contains")
+	filter.BeforeID = r.URL.Query().Get("before_id")
 
 	if minStatus := r.URL.Query().Get("min_status"); minStatus != "" {
 		if v, err := strconv.Atoi(minStatus); err == nil {

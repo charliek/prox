@@ -511,6 +511,27 @@ func TestFormatProxyRequest_InFlight(t *testing.T) {
 	assert.Contains(t, formatted, "200", "status should show the real header-time code")
 }
 
+// TestFormatProxyRequest_Stale verifies a stale in-flight row (D8, #53: the
+// completion event may have been lost, true outcome unknown) renders
+// "stale?" in the duration column instead of the ordinary in-flight dots.
+func TestFormatProxyRequest_Stale(t *testing.T) {
+	model := newTestModel()
+
+	req := proxy.RequestRecord{
+		Timestamp:  time.Now().Add(-10 * time.Minute),
+		Subdomain:  "api",
+		Method:     "GET",
+		URL:        "/stream",
+		StatusCode: 200,
+		InFlight:   true,
+	}
+
+	formatted := model.formatProxyRequest(req)
+
+	assert.Contains(t, formatted, "stale?", "duration column should render 'stale?' for a stale in-flight row")
+	assert.NotContains(t, formatted, "...", "a stale row should not also render the fresh in-flight dots")
+}
+
 func TestFormatProxyRequest_Padding(t *testing.T) {
 	model := newTestModel()
 

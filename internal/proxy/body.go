@@ -2,12 +2,18 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/charliek/prox/internal/constants"
 )
@@ -131,12 +137,13 @@ func CaptureAllowedDirs(primaryDir string) []string {
 // DecodeCapturedBody content-decodes raw (per body.ContentEncoding) and returns
 // serve-ready bytes with post-decode binary semantics.
 //
-// Supported encodings are gzip and x-gzip (case-insensitive, surrounding
-// whitespace tolerated); identity/empty means no decode. Any other token
-// (deflate, br, zstd, chained values like "gzip, br"), a truncated body, a
-// decode failure, or a decoded size exceeding the cap all fall back to serving
-// the raw bytes with IsBinary=true so a JSON string conversion cannot mangle
-// them.
+// Supported encodings are gzip/x-gzip, deflate (zlib-wrapped per RFC 9110,
+// with a fallback to raw deflate for servers that send it unwrapped), zstd,
+// and br (case-insensitive, surrounding whitespace tolerated); identity/empty
+// means no decode. Any other token (chained values like "gzip, br"), a
+// truncated body, a decode failure, or a decoded size exceeding the cap all
+// fall back to serving the raw bytes with IsBinary=true so a JSON string
+// conversion cannot mangle them.
 func DecodeCapturedBody(body *CapturedBody, raw []byte) DecodedBody {
 	token := strings.ToLower(strings.TrimSpace(body.ContentEncoding))
 
@@ -148,23 +155,39 @@ func DecodeCapturedBody(body *CapturedBody, raw []byte) DecodedBody {
 			Available: true,
 		}
 	case "gzip", "x-gzip":
-		// A truncated stream is broken; do not attempt to decode it.
-		if body.Truncated {
-			return rawEncoded(raw, token)
-		}
-		decoded, ok := gunzipLimited(raw, constants.MaxDecodedBodySize)
-		if !ok {
-			return rawEncoded(raw, token)
-		}
-		return DecodedBody{
-			Data:            decoded,
-			IsBinary:        isBinaryContent(decoded, body.ContentType),
-			ContentEncoding: token,
-			Available:       true,
-		}
+		return decodeWithFallback(body, raw, token, gunzipLimited)
+	case "deflate":
+		return decodeWithFallback(body, raw, token, inflateLimited)
+	case "zstd":
+		return decodeWithFallback(body, raw, token, zstdLimited)
+	case "br":
+		return decodeWithFallback(body, raw, token, brotliLimited)
 	default:
 		// Unsupported encoding: serve raw, flagged binary.
 		return rawEncoded(raw, token)
+	}
+}
+
+// decodeWithFallback runs decodeFn (one of the bounded per-codec decoders
+// below) against raw and returns serve-ready decoded bytes, or the raw
+// fallback when the body was truncated, the decode failed, or the decoded
+// size exceeded the cap. Shared by every content-encoding case so the
+// truncated-short-circuit and cap-exceeded-fallback behavior stay identical
+// across codecs.
+func decodeWithFallback(body *CapturedBody, raw []byte, token string, decodeFn func([]byte, int64) ([]byte, bool)) DecodedBody {
+	// A truncated stream is broken; do not attempt to decode it.
+	if body.Truncated {
+		return rawEncoded(raw, token)
+	}
+	decoded, ok := decodeFn(raw, constants.MaxDecodedBodySize)
+	if !ok {
+		return rawEncoded(raw, token)
+	}
+	return DecodedBody{
+		Data:            decoded,
+		IsBinary:        isBinaryContent(decoded, body.ContentType),
+		ContentEncoding: token,
+		Available:       true,
 	}
 }
 
@@ -179,18 +202,15 @@ func rawEncoded(raw []byte, token string) DecodedBody {
 	}
 }
 
-// gunzipLimited gzip-decodes raw, capping output at limit bytes. It returns
-// (nil, false) on a header/stream error or when the decoded size would exceed
-// the cap (zip-bomb guard); memory is bounded to limit+1 bytes.
-func gunzipLimited(raw []byte, limit int64) ([]byte, bool) {
-	gr, err := gzip.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, false
-	}
-	defer gr.Close()
-
+// decodeLimited drains r, capping output at limit bytes. It returns (nil,
+// false) on a read/stream error or when the decoded size would exceed the
+// cap (zip-bomb guard); memory is bounded to limit+1 bytes regardless of
+// codec. Every bounded decoder below (gzip, deflate, zstd, br) funnels
+// through this so the cap-exceeded and stream-error semantics stay identical
+// across encodings.
+func decodeLimited(r io.Reader, limit int64) ([]byte, bool) {
 	// Read one byte past the cap so an over-cap payload is detectable.
-	decoded, err := io.ReadAll(io.LimitReader(gr, limit+1))
+	decoded, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, false
 	}
@@ -198,6 +218,71 @@ func gunzipLimited(raw []byte, limit int64) ([]byte, bool) {
 		return nil, false
 	}
 	return decoded, true
+}
+
+// gunzipLimited gzip-decodes raw, capping output at limit bytes. It returns
+// (nil, false) on a header/stream error or when the decoded size would exceed
+// the cap.
+func gunzipLimited(raw []byte, limit int64) ([]byte, bool) {
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, false
+	}
+	defer gr.Close()
+	return decodeLimited(gr, limit)
+}
+
+// inflateLimited deflate-decodes raw, capping output at limit bytes.
+//
+// RFC 9110 defines the "deflate" content-coding as a zlib-wrapped deflate
+// stream (RFC 1950 header around an RFC 1951 payload), so zlib is tried
+// first. Some servers instead send raw deflate with no zlib header; that
+// case is detected specifically as zlib.ErrHeader from zlib.NewReader (the
+// two-byte CMF/FLG header doesn't look like zlib) and retried against
+// compress/flate. A zlib stream that opens fine but fails later — a
+// mid-stream corruption error — is a genuinely broken stream and must NOT be
+// silently retried as raw deflate; it falls straight through to the raw
+// fallback like any other decode failure.
+func inflateLimited(raw []byte, limit int64) ([]byte, bool) {
+	zr, err := zlib.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		if !errors.Is(err, zlib.ErrHeader) {
+			return nil, false
+		}
+		fr := flate.NewReader(bytes.NewReader(raw))
+		defer fr.Close()
+		return decodeLimited(fr, limit)
+	}
+	defer zr.Close()
+	return decodeLimited(zr, limit)
+}
+
+// zstdLimited zstd-decodes raw, capping output at limit bytes. It returns
+// (nil, false) on a header/stream error or when the decoded size would
+// exceed the cap. WithDecoderMaxMemory bounds the decoder's own window/
+// in-memory allocation to limit bytes as a defense-in-depth measure on top of
+// decodeLimited's output cap, so a hostile stream can't force a large
+// allocation before the output-size check ever runs.
+func zstdLimited(raw []byte, limit int64) ([]byte, bool) {
+	// WithDecoderConcurrency(1) keeps the decode synchronous: the default
+	// spawns per-decoder goroutines, which an adversarial stream could
+	// multiply for CPU burn before the output cap bites. One captured body
+	// decodes at a time here; concurrency buys nothing.
+	zr, err := zstd.NewReader(bytes.NewReader(raw),
+		zstd.WithDecoderMaxMemory(uint64(limit)), zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return nil, false
+	}
+	defer zr.Close()
+	return decodeLimited(zr, limit)
+}
+
+// brotliLimited brotli-decodes raw, capping output at limit bytes. It
+// returns (nil, false) on a stream error or when the decoded size would
+// exceed the cap.
+func brotliLimited(raw []byte, limit int64) ([]byte, bool) {
+	br := brotli.NewReader(bytes.NewReader(raw))
+	return decodeLimited(br, limit)
 }
 
 // LoadDecodedBody composes LoadCapturedBody + DecodeCapturedBody.

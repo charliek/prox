@@ -62,6 +62,47 @@ const (
 	// route timeout, the CLI lifecycle http.Client timeout, and the TUI restart
 	// timeout (#35, D2).
 	LifecycleTimeoutCeiling = MaxStopTimeout + time.Minute
+
+	// DaemonStatusProbeTimeout bounds the /status probe against a possibly
+	// draining old daemon during version-skew recovery (D1). The proxyd client's
+	// 30s default is far too long for an interactive `prox up`.
+	DaemonStatusProbeTimeout = 2 * time.Second
+
+	// DaemonHealthProbeTimeout bounds a single /health probe used while polling
+	// for an old daemon's socket to stop answering during a version-skew heal.
+	DaemonHealthProbeTimeout = 1 * time.Second
+
+	// DaemonProxyProbeTimeout bounds the live /health probe `prox status` issues
+	// against the shared daemon to report proxy health (D5). Short so a downed
+	// daemon never makes `prox status` sit out a long timeout.
+	DaemonProxyProbeTimeout = 500 * time.Millisecond
+
+	// ProxyStatusProbeCacheTTL caches the shared-proxy health probe result so a
+	// polled `prox status` (TUIs/agents) does not pay the probe timeout on every
+	// call; a downed daemon is re-probed at most once per TTL (D5).
+	ProxyStatusProbeCacheTTL = 2 * time.Second
+
+	// ForwarderHealAfterDown is how long the SSE forwarder's reconnect must have
+	// failed continuously before it fires a self-heal (re-ensure a daemon of this
+	// version + re-register this project) from inside its reconnect loop (D6b).
+	// Injectable in tests so the heal path never waits out real wall-clock.
+	ForwarderHealAfterDown = 15 * time.Second
+
+	// ForwarderHealMinInterval is the minimum spacing between forwarder heal
+	// attempts, damping churn against a flapping daemon (D6b). Injectable in tests.
+	ForwarderHealMinInterval = 30 * time.Second
+
+	// InFlightStaleAfter is how long a request record may sit in-flight before
+	// it is reported as stale (D8, #53). Stale does NOT mean broken: SSE
+	// streams, WebSocket upgrades, and large transfers can legitimately stay
+	// in-flight this long while completely healthy. It means "completion
+	// unknown" — the record's completion event (published when the response
+	// body finishes) may have been lost (subscriber channel overrun, process
+	// crash mid-request, etc.), so the true outcome can no longer be inferred
+	// from this record alone. 5 minutes comfortably outlasts ordinary
+	// request/response cycles while still surfacing genuinely stuck rows in a
+	// timely way.
+	InFlightStaleAfter = 5 * time.Minute
 )
 
 // Log configuration

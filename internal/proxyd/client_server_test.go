@@ -38,6 +38,9 @@ func startTestServer(t *testing.T) (*Server, *Client, string) {
 
 	registry := NewRegistry()
 	server.SetRegistry(registry)
+	// Wire the per-project ring set so the request endpoints resolve rings;
+	// tests that need records ensure their project's ring via server.managers.
+	server.SetManagers(NewManagers(constants.DefaultProxyRequestBufferSize, nil))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -230,20 +233,19 @@ func TestShutdownProtected(t *testing.T) {
 func TestClientRequests(t *testing.T) {
 	server, client, _ := startTestServer(t)
 
-	daemonRM := proxy.NewRequestManager(100)
-	server.SetRequestManager(daemonRM)
-
 	// A project dir with a space and a '#': if the client did not URL-escape it,
 	// the '#' would be treated as a fragment and the server's project filter
 	// would never match, returning zero records.
 	const dir = "/weird dir #1"
+	dirRing := server.managers.ensure(dir)
 	for i := 0; i < 5; i++ {
-		daemonRM.Record(proxy.RequestRecord{
+		dirRing.Record(proxy.RequestRecord{
 			ID: fmt.Sprintf("r%d", i), ProjectDir: dir, Method: "GET", URL: "/x", Timestamp: time.Now(),
 		})
 	}
-	// A record for a different project must never leak into the filtered result.
-	daemonRM.Record(proxy.RequestRecord{ID: "other", ProjectDir: "/other", Method: "GET", URL: "/y", Timestamp: time.Now()})
+	// A record for a different project (its own ring) must never leak into the
+	// filtered result.
+	server.managers.ensure("/other").Record(proxy.RequestRecord{ID: "other", ProjectDir: "/other", Method: "GET", URL: "/y", Timestamp: time.Now()})
 
 	t.Run("escapes dir, honors limit, decodes wrapper", func(t *testing.T) {
 		recs, err := client.Requests(t.Context(), dir, 3)

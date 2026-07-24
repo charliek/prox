@@ -644,6 +644,56 @@ func TestRunRequests_TableRendersInFlightDuration(t *testing.T) {
 	}
 }
 
+// TestRunRequests_TableRendersStale verifies the list table's DURATION
+// column shows "stale?" instead of "..." for an in-flight row the server
+// reports as stale (D8, #53).
+func TestRunRequests_TableRendersStale(t *testing.T) {
+	origFollow := requestsFollow
+	origJSON := requestsJSON
+	defer func() {
+		requestsFollow = origFollow
+		requestsJSON = origJSON
+	}()
+
+	originalApiAddr := apiAddr
+	defer func() { apiAddr = originalApiAddr }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestsResponse{
+			Requests: []api.ProxyRequestResponse{
+				{
+					ID:         "stale1",
+					Timestamp:  time.Now().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+					Method:     "GET",
+					URL:        "/stream",
+					StatusCode: 200,
+					DurationMs: 0,
+					InFlight:   true,
+					Stale:      true,
+				},
+			},
+			FilteredCount: 1,
+			TotalCount:    1,
+		})
+	}))
+	defer server.Close()
+	apiAddr = server.URL
+
+	requestsFollow = false
+	requestsJSON = false
+
+	stdout, _ := captureOutput(t, func() {
+		if err := runRequests(requestsCmd, []string{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "stale?") {
+		t.Errorf("expected DURATION column to render 'stale?' for a stale in-flight row, got:\n%s", stdout)
+	}
+}
+
 // TestPrintProxyRequest_InFlight verifies follow-mode prints "(in flight)"
 // instead of a fake "(0ms)" for an in-flight streamed record (D10).
 func TestPrintProxyRequest_InFlight(t *testing.T) {
@@ -706,6 +756,44 @@ func TestShowRequestDetail_InFlight(t *testing.T) {
 	}
 	if strings.Contains(stdout, "capture not enabled") {
 		t.Errorf("expected the misleading capture-not-enabled hint to be suppressed, got:\n%s", stdout)
+	}
+}
+
+// TestShowRequestDetail_Stale verifies the detail view indicates staleness
+// for a stale in-flight request (D8, #53): the Duration line and the
+// in-flight note both call out "stale?" instead of the ordinary in-flight
+// wording.
+func TestShowRequestDetail_Stale(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestDetailResponse{
+			ProxyRequestResponse: api.ProxyRequestResponse{
+				ID:         "stale1",
+				Timestamp:  time.Now().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+				Method:     "GET",
+				URL:        "/stream",
+				StatusCode: 200,
+				DurationMs: 0,
+				InFlight:   true,
+				Stale:      true,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+
+	stdout, _ := captureOutput(t, func() {
+		if err := showRequestDetail(client, "stale1", false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "Duration: (in flight, stale?)") {
+		t.Errorf("expected 'Duration: (in flight, stale?)', got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "stale?") {
+		t.Errorf("expected a stale note in the output, got:\n%s", stdout)
 	}
 }
 
@@ -963,5 +1051,108 @@ func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "Warning:") || !strings.Contains(stderr, "still finishing shutdown") {
 		t.Errorf("expected a Warning about the daemon still finishing, got stderr %q", stderr)
+	}
+}
+
+// statusServerWithProxy starts a fake API server that returns a status response
+// carrying the given proxy block (nil = no block) plus a minimal process list,
+// and points apiAddr at it for the duration of the test.
+func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse) {
+	t.Helper()
+	originalApiAddr := apiAddr
+	t.Cleanup(func() { apiAddr = originalApiAddr })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/status":
+			_ = json.NewEncoder(w).Encode(api.StatusResponse{
+				Status:        "running",
+				UptimeSeconds: 10,
+				ConfigFile:    "prox.yaml",
+				APIVersion:    "v1",
+				Proxy:         proxy,
+			})
+		case "/api/v1/processes":
+			_ = json.NewEncoder(w).Encode(api.ProcessListResponse{
+				Processes: []api.ProcessResponse{
+					{Name: "web", Status: "running", PID: 1234, UptimeSeconds: 5, Health: "healthy"},
+				},
+			})
+		}
+	}))
+	t.Cleanup(server.Close)
+	apiAddr = server.URL
+}
+
+// TestRunStatus_SharedProxyDownExits1 pins D5: when the status block reports a
+// shared proxy that is unreachable, runStatus prints the DOWN line and returns a
+// non-nil error (exit 1) even though the child process is healthy.
+func TestRunStatus_SharedProxyDownExits1(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	})
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus returned nil, want a non-nil error (exit 1) when the shared proxy is down")
+	}
+	if !strings.Contains(stdout, "Proxy: DOWN") {
+		t.Errorf("stdout missing the DOWN line; got:\n%s", stdout)
+	}
+	// The process table must still have printed first.
+	if !strings.Contains(stdout, "web") {
+		t.Errorf("stdout missing the process table; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_SharedProxyUpNoError pins that a reachable shared proxy renders
+// the running line and returns nil (exit 0).
+func TestRunStatus_SharedProxyUpNoError(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: true,
+		DaemonVersion:   "1.2.3",
+	})
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil when the shared proxy is up", runErr)
+	}
+	if !strings.Contains(stdout, "Proxy: shared (running, v1.2.3)") {
+		t.Errorf("stdout missing the running proxy line; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_SharedProxyDownJSONExits1 pins that JSON mode also exits 1 when
+// the shared proxy is down (the block is emitted verbatim; scripts parsing JSON
+// still get the failure signal).
+func TestRunStatus_SharedProxyDownJSONExits1(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	})
+	statusJSON = true
+	t.Cleanup(func() { statusJSON = false })
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus (JSON) returned nil, want a non-nil error when the shared proxy is down")
+	}
+	if !strings.Contains(stdout, "\"daemon_reachable\":false") {
+		t.Errorf("JSON output missing the proxy block; got:\n%s", stdout)
 	}
 }

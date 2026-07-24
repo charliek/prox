@@ -52,6 +52,7 @@ All errors return JSON:
 | `STREAMING_NOT_SUPPORTED` | The server cannot provide an SSE stream for this request |
 | `REQUEST_NOT_FOUND` | Proxy request ID does not exist in the request buffer |
 | `MISSING_REQUEST_ID` | Request detail endpoint was called without an ID |
+| `CURSOR_GONE` | A `before_id` cursor's anchor record is unknown, evicted, or out of scope — restart pagination without a cursor |
 
 ## Endpoints
 
@@ -76,9 +77,34 @@ Supervisor status.
   "status": "running",
   "uptime_seconds": 7200,
   "config_file": "/path/to/prox.yaml",
-  "api_version": "v1"
+  "api_version": "v1",
+  "proxy": {
+    "mode": "shared",
+    "daemon_reachable": true,
+    "daemon_version": "0.2.0",
+    "consecutive_failures": 0,
+    "last_connected_at": "2025-01-19T10:32:01.123Z",
+    "dropped_events": 0,
+    "backfill_failures": 0,
+    "heal_state": "healthy"
+  }
 }
 ```
+
+`proxy` reports this project's shared-proxy health and is present whenever a proxy is configured (`mode` is `"disabled"` and the rest of the block is zero-valued when no proxy is configured):
+
+| Field | Description |
+|-------|--------------|
+| `mode` | `shared` (registered with the shared daemon), `standalone` (this process runs its own proxy listener), or `disabled` |
+| `daemon_reachable` | Result of a live `/health` probe against the shared daemon (500ms timeout, cached 2s); always `false` outside `shared` mode |
+| `daemon_version` | The shared daemon's reported version, when reachable |
+| `consecutive_failures` | The forwarder's current run of failed reconnects to the shared daemon |
+| `last_connected_at` | Last time the forwarder established an SSE stream to the shared daemon |
+| `dropped_events` | Request-stream events lost to a full subscriber channel |
+| `backfill_failures` | Post-connect ring snapshot fetch failures |
+| `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
+
+**When `mode` is `shared` and `daemon_reachable` is `false`, proxied routes are dead** — requests through the proxy will fail even though the project's own processes may be healthy. This is not necessarily an error to act on immediately: the project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s. An agent polling status should treat a brief `daemon_reachable: false` as transient, retry rather than fail the task outright, and only surface it as a real problem if it persists past that window. `prox proxy status` gives daemon-side detail (routes, version) that this per-project block does not.
 
 ### GET /processes
 
@@ -256,6 +282,9 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 | `method` | string | all | Filter by HTTP method (GET, POST, etc.) |
 | `min_status` | int | — | Minimum status code |
 | `max_status` | int | — | Maximum status code |
+| `since` | string | — | Only requests at or after this time (RFC3339 timestamp, e.g. `2025-01-19T10:00:00Z`) |
+| `url_contains` | string | — | Filter by URL substring (path+query, case-insensitive) |
+| `before_id` | string | — | Cursor: page strictly older than this request ID (see below) |
 | `limit` | int | 100 | Max requests to return (max 1000) |
 
 **Response:**
@@ -264,20 +293,26 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 {
   "requests": [
     {
-      "id": "a1b2c3d",
+      "id": "a1b2c3d4e5f6",
       "timestamp": "2025-01-19T10:32:01.123Z",
       "method": "GET",
       "url": "/api/users",
       "subdomain": "api",
+      "hostname": "api.local.dev",
       "status_code": 200,
       "duration_ms": 45,
       "remote_addr": "127.0.0.1"
     }
   ],
   "filtered_count": 50,
-  "total_count": 250
+  "total_count": 250,
+  "next_before_id": "9f8e7d6c5b4a"
 }
 ```
+
+Request IDs are 12 hex characters. A record that's still streaming (recorded at response-header time, before the body finished) carries `"in_flight": true` and `duration_ms: 0` until the completion event replaces it in place; both fields are omitted once the request is complete. A record that has been in-flight for more than 5 minutes also carries `"stale": true` — see [In-flight and stale requests](#in-flight-and-stale-requests) below.
+
+**Cursor pagination (`before_id`):** pass the previous page's `next_before_id` as `before_id` to fetch the next older page. `next_before_id` is the ID of the *oldest scanned* record, not the oldest *returned* one — a page that got filtered down to zero results still advances the cursor instead of stalling. It's omitted when the scan reached the end of the ring (no more history). Ring order is arrival order, not strict timestamp order, so an unknown, evicted, or out-of-scope `before_id` (including a record from a different `?subdomain=`/project scope) returns **`410 Gone`** with code `CURSOR_GONE` — on that response, restart pagination without a cursor rather than retrying the same one.
 
 **Example:**
 
@@ -290,6 +325,9 @@ curl "http://localhost:5555/api/v1/proxy/requests?subdomain=api"
 
 # Filter for errors (5xx)
 curl "http://localhost:5555/api/v1/proxy/requests?min_status=500"
+
+# Page backward through history
+curl "http://localhost:5555/api/v1/proxy/requests?before_id=9f8e7d6c5b4a"
 ```
 
 ### GET /proxy/requests/{id}
@@ -306,11 +344,12 @@ Body data is available only when capture was enabled with `prox up --capture` or
 
 ```json
 {
-  "id": "a1b2c3d",
+  "id": "a1b2c3d4e5f6",
   "timestamp": "2025-01-19T10:32:01.123Z",
   "method": "POST",
   "url": "/api/users",
   "subdomain": "api",
+  "hostname": "api.local.dev",
   "status_code": 201,
   "duration_ms": 45,
   "remote_addr": "127.0.0.1",
@@ -320,8 +359,10 @@ Body data is available only when capture was enabled with `prox up --capture` or
     },
     "request_body": {
       "size": 27,
+      "captured_size": 27,
       "truncated": false,
       "content_type": "application/json",
+      "content_encoding": "",
       "is_binary": false,
       "data": "{\"name\":\"Ada\"}"
     }
@@ -329,11 +370,13 @@ Body data is available only when capture was enabled with `prox up --capture` or
 }
 ```
 
+`captured_size` is the bytes actually retained after any truncation (vs `size`, the original body size). `content_encoding` records the stored `Content-Encoding` (e.g. `gzip`); gzip/deflate/zstd/brotli bodies are decoded transparently, so `data`/`is_binary` reflect the decoded (served) bytes when `include=body` is used. If a body can no longer be loaded (e.g. its capture file was evicted), the body object carries `"unavailable_reason": "evicted"` instead of `data`.
+
 **Examples:**
 
 ```bash
-curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d
-curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d?include=body"
+curl http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6
+curl "http://localhost:5555/api/v1/proxy/requests/a1b2c3d4e5f6?include=body"
 ```
 
 ### GET /proxy/requests/stream
@@ -349,7 +392,7 @@ The stream is long-lived: it is exempt from the 30s request-timeout class and en
 ```
 : connected
 
-data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
+data: {"id":"a1b2c3d4e5f6","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url":"/api/users","subdomain":"api","status_code":200,"duration_ms":45,"remote_addr":"127.0.0.1"}
 ```
 
 **Example:**
@@ -358,6 +401,10 @@ data: {"id":"a1b2c3d","timestamp":"2025-01-19T10:32:01.123Z","method":"GET","url
 curl -N http://localhost:5555/api/v1/proxy/requests/stream
 curl -N "http://localhost:5555/api/v1/proxy/requests/stream?subdomain=api"
 ```
+
+### In-flight and stale requests
+
+A request appears in `prox requests`/the API as soon as its response headers arrive, before the body finishes streaming, with `in_flight: true`. Normally the completion event replaces it in place once the body finishes. If a request stays `in_flight` for more than 5 minutes, it also gains `stale: true` — this means the completion event may have been lost and the true outcome is unknown, **not** that the request is broken: long-lived streams (SSE, WebSocket-over-HTTP) and large transfers can legitimately sit at `stale: true` for a long time while still live.
 
 ### POST /shutdown
 

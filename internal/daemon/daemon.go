@@ -18,35 +18,27 @@ func IsDaemonChild() bool {
 	return os.Getenv(DaemonEnvVar) == "1"
 }
 
-// Daemonize re-executes the current process as a daemon.
+// buildDaemonCommand constructs (but does not start) the detached daemon-child
+// command. It is split out from Daemonize so a test can pin the child protocol
+// (executable, argv, _PROX_DAEMON=1 env marker, Setsid, nil stdio) without
+// actually spawning a process.
 //
-// IMPORTANT: In the parent process, this function calls os.Exit(0) and never returns.
-// Only the child process continues execution (where IsDaemonChild() returns true).
-//
-// The function:
-//  1. Re-executes the current binary with the same arguments
-//  2. Sets _PROX_DAEMON=1 environment variable to mark the child
-//  3. Detaches the child from the terminal (new session)
-//  4. Prints the child PID and exits the parent with status 0
-//
-// Note: There is a small race window where the parent exits before confirming
-// the child successfully initialized. This is acceptable because:
-//   - Client commands use discoverDaemon() which reads state and retries
-//   - The window is very small (child starts immediately)
-//   - A pipe-based confirmation would add significant complexity
-func Daemonize() error {
+// The child protocol here is byte-for-byte identical to prox's pre-D2 behavior:
+// same executable, same os.Args[1:], _PROX_DAEMON=1 appended to the inherited
+// environment, Setsid to detach from the controlling terminal, and nil stdio
+// (the child redirects its own output to the daemon log via SetupLogging).
+func buildDaemonCommand() (*exec.Cmd, error) {
 	// Get the current executable path
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("getting executable path: %w", err)
+		return nil, fmt.Errorf("getting executable path: %w", err)
 	}
-
-	// Prepare environment with daemon marker
-	env := append(os.Environ(), DaemonEnvVar+"=1")
 
 	// Create command with same args
 	cmd := exec.Command(executable, os.Args[1:]...)
-	cmd.Env = env
+
+	// Prepare environment with daemon marker
+	cmd.Env = append(os.Environ(), DaemonEnvVar+"=1")
 
 	// Detach from terminal - create new session
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -58,18 +50,31 @@ func Daemonize() error {
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
-	// Start the daemon process
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting daemon process: %w", err)
+	return cmd, nil
+}
+
+// Daemonize re-executes the current process as a detached daemon child and
+// returns the started child command. Unlike its pre-D2 form, it no longer
+// prints a success line or calls os.Exit(0): the caller (runUp's daemonize
+// branch) owns wait-and-report so `prox up -d` only reports success once the
+// child is actually ready (D2). The returned *exec.Cmd is the direct child, so
+// the caller must Wait() on it (both to detect early death and to reap the
+// zombie).
+//
+// The child continues execution where IsDaemonChild() returns true. The child
+// protocol is unchanged — see buildDaemonCommand.
+func Daemonize() (*exec.Cmd, error) {
+	cmd, err := buildDaemonCommand()
+	if err != nil {
+		return nil, err
 	}
 
-	// Return the child's PID
-	fmt.Printf("prox started (pid %d)\n", cmd.Process.Pid)
+	// Start the daemon process
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting daemon process: %w", err)
+	}
 
-	// Parent exits successfully
-	os.Exit(0)
-
-	return nil // Unreachable, but needed for compiler
+	return cmd, nil
 }
 
 // SetupLogging redirects stdout and stderr to the daemon log file.

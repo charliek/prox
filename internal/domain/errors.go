@@ -97,6 +97,13 @@ const (
 	ErrCodeStreamingNotSupported = "STREAMING_NOT_SUPPORTED"
 	ErrCodeRequestNotFound       = "REQUEST_NOT_FOUND"
 	ErrCodeMissingRequestID      = "MISSING_REQUEST_ID"
+	// ErrCodeCursorGone marks a before_id cursor whose anchor record is
+	// unknown, evicted, or out of the request's filter scope (e.g. a
+	// different project). 410, not 404: the cursor once referred to a real
+	// position that has since aged out of the ring, so pollers should
+	// restart pagination without a cursor rather than retry the same one
+	// (D12, #50).
+	ErrCodeCursorGone = "CURSOR_GONE"
 )
 
 // ErrorCode returns the API error code for a domain error

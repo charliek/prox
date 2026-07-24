@@ -11,10 +11,12 @@ prox <command> [options]
 | Flag | Description |
 |------|-------------|
 | `--config, -c` | Config file path (default: `prox.yaml`) |
-| `--addr` | API address for client commands (auto-discovered from `.prox/prox.state`) |
+| `--addr` | API address for client commands. Used only when passed explicitly; otherwise auto-discovered from `.prox/prox.state` (or `prox.yaml` for a pinned `api.port`) |
 | `--detach, -d` | Run in background (daemon mode) |
 | `--verbose, -v` | Enable verbose output |
 | `--version` | Show version information |
+
+**No implicit `:5555` fallback.** Client commands (`status`, `logs`, `stop`, `start`, `restart`, `down`, `attach`, `requests`) discover the running instance from `.prox/prox.state` in the current directory. If no state file (or configured port) is found and `--addr` was not passed explicitly, the command errors instead of silently dialing the compiled-in `127.0.0.1:5555` default — run the command from the project directory, or pass `--addr host:port`. `version`, `up`, `proxy`, and `completion` are unaffected (they never need discovery).
 
 ## Commands
 
@@ -74,6 +76,10 @@ prox up --capture
 
 When no port is specified (via `--api-port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
 
+**`-d`/`--detach` readiness:** the parent process no longer exits `0` the instant it forks the child. It polls for up to 15s for the child to write a PID-matched `.prox/prox.state` and answer `GET /health`, then prints `prox started (pid N, api http://host:port)` and exits `0` — a truthful signal that the daemon is actually accepting requests. If the child dies during startup (bad config, port bind failure), `prox up -d` exits `1` and prints the last ~20 lines of `.prox/prox.log`. If the child never becomes ready within 15s, `prox up -d` prints the same diagnostics, sends SIGTERM to the child (SIGKILL after a 5s grace if it doesn't exit), and exits `1`.
+
+**Shared-proxy version mismatch:** when this project's proxy would join the per-user shared daemon and the daemon's version doesn't match this `prox` binary's version, `prox up` no longer falls back to a proxy-less standalone start. If the daemon still has registered projects, `prox up` fails hard, naming both versions and the registered project directories, with remediation (`prox proxy stop --force`, then `prox up`/`prox restart` in each listed project). If the daemon is idle, prox auto-replaces it with a fresh daemon of the current version and prints a one-line notice.
+
 ### status
 
 Show process status.
@@ -95,6 +101,8 @@ prox status
 # JSON output (for scripting)
 prox status --json
 ```
+
+**Proxy line and exit code:** when a proxy is configured, output includes a `Proxy:` line reporting the shared-proxy health tracked by [the `proxy` block of `GET /status`](api.md#get-status) — `Proxy: shared (running, vX.Y.Z)` when healthy, `Proxy: standalone` for an in-process proxy, or `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` when the shared daemon is unreachable. In the `DOWN` case, `prox status` **exits 1** even though the project's own processes may all be healthy — this is a breaking change from earlier versions, where `prox status` never consulted the shared proxy and always reflected only process health. The project self-heals in the background (worst case ~45s), so a brief `DOWN` reading is often transient.
 
 ### logs
 

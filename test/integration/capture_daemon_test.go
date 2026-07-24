@@ -72,16 +72,17 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	socketPath := shortSocketPath(t)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	registry := proxyd.NewRegistry()
-	requestMgr := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 
 	captureMgr, err := proxy.NewCaptureManagerAt(daemonCaptureDir, constants.DefaultCaptureMaxBodySize)
 	if err != nil {
 		t.Fatalf("NewCaptureManagerAt: %v", err)
 	}
 	defer captureMgr.Cleanup()
-	requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
 
-	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, requestMgr, captureMgr, logger)
+	// Per-project rings, wired like RunDaemon: each project's ring is created at
+	// register time with the capture eviction callback.
+	managers := proxyd.NewManagers(constants.DefaultProxyRequestBufferSize, captureMgr.CleanupRequest)
+	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, managers, captureMgr, logger)
 
 	server := proxyd.NewServer(proxyd.ServerConfig{
 		SocketPath: socketPath,
@@ -90,7 +91,7 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	})
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
-	server.SetRequestManager(requestMgr)
+	server.SetManagers(managers)
 
 	go func() { _ = server.Start() }()
 	defer server.Shutdown(context.Background())
@@ -133,8 +134,8 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	localRMB := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go proxyd.ForwardRequests(ctx, socketPath, "/projects/a", localRMA)
-	go proxyd.ForwardRequests(ctx, socketPath, "/projects/b", localRMB)
+	go proxyd.ForwardRequests(ctx, socketPath, "/projects/a", localRMA, nil, nil)
+	go proxyd.ForwardRequests(ctx, socketPath, "/projects/b", localRMB, nil, nil)
 
 	// Confirm both bridges are live by pinging until each side observes a record.
 	// (Guards against subscribing after the real traffic was already published.)

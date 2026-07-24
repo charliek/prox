@@ -4,10 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/charliek/prox/internal/constants"
 )
 
 // RequestRecord represents a single proxied request.
@@ -37,6 +40,17 @@ type RequestRecord struct {
 
 	// Details contains captured headers and bodies (nil when capture is disabled)
 	Details *RequestDetails `json:"details,omitempty"`
+}
+
+// StaleAt reports whether this record is stale as of now (D8, #53): still
+// marked in-flight, but running longer than constants.InFlightStaleAfter.
+// "Stale" means completion-unknown, not broken — see the constant's doc
+// comment. Final (non-in-flight) records are never stale: their completion,
+// whatever it was, is already known. This is the single staleness check;
+// every consumer (API response conversion, CLI rendering, TUI rendering)
+// calls it rather than re-deriving the condition.
+func (r RequestRecord) StaleAt(now time.Time) bool {
+	return r.InFlight && now.Sub(r.Timestamp) > constants.InFlightStaleAfter
 }
 
 // RequestDetails contains captured request/response headers and bodies.
@@ -96,13 +110,31 @@ type RequestFilter struct {
 	MaxStatus   int
 	Since       time.Time
 	Limit       int
+
+	// BeforeID anchors RecentPage (and, transitively, Recent) at the ring
+	// position of the record with this ID: only records strictly OLDER than
+	// the anchor, BY RING POSITION, are considered (D12, #50). This is
+	// arrival order, not time order. Backfill interleavings and
+	// completion-after-eviction re-appends (see Upsert: an in-flight record
+	// whose original slot was evicted re-enters the ring at the newest
+	// position when its completion arrives) mean a record's ring position
+	// can diverge from its Timestamp — a page can legitimately contain a
+	// record with a newer Timestamp than the anchor. Empty = no anchor
+	// (start at the newest record, i.e. today's Recent behavior).
+	BeforeID string
 }
 
 // RequestSubscription represents a subscription to request updates.
+//
+// dropped counts events this subscription lost because its channel was full
+// when notifySubscribers tried to deliver (D9). It is an atomic so
+// notifySubscribers can bump it under the manager's read lock; the first drop
+// (0→1 transition) logs once so a slow subscriber is visible without spamming.
 type RequestSubscription struct {
-	ID     string
-	Filter RequestFilter
-	Ch     chan RequestRecord
+	ID      string
+	Filter  RequestFilter
+	Ch      chan RequestRecord
+	dropped atomic.Int64
 }
 
 // EvictionCallback is called when a request is evicted from the ring buffer.
@@ -123,6 +155,19 @@ type RequestManager struct {
 	// closed latches after Close: new Subscribe calls get an already-closed
 	// channel so post-shutdown streams end immediately.
 	closed bool
+
+	// writesClosed latches ring WRITES after Close (D13): a manager destroyed
+	// on deregister must reject a straggler Record/Upsert racing the teardown
+	// — an accepted write would land in a detached ring after the final purge
+	// already ran, leaking that request's capture files. Rejected writers get
+	// false back and clean up their own capture state.
+	writesClosed atomic.Bool
+
+	// droppedTotal is the manager-wide count of notifications dropped because a
+	// subscriber's channel was full (D9). Exposed via DroppedEvents(); surfaced
+	// daemon-side in DaemonStatusResponse and project-side (via the forwarder's
+	// local manager) in the `prox status` proxy block.
+	droppedTotal atomic.Int64
 
 	// onEvict is called when a request is evicted from the buffer
 	onEvict EvictionCallback
@@ -148,8 +193,13 @@ func (m *RequestManager) SetEvictionCallback(fn EvictionCallback) {
 }
 
 // Record adds a new request record to the buffer and notifies subscribers.
-// If the record doesn't have an ID, one is generated.
-func (m *RequestManager) Record(record RequestRecord) {
+// If the record doesn't have an ID, one is generated. It reports whether the
+// record was accepted: false means the manager was already Closed (see
+// writesClosed) and the caller owns any capture-file cleanup for the record.
+func (m *RequestManager) Record(record RequestRecord) bool {
+	if m.writesClosed.Load() {
+		return false
+	}
 	if record.ID == "" {
 		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
@@ -158,6 +208,15 @@ func (m *RequestManager) Record(record RequestRecord) {
 	var onEvict EvictionCallback
 
 	m.mu.Lock()
+	// Re-check the latch under mu: Close does not hold the ring lock, so a
+	// writer that passed the pre-lock check can otherwise commit after the
+	// destroy path's final purge (CodeRabbit PR #68). Under mu the store is
+	// either visible here (rejected) or this write commits before the purge's
+	// own mu acquisition (covered by the purge).
+	if m.writesClosed.Load() {
+		m.mu.Unlock()
+		return false
+	}
 	// Check if we're about to overwrite an existing record
 	if m.count == m.capacity {
 		evicted := m.buffer[m.head]
@@ -181,6 +240,7 @@ func (m *RequestManager) Record(record RequestRecord) {
 
 	// Notify subscribers
 	m.notifySubscribers(record)
+	return true
 }
 
 // Upsert applies a record as a monotonic two-state transition keyed by ID:
@@ -201,7 +261,12 @@ func (m *RequestManager) Record(record RequestRecord) {
 // notifySubscribers only performs non-blocking channel sends under subMu,
 // and no path acquires mu while holding subMu, so this cannot block or
 // deadlock. The eviction callback (disk IO) still runs after unlock.
-func (m *RequestManager) Upsert(record RequestRecord) {
+// Upsert reports whether the record was accepted; false means the manager was
+// already Closed (writesClosed) and the caller owns capture-file cleanup.
+func (m *RequestManager) Upsert(record RequestRecord) bool {
+	if m.writesClosed.Load() {
+		return false
+	}
 	if record.ID == "" {
 		// Defensive: callers always supply IDs. Generate one and fall through
 		// to the normal append path (NOT Record, whose after-unlock notify
@@ -213,6 +278,11 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	var onEvict EvictionCallback
 
 	m.mu.Lock()
+	// Re-check the latch under mu (same reasoning as Record).
+	if m.writesClosed.Load() {
+		m.mu.Unlock()
+		return false
+	}
 	// Scan newest→oldest: in-flight records live in the newest slots.
 	idx := -1
 	for i := 0; i < m.count; i++ {
@@ -227,7 +297,7 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	case idx >= 0 && (!m.buffer[idx].InFlight || record.InFlight):
 		// Terminal existing record, or duplicate in-flight delivery.
 		m.mu.Unlock()
-		return
+		return true
 	case idx >= 0:
 		// In-flight → final: replace in place, ring position preserved.
 		m.buffer[idx] = record
@@ -251,10 +321,38 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	if evictedID != "" && onEvict != nil {
 		onEvict(evictedID)
 	}
+	return true
 }
 
-// Recent returns the most recent requests matching the filter.
+// Recent returns the most recent requests matching the filter. It is
+// RecentPage without the cursor metadata, kept as the simple signature for
+// the many callers (CLI, daemon-internal endpoints, tests) that don't page.
 func (m *RequestManager) Recent(filter RequestFilter) []RequestRecord {
+	records, _, _ := m.RecentPage(filter)
+	return records
+}
+
+// RecentPage returns up to filter.Limit matching records, newest first,
+// optionally anchored at filter.BeforeID (ring-position cursor pagination,
+// D12/#50). It is the shared scan behind Recent.
+//
+// nextBeforeID is the ID of the OLDEST SCANNED record in this call's scan
+// window — not the oldest RETURNED record. The scan continues past
+// non-matching records (up to the ring's oldest record) until it collects
+// filter.Limit matches, so a page whose filter excludes everything
+// remaining still advances all the way through the ring and reports where
+// it stopped, rather than stalling a poller that keeps re-requesting the
+// same cursor. nextBeforeID is empty when the scan reached the ring's
+// oldest record (no older records remain: this is the last page).
+//
+// anchorFound is true when filter.BeforeID is empty (no anchor requested)
+// or names a record that both exists in the ring and matches the rest of
+// filter. An anchor that is unknown, evicted, or excluded by scope (e.g. a
+// different filter.ProjectDir than the anchor's) reports anchorFound=false
+// with no records — callers must treat both cases identically (410 Gone)
+// so an out-of-scope anchor can't be distinguished from a nonexistent one
+// and leak the other scope's record existence.
+func (m *RequestManager) RecentPage(filter RequestFilter) (records []RequestRecord, nextBeforeID string, anchorFound bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -263,19 +361,53 @@ func (m *RequestManager) Recent(filter RequestFilter) []RequestRecord {
 		limit = m.count
 	}
 
-	result := make([]RequestRecord, 0, limit)
+	// startOffset is how many newest-to-oldest steps to skip before scanning
+	// begins: 0 with no anchor (start at the newest record), or the
+	// anchor's position + 1 (strictly older) when filter.BeforeID is set.
+	startOffset := 0
+	if filter.BeforeID != "" {
+		anchorPos := -1
+		for i := 0; i < m.count; i++ {
+			idx := (m.head - 1 - i + m.capacity) % m.capacity
+			if m.buffer[idx].ID == filter.BeforeID {
+				anchorPos = i
+				break
+			}
+		}
+		if anchorPos == -1 {
+			return nil, "", false
+		}
+		anchorIdx := (m.head - 1 - anchorPos + m.capacity) % m.capacity
+		if !m.matchesFilter(m.buffer[anchorIdx], filter) {
+			// Anchor exists but is out of the requested scope (e.g. another
+			// project). Same signal as "not found" — see doc comment.
+			return nil, "", false
+		}
+		startOffset = anchorPos + 1
+	}
 
-	// Iterate from newest to oldest
-	for i := 0; i < m.count && len(result) < limit; i++ {
+	result := make([]RequestRecord, 0, limit)
+	lastScanned := startOffset - 1
+
+	for i := startOffset; i < m.count; i++ {
 		idx := (m.head - 1 - i + m.capacity) % m.capacity
 		record := m.buffer[idx]
+		lastScanned = i
 
 		if m.matchesFilter(record, filter) {
 			result = append(result, record)
 		}
+		if len(result) >= limit {
+			break
+		}
 	}
 
-	return result
+	if lastScanned >= startOffset && lastScanned != m.count-1 {
+		lastIdx := (m.head - 1 - lastScanned + m.capacity) % m.capacity
+		nextBeforeID = m.buffer[lastIdx].ID
+	}
+
+	return result, nextBeforeID, true
 }
 
 // GetByID returns a request record by its ID.
@@ -342,6 +474,11 @@ func (m *RequestManager) Count() int {
 // request racing a shutdown-time Close cannot re-subscribe and pin the API
 // server open. Idempotent.
 func (m *RequestManager) Close() {
+	// Latch writes BEFORE subscriptions: a destroy-path Close must guarantee
+	// that any Record/Upsert observing the latch is rejected, so every record
+	// that DID land in the ring is covered by the destroy's final purge.
+	m.writesClosed.Store(true)
+
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
@@ -361,10 +498,28 @@ func (m *RequestManager) notifySubscribers(record RequestRecord) {
 			select {
 			case sub.Ch <- record:
 			default:
-				// Channel full, drop the message
+				// Channel full: drop the message and count it (D9). The
+				// manager-wide total feeds DroppedEvents(); the per-subscription
+				// count logs once on the first drop so a persistently slow
+				// subscriber is visible without a per-drop log flood. The log
+				// itself runs on a goroutine: notifySubscribers is called with
+				// the ring mutex held on the Upsert path (ordering guarantee),
+				// and logger I/O must not stall the SSE hot path under that
+				// lock.
+				m.droppedTotal.Add(1)
+				if sub.dropped.Add(1) == 1 {
+					go log.Printf("prox: request subscription %s is dropping events (subscriber not keeping up)", sub.ID)
+				}
 			}
 		}
 	}
+}
+
+// DroppedEvents returns the manager-wide number of subscriber notifications
+// dropped because a subscription's channel was full (D9). It is monotonic for
+// the life of the manager.
+func (m *RequestManager) DroppedEvents() int64 {
+	return m.droppedTotal.Load()
 }
 
 func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilter) bool {

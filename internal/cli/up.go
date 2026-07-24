@@ -88,7 +88,7 @@ func completeProcessNames(cmd *cobra.Command, args []string, toComplete string) 
 	return names, cobra.ShellCompDirectiveNoFileComp
 }
 
-func runUp(cmd *cobra.Command, args []string) error {
+func runUp(cmd *cobra.Command, args []string) (err error) {
 	processes := args
 
 	// Validate mutually exclusive flags
@@ -108,11 +108,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// Daemonize - this will re-exec and exit the parent
-		if err := daemon.Daemonize(); err != nil {
+		// Re-exec ourselves detached; the parent no longer blindly exits 0.
+		child, err := daemon.Daemonize()
+		if err != nil {
 			return fmt.Errorf("failed to daemonize: %w", err)
 		}
-		// Parent exits in Daemonize(), this is unreachable for parent
+		// The parent owns wait-and-report (D2): it never runs the supervisor
+		// itself. It returns here — nil (exit 0) once the child is confirmed
+		// ready, or an error (exit 1) on early death / never-ready timeout.
+		return awaitDaemonStartup(&execChild{cmd: child}, cwd, defaultDaemonStartupOps())
 	}
 
 	// If we're the daemon child, set up logging
@@ -124,6 +128,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to setup logging: %w", err)
 		}
 		defer logFile.Close()
+		// Flush a fatal startup error INTO the log before the Close above
+		// runs (defers are LIFO): Execute() prints the returned error to
+		// os.Stderr only after runUp's defers have closed the redirected
+		// log file, so without this the child dies with its reason lost —
+		// the parent's log tail (D2) would show only stale content.
+		defer func() {
+			if err != nil {
+				fmt.Fprintf(logFile, "Error: %v\n", err)
+			}
+		}()
 	}
 
 	// Load config
@@ -342,12 +356,29 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create API handlers and server. The handlers get the absolute config path
 	// so GET /status reports the same file the reload path re-reads (#33, D3).
 	handlers := api.NewHandlers(sup, logMgr, absConfigPath, coordinator)
+
+	// The proxy runtime is the single source of truth for the proxy path (D5):
+	// it feeds the `prox status` proxy block via the handlers, receives forwarder
+	// connection state, and (C6) holds the client swapped in on heal. Created
+	// here (mode defaults to disabled) and resolved to shared/standalone below.
+	runtime := newProxyRuntime()
+	handlers.SetProxyStatusProvider(runtime)
+
 	apiServer := api.NewServer(api.ServerConfig{
 		Host:        cfg.API.Host,
 		Port:        cfg.API.Port,
 		AuthEnabled: authEnabled,
 		Token:       token,
 	}, handlers)
+
+	// Bind the API listener BEFORE the supervisor starts any processes: a
+	// bind failure (port taken) must fail the daemon while nothing is running
+	// yet — binding later would leak an already-started supervisor on the
+	// early error return (CodeRabbit PR #68). Serve starts further down.
+	apiListener, err := apiServer.Listen()
+	if err != nil {
+		return err
+	}
 
 	// Set up signal handling
 	sigCh := make(chan os.Signal, 1)
@@ -371,7 +402,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
 		var proxyErr error
-		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers)
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime)
 		if proxyErr != nil {
 			return proxyErr
 		}
@@ -431,9 +462,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Start API server in background
+	// Serve on the listener bound before supervisor startup (see above).
 	go func() {
-		if err := apiServer.Start(); err != nil {
+		if err := apiServer.Serve(apiListener); err != nil {
 			// Server closed is expected on shutdown
 			if !errors.Is(err, http.ErrServerClosed) {
 				fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
@@ -474,6 +505,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// (before the API stage — see performShutdown).
 	outcome := performShutdown(shutdownDeps{
 		sup:          sup,
+		runtime:      runtime,
 		daemonClient: daemonClient,
 		proxyService: proxyService,
 		apiServer:    apiServer,
@@ -523,7 +555,12 @@ func forwardShutdownSignal(ctx context.Context, sigCh <-chan os.Signal, coordina
 // proxy/API/logMgr deps are nil-able so a helper unit test needs no sockets or
 // daemon.
 type shutdownDeps struct {
-	sup          *supervisor.Supervisor
+	sup *supervisor.Supervisor
+	// runtime is the proxy runtime (D5/D6). When set, performShutdown latches its
+	// shutdown flag before deregister and reads the CURRENT daemon client through
+	// it (a C6-healed client, not the one captured at startup). daemonClient is
+	// the legacy fallback used only when runtime is nil (helper unit tests).
+	runtime      *proxyRuntime
 	daemonClient *proxyd.Client
 	proxyService *proxy.Service
 	apiServer    *api.Server
@@ -590,14 +627,28 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 		deps.sup.RefuseLaunches()
 	}
 
+	// D6c shutdown ordering. Latch the shutdown flag FIRST so an in-flight or next
+	// heal no-ops, then cancel the forwarder BEFORE deregister so its reconnect
+	// loop cannot fire a heal that re-registers the project mid-teardown. Resolve
+	// the daemon client through clientAfterHealBarrier AFTER both: it blocks on the
+	// heal mutex until any heal that began before the latch has finished swapping
+	// the client, so we deregister through the HEALED client, never the one captured
+	// at startup (FIX 3). daemonClient is the fallback for helper tests with no runtime.
+	daemonClient := deps.daemonClient
+	if deps.runtime != nil {
+		deps.runtime.MarkShuttingDown()
+		deps.runtime.CancelForwarder()
+		daemonClient = deps.runtime.clientAfterHealBarrier()
+	}
+
 	// Stage 1a: deregister from the shared proxy daemon. The proxyd client carries
 	// its own 30s HTTP timeout and takes no ctx, so bound it to the stage here:
 	// run it on a goroutine and proceed once the stage deadline passes, leaving the
 	// call to finish or fail in the background (harmless — the daemon is exiting).
-	if deps.daemonClient != nil {
+	if daemonClient != nil {
 		derr := make(chan error, 1) // buffered so an abandoned goroutine never leaks
 		go func() {
-			derr <- deps.daemonClient.Deregister(proxyd.DeregisterRequest{
+			derr <- daemonClient.Deregister(proxyd.DeregisterRequest{
 				ProjectDir: deps.cwd,
 				PID:        os.Getpid(),
 			})
@@ -776,16 +827,34 @@ func proxyStartError(err error) error {
 	if errors.As(err, &portErr) {
 		return fmt.Errorf("%w\n\nAnother process is listening on this port. To identify it:\n  lsof -i :%d\n\nTo start without the proxy:\n  prox up --no-proxy", portErr, portErr.Port)
 	}
-	return fmt.Errorf("proxy failed to start: %w", err)
+	return fmt.Errorf("proxy failed to start: %w\n\nTo start without the proxy:\n  prox up --no-proxy", err)
+}
+
+// captureMaxBodySize resolves the project's configured capture cap to bytes for
+// the register wire (D13, #49). It parses cfg.Proxy.Capture.MaxBodySize (e.g.
+// "1MB", "512KB") with the same parser the standalone capture manager uses. An
+// unset or unparseable value yields 0, which the daemon reads as "use the
+// default cap" — a bad string degrades gracefully rather than failing `prox up`.
+func captureMaxBodySize(cfg *config.Config) int64 {
+	if cfg.Proxy.Capture == nil || cfg.Proxy.Capture.MaxBodySize == "" {
+		return 0
+	}
+	n, err := config.ParseSize(cfg.Proxy.Capture.MaxBodySize)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: invalid proxy.capture.max_body_size %q: %v — using the daemon default capture cap\n",
+			cfg.Proxy.Capture.MaxBodySize, err)
+		return 0
+	}
+	return n
 }
 
 // startProxy attempts to register with the shared proxy daemon. If the daemon
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, *proxy.Service, error) {
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
-	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers)
+	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt)
 	if ok {
 		return client, nil, nil
 	}
@@ -794,15 +863,23 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 		return nil, nil, fatalErr
 	}
 
-	// Fallback to standalone proxy (daemon unavailable or sandboxed)
-	return nil, startStandaloneProxy(cfg, cwd, ctx, handlers), nil
+	// Fallback to standalone proxy (daemon unavailable or sandboxed). A proxy is
+	// configured, so a create/start failure here is fatal (D1): `prox up` must
+	// never start a project with the proxy silently disabled. --no-proxy is the
+	// escape hatch (named in the returned error).
+	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers)
+	if err != nil {
+		return nil, nil, err
+	}
+	rt.SetMode(proxyModeStandalone)
+	return nil, svc, nil
 }
 
 // tryDaemonProxy attempts to register with the shared proxy daemon.
 // Returns (client, true, nil) on success, (nil, false, nil) when daemon is
 // unavailable (fall back to standalone), (nil, false, error) when daemon is
 // running but registration failed (don't fall back, fail the command).
-func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxyd.Client, bool, error) {
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, bool, error) {
 	// Check if we can access the daemon directory
 	if err := proxyd.EnsureDaemonDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
@@ -812,8 +889,21 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	// Ensure daemon is running
 	client, err := proxyd.EnsureRunning()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
-		return nil, false, nil
+		var vme *proxyd.VersionMismatchError
+		if !errors.As(err, &vme) {
+			// Connection-refused / no socket (e.g. a sandboxed environment that
+			// legitimately cannot reach the daemon): fall back to standalone.
+			fmt.Fprintf(os.Stderr, "Warning: proxy daemon unavailable: %v — running proxy in standalone mode\n", err)
+			return nil, false, nil
+		}
+		// Version skew: the shared daemon runs a different version. Never fall
+		// back to standalone (its ports are daemon-held, and a silent
+		// proxy-less start is exactly what D1 closes). Recover or fail fatally.
+		healed, ferr := recoverFromVersionSkew(vme, defaultSkewOps())
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		client = healed
 	}
 
 	// Build registration request
@@ -838,12 +928,25 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		HTTPPort:       cfg.Proxy.HTTPPort,
 		HTTPSPort:      cfg.Proxy.HTTPSPort,
 		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
+		MaxBodySize:    captureMaxBodySize(cfg),
 		StartTime:      startToken,
 	}
 
 	resp, err := client.Register(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", err)
+		if !isShuttingDownError(err) {
+			return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", err)
+		}
+		// D4: the daemon was mid graceful-shutdown when the register queued
+		// behind it. Wait for it to drain, start a fresh daemon, and
+		// re-register once — a second SHUTTING_DOWN or any other error is
+		// fatal exactly as an unrecovered register failure is today.
+		healedClient, healedResp, rerr := retryRegisterAfterShutdown(req, defaultRegisterRetryOps())
+		if rerr != nil {
+			return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", rerr)
+		}
+		client = healedClient
+		resp = healedResp
 	}
 
 	// Print registered routes
@@ -862,16 +965,37 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	}
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
-	// daemon proxy requests into this project's TUI and API.
+	// daemon proxy requests into this project's TUI and API. The runtime records
+	// the shared mode, the active client, the original register request (C6
+	// re-registers with it), and the local manager (source of the dropped-events
+	// count), and receives forwarder connection state as the status sink (D5).
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 	handlers.SetRequestManager(localRM)
-	go proxyd.ForwardRequests(ctx, proxyd.SocketPath(), cwd, localRM)
+	rt.SetMode(proxyModeShared)
+	rt.SetClient(client)
+	rt.SetRegisterRequest(req)
+	rt.SetLocalRequestManager(localRM)
+
+	// Run the forwarder on a context derived from ctx but cancellable on its own,
+	// so performShutdown can stop it BEFORE deregister (D6c) without disturbing the
+	// supervisor (which shares ctx). Its heal callback (D6b) re-ensures and
+	// re-registers against a fresh daemon after a prolonged outage; it no-ops once
+	// shutdown is latched. Deriving from ctx guarantees the forwarder still stops
+	// on any runUp return even if performShutdown never runs.
+	fwdCtx, fwdCancel := context.WithCancel(ctx)
+	rt.SetForwarderCancel(fwdCancel)
+	heal := func() bool { return rt.heal(defaultHealOps()) }
+	go proxyd.ForwardRequests(fwdCtx, proxyd.SocketPath(), cwd, localRM, rt, heal)
 
 	return client, true, nil
 }
 
-// startStandaloneProxy creates and starts a standalone proxy (current behavior).
-func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) *proxy.Service {
+// startStandaloneProxy creates and starts a standalone proxy. When a proxy is
+// configured, create/start failures are fatal (D1): they return an error so
+// `prox up` exits non-zero rather than continuing with the proxy silently
+// disabled. The returned error carries the proxyStartError hint (port-conflict
+// detail plus the --no-proxy escape hatch).
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxy.Service, error) {
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
@@ -880,12 +1004,10 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 
 	proxyService, err := proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to create proxy: %v\n", err)
-		return nil
+		return nil, proxyStartError(err)
 	}
 	if err := proxyService.Start(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: %v\n", proxyStartError(err))
-		return nil
+		return nil, proxyStartError(err)
 	}
 
 	var proxyAddrs []string
@@ -901,7 +1023,7 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 	handlers.SetRequestManager(proxyService.RequestManager())
 	handlers.SetCaptureManager(proxyService.CaptureManager())
 
-	return proxyService
+	return proxyService, nil
 }
 
 // localRequestManager returns the RequestManager for use by the TUI.

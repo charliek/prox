@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -241,13 +242,25 @@ func (s *Server) registerRoutes() {
 	})
 }
 
-// Start starts the HTTP server
-func (s *Server) Start() error {
+// Listen binds the server's TCP listener synchronously so callers can treat
+// a bind failure as fatal instead of losing it inside a background serve
+// goroutine. Without this, a child whose API port is already taken keeps
+// running with no control surface — and, worse, whatever process holds the
+// port answers /health and can fool the `prox up -d` readiness poll (D2).
+func (s *Server) Listen() (net.Listener, error) {
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("binding API server on %s: %w", addr, err)
+	}
+	return ln, nil
+}
 
+// Serve serves HTTP on ln, blocking until Shutdown or a serve error.
+func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.httpServer = &http.Server{
-		Addr:         addr,
+		Addr:         ln.Addr().String(),
 		Handler:      s.router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 0, // Disable for SSE
@@ -256,7 +269,16 @@ func (s *Server) Start() error {
 	server := s.httpServer
 	s.mu.Unlock()
 
-	return server.ListenAndServe()
+	return server.Serve(ln)
+}
+
+// Start binds and serves in one call (Listen + Serve).
+func (s *Server) Start() error {
+	ln, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
 }
 
 // Shutdown gracefully shuts down the server

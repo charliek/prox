@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charliek/prox/internal/proxy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -152,11 +151,11 @@ func newProxyServerWithCertMgr(t *testing.T, cm certManager) *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 	s := NewServer(ServerConfig{SocketPath: "", Logger: logger, Version: "test"})
 	reg := NewRegistry()
-	rm := proxy.NewRequestManager(100)
-	dp := NewDynamicProxy(reg, cm, rm, nil, logger)
+	ms := NewManagers(100, nil)
+	dp := NewDynamicProxy(reg, cm, ms, nil, logger)
 	s.SetRegistry(reg)
 	s.SetProxy(dp)
-	s.SetRequestManager(rm)
+	s.SetManagers(ms)
 	t.Cleanup(func() { _ = dp.Shutdown(context.Background()) })
 	return s
 }

@@ -5,6 +5,61 @@ import (
 	"testing"
 )
 
+// TestBuildDaemonCommand pins the daemon child protocol (D2): the constructed
+// command must re-exec this binary with the same os.Args[1:], append exactly
+// one _PROX_DAEMON=1 env marker, request Setsid, and use nil stdio. This is the
+// byte-for-byte contract the parent's wait-and-report path depends on and must
+// not drift.
+func TestBuildDaemonCommand(t *testing.T) {
+	cmd, err := buildDaemonCommand()
+	if err != nil {
+		t.Fatalf("buildDaemonCommand failed: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+
+	// argv: [executable, os.Args[1:]...]
+	if cmd.Path != exe {
+		t.Errorf("expected Path %q, got %q", exe, cmd.Path)
+	}
+	wantArgs := append([]string{exe}, os.Args[1:]...)
+	if len(cmd.Args) != len(wantArgs) {
+		t.Fatalf("expected %d args %v, got %d args %v", len(wantArgs), wantArgs, len(cmd.Args), cmd.Args)
+	}
+	for i := range wantArgs {
+		if cmd.Args[i] != wantArgs[i] {
+			t.Errorf("arg[%d]: expected %q, got %q", i, wantArgs[i], cmd.Args[i])
+		}
+	}
+
+	// env: inherited environment plus exactly one _PROX_DAEMON=1 marker.
+	markerCount := 0
+	for _, e := range cmd.Env {
+		if e == DaemonEnvVar+"=1" {
+			markerCount++
+		}
+	}
+	if markerCount != 1 {
+		t.Errorf("expected exactly one %s=1 env entry, got %d (env=%v)", DaemonEnvVar, markerCount, cmd.Env)
+	}
+	if len(cmd.Env) != len(os.Environ())+1 {
+		t.Errorf("expected env len %d (environ+marker), got %d", len(os.Environ())+1, len(cmd.Env))
+	}
+
+	// SysProcAttr: detached session.
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setsid {
+		t.Errorf("expected SysProcAttr.Setsid=true, got %+v", cmd.SysProcAttr)
+	}
+
+	// nil stdio — the child manages its own logging.
+	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil {
+		t.Errorf("expected nil stdio, got stdin=%v stdout=%v stderr=%v", cmd.Stdin, cmd.Stdout, cmd.Stderr)
+	}
+}
+
 func TestIsDaemonChild(t *testing.T) {
 	t.Run("returns false when env var not set", func(t *testing.T) {
 		// Save current value

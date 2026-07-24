@@ -2,11 +2,13 @@ package tui
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -1064,9 +1066,12 @@ func (b *BaseModel) formatRequestDetail() []string {
 	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
 	lines = append(lines, fmt.Sprintf("  URL:      %s", d.URL))
 	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
-	if d.InFlight {
+	switch {
+	case d.InFlight && d.Stale:
+		lines = append(lines, "  Duration: (in flight, stale?)")
+	case d.InFlight:
 		lines = append(lines, "  Duration: (in flight)")
-	} else {
+	default:
 		lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
 	}
 	lines = append(lines, fmt.Sprintf("  Remote:   %s", d.RemoteAddr))
@@ -1078,12 +1083,18 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// rendering nothing.
 	if d.InFlight {
 		lines = append(lines, "")
-		if b.detailRefreshFailed {
+		switch {
+		case b.detailRefreshFailed:
 			// A live-refresh attempt (attach mode — D16) failed while this
 			// in-flight snapshot was on screen: say so instead of silently
 			// re-promising details that may never arrive automatically.
 			lines = append(lines, dimStyle.Render("(live refresh failed — press esc and re-enter to reload)"))
-		} else {
+		case d.Stale:
+			// D8, #53: the completion event may have been lost — the true
+			// outcome is unknown, not necessarily broken (long-lived
+			// streams/transfers can legitimately still be live here).
+			lines = append(lines, dimStyle.Render("(request in flight, stale? — the completion event may have been lost; true outcome unknown)"))
+		default:
 			lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
 		}
 	}
@@ -1156,21 +1167,22 @@ func bodySectionTitle(title string, b *BodyData) string {
 }
 
 // renderBodyLines renders the content lines for a captured body: an
-// unavailable (evicted) notice, a binary-data marker, or the body text split
-// into lines. Non-binary JSON bodies (Content-Type contains "json", or the
-// raw text is itself valid JSON) are pretty-printed 2-space indented; any
-// json.Indent failure falls back to the raw text. Text otherwise renders
-// unchanged except that ASCII control characters (< 0x20, other than tab and
-// the newlines used for line splitting) and DEL (0x7F) are replaced with the
-// Unicode replacement character, so ESC/BEL/OSC sequences from a captured body
-// cannot manipulate the terminal. (Classification usually marks such bodies
-// binary, but a socket-supplied record could lie; this is a cheap defense.)
+// unavailable (evicted) notice, a bounded hexdump preview for binary data, or
+// the body text split into lines. Non-binary JSON bodies (Content-Type
+// contains "json", or the raw text is itself valid JSON) are pretty-printed
+// 2-space indented; any json.Indent failure falls back to the raw text. Text
+// otherwise renders unchanged except that ASCII control characters (< 0x20,
+// other than tab and the newlines used for line splitting) and DEL (0x7F) are
+// replaced with the Unicode replacement character, so ESC/BEL/OSC sequences
+// from a captured body cannot manipulate the terminal. (Classification
+// usually marks such bodies binary, but a socket-supplied record could lie;
+// this is a cheap defense.)
 func renderBodyLines(body *BodyData) []string {
 	if body.Unavailable {
 		return []string{dimStyle.Render("(body no longer available)")}
 	}
 	if body.IsBinary {
-		return []string{dimStyle.Render("[binary data]")}
+		return renderBinaryPreview(body.Data, body.DataBase64)
 	}
 	if body.Data == "" {
 		return nil
@@ -1205,6 +1217,116 @@ func sanitizeControlChars(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// hexPreviewMaxBytes caps how many leading bytes of a binary body are
+// hex-dumped in the detail view (D11, #50.2): enough to identify the format
+// (magic bytes, headers) without flooding the terminal with a large payload.
+const hexPreviewMaxBytes = 256
+
+// hexPreviewBytesPerLine is the hexdump -C convention of 16 bytes per line,
+// split into two 8-byte groups.
+const hexPreviewBytesPerLine = 16
+
+// renderBinaryPreview turns a binary body's Data into hexdump-style preview
+// lines, dimming the trailing "more bytes" line. Data reaches the TUI two
+// ways: the API always base64-encodes binary bytes for the wire
+// (attach mode, client.go fetchRequestDetail -> clientBodyToBodyData), while
+// local mode (convertCapturedBodyToBodyData) stores the raw decoded bytes
+// directly in the string. A base64 decode is tried first; a decode failure
+// (the common case for raw local-mode bytes, which are essentially never
+// valid base64) falls back to treating Data as the raw bytes themselves, so
+// both paths are previewed correctly. Empty raw bytes (nothing to preview,
+// e.g. a body flagged binary but not actually loaded) fall back to the
+// original placeholder rather than an empty hexdump.
+func renderBinaryPreview(data string, dataBase64 bool) []string {
+	raw := []byte(data)
+	if dataBase64 {
+		decoded, err := base64.StdEncoding.DecodeString(data)
+		if err == nil {
+			raw = decoded
+		}
+	}
+	if len(raw) == 0 {
+		return []string{dimStyle.Render("[binary data]")}
+	}
+
+	lines := hexPreviewLines(raw, hexPreviewMaxBytes)
+	if len(raw) > hexPreviewMaxBytes && len(lines) > 0 {
+		lines[len(lines)-1] = dimStyle.Render(lines[len(lines)-1])
+	}
+	return lines
+}
+
+// hexPreviewLines renders up to maxBytes of data as an `hexdump -C`-style
+// preview: an 8-digit offset, two 8-byte hex groups (an extra space between
+// the groups), and an ASCII gutter between pipes where only printable ASCII
+// (0x20-0x7E) renders as itself and everything else renders as '.' — the
+// gutter never emits a raw control byte, the same terminal-safety discipline
+// as sanitizeControlChars. When data is longer than maxBytes, only the first
+// maxBytes are dumped and a final "(… N more bytes)" line reports the
+// remainder (styling that line, if desired, is the caller's job — this
+// function returns plain text so it stays a pure, golden-testable mapping
+// from bytes to lines).
+func hexPreviewLines(data []byte, maxBytes int) []string {
+	preview := data
+	remaining := 0
+	if len(data) > maxBytes {
+		preview = data[:maxBytes]
+		remaining = len(data) - maxBytes
+	}
+
+	var lines []string
+	for offset := 0; offset < len(preview); offset += hexPreviewBytesPerLine {
+		end := offset + hexPreviewBytesPerLine
+		if end > len(preview) {
+			end = len(preview)
+		}
+		lines = append(lines, formatHexLine(offset, preview[offset:end]))
+	}
+	if remaining > 0 {
+		lines = append(lines, fmt.Sprintf("(… %d more bytes)", remaining))
+	}
+	return lines
+}
+
+// formatHexLine renders one hexdump -C line for a chunk of 1-16 bytes at the
+// given offset: "OFFSET  HEXGROUP1 HEXGROUP2 |ASCII|". Short chunks (the
+// final line of a body whose length isn't a multiple of 16) pad the hex
+// groups with blanks to keep the ASCII gutter aligned, but the ASCII gutter
+// itself only shows the bytes actually present (matching hexdump -C).
+func formatHexLine(offset int, chunk []byte) string {
+	first := chunk
+	var second []byte
+	if len(chunk) > hexPreviewBytesPerLine/2 {
+		first = chunk[:hexPreviewBytesPerLine/2]
+		second = chunk[hexPreviewBytesPerLine/2:]
+	}
+
+	var ascii strings.Builder
+	for _, b := range chunk {
+		if b >= 0x20 && b <= 0x7e {
+			ascii.WriteByte(b)
+		} else {
+			ascii.WriteByte('.')
+		}
+	}
+
+	return fmt.Sprintf("%08x  %s %s |%s|", offset, hexGroup(first), hexGroup(second), ascii.String())
+}
+
+// hexGroup renders up to 8 bytes as "%02x " each, padding absent slots with
+// "   " so hex columns stay aligned regardless of how many bytes are present.
+func hexGroup(b []byte) string {
+	var sb strings.Builder
+	for i := 0; i < hexPreviewBytesPerLine/2; i++ {
+		if i < len(b) {
+			fmt.Fprintf(&sb, "%02x ", b[i])
+		} else {
+			sb.WriteString("   ")
+		}
+	}
+	return sb.String()
 }
 
 // shouldPrettyPrintJSON reports whether a non-binary body should be run
@@ -1304,21 +1426,26 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	}
 	status := statusStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
 
-	// Format duration with overflow handling. In-flight rows have no
-	// duration yet (the response is still streaming) — render dots in place
-	// of digits, padded to the same 5-char width so columns stay aligned.
+	// Format the duration column, including its "ms" unit, in one piece: the
+	// normal/in-flight/overflow cases share a digits-or-filler value plus
+	// "ms". A stale in-flight row (D8, #53: the completion event may have
+	// been lost, true outcome unknown — not necessarily broken, long-lived
+	// streams/transfers can legitimately still be live here) renders
+	// "stale?" instead, which isn't a duration so it carries no "ms" suffix.
 	durationMs := req.Duration.Milliseconds()
 	var duration string
 	switch {
+	case req.StaleAt(time.Now()):
+		duration = "stale?"
 	case req.InFlight:
-		duration = "  ..."
+		duration = "  ...ms"
 	case durationMs > 9999:
-		duration = "9999+"
+		duration = "9999+ms"
 	default:
-		duration = fmt.Sprintf("%5d", durationMs)
+		duration = fmt.Sprintf("%5dms", durationMs)
 	}
 
-	return fmt.Sprintf("%s  %s  %s %s %sms  %s",
+	return fmt.Sprintf("%s  %s  %s %s %s  %s",
 		dimStyle.Render(ts),
 		dimStyle.Render(subdomain),
 		method,
@@ -1702,6 +1829,7 @@ func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs [
 		DurationMs: req.Duration.Milliseconds(),
 		RemoteAddr: req.RemoteAddr,
 		InFlight:   req.InFlight,
+		Stale:      req.StaleAt(time.Now()),
 	}
 
 	if req.Details != nil {
@@ -1743,14 +1871,17 @@ func convertCapturedBodyToBodyData(body *proxy.CapturedBody, allowedDirs []strin
 	}
 
 	bd.IsBinary = decoded.IsBinary
-	// Defense in depth (mirrors the API serve path): never string-convert bytes
-	// that are not valid UTF-8, even if the loaded record claims they are text —
-	// a socket-supplied flag or a mutated disk file must not reach the terminal
-	// as raw control bytes.
+	// Defense in depth (mirrors the API serve path): never treat bytes that are
+	// not valid UTF-8 as text, even if the loaded record claims they are — a
+	// socket-supplied flag or a mutated disk file must not reach the terminal
+	// as raw control bytes. Either way the raw bytes are kept in bd.Data
+	// (unlike the attach path, local mode never base64-encodes them) so a
+	// binary body still has bytes for the hexdump preview (D11, #50.2).
 	if !decoded.IsBinary && utf8.Valid(decoded.Data) {
 		bd.Data = string(decoded.Data)
 	} else {
 		bd.IsBinary = true
+		bd.Data = string(decoded.Data)
 	}
 	return bd
 }

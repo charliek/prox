@@ -21,6 +21,27 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// DaemonAPIError is returned by Client methods when the daemon responds with a
+// non-2xx status and a decodable ErrorResponse body. It carries the daemon's
+// Code (e.g. "SHUTTING_DOWN", "VERSION_MISMATCH") so callers can drive
+// recovery via errors.As instead of matching on message text — following the
+// ProjectConflictError precedent (registry.go). Error() reproduces the plain
+// message text callers previously saw from readError, so existing
+// message-only handling keeps working unchanged.
+type DaemonAPIError struct {
+	// Code is the daemon's machine-readable error code (ErrorResponse.Code).
+	// Empty when the daemon's body didn't include one.
+	Code string
+	// Message is the daemon's human-readable error text (ErrorResponse.Error).
+	Message string
+	// Status is the HTTP status code the daemon responded with.
+	Status int
+}
+
+func (e *DaemonAPIError) Error() string {
+	return e.Message
+}
+
 // NewClient creates a new daemon client that connects via Unix socket.
 func NewClient(socketPath string) *Client {
 	dialer := &net.Dialer{}
@@ -39,7 +60,14 @@ func NewClient(socketPath string) *Client {
 
 // Health checks if the daemon is alive and returns its version.
 func (c *Client) Health() (string, error) {
-	resp, err := c.get("/health")
+	return c.HealthWithContext(context.Background())
+}
+
+// HealthWithContext is Health bounded by ctx, so a caller can probe a possibly
+// unresponsive daemon with a short timeout instead of waiting out the client's
+// 30s default (used by the version-skew drain poll in D1).
+func (c *Client) HealthWithContext(ctx context.Context) (string, error) {
+	resp, err := c.getWithContext(ctx, "/health")
 	if err != nil {
 		return "", err
 	}
@@ -56,7 +84,10 @@ func (c *Client) Health() (string, error) {
 	return result["version"], nil
 }
 
-// Register registers a project's routes with the daemon.
+// Register registers a project's routes with the daemon. On a non-2xx
+// response it returns a *DaemonAPIError (errors.As) carrying the daemon's
+// error Code — e.g. "SHUTTING_DOWN" during the daemon's graceful-shutdown
+// grace (D4 retries this in tryDaemonProxy) or "VERSION_MISMATCH".
 func (c *Client) Register(req RegisterRequest) (*RegisterResponse, error) {
 	resp, err := c.post("/api/v1/register", req)
 	if err != nil {
@@ -91,7 +122,14 @@ func (c *Client) Deregister(req DeregisterRequest) error {
 
 // Status returns the daemon's current status.
 func (c *Client) Status() (*DaemonStatusResponse, error) {
-	resp, err := c.get("/api/v1/status")
+	return c.StatusWithContext(context.Background())
+}
+
+// StatusWithContext is Status bounded by ctx. The version-skew recovery path
+// probes a possibly-draining old daemon with a short timeout (D1) rather than
+// the client's 30s default.
+func (c *Client) StatusWithContext(ctx context.Context) (*DaemonStatusResponse, error) {
+	resp, err := c.getWithContext(ctx, "/api/v1/status")
 	if err != nil {
 		return nil, err
 	}
@@ -232,13 +270,17 @@ func (c *Client) post(path string, body any) (*http.Response, error) {
 	return c.httpClient.Post("http://proxyd"+path, "application/json", bodyReader)
 }
 
-// readError reads an error response from the daemon.
+// readError reads an error response from the daemon. When the body decodes to
+// an ErrorResponse with a non-empty Error field, it returns a *DaemonAPIError
+// (matched with errors.As by callers, e.g. the D4 SHUTTING_DOWN retry) rather
+// than a plain error, so the daemon's Code survives past this call. Its
+// Error() text is identical to what callers previously received.
 func (c *Client) readError(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
 
 	var errResp ErrorResponse
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return fmt.Errorf("%s", errResp.Error)
+		return &DaemonAPIError{Code: errResp.Code, Message: errResp.Error, Status: resp.StatusCode}
 	}
 	return fmt.Errorf("daemon returned %d: %s", resp.StatusCode, string(body))
 }
