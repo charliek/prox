@@ -43,6 +43,24 @@ All notable changes to this project will be documented in this file.
   stderr for the `Warning:` line) if they need to distinguish a fully torn
   down daemon from one still finishing up.
 
+### Lifecycle
+
+- **Crashed projects' routes converge in about one request instead of up to
+  30s** (#74). Previously, when a project crashed, the shared proxy kept
+  serving its routes — returning `502 Backend unavailable` — until the periodic
+  stale-PID sweep noticed the dead owner, which could take up to 30 seconds. The
+  daemon now also probes on demand: when a route's backend transport fails and
+  the proxy returns a 502, it checks that route's owning `prox up` process
+  off the request path and, if it is dead, reaps the registration right away, so
+  subsequent requests get a clean `404` (or fall through to a shared-port
+  neighbor) almost immediately. The probe is flap-safe — it keys on the
+  *owner's* identity, not the backend's, so a merely restarting or flapping
+  backend under a live `prox up` is never deregistered — and cheap under load: a
+  single in-flight probe per project, rate-limited, with a trailing probe so a
+  502 that arrives right after the crash is never missed. The 30s sweep remains
+  the backstop for cases with no live 502 to trigger on (backend-authored 502s,
+  mid-stream aborts, and dead projects receiving no traffic).
+
 ## v0.2.1
 
 A hardening pass on lifecycle signals and the requests pipeline: `prox up`/`prox status`/`prox stop` now give trustworthy exit codes and error messages instead of silently degrading, the shared proxy daemon self-heals and isolates projects from each other, and captured request/response bodies decode more content types. Plus a refreshed agent skill and docs.

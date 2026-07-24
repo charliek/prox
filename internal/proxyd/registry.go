@@ -17,12 +17,20 @@ type PortSpec struct {
 
 // Route represents a single registered proxy route.
 type Route struct {
-	Hostname     string
-	Port         int
-	Protocol     string // "http" or "https"
-	Target       ServiceTarget
-	ProjectDir   string
-	PID          int
+	Hostname   string
+	Port       int
+	Protocol   string // "http" or "https"
+	Target     ServiceTarget
+	ProjectDir string
+	PID        int
+	// StartTime is the owning process's opaque start token, copied from the
+	// project's ProjectRegistration (see daemon.ProcessStartTime). It freezes
+	// the generation identity onto the route so the dynamic proxy's on-502
+	// dead-owner probe (#74) can hand the exact (dir, PID, StartTime) tuple of
+	// the failing generation to the identity-guarded removal path, never
+	// re-resolving it — a restart that reused the PID reads as a different
+	// generation and is protected by DeregisterIfIdentity.
+	StartTime    int64
 	RegisteredAt time.Time
 	// CaptureEnabled is stamped from the owning project's registration so the
 	// dynamic proxy can gate body capture per project (a capture-disabled
@@ -193,6 +201,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			Target:         p.target,
 			ProjectDir:     req.ProjectDir,
 			PID:            req.PID,
+			StartTime:      req.StartTime,
 			RegisteredAt:   now,
 			CaptureEnabled: req.CaptureEnabled,
 			MaxBodySize:    req.MaxBodySize,

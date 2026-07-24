@@ -92,6 +92,18 @@ const (
 	// attempts, damping churn against a flapping daemon (D6b). Injectable in tests.
 	ForwarderHealMinInterval = 30 * time.Second
 
+	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
+	// liveness probes for a single project (#74). When a route's backend
+	// transport fails, the daemon probes the owning `prox up` process's liveness
+	// and reaps the registration if it is dead, converging a crashed project's
+	// routes in ~one request instead of waiting up to a full
+	// stalePIDCheckInterval (30s) for the periodic sweep. The single-in-flight
+	// probe state machine bounds concurrency (one chain per project); this
+	// interval bounds frequency, damping a 502 storm into at most one probe per
+	// interval while still guaranteeing a trailing probe for a 502 suppressed
+	// inside the window. Injectable in tests.
+	DeadRouteProbeMinInterval = 1 * time.Second
+
 	// InFlightStaleAfter is how long a request record may sit in-flight before
 	// it is reported as stale (D8, #53). Stale does NOT mean broken: SSE
 	// streams, WebSocket upgrades, and large transfers can legitimately stay

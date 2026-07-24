@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/proxy"
 )
 
@@ -50,6 +51,49 @@ type DynamicProxy struct {
 	managers       *Managers
 	captureManager *proxy.CaptureManager
 	logger         *slog.Logger
+
+	// --- on-502 dead-owner probe (#74) ---
+	// probeMu guards the entire probe state machine: the probes map AND every
+	// field of each *probeState. It is held ONLY for those field reads/writes —
+	// never across an OS liveness check, the removal callback (which takes the
+	// Server's lifecycleMu), or a sleep — so the data plane never blocks on a
+	// probe and the accepted lock ordering (never probeMu → lifecycleMu) holds.
+	probeMu sync.Mutex
+	// probes holds one small state struct per project dir with an active or
+	// recently-fired probe. Entries are created lazily on the first 502 for a
+	// dir and pruned when a probe finds the owner dead (successful reap) or the
+	// dir is gone; entries for never-removed dirs persist, bounded by the
+	// distinct project dirs a daemon serves (accepted, D4).
+	probes map[string]*probeState
+	// deadRouteRemover reaps a dead generation's registration. Installed once via
+	// SetDeadRouteRemover before listeners serve and immutable afterwards; nil
+	// disables probing (checked once per trigger). RunDaemon wires the closure
+	// that mirrors the stale-PID sweep's epilogue (removal + shutdown scheduling).
+	deadRouteRemover func(dir string, pid int, startTime int64)
+	// probeMinInterval, probeClock, probeSleep, and probeIsAlive are the probe's
+	// injectable timing/liveness seams (mirrors forwarderConfig): production
+	// values are wired in NewDynamicProxy, tests override them before serving to
+	// drive the gate deterministically with no wall-clock waits.
+	probeMinInterval time.Duration
+	probeClock       func() time.Time
+	probeSleep       func(time.Duration)
+	probeIsAlive     func(pid int, startTime int64) bool
+}
+
+// probeState is the per-project dead-owner probe gate (#74), guarded by
+// DynamicProxy.probeMu. lastStart is the time the most recent probe began (the
+// rate-limit anchor); inFlight is true while a probe chain — a running probe or
+// a parked trailing waiter — owns the dir (the single-in-flight bound); pending
+// records that a 502 arrived while a chain was active, pinning one trailing
+// probe so a post-death 502 is never lost. pid/startTime are the frozen
+// generation identity of the most recent failing 502, handed to the liveness
+// check and the removal callback unchanged.
+type probeState struct {
+	lastStart time.Time
+	inFlight  bool
+	pending   bool
+	pid       int
+	startTime int64
 }
 
 // NewDynamicProxy creates a new dynamic proxy. captureManager may be nil, in
@@ -62,12 +106,17 @@ type DynamicProxy struct {
 // (a non-nil interface wrapping a nil pointer) and panic on the first HTTPS bind.
 func NewDynamicProxy(registry *Registry, certMgr certManager, managers *Managers, captureManager *proxy.CaptureManager, logger *slog.Logger) *DynamicProxy {
 	return &DynamicProxy{
-		listeners:      make(map[int]*managedListener),
-		registry:       registry,
-		certMgr:        certMgr,
-		managers:       managers,
-		captureManager: captureManager,
-		logger:         logger,
+		listeners:        make(map[int]*managedListener),
+		registry:         registry,
+		certMgr:          certMgr,
+		managers:         managers,
+		captureManager:   captureManager,
+		logger:           logger,
+		probes:           make(map[string]*probeState),
+		probeMinInterval: constants.DeadRouteProbeMinInterval,
+		probeClock:       time.Now,
+		probeSleep:       time.Sleep,
+		probeIsAlive:     daemon.IsProcessAlive,
 		transport: &http.Transport{
 			DialContext: (&net.Dialer{
 				Timeout:   constants.DefaultProxyDialTimeout,
@@ -77,6 +126,148 @@ func NewDynamicProxy(registry *Registry, certMgr certManager, managers *Managers
 			IdleConnTimeout:     constants.DefaultProxyIdleConnTimeout,
 			TLSHandshakeTimeout: 10 * time.Second,
 		},
+	}
+}
+
+// SetDeadRouteRemover installs the callback that reaps a dead generation's
+// registration when an on-502 probe finds its owning process dead (#74). It
+// must be called once during daemon setup, before any listener serves, and is
+// not safe to change concurrently with live traffic. A nil remover (the default
+// for the standalone/test proxies that never wire it) leaves probing disabled:
+// every trigger short-circuits before touching the state machine.
+func (dp *DynamicProxy) SetDeadRouteRemover(remove func(dir string, pid int, startTime int64)) {
+	dp.deadRouteRemover = remove
+}
+
+// decideProbe is the pure probe gate (#74): given a project's current state and
+// the trigger time, it decides — under the caller's probeMu — whether to spawn
+// a probe chain and, if so, after what initial wait. It mutates st in place.
+//
+//   - A chain already owns the dir (inFlight) → record pending, spawn nothing.
+//     The running chain will fire exactly one trailing probe when it finishes.
+//   - No chain owns the dir → claim it (inFlight=true, clear pending). If the
+//     last probe began within minInterval, defer the probe to the trailing edge
+//     (wait out the remainder) so a 502 storm produces at most one probe per
+//     interval; otherwise probe immediately.
+//
+// This is the atomic check-AND-set: the inFlight claim and the spawn decision
+// happen under one lock, so two concurrent 502s can never both spawn a chain.
+func decideProbe(st *probeState, now time.Time, minInterval time.Duration) (spawn bool, wait time.Duration) {
+	if st.inFlight {
+		st.pending = true
+		return false, 0
+	}
+	st.inFlight = true
+	st.pending = false
+	if st.lastStart.IsZero() {
+		return true, 0
+	}
+	// Defer to the trailing edge for whatever remains of the cooldown, floored
+	// at zero once the interval has already elapsed (probe immediately).
+	if wait = minInterval - now.Sub(st.lastStart); wait < 0 {
+		wait = 0
+	}
+	return true, wait
+}
+
+// triggerDeadRouteProbe is the ErrorHandler's entry into the probe gate. It runs
+// on the data-plane goroutine AFTER the 502 has been written, so it must return
+// promptly: it only takes probeMu to update the frozen identity and run the pure
+// gate, then spawns the probe chain (if any) on its own goroutine. It never
+// blocks on the OS liveness check or the removal callback.
+func (dp *DynamicProxy) triggerDeadRouteProbe(dir string, pid int, startTime int64) {
+	if dp.deadRouteRemover == nil {
+		return
+	}
+	dp.probeMu.Lock()
+	st := dp.probes[dir]
+	if st == nil {
+		st = &probeState{}
+		dp.probes[dir] = st
+	}
+	// Freeze the most recent failing generation's identity onto the state; the
+	// probe and removal use this tuple unchanged (DeregisterIfIdentity guards a
+	// newer generation).
+	st.pid = pid
+	st.startTime = startTime
+	spawn, wait := decideProbe(st, dp.probeClock(), dp.probeMinInterval)
+	dp.probeMu.Unlock()
+
+	if spawn {
+		go dp.runProbeChain(dir, wait)
+	}
+}
+
+// runProbeChain is the single-in-flight probe goroutine for one project dir. It
+// probes the frozen owner's liveness with NO locks held; on a dead owner it
+// invokes the removal callback (which takes lifecycleMu), converging the crashed
+// project's routes. Whether the owner was alive or dead, it then checks pending
+// under the lock: a 502 that arrived during the probe (its identity now frozen
+// on the state, possibly a newer generation) fires exactly one more probe on the
+// trailing edge, so a post-death 502 is never lost — even one that re-registered
+// and died during the previous generation's reap. Only when nothing is pending
+// does it finish: a live owner releases the chain (keeping the entry to
+// rate-limit later 502s); a reaped dead owner prunes the entry.
+func (dp *DynamicProxy) runProbeChain(dir string, wait time.Duration) {
+	if wait > 0 {
+		dp.probeSleep(wait)
+	}
+	for {
+		dp.probeMu.Lock()
+		st := dp.probes[dir]
+		if st == nil {
+			// Pruned out from under us (a concurrent chain reaped the dir).
+			dp.probeMu.Unlock()
+			return
+		}
+		pid, startTime := st.pid, st.startTime
+		st.lastStart = dp.probeClock()
+		dp.probeMu.Unlock()
+
+		// OS liveness check (and, on a dead owner, the reap) with NO locks held —
+		// the data plane must never block on a probe, and probeMu must never be
+		// held across an OS read, the removal callback, or lifecycleMu.
+		alive := dp.probeIsAlive(pid, startTime)
+		if !alive {
+			// Dead owner: hand the frozen tuple to the identity-guarded removal
+			// path (a newer generation is protected by DeregisterIfIdentity).
+			dp.deadRouteRemover(dir, pid, startTime)
+		}
+
+		// Both the alive and dead paths converge here. A 502 that arrived while
+		// this iteration ran with the lock released set pending (and overwrote the
+		// frozen identity to that newer 502's generation). The trailing edge must
+		// honor it BEFORE we prune — otherwise a generation that re-registered and
+		// then died during the reap of the previous generation would be dropped
+		// and left to the 30s sweep, losing the "one trailing probe per suppressed
+		// 502" guarantee (AC4).
+		dp.probeMu.Lock()
+		st = dp.probes[dir]
+		if st == nil {
+			// A concurrent chain already pruned the dir.
+			dp.probeMu.Unlock()
+			return
+		}
+		if st.pending {
+			st.pending = false
+			trailing := dp.probeMinInterval - dp.probeClock().Sub(st.lastStart)
+			dp.probeMu.Unlock()
+			if trailing > 0 {
+				dp.probeSleep(trailing)
+			}
+			continue
+		}
+		if alive {
+			// Live owner (the flap-safe common case): release the chain but keep
+			// the entry so lastStart keeps rate-limiting later 502s.
+			st.inFlight = false
+		} else {
+			// Dead owner reaped and nothing pending: prune the entry (a later 502
+			// for a fresh generation re-creates it from scratch).
+			delete(dp.probes, dir)
+		}
+		dp.probeMu.Unlock()
+		return
 	}
 }
 
@@ -266,6 +457,13 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			// WriteHeader first would commit the response before http.Error
 			// could set its error headers.
 			http.Error(w, "Backend unavailable", http.StatusBadGateway)
+			// After the 502 is written, hand the frozen identity of the exact
+			// generation that produced this failure to the dead-owner probe gate
+			// (#74). This returns promptly — the actual liveness check and any
+			// reap run on a separate goroutine, so the data plane never blocks.
+			// A live owner (flapping backend) probes alive and is a structural
+			// no-op; only a dead `prox up` owner converges the route.
+			dp.triggerDeadRouteProbe(route.ProjectDir, route.PID, route.StartTime)
 		}
 
 		// buildRecord is the single field-parity point for the two-phase
