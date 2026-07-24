@@ -88,7 +88,7 @@ func completeProcessNames(cmd *cobra.Command, args []string, toComplete string) 
 	return names, cobra.ShellCompDirectiveNoFileComp
 }
 
-func runUp(cmd *cobra.Command, args []string) error {
+func runUp(cmd *cobra.Command, args []string) (err error) {
 	processes := args
 
 	// Validate mutually exclusive flags
@@ -128,6 +128,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to setup logging: %w", err)
 		}
 		defer logFile.Close()
+		// Flush a fatal startup error INTO the log before the Close above
+		// runs (defers are LIFO): Execute() prints the returned error to
+		// os.Stderr only after runUp's defers have closed the redirected
+		// log file, so without this the child dies with its reason lost —
+		// the parent's log tail (D2) would show only stale content.
+		defer func() {
+			if err != nil {
+				fmt.Fprintf(logFile, "Error: %v\n", err)
+			}
+		}()
 	}
 
 	// Load config
