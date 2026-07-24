@@ -145,6 +145,11 @@ type BodyData struct {
 	ContentEncoding string
 	IsBinary        bool
 	Data            string
+	// DataBase64 marks Data as base64-encoded (the attach-mode wire format:
+	// the API base64-encodes binary bodies). Local mode stores raw bytes and
+	// leaves this false, so the hex preview never has to guess — raw bytes
+	// that merely LOOK like base64 must not be decoded.
+	DataBase64 bool
 	// Unavailable is true when the body existed but could no longer be loaded
 	// (e.g. its disk file was evicted); UnavailableReason explains why.
 	Unavailable       bool

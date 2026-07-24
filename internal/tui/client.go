@@ -298,12 +298,14 @@ func (m ClientModel) fetchRequestDetail(id string, seq int) tea.Cmd {
 // unavailable_reason marks an evicted body.
 func clientBodyToBodyData(body *api.CapturedBodyResponse) *BodyData {
 	return &BodyData{
-		Size:              body.Size,
-		Truncated:         body.Truncated,
-		ContentType:       body.ContentType,
-		ContentEncoding:   body.ContentEncoding,
-		IsBinary:          body.IsBinary,
-		Data:              body.Data,
+		Size:            body.Size,
+		Truncated:       body.Truncated,
+		ContentType:     body.ContentType,
+		ContentEncoding: body.ContentEncoding,
+		IsBinary:        body.IsBinary,
+		Data:            body.Data,
+		DataBase64:      body.IsBinary, // API base64-encodes binary body data
+
 		Unavailable:       body.UnavailableReason != "",
 		UnavailableReason: body.UnavailableReason,
 	}
