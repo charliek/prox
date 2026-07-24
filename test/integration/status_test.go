@@ -39,16 +39,17 @@ processes:
 		t.Fatalf("failed to start daemon: %v\noutput: %s", err, out)
 	}
 
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-
 	// Always tear the daemon down so a wedged test never strands a daemon.
-	defer func() {
+	// Registered before the readiness wait so a failed wait still cleans up.
+	t.Cleanup(func() {
 		stop := exec.Command(binary, "stop", "-c", configPath)
 		stop.Dir = tmpDir
 		_, _ = stop.CombinedOutput()
 		time.Sleep(300 * time.Millisecond)
-	}()
+	})
+
+	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	waitForStateFile(t, statePath, 10*time.Second)
 
 	// runStatus runs `prox status` (with optional extra args) in the project
 	// directory and returns its stdout, stderr, and exit code separately (the

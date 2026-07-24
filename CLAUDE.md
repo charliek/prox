@@ -7,7 +7,7 @@ Working conventions for agent sessions in this repo. See `RELEASING.md` and
 
 Run before every commit:
 
-```
+```shell
 make lint && make test && make test-race && make build
 ```
 
@@ -32,7 +32,7 @@ killed mid-run, this process can be stranded holding port 15561
 orphan-grandchild integration tests fail with `marker GRANDCHILD_PID= not
 found`. Recover with:
 
-```
+```shell
 lsof -nP -i :15561
 kill -9 <pid>
 ```
