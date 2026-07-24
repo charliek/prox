@@ -824,3 +824,31 @@ func TestRequestManager_RecentPage_PaginationCarriesAndOmitsCursor(t *testing.T)
 	// omitted (no more pages) instead of pointing back at r1.
 	assert.Empty(t, next3)
 }
+
+// TestRequestManager_WritesRejectedAfterClose pins the D13 destroy-race latch
+// (codex C12 review): once Close runs, Record and Upsert are rejected (false)
+// so a completion racing a deregister-destroy cleans its own capture files
+// instead of landing in a detached ring after the final purge already ran.
+// Writes accepted BEFORE the latch stay covered by the destroy's final purge.
+func TestRequestManager_WritesRejectedAfterClose(t *testing.T) {
+	m := NewRequestManager(10)
+
+	if ok := m.Record(RequestRecord{ID: "before-close", Method: "GET", URL: "/a"}); !ok {
+		t.Fatal("Record before Close must be accepted")
+	}
+	if ok := m.Upsert(RequestRecord{ID: "before-close", Method: "GET", URL: "/a"}); !ok {
+		t.Fatal("Upsert before Close must be accepted (terminal no-op still reports accepted)")
+	}
+
+	m.Close()
+
+	if ok := m.Record(RequestRecord{ID: "after-close-r", Method: "GET", URL: "/b"}); ok {
+		t.Error("Record after Close must be rejected")
+	}
+	if ok := m.Upsert(RequestRecord{ID: "after-close-u", Method: "GET", URL: "/c"}); ok {
+		t.Error("Upsert after Close must be rejected")
+	}
+	if m.Count() != 1 {
+		t.Errorf("ring count = %d, want 1 (no post-Close writes landed)", m.Count())
+	}
+}

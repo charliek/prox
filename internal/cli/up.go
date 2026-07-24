@@ -818,6 +818,24 @@ func proxyStartError(err error) error {
 	return fmt.Errorf("proxy failed to start: %w\n\nTo start without the proxy:\n  prox up --no-proxy", err)
 }
 
+// captureMaxBodySize resolves the project's configured capture cap to bytes for
+// the register wire (D13, #49). It parses cfg.Proxy.Capture.MaxBodySize (e.g.
+// "1MB", "512KB") with the same parser the standalone capture manager uses. An
+// unset or unparseable value yields 0, which the daemon reads as "use the
+// default cap" — a bad string degrades gracefully rather than failing `prox up`.
+func captureMaxBodySize(cfg *config.Config) int64 {
+	if cfg.Proxy.Capture == nil || cfg.Proxy.Capture.MaxBodySize == "" {
+		return 0
+	}
+	n, err := config.ParseSize(cfg.Proxy.Capture.MaxBodySize)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: invalid proxy.capture.max_body_size %q: %v — using the daemon default capture cap\n",
+			cfg.Proxy.Capture.MaxBodySize, err)
+		return 0
+	}
+	return n
+}
+
 // startProxy attempts to register with the shared proxy daemon. If the daemon
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
@@ -898,6 +916,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		HTTPPort:       cfg.Proxy.HTTPPort,
 		HTTPSPort:      cfg.Proxy.HTTPSPort,
 		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
+		MaxBodySize:    captureMaxBodySize(cfg),
 		StartTime:      startToken,
 	}
 

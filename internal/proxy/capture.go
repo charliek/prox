@@ -115,10 +115,33 @@ func (cm *CaptureManager) Enabled() bool {
 	return cm.enabled
 }
 
-// CaptureRequest captures the request body using a TeeReader.
+// effectiveLimit resolves a per-call capture cap: a positive limit is used
+// verbatim, and 0 (or negative) falls back to the manager's configured
+// maxBodySize (which itself defaults to DefaultCaptureMaxBodySize). The daemon
+// passes each route's own cap here (D13, #49); the standalone in-process proxy
+// passes 0, keeping the project's configured cap. maxBodySize is set once at
+// construction and never mutated, so no lock is needed.
+func (cm *CaptureManager) effectiveLimit(limit int64) int64 {
+	if limit > 0 {
+		return limit
+	}
+	return cm.maxBodySize
+}
+
+// CaptureRequest captures the request body using the manager's configured cap.
+// It is CaptureRequestWithLimit with a 0 (manager-default) limit — the signature
+// the standalone in-process proxy uses.
+func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*CapturedBody, io.ReadCloser, http.Header) {
+	return cm.CaptureRequestWithLimit(requestID, r, 0)
+}
+
+// CaptureRequestWithLimit captures the request body using a TeeReader bounded by
+// a per-call cap (D13, #49): the daemon passes the matched route's MaxBodySize so
+// each project honors its own quota through the one shared capture dir. A limit
+// of 0 falls back to the manager's configured cap (see effectiveLimit).
 // Returns the captured body info and a new ReadCloser to use in place of the original body.
 // The original body is wrapped so that reading from the returned ReadCloser also captures the data.
-func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*CapturedBody, io.ReadCloser, http.Header) {
+func (cm *CaptureManager) CaptureRequestWithLimit(requestID string, r *http.Request, limit int64) (*CapturedBody, io.ReadCloser, http.Header) {
 	if !cm.enabled || r.Body == nil {
 		return nil, r.Body, cloneHeaders(r.Header)
 	}
@@ -128,7 +151,7 @@ func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*Ca
 
 	// Create a buffer to capture the body
 	captured := &captureBuffer{
-		maxSize:   cm.maxBodySize,
+		maxSize:   cm.effectiveLimit(limit),
 		requestID: requestID,
 		suffix:    "_req",
 		cm:        cm,
@@ -152,11 +175,20 @@ func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*Ca
 	return body, wrappedBody, headers
 }
 
-// WrapResponseWriter wraps w in a CaptureResponseWriter that records up to the
-// manager's configured max body size while forwarding all writes downstream.
-// The returned writer preserves http.Flusher/Hijacker/Pusher/Unwrap behavior.
+// WrapResponseWriter wraps w in a CaptureResponseWriter bounded by the manager's
+// configured max body size. It is WrapResponseWriterWithLimit with a 0
+// (manager-default) limit — the signature the standalone in-process proxy uses.
 func (cm *CaptureManager) WrapResponseWriter(w http.ResponseWriter) *CaptureResponseWriter {
-	return newCaptureResponseWriter(w, cm.maxBodySize)
+	return cm.WrapResponseWriterWithLimit(w, 0)
+}
+
+// WrapResponseWriterWithLimit wraps w in a CaptureResponseWriter that records up
+// to a per-call cap (D13, #49) while forwarding all writes downstream: the daemon
+// passes the matched route's MaxBodySize so each project honors its own quota. A
+// limit of 0 falls back to the manager's configured cap (see effectiveLimit).
+// The returned writer preserves http.Flusher/Hijacker/Pusher/Unwrap behavior.
+func (cm *CaptureManager) WrapResponseWriterWithLimit(w http.ResponseWriter, limit int64) *CaptureResponseWriter {
+	return newCaptureResponseWriter(w, cm.effectiveLimit(limit))
 }
 
 // FinalizeResponse captures the response body from a CaptureResponseWriter.

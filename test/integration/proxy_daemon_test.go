@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/proxyd"
 )
 
@@ -26,14 +25,13 @@ func startDaemonServer(t *testing.T) (*proxyd.Client, func()) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	registry := proxyd.NewRegistry()
-	requestMgr := proxy.NewRequestManager(100)
 	server := proxyd.NewServer(proxyd.ServerConfig{
 		SocketPath: socketPath,
 		Logger:     logger,
 		Version:    "test",
 	})
 	server.SetRegistry(registry)
-	server.SetRequestManager(requestMgr)
+	server.SetManagers(proxyd.NewManagers(100, nil))
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Start() }()

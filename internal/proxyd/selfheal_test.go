@@ -27,11 +27,11 @@ func newProxyServer(t *testing.T) *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 	s := NewServer(ServerConfig{SocketPath: "", Logger: logger, Version: "test"})
 	reg := NewRegistry()
-	rm := proxy.NewRequestManager(100)
-	dp := NewDynamicProxy(reg, nil, rm, nil, logger)
+	ms := NewManagers(100, nil)
+	dp := NewDynamicProxy(reg, nil, ms, nil, logger)
 	s.SetRegistry(reg)
 	s.SetProxy(dp)
-	s.SetRequestManager(rm)
+	s.SetManagers(ms)
 	t.Cleanup(func() { _ = dp.Shutdown(context.Background()) })
 	return s
 }
@@ -182,13 +182,12 @@ func TestSelfHeal_Concurrency_RegisterVsSweep(t *testing.T) {
 			// A late sweep tick for the dead PID must not touch the live
 			// generation's route or records.
 			recID := fmt.Sprintf("newgen-%d", i)
-			s.requestManager.Record(proxy.RequestRecord{ID: recID, ProjectDir: "/projects/dead", Method: "GET", URL: "/n", Details: &proxy.RequestDetails{}})
+			recordInto(s, proxy.RequestRecord{ID: recID, ProjectDir: "/projects/dead", Method: "GET", URL: "/n", Details: &proxy.RequestDetails{}})
 			removed, _, _ := s.removeStaleProject("/projects/dead", dead, 0)
 			assert.False(t, removed, "iteration %d: late sweep must skip the live generation", i)
 			_, ok = s.registry.Lookup("api.local.dev", port)
 			assert.True(t, ok, "iteration %d: live route must survive a late sweep", i)
-			_, ok = s.requestManager.GetByID(recID)
-			assert.True(t, ok, "iteration %d: new generation's record must survive a late sweep", i)
+			assert.True(t, projectHas(s, "/projects/dead", recID), "iteration %d: new generation's record must survive a late sweep", i)
 		}
 	}
 	// The race must not be able to starve the restart entirely — the whole
@@ -221,7 +220,7 @@ func TestSelfHeal_RollbackBindFailSchedulesShutdown(t *testing.T) {
 	// A record captured for the project while its routes were briefly visible
 	// (shared-port listener window) must not survive the rollback as an
 	// orphan — pre-seed one to pin the purge.
-	s.requestManager.Record(proxy.RequestRecord{
+	recordInto(s, proxy.RequestRecord{
 		ID: "rollback-orphan", ProjectDir: "/projects/dead", Method: "GET", URL: "/w",
 	})
 
@@ -233,8 +232,7 @@ func TestSelfHeal_RollbackBindFailSchedulesShutdown(t *testing.T) {
 	status, body := s.register(reReq)
 	require.Equal(t, http.StatusInternalServerError, status, "bind failure expected: %v", body)
 	require.True(t, s.registry.IsEmpty(), "rollback must empty the registry")
-	_, found := s.requestManager.GetByID("rollback-orphan")
-	require.False(t, found, "rollback must purge the project's captured records")
+	require.False(t, projectHas(s, "/projects/dead", "rollback-orphan"), "rollback must purge the project's captured records")
 
 	select {
 	case <-s.ShutdownCh():

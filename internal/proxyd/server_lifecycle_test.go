@@ -25,7 +25,7 @@ func newLifecycleServer() *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 	s := NewServer(ServerConfig{SocketPath: "", Logger: logger, Version: "test"})
 	s.SetRegistry(NewRegistry())
-	s.SetRequestManager(proxy.NewRequestManager(100))
+	s.SetManagers(NewManagers(100, nil))
 	return s
 }
 
@@ -43,9 +43,9 @@ func TestServer_RemoveProject_ScopedByProject(t *testing.T) {
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 4000}}, 0, 8443))
 	require.NoError(t, err)
 
-	// Records for each project, same hostname.
-	s.requestManager.Record(proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
-	s.requestManager.Record(proxy.RequestRecord{ID: "b1", Method: "GET", URL: "/b", Hostname: "api.local.dev", ProjectDir: "/projects/b"})
+	// Records for each project, same hostname, in their own per-project rings.
+	recordInto(s, proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
+	recordInto(s, proxy.RequestRecord{ID: "b1", Method: "GET", URL: "/b", Hostname: "api.local.dev", ProjectDir: "/projects/b"})
 
 	removed, _ := s.removeProject("/projects/a")
 	assert.Equal(t, []string{"api.local.dev"}, removed)
@@ -56,8 +56,9 @@ func TestServer_RemoveProject_ScopedByProject(t *testing.T) {
 	_, okB := s.registry.Lookup("api.local.dev", 8443)
 	assert.True(t, okB, "B's route should survive")
 
-	// A's records purged, B's survive.
-	remaining := s.requestManager.Recent(proxy.RequestFilter{})
+	// A's ring destroyed, B's ring survives with its record.
+	assert.Nil(t, projectRing(s, "/projects/a"), "A's ring must be destroyed on deregister")
+	remaining := projectRecent(s, "/projects/b")
 	require.Len(t, remaining, 1)
 	assert.Equal(t, "b1", remaining[0].ID)
 }
@@ -78,8 +79,8 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 	_, _, err := s.registry.Register(req)
 	require.NoError(t, err)
 
-	s.requestManager.Record(proxy.RequestRecord{ID: "d1", Method: "GET", URL: "/d", Hostname: "api.local.dev", ProjectDir: "/projects/dead"})
-	require.Equal(t, 1, s.requestManager.Count())
+	recordInto(s, proxy.RequestRecord{ID: "d1", Method: "GET", URL: "/d", Hostname: "api.local.dev", ProjectDir: "/projects/dead"})
+	require.Equal(t, 1, projectCount(s, "/projects/dead"))
 
 	// The daemon sweep: detect stale PIDs, then remove via the PID-guarded path.
 	stale := s.registry.StalePIDs()
@@ -90,7 +91,7 @@ func TestServer_StalePIDSweep_PurgesRecords(t *testing.T) {
 	}
 
 	assert.True(t, s.registry.IsEmpty(), "registry should be empty after stale sweep")
-	assert.Equal(t, 0, s.requestManager.Count(), "stale project's records must be purged")
+	assert.Nil(t, projectRing(s, "/projects/dead"), "stale project's ring must be destroyed")
 }
 
 // TestServer_RemoveStaleProject_SkipsReRegistered pins the detection→removal
@@ -117,13 +118,13 @@ func TestServer_RemoveStaleProject_SkipsReRegistered(t *testing.T) {
 	reReq.PID = 1 // always-alive PID (launchd/init)
 	_, _, err = s.registry.Register(reReq)
 	require.NoError(t, err)
-	s.requestManager.Record(proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
+	recordInto(s, proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
 
 	removed, _, _ := s.removeStaleProject(stale[0].Dir, stale[0].PID, stale[0].StartTime)
 	assert.False(t, removed, "guarded removal must skip the re-registered project")
 	_, ok := s.registry.Lookup("api.local.dev", 443)
 	assert.True(t, ok, "live registration's route must survive")
-	assert.Equal(t, 1, s.requestManager.Count(), "live registration's records must survive")
+	assert.Equal(t, 1, projectCount(s, "/projects/x"), "live registration's records must survive")
 }
 
 // TestServer_RemoveStaleProject_SkipsReusedPID pins the reused-PID teardown fix
@@ -164,7 +165,7 @@ func TestServer_RemoveStaleProject_SkipsReusedPID(t *testing.T) {
 	reReq.StartTime = t2
 	_, _, err = s.registry.Register(reReq)
 	require.NoError(t, err)
-	s.requestManager.Record(proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
+	recordInto(s, proxy.RequestRecord{ID: "x1", Method: "GET", URL: "/x", ProjectDir: "/projects/x"})
 
 	// Guard half: the delayed sweep removal targets the dead generation's
 	// identity (deadP, T1), but the current registration carries T2 — the
@@ -173,7 +174,7 @@ func TestServer_RemoveStaleProject_SkipsReusedPID(t *testing.T) {
 	assert.False(t, removed, "reused-PID restart under a new token must survive the sweep")
 	_, ok := s.registry.Lookup("api.local.dev", 443)
 	assert.True(t, ok, "live restart's route must survive")
-	assert.Equal(t, 1, s.requestManager.Count(), "live restart's records must survive")
+	assert.Equal(t, 1, projectCount(s, "/projects/x"), "live restart's records must survive")
 }
 
 // TestHandleRegister_RejectsEmptyProjectDir pins the identity requirement:
@@ -195,7 +196,7 @@ func TestHandleRegister_RejectsEmptyProjectDir(t *testing.T) {
 // records.
 func TestRequestEndpoints_RequireProjectParam(t *testing.T) {
 	server, client, _ := startTestServer(t)
-	server.SetRequestManager(proxy.NewRequestManager(10))
+	_ = server // ring set already wired by startTestServer
 
 	resp, err := client.httpClient.Get("http://proxyd/api/v1/requests")
 	require.NoError(t, err)
@@ -215,8 +216,7 @@ func TestRequestEndpoints_RequireProjectParam(t *testing.T) {
 // default of 100.
 func TestHandleGetRequests_LimitClamp(t *testing.T) {
 	server, client, _ := startTestServer(t)
-	rm := proxy.NewRequestManager(1500)
-	server.SetRequestManager(rm)
+	rm := server.managers.ensure("/projects/a")
 
 	for i := 0; i < 150; i++ {
 		rm.Record(proxy.RequestRecord{
@@ -281,7 +281,10 @@ func TestServer_SelfHeal_DeadPIDReRegister(t *testing.T) {
 	// purged — the eviction callback fires only for records carrying Details.
 	bodyFile := filepath.Join(t.TempDir(), "body.bin")
 	require.NoError(t, os.WriteFile(bodyFile, []byte("stale body"), 0o600))
-	s.requestManager.SetEvictionCallback(func(id string) {
+	// Wire the eviction callback onto the dead project's own ring: purging its
+	// records must delete the on-disk body file.
+	deadRing := s.managers.ensure("/projects/dead")
+	deadRing.SetEvictionCallback(func(id string) {
 		if id == "dead-rec" {
 			_ = os.Remove(bodyFile)
 		}
@@ -293,7 +296,7 @@ func TestServer_SelfHeal_DeadPIDReRegister(t *testing.T) {
 	otherReq.PID = os.Getpid()
 	_, _, err := s.registry.Register(otherReq)
 	require.NoError(t, err)
-	s.requestManager.Record(proxy.RequestRecord{ID: "other-rec", ProjectDir: "/projects/other", Method: "GET", URL: "/o", Details: &proxy.RequestDetails{}})
+	recordInto(s, proxy.RequestRecord{ID: "other-rec", ProjectDir: "/projects/other", Method: "GET", URL: "/o", Details: &proxy.RequestDetails{}})
 
 	// Dead generation: register under a PID that is guaranteed dead.
 	deadReq := newTestRequest("/projects/dead", "local.dev",
@@ -301,7 +304,7 @@ func TestServer_SelfHeal_DeadPIDReRegister(t *testing.T) {
 	deadReq.PID = deadPID(t)
 	_, _, err = s.registry.Register(deadReq)
 	require.NoError(t, err)
-	s.requestManager.Record(proxy.RequestRecord{ID: "dead-rec", ProjectDir: "/projects/dead", Method: "GET", URL: "/d", Details: &proxy.RequestDetails{}})
+	deadRing.Record(proxy.RequestRecord{ID: "dead-rec", ProjectDir: "/projects/dead", Method: "GET", URL: "/d", Details: &proxy.RequestDetails{}})
 
 	// Restart: same dir, a live PID. Self-heal replaces the dead registration.
 	reReq := deadReq
@@ -315,16 +318,15 @@ func TestServer_SelfHeal_DeadPIDReRegister(t *testing.T) {
 	require.True(t, ok, "new generation's route must be registered")
 	assert.Equal(t, os.Getpid(), route.PID, "route must carry the live generation's PID")
 
-	// Dead generation's record purged, including its on-disk body file.
-	_, ok = s.requestManager.GetByID("dead-rec")
-	assert.False(t, ok, "dead generation's record must be purged")
+	// Dead generation's record purged (the crash-replace keeps the ring but
+	// purges its records), including its on-disk body file.
+	assert.False(t, projectHas(s, "/projects/dead", "dead-rec"), "dead generation's record must be purged")
 	assert.NoFileExists(t, bodyFile, "dead generation's body file must be deleted")
 
 	// Unrelated project untouched.
 	_, ok = s.registry.Lookup("api.other.dev", 8443)
 	assert.True(t, ok, "unrelated project's route must survive")
-	_, ok = s.requestManager.GetByID("other-rec")
-	assert.True(t, ok, "unrelated project's records must survive")
+	assert.True(t, projectHas(s, "/projects/other", "other-rec"), "unrelated project's records must survive")
 }
 
 // TestServer_SelfHeal_LivePIDStillConflicts pins that a second prox up in the
@@ -557,7 +559,7 @@ func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
 		req.PID = os.Getpid()
 		_, _, err := s.registry.Register(req)
 		require.NoError(t, err)
-		s.requestManager.Record(proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
+		recordInto(s, proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
 
 		s.RequestShutdown()
 
@@ -567,7 +569,7 @@ func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
 
 		_, ok := s.registry.Lookup("api.local.dev", 443)
 		assert.True(t, ok, "route must survive for the exiting daemon to reap")
-		assert.Equal(t, 1, s.requestManager.Count(), "records must not be purged mid-teardown")
+		assert.Equal(t, 1, projectCount(s, "/projects/a"), "records must not be purged mid-teardown")
 	})
 
 	t.Run("removeStaleProject", func(t *testing.T) {
@@ -577,7 +579,7 @@ func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
 		req.PID = os.Getpid()
 		_, _, err := s.registry.Register(req)
 		require.NoError(t, err)
-		s.requestManager.Record(proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
+		recordInto(s, proxy.RequestRecord{ID: "a1", Method: "GET", URL: "/a", ProjectDir: "/projects/a"})
 
 		s.RequestShutdown()
 
@@ -588,7 +590,7 @@ func TestRemoveProject_NoOpsWhileShuttingDown(t *testing.T) {
 
 		_, ok := s.registry.Lookup("api.local.dev", 443)
 		assert.True(t, ok, "route must survive for the exiting daemon to reap")
-		assert.Equal(t, 1, s.requestManager.Count(), "records must not be purged mid-teardown")
+		assert.Equal(t, 1, projectCount(s, "/projects/a"), "records must not be purged mid-teardown")
 	})
 }
 
@@ -608,10 +610,10 @@ func TestHandleShutdown_SetsFlagBeforeResponse(t *testing.T) {
 }
 
 // TestServer_RemoveProject_NilRequestManager guards the daemon-startup window
-// where the request manager may not be set yet.
+// where the ring set may not be set yet.
 func TestServer_RemoveProject_NilRequestManager(t *testing.T) {
 	s := newLifecycleServer()
-	s.requestManager = nil // model the startup window before the manager is wired
+	s.managers = nil // model the startup window before the ring set is wired
 
 	_, _, err := s.registry.Register(newTestRequest("/projects/a", "local.dev",
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443))

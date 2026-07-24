@@ -53,9 +53,14 @@ type Server struct {
 	lifecycleEpoch atomic.Uint64
 
 	// Core components
-	registry       *Registry
-	proxy          *DynamicProxy
-	requestManager *proxy.RequestManager
+	registry *Registry
+	proxy    *DynamicProxy
+	// managers holds the per-project request rings (D13, #49): one full-capacity
+	// ring per registered project, so one project's flood cannot evict another's
+	// records. It replaces the single shared RequestManager. Guarded by its own
+	// lock (see Managers); the hot path reaches it via DynamicProxy, never
+	// touching lifecycleMu.
+	managers *Managers
 }
 
 // ServerConfig holds configuration for creating a daemon server.
@@ -93,9 +98,11 @@ func (s *Server) SetProxy(p *DynamicProxy) {
 	s.proxy = p
 }
 
-// SetRequestManager sets the request manager (called during daemon setup).
-func (s *Server) SetRequestManager(rm *proxy.RequestManager) {
-	s.requestManager = rm
+// SetManagers sets the per-project request-ring set (called during daemon
+// setup). The same set is shared with the DynamicProxy so the hot path and the
+// control-plane endpoints resolve the identical per-project rings.
+func (s *Server) SetManagers(ms *Managers) {
+	s.managers = ms
 }
 
 // ShutdownCh returns a channel that is closed when the daemon should exit.
@@ -307,6 +314,18 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 		}
 	}
 
+	// The registry now holds this project's routes, so the hot path can resolve
+	// them. Ensure its per-project ring exists BEFORE the cert/listener phases so
+	// records captured while the routes are briefly visible on already-bound
+	// shared-port listeners land in the ring (and are purged on rollback), and so
+	// the no-op idempotent refresh — which returned earlier without reaching this
+	// point — keeps the project's existing ring untouched. ensure is idempotent:
+	// the config-changed and crash-replace arms above kept the manager, and this
+	// returns it unchanged.
+	if s.managers != nil {
+		s.managers.ensure(req.ProjectDir)
+	}
+
 	// Ensure a cert exists for the registration's domain whenever it registers any
 	// HTTPS route. Gating on req.HTTPSPort > 0 (not on a NEW listener port) is the
 	// #58 fix: a domain joining an already-bound shared HTTPS port has no new port
@@ -314,10 +333,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 	// EnsureDomain is idempotent (one cert per base domain), so re-calls are cheap.
 	if s.proxy != nil && s.proxy.certMgr != nil && req.HTTPSPort > 0 {
 		if err := s.proxy.certMgr.EnsureDomain(req.Domain); err != nil {
-			s.rollbackRegistration(req.ProjectDir)
-			if restoreSnap != nil {
-				s.restoreSnapshotLocked(*restoreSnap)
-			}
+			s.unwindRegistration(req.ProjectDir, restoreSnap)
 			return http.StatusInternalServerError, ErrorResponse{
 				Error: fmt.Sprintf("failed to generate certs for %s: %v", req.Domain, err),
 				Code:  "CERT_GENERATION_FAILED",
@@ -340,10 +356,7 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 				for _, p := range startedPorts {
 					_ = s.proxy.RemoveListener(p)
 				}
-				s.rollbackRegistration(req.ProjectDir)
-				if restoreSnap != nil {
-					s.restoreSnapshotLocked(*restoreSnap)
-				}
+				s.unwindRegistration(req.ProjectDir, restoreSnap)
 				return http.StatusInternalServerError, ErrorResponse{
 					Error: fmt.Sprintf("failed to bind port %d: %v", ps.Port, err),
 					Code:  "PORT_BIND_FAILED",
@@ -442,11 +455,19 @@ func (s *Server) removeProject(projectDir string) (removedHostnames []string, em
 	if s.isShuttingDown() {
 		return nil, nil
 	}
-	return s.removeProjectLocked(projectDir)
+	removedHostnames, emptyPorts = s.removeProjectLocked(projectDir)
+	// Genuine deregister: tear down the project's per-project ring after the
+	// shared removeProjectLocked purged its records. The register-inline arms
+	// (config-changed / crash-replace re-register) call removeProjectLocked
+	// directly and KEEP the ring — only this top-level entry destroys it.
+	s.destroyProjectManager(projectDir)
+	return removedHostnames, emptyPorts
 }
 
 // removeProjectLocked is removeProject's body; lifecycleMu must be held. It lets
 // register run a stale-registration replace while already holding the mutex.
+// It purges the project's records but KEEPS its ring manager (the re-register
+// arms reuse it); only the top-level removeProject destroys the manager.
 func (s *Server) removeProjectLocked(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	if s.registry == nil {
 		return nil, nil
@@ -471,7 +492,14 @@ func (s *Server) removeStaleProject(projectDir string, pid int, startTime int64)
 	if s.isShuttingDown() {
 		return false, nil, nil
 	}
-	return s.removeStaleProjectLocked(projectDir, pid, startTime)
+	removed, removedHostnames, emptyPorts = s.removeStaleProjectLocked(projectDir, pid, startTime)
+	// Only destroy the ring when a removal actually happened: a guarded no-op
+	// (the project re-registered under a live PID between detection and removal)
+	// must leave the live generation's ring — and its records — untouched.
+	if removed {
+		s.destroyProjectManager(projectDir)
+	}
+	return removed, removedHostnames, emptyPorts
 }
 
 // removeStaleProjectLocked is removeStaleProject's body; lifecycleMu must be
@@ -490,8 +518,10 @@ func (s *Server) removeStaleProjectLocked(projectDir string, pid int, startTime 
 }
 
 // finishRemoval closes listeners for now-empty ports and purges the project's
-// captured requests (firing eviction callbacks so on-disk body files are
-// cleaned up).
+// captured requests from its per-project ring (firing eviction callbacks so
+// on-disk body files are cleaned up). It KEEPS the ring manager itself — the
+// register-inline re-register arms reuse it. Genuine removal additionally
+// destroys the manager via destroyProjectManager.
 func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 	if s.proxy != nil {
 		for _, port := range emptyPorts {
@@ -501,8 +531,24 @@ func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 		}
 	}
 
-	if s.requestManager != nil {
-		s.requestManager.PurgeByProject(projectDir)
+	s.managers.purge(projectDir)
+}
+
+// destroyProjectManager tears down a project's request ring on genuine removal
+// (explicit deregister, stale-PID sweep, or a fresh registration's rollback):
+// it Closes the manager FIRST — releasing any daemon-side SSE handler blocked on
+// its subscription — then removes it from the set so later hot-path lookups
+// return nil. finishRemoval (or rollbackRegistration) already purged the
+// records+bodies for the common path; the final PurgeByProject on the detached
+// manager is a safety sweep so a record that landed in the narrow window between
+// that purge and the Close doesn't orphan its on-disk body file. lifecycleMu
+// must be held. No-op when the project has no ring.
+func (s *Server) destroyProjectManager(projectDir string) {
+	if s.managers == nil {
+		return
+	}
+	if mgr := s.managers.remove(projectDir); mgr != nil {
+		mgr.PurgeByProject(projectDir)
 	}
 }
 
@@ -514,11 +560,23 @@ func (s *Server) finishRemoval(projectDir string, emptyPorts []int) {
 // strand an idle daemon. lifecycleMu must be held.
 func (s *Server) rollbackRegistration(projectDir string) {
 	s.registry.Deregister(projectDir)
-	if s.requestManager != nil {
-		s.requestManager.PurgeByProject(projectDir)
-	}
+	s.managers.purge(projectDir)
 	s.lifecycleEpoch.Add(1)
 	s.scheduleShutdownWhenEmpty()
+}
+
+// unwindRegistration reverses a registration attempt that failed AFTER its ring
+// was ensured (cert or listener phase): it rolls back the registry entry and
+// purges the ring, then either restores the project's prior registration (the
+// same-identity config-change replace arm) or destroys the freshly-ensured ring
+// (a brand-new project's rollback). lifecycleMu must be held.
+func (s *Server) unwindRegistration(projectDir string, restoreSnap *projectSnapshot) {
+	s.rollbackRegistration(projectDir)
+	if restoreSnap != nil {
+		s.restoreSnapshotLocked(*restoreSnap)
+	} else {
+		s.destroyProjectManager(projectDir)
+	}
 }
 
 // restoreSnapshotLocked re-injects a project snapshot into the registry and
@@ -586,8 +644,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if resp.ListenerPorts == nil {
 		resp.ListenerPorts = []int{}
 	}
-	if s.requestManager != nil {
-		resp.DroppedEvents = s.requestManager.DroppedEvents()
+	if s.managers != nil {
+		// Dropped events are summed across every project's ring; per-project
+		// record counts make the N×ring memory trade-off diagnosable (D13).
+		resp.DroppedEvents = s.managers.droppedTotal()
+		resp.RecordCounts = s.managers.recordCounts()
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -642,7 +703,7 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
-	if s.requestManager == nil {
+	if s.managers == nil {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error: "request manager not available",
 			Code:  "NOT_READY",
@@ -662,8 +723,8 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 	// Filter the stream by owning project (exact match). Scoping by project
 	// dir rather than hostname prevents cross-project record delivery when two
 	// projects own the same hostname on different ports. The param is
-	// mandatory: an empty ProjectDir filter would match ALL projects' records,
-	// so a caller that forgot the param would silently receive everything.
+	// mandatory: an empty ProjectDir filter would resolve no ring, so a caller
+	// that forgot the param would silently receive nothing.
 	projectDir := r.URL.Query().Get("project")
 	if projectDir == "" {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
@@ -672,15 +733,29 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	filter := proxy.RequestFilter{ProjectDir: projectDir}
-	sub := s.requestManager.Subscribe(filter)
-	defer s.requestManager.Unsubscribe(sub.ID)
 
-	// Set SSE headers
+	// Set SSE headers before resolving the ring so a missing-project stream
+	// still returns 200 (the forwarder treats a clean stream end as a reconnect
+	// signal, which is exactly right during a heal/deregister window).
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+
+	// A project with no ring (never registered, or already deregistered)
+	// subscribes to nothing and ends cleanly right after the headers rather than
+	// blocking forever on a subscription no writer will ever feed (D13).
+	mgr := s.managers.get(projectDir)
+	if mgr == nil {
+		s.logger.Info("requests stream for a project with no ring; ending cleanly", "project", projectDir)
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+		return
+	}
+
+	filter := proxy.RequestFilter{ProjectDir: projectDir}
+	sub := mgr.Subscribe(filter)
+	defer mgr.Unsubscribe(sub.ID)
 
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
@@ -706,7 +781,7 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
-	if s.requestManager == nil {
+	if s.managers == nil {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error: "request manager not available",
 			Code:  "NOT_READY",
@@ -715,13 +790,23 @@ func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mandatory for the same reason as the stream endpoint: an empty
-	// ProjectDir filter matches every project's records.
+	// ProjectDir resolves no ring.
 	projectDir := r.URL.Query().Get("project")
 	if projectDir == "" {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: "project query parameter is required",
 			Code:  "BAD_REQUEST",
 		})
+		return
+	}
+
+	// A project with no ring (never registered, or already deregistered)
+	// returns 200 with an empty list — a stable contract for the forwarder's
+	// backfill during a heal/deregister window (D13). One log line records it.
+	mgr := s.managers.get(projectDir)
+	if mgr == nil {
+		s.logger.Info("requests snapshot for a project with no ring; returning empty list", "project", projectDir)
+		writeJSON(w, http.StatusOK, map[string]any{"requests": []proxy.RequestRecord{}})
 		return
 	}
 
@@ -741,7 +826,10 @@ func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 		Limit:      limit,
 	}
 
-	records := s.requestManager.Recent(filter)
+	records := mgr.Recent(filter)
+	if records == nil {
+		records = []proxy.RequestRecord{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"requests": records})
 }
 

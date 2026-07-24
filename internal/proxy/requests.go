@@ -156,6 +156,13 @@ type RequestManager struct {
 	// channel so post-shutdown streams end immediately.
 	closed bool
 
+	// writesClosed latches ring WRITES after Close (D13): a manager destroyed
+	// on deregister must reject a straggler Record/Upsert racing the teardown
+	// — an accepted write would land in a detached ring after the final purge
+	// already ran, leaking that request's capture files. Rejected writers get
+	// false back and clean up their own capture state.
+	writesClosed atomic.Bool
+
 	// droppedTotal is the manager-wide count of notifications dropped because a
 	// subscriber's channel was full (D9). Exposed via DroppedEvents(); surfaced
 	// daemon-side in DaemonStatusResponse and project-side (via the forwarder's
@@ -186,8 +193,13 @@ func (m *RequestManager) SetEvictionCallback(fn EvictionCallback) {
 }
 
 // Record adds a new request record to the buffer and notifies subscribers.
-// If the record doesn't have an ID, one is generated.
-func (m *RequestManager) Record(record RequestRecord) {
+// If the record doesn't have an ID, one is generated. It reports whether the
+// record was accepted: false means the manager was already Closed (see
+// writesClosed) and the caller owns any capture-file cleanup for the record.
+func (m *RequestManager) Record(record RequestRecord) bool {
+	if m.writesClosed.Load() {
+		return false
+	}
 	if record.ID == "" {
 		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
@@ -219,6 +231,7 @@ func (m *RequestManager) Record(record RequestRecord) {
 
 	// Notify subscribers
 	m.notifySubscribers(record)
+	return true
 }
 
 // Upsert applies a record as a monotonic two-state transition keyed by ID:
@@ -239,7 +252,12 @@ func (m *RequestManager) Record(record RequestRecord) {
 // notifySubscribers only performs non-blocking channel sends under subMu,
 // and no path acquires mu while holding subMu, so this cannot block or
 // deadlock. The eviction callback (disk IO) still runs after unlock.
-func (m *RequestManager) Upsert(record RequestRecord) {
+// Upsert reports whether the record was accepted; false means the manager was
+// already Closed (writesClosed) and the caller owns capture-file cleanup.
+func (m *RequestManager) Upsert(record RequestRecord) bool {
+	if m.writesClosed.Load() {
+		return false
+	}
 	if record.ID == "" {
 		// Defensive: callers always supply IDs. Generate one and fall through
 		// to the normal append path (NOT Record, whose after-unlock notify
@@ -265,7 +283,7 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	case idx >= 0 && (!m.buffer[idx].InFlight || record.InFlight):
 		// Terminal existing record, or duplicate in-flight delivery.
 		m.mu.Unlock()
-		return
+		return true
 	case idx >= 0:
 		// In-flight → final: replace in place, ring position preserved.
 		m.buffer[idx] = record
@@ -289,6 +307,7 @@ func (m *RequestManager) Upsert(record RequestRecord) {
 	if evictedID != "" && onEvict != nil {
 		onEvict(evictedID)
 	}
+	return true
 }
 
 // Recent returns the most recent requests matching the filter. It is
@@ -441,6 +460,11 @@ func (m *RequestManager) Count() int {
 // request racing a shutdown-time Close cannot re-subscribe and pin the API
 // server open. Idempotent.
 func (m *RequestManager) Close() {
+	// Latch writes BEFORE subscriptions: a destroy-path Close must guarantee
+	// that any Record/Upsert observing the latch is rejected, so every record
+	// that DID land in the ring is covered by the destroy's final purge.
+	m.writesClosed.Store(true)
+
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 

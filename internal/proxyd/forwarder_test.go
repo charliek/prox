@@ -166,8 +166,11 @@ func TestStreamRequests_OversizeEventSkippedStreamContinues(t *testing.T) {
 func TestForwardRequests_FiltersByProject(t *testing.T) {
 	server, _, socketPath := startTestServer(t)
 
-	daemonRM := proxy.NewRequestManager(100)
-	server.SetRequestManager(daemonRM)
+	// Create both projects' rings before the forwarder subscribes, so its first
+	// subscription to /projects/a's ring succeeds rather than hitting the
+	// no-ring clean-end path.
+	aRing := server.managers.ensure("/projects/a")
+	bRing := server.managers.ensure("/projects/b")
 
 	localRM := proxy.NewRequestManager(100)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -191,8 +194,8 @@ loop:
 		case <-tick.C:
 			i++
 			ts := time.Now()
-			daemonRM.Record(proxy.RequestRecord{Timestamp: ts, Method: "GET", URL: "/a", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
-			daemonRM.Record(proxy.RequestRecord{Timestamp: ts.Add(time.Duration(i)), Method: "GET", URL: "/b", Hostname: "api.local.dev", ProjectDir: "/projects/b"})
+			aRing.Record(proxy.RequestRecord{Timestamp: ts, Method: "GET", URL: "/a", Hostname: "api.local.dev", ProjectDir: "/projects/a"})
+			bRing.Record(proxy.RequestRecord{Timestamp: ts.Add(time.Duration(i)), Method: "GET", URL: "/b", Hostname: "api.local.dev", ProjectDir: "/projects/b"})
 			if localRM.Count() > 0 {
 				break loop
 			}

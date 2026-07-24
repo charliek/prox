@@ -69,11 +69,13 @@ func newCaptureProxy(t *testing.T, captureEnabled bool, backendHost string, back
 	if err != nil {
 		t.Fatalf("NewCaptureManagerAt: %v", err)
 	}
-	rm := proxy.NewRequestManager(bufferCap)
-	rm.SetEvictionCallback(cm.CleanupRequest)
+	ms := NewManagers(bufferCap, cm.CleanupRequest)
+	// Pre-create the project ring the hot path will record into, and return it as
+	// the manager under test (the hot path resolves managers.get("/projects/a")).
+	rm := ms.ensure("/projects/a")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dp := NewDynamicProxy(reg, nil, rm, cm, logger)
+	dp := NewDynamicProxy(reg, nil, ms, cm, logger)
 	return dp, rm, cm
 }
 
@@ -306,9 +308,9 @@ func TestDynamicProxy_ErrorHandler_CaptureRecordsBadGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCaptureManagerAt: %v", err)
 	}
-	rm := proxy.NewRequestManager(10)
-	rm.SetEvictionCallback(cm.CleanupRequest)
-	dp := NewDynamicProxy(reg, nil, rm, cm, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ms := NewManagers(10, cm.CleanupRequest)
+	rm := ms.ensure("/projects/a")
+	dp := NewDynamicProxy(reg, nil, ms, cm, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rec := serve(dp, "GET", "http://api.local.dev/down", "", nil)
 	if rec.Code != http.StatusBadGateway {

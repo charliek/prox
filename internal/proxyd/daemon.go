@@ -171,7 +171,6 @@ func RunDaemon(ctx context.Context) error {
 	// Create core components
 	registry := NewRegistry()
 	certMgr := NewMultiDomainCertManager(constants.DefaultCertsDir)
-	requestMgr := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 
 	// Create the daemon's capture manager, rooted at ~/.prox/capture. Resolve
 	// the home directory explicitly; on failure log and run without capture
@@ -190,14 +189,22 @@ func RunDaemon(ctx context.Context) error {
 	// first. Registered immediately after construction so an early startup
 	// error still removes the capture dir. Cleanup is RemoveAll, so it is
 	// idempotent and safe to leave deferred here.
+	var evict proxy.EvictionCallback
 	if captureMgr != nil {
 		defer func() { _ = captureMgr.Cleanup() }()
-		// Evicting a record from the ring buffer must delete its on-disk body
+		// Evicting a record from a project ring must delete its on-disk body
 		// files; the capture manager's per-request cleanup does exactly that.
-		requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
+		// The set wires this onto every per-project ring at creation.
+		evict = captureMgr.CleanupRequest
 	}
 
-	dynamicProxy := NewDynamicProxy(registry, certMgr, requestMgr, captureMgr, logger)
+	// Per-project request rings (D13, #49): one full-capacity ring per registered
+	// project, created at register time, so one project's flood cannot evict
+	// another's records. Shared by the dynamic proxy (hot path) and the socket
+	// server (control-plane endpoints).
+	managers := NewManagers(constants.DefaultProxyRequestBufferSize, evict)
+
+	dynamicProxy := NewDynamicProxy(registry, certMgr, managers, captureMgr, logger)
 
 	// Create and configure the socket server
 	server := NewServer(ServerConfig{
@@ -207,7 +214,7 @@ func RunDaemon(ctx context.Context) error {
 	})
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
-	server.SetRequestManager(requestMgr)
+	server.SetManagers(managers)
 
 	// Handle OS signals
 	ctx, cancel := context.WithCancel(ctx)
@@ -293,10 +300,10 @@ func RunDaemon(ctx context.Context) error {
 	if err := dynamicProxy.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down proxy", "error", err)
 	}
-	// Close the request manager before the socket server so active SSE
+	// Close every project ring before the socket server so active SSE
 	// subscribers observe end-of-stream and release the server, rather than
 	// pinning it open through the shutdown grace period.
-	requestMgr.Close()
+	managers.closeAll()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error shutting down server", "error", err)
 	}

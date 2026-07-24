@@ -358,16 +358,17 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 	socketPath := shortSocketPath(t)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	registry := proxyd.NewRegistry()
-	requestMgr := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 
 	captureMgr, err := proxy.NewCaptureManagerAt(daemonCaptureDir, constants.DefaultCaptureMaxBodySize)
 	if err != nil {
 		t.Fatalf("NewCaptureManagerAt: %v", err)
 	}
 	t.Cleanup(func() { captureMgr.Cleanup() })
-	requestMgr.SetEvictionCallback(captureMgr.CleanupRequest)
 
-	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, requestMgr, captureMgr, logger)
+	// Per-project rings, wired like RunDaemon: each project's ring is created at
+	// register time with the capture eviction callback.
+	managers := proxyd.NewManagers(constants.DefaultProxyRequestBufferSize, captureMgr.CleanupRequest)
+	dynamicProxy := proxyd.NewDynamicProxy(registry, nil, managers, captureMgr, logger)
 
 	server := proxyd.NewServer(proxyd.ServerConfig{
 		SocketPath: socketPath,
@@ -376,7 +377,7 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 	})
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
-	server.SetRequestManager(requestMgr)
+	server.SetManagers(managers)
 
 	go func() { _ = server.Start() }()
 	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })

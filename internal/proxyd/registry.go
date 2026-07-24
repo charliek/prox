@@ -28,6 +28,10 @@ type Route struct {
 	// dynamic proxy can gate body capture per project (a capture-disabled
 	// project's traffic is recorded as metadata only).
 	CaptureEnabled bool
+	// MaxBodySize is the project's per-request/response capture cap in bytes
+	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
+	// proxy passes it as the per-call capture limit; 0 means the daemon default.
+	MaxBodySize int64
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -42,6 +46,9 @@ type ProjectRegistration struct {
 	StartTime      int64
 	RegisteredAt   time.Time
 	CaptureEnabled bool
+	// MaxBodySize is the project's per-request/response capture cap in bytes
+	// (D13, #49); 0 means the daemon default. Stamped onto each Route.
+	MaxBodySize int64
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -188,6 +195,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			PID:            req.PID,
 			RegisteredAt:   now,
 			CaptureEnabled: req.CaptureEnabled,
+			MaxBodySize:    req.MaxBodySize,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -213,6 +221,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		StartTime:      req.StartTime,
 		RegisteredAt:   now,
 		CaptureEnabled: req.CaptureEnabled,
+		MaxBodySize:    req.MaxBodySize,
 	}
 
 	for port, proto := range portsNeeded {
@@ -278,6 +287,11 @@ func (r *Registry) registrationMatches(req RegisterRequest) bool {
 		return false
 	}
 	if proj.CaptureEnabled != req.CaptureEnabled {
+		return false
+	}
+	// A changed capture cap must NOT take the no-op refresh path — the new cap
+	// has to reach the routes so subsequent captures honor it (D13).
+	if proj.MaxBodySize != req.MaxBodySize {
 		return false
 	}
 

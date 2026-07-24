@@ -99,7 +99,10 @@ func TestIdempotentReRegister_NoOpRefreshPreservesRecords(t *testing.T) {
 	registerOK(t, s, req)
 
 	// Record a daemon-side request for the project (as the proxy hot path would).
-	s.requestManager.Record(proxy.RequestRecord{
+	// registerOK created the project's ring; record straight into it.
+	ring := s.managers.get("/projects/rec")
+	require.NotNil(t, ring, "register must have created the project's ring")
+	ring.Record(proxy.RequestRecord{
 		ID:         "rec000000001",
 		Timestamp:  time.Now(),
 		Method:     "GET",
@@ -108,16 +111,17 @@ func TestIdempotentReRegister_NoOpRefreshPreservesRecords(t *testing.T) {
 		StatusCode: 200,
 		ProjectDir: "/projects/rec",
 	})
-	before := s.requestManager.Recent(proxy.RequestFilter{ProjectDir: "/projects/rec"})
+	before := projectRecent(s, "/projects/rec")
 	require.Len(t, before, 1, "precondition: one record captured for the project")
 
 	// Re-register the SAME identity with the SAME config: a true no-op refresh.
 	status, body := s.register(req)
 	require.Equal(t, http.StatusOK, status, "no-op refresh must succeed: %v", body)
 
-	// The record must survive (the destructive path would have purged it), and the
-	// route must be unchanged.
-	after := s.requestManager.Recent(proxy.RequestFilter{ProjectDir: "/projects/rec"})
+	// The record must survive (the destructive path would have purged it) in the
+	// SAME preserved ring, and the route must be unchanged.
+	require.Same(t, ring, s.managers.get("/projects/rec"), "no-op refresh must keep the same ring instance")
+	after := projectRecent(s, "/projects/rec")
 	require.Len(t, after, 1, "no-op refresh must NOT purge the project's daemon-side records")
 	assert.Equal(t, "rec000000001", after[0].ID, "the exact record must survive the no-op refresh")
 
