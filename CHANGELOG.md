@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking
+
+- **`prox status` exits 1 when any child process is crashed** (#72). Previously
+  `prox status` exited 0 while the table showed a `crashed` child, so scripts
+  and coding agents keying on the exit code could miss a dead process entirely.
+  It now exits non-zero whenever any process is in the `crashed` state: the
+  table adds a `Crashed: <name>[, ...] — check 'prox logs <name>'.` line after
+  the proxy line, and stderr carries `Error: N process(es) crashed` — unless the shared
+  proxy is also down, in which case the proxy-down error takes stderr
+  precedence while both signals still print (the JSON
+  payload is unchanged — it already reports each process's `status`). The
+  exit-0 contract is now exact: `prox status` exits 0 only when the supervisor
+  query succeeded, no process is `crashed`, and any configured shared proxy is
+  reachable — it does **not** assert every process is `running` or `healthy`
+  (`starting`, `stopping`, `stopped`, and running-but-`unhealthy` all still
+  exit 0). Note the supervisor marks *any* non-Stop-driven exit as `crashed`,
+  including a one-shot child that exits 0 (a migration/seed step): such a
+  project fails `prox status` until restarted, so one-shot helpers should live
+  outside `prox.yaml` or expect a non-zero status. Scripts that need the old
+  behavior must read `prox status --json` and inspect the per-process `status`
+  they care about — not `prox status || true`, which would also mask discovery
+  errors and an unreachable supervisor. This consolidates the status
+  exit-code churn started in v0.2.1 (proxy-down → exit 1, #66) into one
+  adoption window.
+
 ## v0.2.1
 
 A hardening pass on lifecycle signals and the requests pipeline: `prox up`/`prox status`/`prox stop` now give trustworthy exit codes and error messages instead of silently degrading, the shared proxy daemon self-heals and isolates projects from each other, and captured request/response bodies decode more content types. Plus a refreshed agent skill and docs.

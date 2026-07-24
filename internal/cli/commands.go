@@ -54,6 +54,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// JSON and table paths honor it.
 	proxyDown := sharedProxyDown(status.Proxy)
 
+	// A crashed child likewise fails `prox status` (D1, #72, breaking change):
+	// exit 0 must not mask a dead process. Computed once so both the JSON and
+	// table paths honor it. Precedence: when both a crash and a proxy-down hold,
+	// both signals are printed but the proxy sentinel wins the return (see below).
+	crashed := crashedProcesses(processes.Processes)
+
 	if statusJSON {
 		output := map[string]interface{}{
 			"status":    status,
@@ -62,10 +68,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to encode output: %v\n", err)
 		}
-		if proxyDown {
-			return errSharedProxyDown
-		}
-		return nil
+		// The JSON payload already carries each process's status, so no extra
+		// line is printed here — only the exit code changes.
+		return statusExitError(proxyDown, crashed)
 	}
 
 	// Print status
@@ -89,17 +94,66 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// Proxy line (D5). Printed after the table so the process status is always
 	// visible even when the shared proxy is down (which then forces exit 1).
 	renderProxyStatus(status.Proxy)
-	if proxyDown {
-		return errSharedProxyDown
+
+	// Crashed line (D1, #72). Printed after the proxy line, naming the crashed
+	// process(es) in the order the supervisor reported them (no sort), with a
+	// pointer at their logs. Printed even when the proxy is also down so neither
+	// signal is hidden.
+	if len(crashed) > 0 {
+		fmt.Printf("\nCrashed: %s — check 'prox logs %s'.\n", strings.Join(crashed, ", "), crashed[0])
 	}
-	return nil
+
+	// Both signals print above; the exit code follows the shared precedence.
+	return statusExitError(proxyDown, crashed)
+}
+
+// statusExitError maps runStatus's two exit-1 conditions to the error it
+// returns (nil = exit 0), keeping the precedence in one place for both the JSON
+// and table paths. When both hold, proxy-down wins the return — existing
+// behavior wins the tie; both map to exit 1 either way, and both human-readable
+// signals are printed by the caller regardless.
+func statusExitError(proxyDown bool, crashed []string) error {
+	switch {
+	case proxyDown:
+		return errSharedProxyDown
+	case len(crashed) > 0:
+		return errProcessesCrashed(len(crashed))
+	default:
+		return nil
+	}
 }
 
 // errSharedProxyDown is returned by runStatus when the shared proxy daemon is
-// unreachable, so `prox status` exits non-zero (D5). The message has already
-// been printed to the user; rootCmd sets SilenceErrors, so cobra does not
-// reprint it — the error only drives the exit code.
+// unreachable, so `prox status` exits non-zero (D5). Its text IS user-visible:
+// Execute() prints `Error: %v` to stderr for any non-nil RunE error
+// (root.go:113-116). rootCmd sets SilenceErrors, which only stops cobra from
+// reprinting the error itself — it does not suppress that `Error:` line.
 var errSharedProxyDown = fmt.Errorf("shared proxy daemon is unreachable")
+
+// errProcessesCrashed is returned by runStatus when one or more child processes
+// are in the crashed state, so `prox status` exits non-zero (D1, #72). Like
+// errSharedProxyDown its text is user-visible (Execute prints `Error: %v`); the
+// count is baked in so the stderr line names how many processes crashed.
+func errProcessesCrashed(n int) error {
+	return fmt.Errorf("%d process(es) crashed", n)
+}
+
+// crashedProcesses returns the names of processes in the crashed state, in the
+// order the supervisor reported them (no sort). `prox status` exits non-zero
+// when this is non-empty (D1, #72): exit 0 must not mask a dead child. Only
+// domain.ProcessStateCrashed counts — starting/stopping/deliberately-stopped
+// and running-but-unhealthy processes are NOT failures for this contract, and
+// health is a separate axis kept out of it. (Do not use ProcessState.IsStopped,
+// which collapses stopped and crashed.)
+func crashedProcesses(procs []api.ProcessResponse) []string {
+	var crashed []string
+	for _, p := range procs {
+		if p.Status == string(domain.ProcessStateCrashed) {
+			crashed = append(crashed, p.Name)
+		}
+	}
+	return crashed
+}
 
 // sharedProxyDown is the single "down" predicate behind both the DOWN line and
 // the exit-1 contract (D5): a shared proxy whose daemon is unreachable. Sourcing
