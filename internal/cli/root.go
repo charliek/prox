@@ -33,20 +33,49 @@ processes for local development. It supports:
   - HTTPS reverse proxy with subdomain routing
   - Interactive TUI for monitoring
   - Background daemon mode`,
-	Version:       version.Version,
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Check if --addr was explicitly provided
-		if cmd.Flags().Changed("addr") {
-			apiAddrExplicitlySet = true
-		}
+	Version:           version.Version,
+	SilenceUsage:      true,
+	SilenceErrors:     true,
+	PersistentPreRunE: rootPersistentPreRunE,
+}
 
-		// For client commands, try to discover API address if not explicitly set
-		if clientCommands[cmd.Name()] && !apiAddrExplicitlySet {
-			apiAddr = discoverAPIAddress()
+// rootPersistentPreRunE resolves apiAddr before any command runs. It is a
+// standalone function (rather than an inline closure) so tests can drive it
+// directly against a synthetic *cobra.Command without going through the full
+// rootCmd tree.
+//
+// An explicit --addr (cmd.Flags().Changed("addr")) always wins and skips
+// discovery, including the discovery error below. For commands in the
+// clientCommands allowlist, a discovery failure is returned as an error —
+// there is no silent fallback to constants.DefaultAPIAddress (D3). Commands
+// outside the allowlist (version, up, proxy, completion, __complete, help)
+// never call discoverAPIAddress and so are unaffected by missing state.
+func rootPersistentPreRunE(cmd *cobra.Command, args []string) error {
+	// Check if --addr was explicitly provided
+	if cmd.Flags().Changed("addr") {
+		apiAddrExplicitlySet = true
+	}
+
+	// For client commands, try to discover API address if not explicitly set.
+	if needsAPIDiscovery(cmd) && !apiAddrExplicitlySet {
+		addr, err := discoverAPIAddress()
+		if err != nil {
+			return err
 		}
-	},
+		apiAddr = addr
+	}
+	return nil
+}
+
+// needsAPIDiscovery reports whether cmd is a TOP-LEVEL client command that
+// talks to the project daemon API via apiAddr. The allowlist is matched by
+// name AND parent: nested subcommands can share a name with a top-level
+// client command (`prox proxy status`/`prox proxy stop` vs `prox status`/
+// `prox stop`) but talk to the proxy daemon's Unix socket, not apiAddr —
+// matching on bare cmd.Name() would wrongly demand (and now fail) discovery
+// for them outside a project directory.
+func needsAPIDiscovery(cmd *cobra.Command) bool {
+	return clientCommands[cmd.Name()] && cmd.Parent() == cmd.Root()
 }
 
 // clientCommands is the discovery allowlist: the commands that talk to the
@@ -97,7 +126,7 @@ var versionCmd = &cobra.Command{
 func init() {
 	// Persistent flags available to all subcommands
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", constants.DefaultConfigFile, "Config file")
-	rootCmd.PersistentFlags().StringVar(&apiAddr, "addr", constants.DefaultAPIAddress, "API address for remote commands")
+	rootCmd.PersistentFlags().StringVar(&apiAddr, "addr", constants.DefaultAPIAddress, "API address for remote commands (used only when passed explicitly; otherwise discovered from .prox/prox.state or the config file)")
 	rootCmd.PersistentFlags().BoolVarP(&detach, "detach", "d", false, "Run in background (daemon mode)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 
@@ -128,28 +157,38 @@ func loadAPIAddrFromConfig() string {
 	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
+// errNoRunningInstance is returned by discoverAPIAddress when neither the
+// state file nor the config file yields an API address and the caller did
+// not pass --addr explicitly. There is deliberately no silent fallback to
+// constants.DefaultAPIAddress here (see D3 in the hardening plan): dialing
+// the compiled-in :5555 default against a dynamic-port daemon silently talks
+// to nothing, or worse, to an unrelated daemon.
+var errNoRunningInstance = fmt.Errorf(
+	"no running prox instance found in this directory (no .prox/prox.state); run from the project directory, or pass --addr",
+)
+
 // discoverAPIAddress attempts to discover the API address.
 // Priority:
 // 1. State file (.prox/prox.state) - for running instances
-// 2. Config file (prox.yaml) - for configured port
-// 3. Default address
-func discoverAPIAddress() string {
+// 2. Config file (prox.yaml) - for a configured (non-dynamic) port
+// It returns an error if neither source yields an address; callers must not
+// fall back to constants.DefaultAPIAddress implicitly.
+func discoverAPIAddress() (string, error) {
 	// First, try to load from state file
 	cwd, err := os.Getwd()
 	if err == nil {
 		state, err := daemon.LoadState(cwd)
 		if err == nil {
-			return fmt.Sprintf("http://%s:%d", state.Host, state.Port)
+			return fmt.Sprintf("http://%s:%d", state.Host, state.Port), nil
 		}
 	}
 
 	// Fall back to config file
 	if addr := loadAPIAddrFromConfig(); addr != "" {
-		return addr
+		return addr, nil
 	}
 
-	// Fall back to default
-	return constants.DefaultAPIAddress
+	return "", errNoRunningInstance
 }
 
 // getProcessNames returns process names from config for shell completion
