@@ -322,7 +322,7 @@ services:
 
 ### Request Capture
 
-Request capture records request and response body metadata for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated.
+Request capture records request and response body metadata for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated. This cap is enforced per project: when several projects share one proxy daemon, each project's `max_body_size` (sent to the daemon at registration) governs only that project's captures — one project cannot inflate or shrink another's capture limit.
 
 ```yaml
 proxy:

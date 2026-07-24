@@ -9,7 +9,7 @@ prox is a process manager for local development written in Go. It provides proce
 
 ## First Step: Read prox.yaml
 
-**Always read the project's `prox.yaml` before taking any action.** This file defines the project's local development topology — what processes exist, what commands they run, what ports they use, and whether proxy routing is enabled. Without reading this file you cannot help effectively.
+**Always read the project's `prox.yaml` before taking any action.** This file defines the project's process topology, commands, ports, and whether proxy routing is enabled — read it before doing anything else.
 
 If the config file is at a non-default path, the user or CLAUDE.md will specify it (the `--config` / `-c` flag overrides the default).
 
@@ -28,15 +28,17 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 | Check what's running | `prox status` |
 | Attach interactive TUI | `prox attach` |
 
-**Editing `prox.yaml`?** `prox restart <name>` (and `prox start <name>` after a `prox stop <name>`) re-reads the file and applies that process's current config — changed `cmd`, `healthcheck`, `stop_timeout`, and `env`/`env_file`. So the edit → restart loop needs no full `prox stop` + `prox up`. Adding/removing/renaming processes or changing `services`/`proxy` still requires `prox up`.
+**Editing `prox.yaml`?** `prox restart <name>` (or `prox start <name>` after `prox stop <name>`) re-reads the file and applies that process's current `cmd`, `healthcheck`, `stop_timeout`, and `env`/`env_file` — no full `prox stop` + `prox up` needed. Adding/removing/renaming processes or changing `services`/`proxy` still requires `prox up`.
 
-**Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block.
+**Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block. `prox up -d` now confirms real readiness: it exits non-zero with a `.prox/prox.log` tail if the daemon never becomes healthy (trust the exit code), and fails hard with remediation on a daemon/CLI version mismatch instead of silently degrading.
 
 **Never kill processes directly** (e.g., `kill <pid>`). Use prox commands so it can track state and handle restarts correctly.
 
+**Run client commands (`status`, `logs`, `requests`, etc.) from the project directory.** They auto-discover the instance via `.prox/prox.state`; outside a project directory they now error instead of silently falling back to `:5555` — pass `--addr host:port` if running from elsewhere.
+
 ## Shared Proxy and Multiple Projects
 
-When a project enables a proxy (see "Making HTTP Requests" below), prox serves its services through a single background **proxy daemon** shared across all projects on the machine. This is what lets several projects expose their domains on the same port (e.g. 443) without conflicts. Routing is by full hostname, so two projects can share one port as long as their hostnames differ.
+When a project enables a proxy (see "Making HTTP Requests" below), its services are served through a single background **proxy daemon** shared across all projects on the machine, letting several projects share one port (e.g. 443). Routing is by full hostname, so two projects can share a port as long as their hostnames differ.
 
 You normally never manage the daemon directly: `prox up` starts it (or registers with the already-running one) and `prox down` deregisters the project, stopping the daemon when the last project leaves.
 
@@ -51,7 +53,7 @@ prox proxy stop --force      # Stop anyway, disconnecting all projects
 
 If a proxied request returns a connection error or an unexpected 404, check `prox proxy routes` first to confirm the target hostname is actually registered.
 
-**Green `prox status` does not mean the proxy is up.** `prox status` reports only the *project* daemon and its processes — it does not check the shared proxy. If a proxied request is connection-refused (or `:443` is dead) while `prox status` still shows everything "running", run **`prox proxy status`**: the shared daemon can be down (killed by a reboot/logout, or `prox proxy stop --force`) while every project daemon keeps reporting healthy. If it's down, `prox up` re-starts it. (See prox#66.)
+**`prox status` now surfaces shared-proxy health itself.** When a proxy is configured, it prints a `Proxy: DOWN — shared proxy daemon unreachable` line and **exits 1** if the shared daemon is unreachable, even though every child process is still healthy — you don't need a separate check for this. The project also self-heals: it re-registers with a fresh or recovered daemon automatically (worst case ~45s), so a brief `DOWN` reading is often transient. Reach for `prox proxy status` / `prox proxy routes` for daemon-side detail `prox status` doesn't carry — which projects/routes the daemon holds, its version. (See prox#66.)
 
 ## Viewing Logs
 
@@ -61,13 +63,12 @@ prox aggregates output from all processes. When debugging, check logs first.
 prox logs --lines 50                          # Recent 50 lines, all processes
 prox logs --lines 50 --process api            # Recent 50 lines from "api"
 prox logs -f --process api                    # Stream logs from "api"
-prox logs --lines 100 --pattern ERROR         # Filter for "ERROR"
-prox logs --lines 100 --pattern "err.*" --regex  # Regex filter
+prox logs --lines 100 --pattern ERROR         # Filter for "ERROR" (add --regex for regex patterns)
 ```
 
 **Always use `--lines N`** to limit output. Without it, prox may return hundreds of lines that flood context.
 
-**Pipe through bash tools when needed** — prox's built-in `--pattern` handles most filtering, but for counting (`| grep -c ERROR`), multi-pattern matching (`| grep -E "ERROR|WARN"`), or extracting specific fields, pipe through standard unix tools.
+**Pipe through bash tools when needed** — `--pattern` handles most filtering, but for counting, multi-pattern matches, or field extraction, pipe through standard unix tools (`| grep -c ERROR`, `| grep -E "ERROR|WARN"`).
 
 For daemon startup issues, check the daemon log directly: `cat .prox/prox.log`
 
@@ -94,9 +95,7 @@ services:
   app: 3000
 ```
 
-Then:
-- `curl http://api.lvh.me:6788/endpoint` → reaches the api service on port 8000
-- `curl http://app.lvh.me:6788/` → reaches the app service on port 3000
+Then `curl http://api.lvh.me:6788/endpoint` reaches the api service (port 8000), and `curl http://app.lvh.me:6788/` reaches app (port 3000).
 
 For HTTPS, use `https://<service>.<domain>:<https_port>/path` (requires mkcert setup).
 
@@ -110,11 +109,15 @@ Use direct ports from the process commands in prox.yaml. For example, if a proce
 prox requests                                  # Recent requests
 prox requests -f                               # Stream in real-time
 prox requests --subdomain api --min-status 400 # Filter for errors on api
+prox requests --method POST --since 5m         # POST requests in the last 5 minutes
+prox requests --url /api/users --json          # URL substring match, machine-readable output
 prox requests <id>                             # Details for specific request
-prox requests <id> --body                      # Include captured bodies
+prox requests <id> --body                      # Include captured bodies (gzip/deflate/zstd/br decoded automatically)
 ```
 
 `prox requests` shows traffic that reached the proxy; if a request never arrives, use `prox proxy routes` (see "Shared Proxy and Multiple Projects") to check whether the service's hostname is registered at all.
+
+A request can show **`stale?`** instead of a duration: in-flight for over 5 minutes, meaning its completion event may have been lost and the outcome is unknown — not necessarily broken. Long-lived streams and large transfers can legitimately stay `stale?` while still live.
 
 ## Configuration (prox.yaml)
 
@@ -139,11 +142,7 @@ processes:
       start_period: 30s
 ```
 
-Environment variable precedence (later overrides earlier):
-1. System environment
-2. Global `env_file`
-3. Process-specific `env_file`
-4. Process-specific `env` map
+Environment variable precedence, later overrides earlier: system environment → global `env_file` → process-specific `env_file` → process-specific `env` map.
 
 For the full configuration reference including all proxy, service, and certificate fields, read `references/configuration.md`.
 
