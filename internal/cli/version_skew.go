@@ -91,22 +91,14 @@ func recoverFromVersionSkew(vme *proxyd.VersionMismatchError, ops skewOps) (*pro
 	// Poll until the old daemon's socket stops answering /health (bounded). Never
 	// force-kill a still-draining daemon: if it still answers at the deadline,
 	// treat it as busy and fail.
-	deadline := ops.now().Add(ops.drainTimeout)
-	for ops.healthAnswers() {
-		if !ops.now().Before(deadline) {
-			return nil, versionSkewFatalError(vme, status.Routes)
-		}
-		ops.sleep(ops.drainPoll)
+	if !waitForDrain(ops.healthAnswers, ops.sleep, ops.now, ops.drainTimeout, ops.drainPoll) {
+		return nil, versionSkewFatalError(vme, status.Routes)
 	}
 
 	// Start a fresh daemon of this version. The old daemon removes its socket
 	// before its deferred PID-lock release, so the first start can lose the race
 	// and report not-ready; retry once after a short delay (ErrDaemonNotReady).
-	client, err := ops.ensureRunning()
-	if err != nil && errors.Is(err, proxyd.ErrDaemonNotReady) {
-		ops.sleep(ops.retryDelay)
-		client, err = ops.ensureRunning()
-	}
+	client, err := ensureRunningWithRetry(ops.ensureRunning, ops.sleep, ops.retryDelay)
 	if err != nil {
 		return nil, versionSkewFatalError(vme, status.Routes)
 	}
@@ -114,6 +106,55 @@ func recoverFromVersionSkew(vme *proxyd.VersionMismatchError, ops skewOps) (*pro
 	fmt.Printf("Replaced idle proxy daemon (version %s) with a fresh daemon (version %s).\n",
 		vme.DaemonVersion, vme.ClientVersion)
 	return client, nil
+}
+
+// ensureRunningWithRetry starts/connects a fresh daemon via ensureRunning,
+// retrying once after retryDelay if the first attempt reports
+// proxyd.ErrDaemonNotReady. This covers the socket-removed-before-PID-lock-
+// released window (an old daemon removes its socket in server.Shutdown before
+// its deferred PID-lock release in RunDaemon, so a replacement start can
+// briefly lose the lock and report not-ready). Shared by the version-skew
+// heal path (D1) and the SHUTTING_DOWN register retry (D4) — both restart a
+// daemon that just vacated the same socket/PID-lock pair, so both need the
+// identical one-retry guard.
+func ensureRunningWithRetry(ensureRunning func() (*proxyd.Client, error), sleep func(time.Duration), retryDelay time.Duration) (*proxyd.Client, error) {
+	client, err := ensureRunning()
+	if err != nil && errors.Is(err, proxyd.ErrDaemonNotReady) {
+		sleep(retryDelay)
+		client, err = ensureRunning()
+	}
+	return client, err
+}
+
+// waitForDrain polls healthAnswers until the old daemon's socket stops
+// answering /health, bounded by drainTimeout (checked via now, slept between
+// probes via drainPoll). Drained requires TWO consecutive misses: a single
+// failed probe can be a transient blip on a daemon that is still draining,
+// and declaring victory on it would hand the caller a fresh-daemon path that
+// immediately collides with the still-live old daemon (burning the one
+// re-register attempt). Returns false if the deadline elapsed without a
+// confirmed drain — callers must never force-restart over a still-draining
+// daemon, so a false means "treat as busy and fail". Shared by the
+// version-skew heal path (D1) and the SHUTTING_DOWN register retry (D4),
+// which poll the identical old-daemon socket the identical way; only the
+// fatal error each builds on a false differs.
+func waitForDrain(healthAnswers func() bool, sleep func(time.Duration), now func() time.Time, drainTimeout, drainPoll time.Duration) bool {
+	deadline := now().Add(drainTimeout)
+	misses := 0
+	for {
+		if !healthAnswers() {
+			misses++
+			if misses >= 2 {
+				return true
+			}
+		} else {
+			misses = 0
+		}
+		if !now().Before(deadline) {
+			return false
+		}
+		sleep(drainPoll)
+	}
 }
 
 // dedupeProjectDirs returns the unique, order-preserving project dirs across the

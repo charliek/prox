@@ -863,7 +863,19 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 
 	resp, err := client.Register(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", err)
+		if !isShuttingDownError(err) {
+			return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", err)
+		}
+		// D4: the daemon was mid graceful-shutdown when the register queued
+		// behind it. Wait for it to drain, start a fresh daemon, and
+		// re-register once — a second SHUTTING_DOWN or any other error is
+		// fatal exactly as an unrecovered register failure is today.
+		healedClient, healedResp, rerr := retryRegisterAfterShutdown(req, defaultRegisterRetryOps())
+		if rerr != nil {
+			return nil, false, fmt.Errorf("failed to register with proxy daemon: %w", rerr)
+		}
+		client = healedClient
+		resp = healedResp
 	}
 
 	// Print registered routes
