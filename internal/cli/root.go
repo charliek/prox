@@ -30,7 +30,8 @@ var rootCmd = &cobra.Command{
 processes for local development. It supports:
   - Process supervision with automatic restarts
   - Real-time log aggregation and filtering
-  - HTTPS reverse proxy with subdomain routing
+  - HTTP/HTTPS reverse proxy with hostname routing, shared across projects
+  - Proxied request inspection (prox requests) with captured bodies
   - Interactive TUI for monitoring
   - Background daemon mode`,
 	Version:           version.Version,

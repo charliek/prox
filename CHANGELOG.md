@@ -2,6 +2,142 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+A hardening pass on lifecycle signals and the requests pipeline: `prox up`/`prox status`/`prox stop` now give trustworthy exit codes and error messages instead of silently degrading, the shared proxy daemon self-heals and isolates projects from each other, and captured request/response bodies decode more content types. Plus a refreshed agent skill and docs.
+
+> **Upgrading:** as with v0.2.0, the shared daemon requires an exact version
+> match with its clients. After installing this release, stop the old daemon
+> and restart every project: `prox proxy stop --force`, then `prox up` in
+> each project — or just run `prox up` in one project and let the idle-daemon
+> auto-heal (below) replace it for you.
+
+### Breaking
+
+- **`prox status` exits 1 when the shared proxy is down** (#66). Previously
+  `prox status` only reflected the project supervisor's own process health,
+  so a dead shared proxy daemon could go unnoticed behind a clean-looking
+  status. It now probes the daemon and prints `Proxy: DOWN — shared proxy
+  daemon unreachable (proxied routes are dead). Check 'prox proxy status'.`,
+  exiting non-zero, even when every child process is healthy. Scripts that
+  treated `prox status`'s exit code as pure process health must account for
+  proxy health too.
+- **Client commands no longer fall back to `:5555`** (#66). `status`,
+  `logs`, `stop`, `start`, `restart`, `down`, `attach`, and `requests`
+  previously dialed the compiled-in `127.0.0.1:5555` default when they
+  couldn't discover a running instance from `.prox/prox.state` — silently
+  talking to nothing, or the wrong daemon. They now error with remediation
+  ("run from the project directory, or pass `--addr`") instead. Scripts
+  invoking these commands from outside the project directory must pass
+  `--addr` explicitly.
+- **`prox up -d` exit code is now truthful** (was always 0). The detach
+  parent used to print `prox started (pid N)` and exit 0 immediately after
+  forking, before the child had loaded its config, bound its ports, or
+  registered its routes — so a child that died during startup still reported
+  success. `prox up -d` now polls up to 15s for the child to become ready
+  (state file + `/health`) before exiting 0; it exits 1 with a
+  `.prox/prox.log` tail on early child death or a never-ready timeout
+  (killing the child on timeout).
+- **Orphan ledger format is a forward-incompatible envelope** (#67). The
+  supervisor's crash-recovery ledger (`.prox/prox.children`) is now
+  `{"boot_marker":"...","children":[...]}` instead of a bare array, so a
+  reboot can't let a PID/start-token collision reap an unrelated process
+  group. A pre-upgrade `prox` binary cannot parse the new envelope — it
+  fails to unmarshal and simply skips the reap (never unsafe, just less
+  helpful) until every project has been restarted on this version. Downgrade
+  from this version briefly loses crash-recovery reaping for the same
+  reason.
+- **New dependencies**: `github.com/klauspost/compress` (zstd decoding) and
+  `github.com/andybalholm/brotli` (brotli decoding), both pure Go.
+
+### Lifecycle
+
+- **Version-skew hard fail with idle-daemon auto-heal**. A shared proxy
+  daemon running a different version than the connecting `prox` used to
+  silently fall back to a proxy-less standalone start. Now a version
+  mismatch is a typed error: if the daemon still has registered projects,
+  `prox up` fails hard, naming both versions, every registered project
+  directory, and the exact remediation; if the daemon is idle, `prox up`
+  auto-replaces it with a fresh daemon of the current version and prints a
+  one-line notice. Standalone proxy create/start failures are likewise now
+  fatal when a proxy is configured (`--no-proxy` is the escape hatch)
+  instead of warn-and-continue — no code path starts a project with a
+  silently-disabled proxy anymore.
+- **Registration recovers from a draining daemon**. Registering during the
+  shared daemon's brief shutdown grace used to be a fatal `SHUTTING_DOWN`
+  error whose text said "retry" but nothing retried. `prox up` now polls for
+  the old daemon to finish draining (up to 10s), starts a fresh daemon, and
+  re-registers automatically; a second failure is still fatal.
+- **Forwarder self-heal after daemon death** (#66). When the shared daemon
+  dies, every registered project used to reconnect silently forever with no
+  path back. Projects now detect a prolonged (15s+) connection failure and
+  re-register with a fresh or recovered daemon automatically (damped to at
+  most once per 30s), worst case within ~45s — no `prox proxy stop --force`
+  required. The daemon's re-registration path was also made idempotent for a
+  live same-identity holder, closing a would-be `REGISTRATION_CONFLICT`
+  loop. Healing is suppressed while a project is itself shutting down, and a
+  version-mismatch failure surfaces as a status state rather than
+  restarting a daemon that might still be in use.
+- **Boot-marker guard for the orphan ledger** (#67). See Breaking above —
+  the ledger now discards itself across a reboot (and on Linux, when it
+  predates this marker) instead of risking a PID/start-token collision.
+
+### Requests
+
+- **`prox status` / `GET /status` surface shared-proxy health** (#66). A new
+  `proxy` block reports `mode` (`shared`/`standalone`/`disabled`),
+  `daemon_reachable`, `daemon_version`, reconnect/drop/backfill counters,
+  and `heal_state`. The CLI renders this as a `Proxy:` line (see Breaking).
+- **Stale flag for stuck in-flight requests** (#53). A request that has been
+  `in_flight` for more than 5 minutes now also carries `stale: true`
+  (`stale?` in the CLI/TUI) — the completion event may have been lost and
+  the outcome is unknown. Computed at serve time; no protocol or storage
+  change. Long-lived streams and large transfers can legitimately show
+  `stale?` while still live.
+- **Drop and degradation counters**. The request stream's subscriber
+  channels used to drop events silently on overflow. Dropped-event and
+  backfill-failure counts are now tracked (atomics) and exposed through the
+  `proxy` status block, so silent request loss becomes visible.
+- **More captured-body content types decoded** (#50). `deflate` (zlib with a
+  raw-deflate fallback), `zstd`, and `br` (brotli) captured bodies now
+  decode for display, joining `gzip`/`x-gzip`; all four are bounded by the
+  same 10MB decode cap. Chained or unrecognized encodings, truncated
+  captures, and corrupt streams still fall back to raw bytes.
+- **Hex preview for binary bodies in the TUI** (#50). The request detail
+  view renders binary bodies as a bounded `hexdump -C`-style preview (first
+  256 bytes, offset + hex + ASCII gutter) instead of an inert
+  `[binary data]` placeholder.
+- **Cursor pagination for `GET /proxy/requests`** (#50). A new `before_id`
+  parameter pages strictly older than the given record, returning
+  `next_before_id` (the oldest *scanned* record, so a fully-filtered page
+  still advances) for the next page. An unknown, evicted, or out-of-scope
+  cursor returns `410` with code `CURSOR_GONE`. `prox requests` (CLI) is
+  unchanged — this is an API-only capability for now.
+- **Per-project request rings and capture caps on the shared daemon**
+  (#49). The daemon's single global request ring and capture cap used to let
+  one chatty project evict another project's records and bodies, and a
+  per-project `capture.max_body_size` was silently ignored on the daemon.
+  Each registered project now gets its own full-capacity ring and its
+  `max_body_size` is enforced per request on the shared capture path — one
+  project flooding traffic cannot affect another's history or capture
+  quota.
+
+### Skill & Docs
+
+- **Agent skill refreshed to post-hardening reality**. `skills/prox/references/api.md`
+  and `SKILL.md` now document 12-char request IDs, `since`/`url_contains`,
+  `in_flight`/`stale`/`captured_size`/`content_encoding`/`unavailable_reason`,
+  the `before_id`/`next_before_id`/`CURSOR_GONE` cursor, the `proxy` status
+  block, the no-`:5555`-fallback rule, and the truthful `prox up -d` exit
+  code / version-mismatch behavior.
+- **README, architecture, and reference docs updated to match**: the HTTP
+  API table gains the `/proxy/requests` endpoints; `docs/development/architecture.md`
+  documents the shared proxy daemon, the capture pipeline, and the forwarder
+  bridge; `docs/reference/api.md`/`cli.md`/`configuration.md` document the
+  `proxy` status block, `stale`, cursor pagination, the decoder list, and
+  per-project `max_body_size`; `docs/guides/shared-proxy.md` documents
+  self-healing and version-mismatch behavior.
+
 ## v0.2.0
 
 The requests/capture overhaul: the shared proxy daemon now captures request and
