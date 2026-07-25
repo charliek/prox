@@ -101,6 +101,15 @@ type DaemonStatusResponse struct {
 	// (#69). Both are 0 when the daemon has no capture manager.
 	CaptureDiskUsed   int64 `json:"capture_disk_used"`
 	CaptureDiskBudget int64 `json:"capture_disk_budget"`
+	// CaptureAvailable reports whether the daemon initialized a capture manager
+	// at startup (plan 012 D1, C4). false here means capture cannot work for ANY
+	// project on this daemon regardless of their own proxy.capture.enabled --
+	// distinct from a project simply choosing capture off. CaptureError carries
+	// the init failure reason (e.g. home directory unresolved, capture dir
+	// uncreatable) when CaptureAvailable is false; empty when capture is
+	// available or the daemon predates this field.
+	CaptureAvailable bool   `json:"capture_available"`
+	CaptureError     string `json:"capture_error,omitempty"`
 }
 
 // ErrorResponse is the standard error format for daemon API responses.

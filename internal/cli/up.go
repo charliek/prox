@@ -48,6 +48,7 @@ var (
 	httpPort      int
 	httpsPort     int
 	enableCapture bool
+	noCapture     bool
 )
 
 // upCmd represents the up command
@@ -65,7 +66,7 @@ Examples:
   prox up --tui               # Start with interactive TUI
   prox up web api             # Start specific processes
   prox up --no-proxy          # Start without proxy
-  prox up --capture           # Enable request/response capture`,
+  prox up --no-capture        # Disable request/response capture for this run`,
 	Args:              cobra.ArbitraryArgs,
 	RunE:              runUp,
 	ValidArgsFunction: completeProcessNames,
@@ -79,7 +80,8 @@ func init() {
 	upCmd.Flags().IntVarP(&apiPort, "api-port", "p", 0, "Override API server port (otherwise dynamic)")
 	upCmd.Flags().IntVar(&httpPort, "http-port", 0, "Override proxy HTTP port")
 	upCmd.Flags().IntVar(&httpsPort, "https-port", 0, "Override proxy HTTPS port")
-	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Enable request/response body capture")
+	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Force request/response body capture on (default: on when the proxy is enabled; kept for explicitness/compat)")
+	upCmd.Flags().BoolVar(&noCapture, "no-capture", false, "Disable request/response body capture for this run")
 }
 
 // completeProcessNames provides shell completion for process names
@@ -94,6 +96,14 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Validate mutually exclusive flags
 	if useTUI && detach {
 		return fmt.Errorf("--tui and --detach are mutually exclusive")
+	}
+	// captureOverrideSet/captureOverrideEnabled resolve once here (before cfg is
+	// even loaded) so the mutual-exclusivity error surfaces immediately, mirroring
+	// the --tui/--detach check above; applied to cfg.Proxy.Capture.Enabled below
+	// once cfg is loaded.
+	captureOverrideEnabled, captureOverrideSet, err := resolveCaptureFlag(enableCapture, noCapture)
+	if err != nil {
+		return err
 	}
 
 	// Get working directory for state files
@@ -203,12 +213,21 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		return fmt.Errorf("invalid runtime configuration after CLI overrides: %w", err)
 	}
 
-	// Enable capture if --capture flag is set
-	if enableCapture && cfg.Proxy != nil {
+	// Apply --capture/--no-capture overrides on top of the materialized config
+	// default (capture-by-default whenever the proxy is enabled, plan 012 D1).
+	// Precedence: flags > config > default-on (captureOverrideSet is false when
+	// neither flag was passed, leaving the config's own value untouched). Parse
+	// always materializes cfg.Proxy.Capture whenever cfg.Proxy is non-nil (see
+	// config.materializeCapture), so the defensive nil-check here only guards a
+	// hand-built Config bypassing Parse (e.g. a future direct construction in
+	// tests).
+	if cfg.Proxy != nil {
 		if cfg.Proxy.Capture == nil {
 			cfg.Proxy.Capture = &config.CaptureConfig{}
 		}
-		cfg.Proxy.Capture.Enabled = true
+		if captureOverrideSet {
+			cfg.Proxy.Capture.Enabled = captureOverrideEnabled
+		}
 	}
 
 	// For foreground mode, also check if already running and handle state
@@ -820,6 +839,27 @@ func ensureNotAlreadyRunning(cwd string) error {
 	return nil
 }
 
+// resolveCaptureFlag applies --capture/--no-capture precedence over the
+// materialized config default (plan 012 D1, C4): flags always win over
+// config, which in turn defaults on whenever the proxy is enabled. Passing
+// both flags is an error, mirroring the --tui/--detach exclusivity check.
+// ok reports whether either flag was passed at all; when ok is false, the
+// caller must leave the config's own Enabled value untouched (neither flag
+// set means "config wins / default-on", not "force off").
+func resolveCaptureFlag(enableCapture, noCapture bool) (enabled, ok bool, err error) {
+	if enableCapture && noCapture {
+		return false, false, fmt.Errorf("--capture and --no-capture are mutually exclusive")
+	}
+	switch {
+	case enableCapture:
+		return true, true, nil
+	case noCapture:
+		return false, true, nil
+	default:
+		return false, false, nil
+	}
+}
+
 // proxyStartError formats an actionable error message for proxy startup failures.
 // For port conflicts it includes the port number and a hint to identify the process.
 func proxyStartError(err error) error {
@@ -952,14 +992,19 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 
 	redactHeaders, redactQueryParams := captureRedactLists(cfg)
 	req := proxyd.RegisterRequest{
-		ProjectDir:     cwd,
-		PID:            os.Getpid(),
-		Version:        version.Version,
-		Domain:         cfg.Proxy.Domain,
-		Services:       services,
-		HTTPPort:       cfg.Proxy.HTTPPort,
-		HTTPSPort:      cfg.Proxy.HTTPSPort,
-		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
+		ProjectDir: cwd,
+		PID:        os.Getpid(),
+		Version:    version.Version,
+		Domain:     cfg.Proxy.Domain,
+		Services:   services,
+		HTTPPort:   cfg.Proxy.HTTPPort,
+		HTTPSPort:  cfg.Proxy.HTTPSPort,
+		// CaptureEffectivelyEnabled re-checks the proxy-enabled gate (plan 012 D1,
+		// C4): tryDaemonProxy is only ever reached when cfg.Proxy.Enabled is
+		// already true (see the call site in runUp), so this is equivalent to the
+		// prior "Capture != nil && Capture.Enabled" here, but it is the single
+		// helper every gated use site shares rather than re-deriving the check.
+		CaptureEnabled: cfg.Proxy.CaptureEffectivelyEnabled(),
 		MaxBodySize:    captureMaxBodySize(cfg),
 		DiskBudget:     captureDiskBudget(cfg),
 		// Capture-time redaction policy (plan 012 D4). RedactEnabled is safe on a

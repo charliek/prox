@@ -66,6 +66,12 @@ type Server struct {
 	// disk budget onto it after every committed registry mutation (#69). nil when
 	// capture is disabled (home dir unresolved / init failure).
 	captureMgr *proxy.CaptureManager
+	// captureInitErr is the reason captureMgr is nil, when it failed to
+	// initialize at daemon startup (plan 012 D1, C4) -- as opposed to a project
+	// simply choosing capture off in its own config. Empty when capture
+	// initialized fine (or the daemon never tried, e.g. in older-shaped tests).
+	// Surfaced via /status as capture_available=false + capture_error.
+	captureInitErr string
 }
 
 // ServerConfig holds configuration for creating a daemon server.
@@ -115,6 +121,15 @@ func (s *Server) SetManagers(ms *Managers) {
 // budget onto it (#69). It is the same instance the DynamicProxy holds.
 func (s *Server) SetCaptureManager(cm *proxy.CaptureManager) {
 	s.captureMgr = cm
+}
+
+// SetCaptureInitError records why the daemon's capture manager failed to
+// initialize at startup (plan 012 D1, C4), so /status can distinguish
+// "capture unavailable in the daemon" from a project's own capture config
+// being off. Called with an empty string when init succeeded (or was never
+// attempted); a no-op either way beyond storing the string.
+func (s *Server) SetCaptureInitError(msg string) {
+	s.captureInitErr = msg
 }
 
 // syncCaptureBudget recomputes the effective daemon-wide capture disk budget from
@@ -693,10 +708,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.DroppedEvents = s.managers.droppedTotal()
 		resp.RecordCounts = s.managers.recordCounts()
 	}
+	resp.CaptureAvailable = s.captureMgr != nil
 	if s.captureMgr != nil {
 		// Capture disk accounting for the one shared capture dir, read under a
 		// single lock so used/budget always coexisted (#69).
 		resp.CaptureDiskUsed, resp.CaptureDiskBudget = s.captureMgr.DiskStats()
+	} else {
+		resp.CaptureError = s.captureInitErr
 	}
 
 	writeJSON(w, http.StatusOK, resp)

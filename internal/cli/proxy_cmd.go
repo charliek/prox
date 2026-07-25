@@ -62,7 +62,17 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 	if len(status.ListenerPorts) > 0 {
 		fmt.Printf("  Ports:      %v\n", status.ListenerPorts)
 	}
-	if status.CaptureDiskBudget > 0 {
+	if !status.CaptureAvailable {
+		// The daemon's capture manager failed to initialize at startup (plan 012
+		// D1, C4) -- distinct from a project simply setting proxy.capture.enabled:
+		// false, which never shows up here (capture-off projects just don't
+		// contribute to the disk stats below).
+		if status.CaptureError != "" {
+			fmt.Printf("  Capture:    unavailable (%s)\n", status.CaptureError)
+		} else {
+			fmt.Printf("  Capture:    unavailable\n")
+		}
+	} else if status.CaptureDiskBudget > 0 {
 		fmt.Printf("  Capture:    %s used / %s budget on disk\n",
 			formatBytes(status.CaptureDiskUsed), formatBytes(status.CaptureDiskBudget))
 	}

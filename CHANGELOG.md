@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+Capture-by-default (plan 012): a proxy-enabled project now records
+request/response headers and bodies through the proxy with no extra config,
+bounded by the disk-budget accounting from #69 and covered by capture-time
+header/query-param redaction. Bodies are captured verbatim, though — see the
+Breaking entry.
+
+### Breaking
+
+- **Capture is on by default whenever the proxy is enabled** (plan 012).
+  Previously a proxy-enabled project recorded only request/response metadata
+  (method, URL, status, timing) unless `--capture` was passed; now it also
+  captures headers and bodies by default, spilling large bodies to
+  `~/.prox/capture` under the shared disk-budget accounting (#69, 1GiB default
+  across all projects on the daemon). To opt out, set `proxy.capture.enabled:
+  false` in `prox.yaml`, or pass the new `--no-capture` flag for one run
+  (`--capture` still exists for explicitness/compat but no longer does
+  anything a default-on project doesn't already get; the two flags are
+  mutually exclusive). Capture-time redaction (below) covers headers and URLs
+  only — request/response **bodies are captured verbatim**, so a project
+  whose bodies carry secrets (API keys, tokens, PII in JSON/form payloads)
+  should opt out entirely rather than rely on redaction. Anything that assumes
+  `~/.prox/capture` stays empty (disk-space checks, backup exclusions,
+  sandboxed CI with a tight tmpfs) should account for the new default.
+  `prox proxy status` gained `capture_available`/`capture_error` (JSON) and a
+  `Capture: unavailable (<reason>)` line (human output) for the case where the
+  daemon's own capture manager failed to initialize — distinct from a project
+  simply choosing capture off.
+
+### Added
+
+- **Capture disk budget + record-group FIFO eviction** (#69).
+  `proxy.capture.disk_budget` (e.g. `512MB`, `2GB`) bounds the shared daemon's
+  total spilled-body bytes across every registered project; unset defaults to
+  1GiB, and the daemon-wide effective bound is the **minimum** across every
+  capture-enabled project's own budget (a project that leaves it unset
+  contributes the default to that minimum). Once the bound is exceeded, the
+  oldest record's spilled body files are evicted first (FIFO by record
+  group).
+- **O(1) ID index for the request ring** (#71). `RequestManager`'s
+  `Upsert`/`GetByID`/cursor-anchoring lookups no longer linear-scan the ring,
+  keeping `prox requests` and the TUI responsive as capture-by-default raises
+  per-project request volume.
+- **Capture-time redaction of sensitive headers and query params** (plan 012
+  D4). On by default whenever a capture config exists (disable with `redact:
+  false`); the built-in sets always redact the `Authorization`,
+  `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`
+  headers and the `access_token`, `refresh_token`, `id_token`, `token`,
+  `api_key`, `apikey`, `client_secret`, `code` query params — including
+  inside a `Location`/`Referer` redirect URL's query string — and are
+  extendable per project via `redact_headers`/`redact_query_params` (these
+  only add to the built-ins, never replace them). Limitation: redaction never
+  touches request/response bodies — see the Breaking entry above.
+
 ## v0.2.2
 
 An exit-contract polish pass (plan 011, PR #77): `prox status` and `prox

@@ -254,6 +254,43 @@ func TestStatusEndpoint_ReportsCaptureDiskUsage(t *testing.T) {
 	assert.Equal(t, int64(2*body), status2.CaptureDiskUsed, "used reflects two surviving groups")
 }
 
+// TestStatusEndpoint_CaptureAvailable pins the capture_available/capture_error
+// status surface (plan 012 D1, C4): a nil capture manager (init failure at
+// daemon startup, or a server that never called SetCaptureManager) reports
+// capture_available=false and surfaces whatever SetCaptureInitError recorded;
+// a real capture manager reports capture_available=true with no error.
+func TestStatusEndpoint_CaptureAvailable(t *testing.T) {
+	t.Run("no capture manager: unavailable, no error recorded", func(t *testing.T) {
+		_, client, _ := startTestServer(t)
+		status, err := client.Status()
+		require.NoError(t, err)
+		assert.False(t, status.CaptureAvailable)
+		assert.Empty(t, status.CaptureError)
+	})
+
+	t.Run("capture manager init failure: unavailable with the recorded reason", func(t *testing.T) {
+		server, client, _ := startTestServer(t)
+		server.SetCaptureInitError("could not resolve home directory: boom")
+
+		status, err := client.Status()
+		require.NoError(t, err)
+		assert.False(t, status.CaptureAvailable)
+		assert.Equal(t, "could not resolve home directory: boom", status.CaptureError)
+	})
+
+	t.Run("capture manager present: available, no error", func(t *testing.T) {
+		server, client, _ := startTestServer(t)
+		cm, err := proxy.NewCaptureManagerAt(t.TempDir(), constants.DefaultCaptureMaxBodySize)
+		require.NoError(t, err)
+		server.SetCaptureManager(cm)
+
+		status, err := client.Status()
+		require.NoError(t, err)
+		assert.True(t, status.CaptureAvailable)
+		assert.Empty(t, status.CaptureError)
+	})
+}
+
 func fileExistsAt(t *testing.T, path string) bool {
 	t.Helper()
 	_, err := os.Stat(filepath.Clean(path))

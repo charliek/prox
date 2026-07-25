@@ -562,6 +562,115 @@ services:
 		assert.Equal(t, "2MB", cfg.Proxy.Capture.MaxBodySize)
 	})
 
+	// TestParse_CaptureMaterialization pins the capture-by-default materialization
+	// matrix (plan 012 D1, C4): Parse always builds cfg.Proxy.Capture whenever a
+	// proxy: block exists at all -- with no capture: block, an empty one, or an
+	// explicit enabled value -- defaulting Enabled to true and letting an explicit
+	// `enabled: false` survive.
+	t.Run("no capture block materializes Capture with Enabled true", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  http_port: 6788
+  domain: local.test.dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy)
+		require.NotNil(t, cfg.Proxy.Capture, "capture must be materialized even with no capture: block")
+		assert.True(t, cfg.Proxy.Capture.Enabled)
+	})
+
+	t.Run("empty capture block materializes Enabled true", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  http_port: 6788
+  domain: local.test.dev
+  capture: {}
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy.Capture)
+		assert.True(t, cfg.Proxy.Capture.Enabled)
+	})
+
+	t.Run("explicit enabled false survives", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  http_port: 6788
+  domain: local.test.dev
+  capture:
+    enabled: false
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy.Capture)
+		assert.False(t, cfg.Proxy.Capture.Enabled)
+	})
+
+	t.Run("explicit enabled true survives", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  http_port: 6788
+  domain: local.test.dev
+  capture:
+    enabled: true
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy.Capture)
+		assert.True(t, cfg.Proxy.Capture.Enabled)
+	})
+
+	t.Run("proxy disabled: capture materializes but is effectively off", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: false
+  http_port: 6788
+  domain: local.test.dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		require.NotNil(t, cfg.Proxy)
+		require.NotNil(t, cfg.Proxy.Capture, "capture still materializes on a disabled proxy block")
+		assert.True(t, cfg.Proxy.Capture.Enabled, "the capture config's own field still defaults on")
+		assert.False(t, cfg.Proxy.CaptureEffectivelyEnabled(), "but effective capture is gated off by the disabled proxy")
+	})
+
+	t.Run("no proxy block at all: no capture materialized", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+`
+		cfg, err := Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		assert.Nil(t, cfg.Proxy)
+	})
+
 	t.Run("HTTP only does not auto-create certs", func(t *testing.T) {
 		yaml := `
 processes:

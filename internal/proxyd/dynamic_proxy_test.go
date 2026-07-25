@@ -142,12 +142,21 @@ func TestDynamicProxy_CaptureEnabled_RecordsDetailsInline(t *testing.T) {
 	}
 }
 
+// TestDynamicProxy_CaptureDisabled_MetadataOnly pins the config-level opt-out
+// end to end (plan 012 D1, C4): a project registered with CaptureEnabled:
+// false -- the wire value config.ProxyConfig.CaptureEffectivelyEnabled sends
+// for an explicit proxy.capture.enabled: false -- gets metadata-only records
+// (nil Details) AND never spills a single byte to the capture manager's disk
+// accounting, even for a response well over the inline-capture threshold that
+// a capture-enabled route would spill.
 func TestDynamicProxy_CaptureDisabled_MetadataOnly(t *testing.T) {
+	big := strings.Repeat("A", constants.DefaultCaptureInlineThreshold+4096)
 	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("hello"))
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(big))
 	})
 
-	dp, rm, _ := newCaptureProxy(t, false, host, port, 10)
+	dp, rm, cm := newCaptureProxy(t, false, host, port, 10)
 
 	rec := serve(dp, "POST", "http://api.local.dev/echo", "ping", nil)
 	if rec.Code != http.StatusOK {
@@ -168,6 +177,10 @@ func TestDynamicProxy_CaptureDisabled_MetadataOnly(t *testing.T) {
 	}
 	if rec0.StatusCode != http.StatusOK {
 		t.Errorf("StatusCode = %d, want 200", rec0.StatusCode)
+	}
+
+	if used, _ := cm.DiskStats(); used != 0 {
+		t.Errorf("capture disk usage = %d bytes, want 0 -- a capture-disabled route must never spill a body to disk", used)
 	}
 }
 

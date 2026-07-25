@@ -36,8 +36,32 @@ type ProxyConfig struct {
 	Capture   *CaptureConfig `yaml:"capture,omitempty"`
 }
 
-// CaptureConfig defines request/response capture settings
+// CaptureEffectivelyEnabled reports whether capture is actually on for this
+// project (plan 012 D1, C4): the proxy itself must be enabled AND its capture
+// config -- always materialized by Parse whenever a proxy: block exists, see
+// materializeCapture -- must have Enabled == true. Capture is gated on the
+// proxy being enabled at every use site (the register wire, the CLI hint);
+// this is the single place that encodes the gate. Safe on a nil receiver (no
+// proxy configured at all -> false).
+func (p *ProxyConfig) CaptureEffectivelyEnabled() bool {
+	if p == nil || !p.Enabled {
+		return false
+	}
+	return p.Capture != nil && p.Capture.Enabled
+}
+
+// CaptureConfig defines request/response capture settings. It is always the
+// MATERIALIZED form: Parse builds one (via materializeCapture) whenever a
+// proxy: block exists at all, even with no capture: block or an empty one, so
+// a project's capture policy is never nil to check once cfg.Proxy is non-nil.
+// Its own raw YAML parsing lives on rawCaptureConfig, which carries the
+// Enabled tri-state Parse needs to distinguish "absent" from "explicit false"
+// (plan 012 D1, C4); CaptureConfig no longer doubles as its own raw type.
 type CaptureConfig struct {
+	// Enabled defaults to true whenever a proxy: block exists (capture-by-
+	// default, plan 012 D1): materializeCapture sets it unless the config
+	// explicitly says `enabled: false`. Effective capture also requires the
+	// proxy itself to be enabled -- see ProxyConfig.CaptureEffectivelyEnabled.
 	Enabled     bool   `yaml:"enabled"`
 	MaxBodySize string `yaml:"max_body_size"` // e.g., "1MB", "512KB"
 	// DiskBudget is the ceiling on the TOTAL bytes of spilled capture body files
@@ -51,9 +75,8 @@ type CaptureConfig struct {
 	// Redact controls capture-time redaction of sensitive headers and query
 	// params (plan 012 D4). It is a tri-state pointer: nil (key absent) and
 	// explicit true both mean redaction ON — redaction defaults on whenever a
-	// capture config exists — and only an explicit false disables it. Modeled as
-	// *bool directly on CaptureConfig so C4's rawCaptureConfig tri-state refactor
-	// can absorb the pointer without a shape change (see RedactEnabled).
+	// capture config exists — and only an explicit false disables it. See
+	// RedactEnabled.
 	Redact *bool `yaml:"redact,omitempty"`
 	// RedactHeaders and RedactQueryParams EXTEND (never replace) the built-in
 	// redaction sets in internal/proxy (plan 012 D4). Header names are canonical-
@@ -118,11 +141,53 @@ type HealthcheckConfig struct {
 }
 
 type rawProxyConfig struct {
-	Enabled   *bool          `yaml:"enabled,omitempty"`
-	HTTPPort  int            `yaml:"http_port"`
-	HTTPSPort int            `yaml:"https_port"`
-	Domain    string         `yaml:"domain"`
-	Capture   *CaptureConfig `yaml:"capture,omitempty"`
+	Enabled   *bool             `yaml:"enabled,omitempty"`
+	HTTPPort  int               `yaml:"http_port"`
+	HTTPSPort int               `yaml:"https_port"`
+	Domain    string            `yaml:"domain"`
+	Capture   *rawCaptureConfig `yaml:"capture,omitempty"`
+}
+
+// rawCaptureConfig is the raw YAML parse shape for a proxy's capture: block
+// (plan 012 D1, C4). It mirrors rawProxyConfig's Enabled tri-state pattern:
+// nil means "key absent" (materializeCapture defaults it to true, the
+// capture-by-default flip), so an explicit `enabled: false` can be told apart
+// from an absent key. The remaining fields are absorbed straight from what
+// used to live directly on CaptureConfig, which stops doubling as its own raw
+// parse type.
+type rawCaptureConfig struct {
+	Enabled           *bool    `yaml:"enabled,omitempty"`
+	MaxBodySize       string   `yaml:"max_body_size"`
+	DiskBudget        string   `yaml:"disk_budget"`
+	Redact            *bool    `yaml:"redact,omitempty"`
+	RedactHeaders     []string `yaml:"redact_headers,omitempty"`
+	RedactQueryParams []string `yaml:"redact_query_params,omitempty"`
+}
+
+// materializeCapture builds the CaptureConfig for a proxy block (plan 012 D1,
+// C4). Enabled defaults to true whenever a proxy: block exists at all --
+// including when raw is nil (no capture: block) or every field on it is zero
+// (an empty capture: block) -- so capture is on by default the moment a
+// project turns the proxy on. An explicit `enabled: false` (or `true`)
+// survives untouched. Whether capture is EFFECTIVELY on also requires the
+// proxy itself to be enabled; that gate lives in
+// ProxyConfig.CaptureEffectivelyEnabled, applied at use sites, not here --
+// materialization always happens so cfg.Proxy.Capture is never nil once
+// cfg.Proxy is non-nil.
+func materializeCapture(raw *rawCaptureConfig) *CaptureConfig {
+	cfg := &CaptureConfig{Enabled: true}
+	if raw == nil {
+		return cfg
+	}
+	if raw.Enabled != nil {
+		cfg.Enabled = *raw.Enabled
+	}
+	cfg.MaxBodySize = raw.MaxBodySize
+	cfg.DiskBudget = raw.DiskBudget
+	cfg.Redact = raw.Redact
+	cfg.RedactHeaders = raw.RedactHeaders
+	cfg.RedactQueryParams = raw.RedactQueryParams
+	return cfg
 }
 
 // rawConfig is used for initial YAML parsing to handle the flexible process/service format
@@ -179,7 +244,10 @@ func Parse(data []byte) (*Config, error) {
 			HTTPPort:  raw.Proxy.HTTPPort,
 			HTTPSPort: raw.Proxy.HTTPSPort,
 			Domain:    raw.Proxy.Domain,
-			Capture:   raw.Proxy.Capture,
+			// Materialized unconditionally -- even with no capture: block at all --
+			// so capture is on by default the moment a proxy: block exists (plan 012
+			// D1, C4). See materializeCapture.
+			Capture: materializeCapture(raw.Proxy.Capture),
 		}
 		if raw.Proxy.Enabled != nil {
 			config.Proxy.Enabled = *raw.Proxy.Enabled
