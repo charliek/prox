@@ -128,6 +128,10 @@ type DepSnapshot struct {
 	// StartInvoked records whether the start: command was launched this
 	// generation (it never runs when the initial check already passed).
 	StartInvoked bool
+	// Gen is the node's generation. A caller that wants to Reset a dependency it
+	// observed in a terminal (e.g. failed) state passes this to ResetIfGeneration
+	// so a NEWER generation another demander just started is never clobbered.
+	Gen uint64
 }
 
 // LogFunc routes a formatted line to the supervisor's system log. It mirrors
@@ -585,6 +589,30 @@ func (r *Resolver) Reset(name string) {
 	r.nextGen[name]++
 }
 
+// ResetIfGeneration is a generation-conditional Reset (plan 013 D4). It behaves
+// exactly like Reset(name) -- cancels the current resolution and drops the cached
+// node so the next Demand re-resolves under a fresh generation -- but ONLY when
+// the current node's generation still equals gen. It returns whether it acted.
+//
+// This closes a coordinator race: a caller that Snapshots a node in a terminal
+// (e.g. failed) state at generation N and later decides to Reset it must not
+// clobber a generation N+1 that some OTHER demander started resolving in the
+// meantime -- doing so would cancel that fresh resolution and strand its
+// dependents. Passing the snapshot's Gen makes the Reset a no-op once the node
+// has moved on. (Reset(name) stays the unconditional primitive.)
+func (r *Resolver) ResetIfGeneration(name string, gen uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	node := r.nodes[name]
+	if node == nil || node.gen != gen {
+		return false
+	}
+	node.cancelNode()
+	delete(r.nodes, name)
+	r.nextGen[name]++
+	return true
+}
+
 // Close cancels every in-flight resolution (supervisor shutdown). After Close,
 // Demand returns a canceled outcome without starting new work.
 func (r *Resolver) Close() {
@@ -686,6 +714,7 @@ func (n *depNode) snapshot(name string) DepSnapshot {
 		State:        n.state,
 		LastError:    lastErr,
 		StartInvoked: n.startInvoked,
+		Gen:          n.gen,
 	}
 }
 

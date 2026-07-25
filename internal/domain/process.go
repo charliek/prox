@@ -17,6 +17,24 @@ const (
 	ProcessStateStopping ProcessState = "stopping"
 	// ProcessStateCrashed indicates the process exited unexpectedly or failed to start
 	ProcessStateCrashed ProcessState = "crashed"
+	// ProcessStateWaiting indicates a gated process whose depends_on targets are
+	// still being resolved before it may launch (plan 013 D4). It is a limbo
+	// state: NOT running (no PID/instance, monitor not started) and NOT stopped
+	// (the process is scheduled and will still launch, block, or be stopped). A
+	// waiting process has never been handed to the runner, so it carries no
+	// process instance.
+	ProcessStateWaiting ProcessState = "waiting"
+	// ProcessStateBlocked is the terminal state a gated process reaches when a
+	// required depends_on target failed (dependency exhausted its budget with
+	// on_failure=fail); the process never launches (plan 013 D4). It is terminal
+	// like stopped/crashed: no PID, no instance. The blocking target names are
+	// recorded on the ManagedProcess (see ManagedProcess.BlockedBy) for status
+	// surfacing (C5).
+	ProcessStateBlocked ProcessState = "blocked"
+	// ProcessStateCompleted is the terminal success state of a run-to-completion
+	// task (plan 013 D4). The constant lands here with the rest of the plan-013
+	// state enum; task execution that drives a process/task into it is C4.
+	ProcessStateCompleted ProcessState = "completed"
 )
 
 // String returns the string representation of ProcessState
@@ -29,9 +47,14 @@ func (s ProcessState) IsRunning() bool {
 	return s == ProcessStateRunning
 }
 
-// IsStopped returns true if the process is stopped or crashed
+// IsStopped returns true if the process is in a terminal not-running state:
+// stopped, crashed, blocked (a gated process that will never launch, plan 013
+// D4), or completed (a finished task, plan 013 D4). Callers use it as the "no
+// live process / report PID 0" predicate. A waiting process is deliberately
+// EXCLUDED -- it is neither running nor stopped but scheduled to launch.
 func (s ProcessState) IsStopped() bool {
-	return s == ProcessStateStopped || s == ProcessStateCrashed
+	return s == ProcessStateStopped || s == ProcessStateCrashed ||
+		s == ProcessStateBlocked || s == ProcessStateCompleted
 }
 
 // ProcessConfig defines the configuration for a single process

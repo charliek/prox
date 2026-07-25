@@ -10,6 +10,11 @@ import (
 var (
 	ErrProcessNotFound       = errors.New("process not found")
 	ErrProcessAlreadyRunning = errors.New("process already running")
+	// ErrProcessAlreadyWaiting is returned when a manual start targets a gated
+	// process that is already waiting on its depends_on targets (plan 013 D4).
+	// It mirrors ErrProcessAlreadyRunning's already-active handling (409): the
+	// process is already scheduled, so the start is a no-op.
+	ErrProcessAlreadyWaiting = errors.New("process already waiting on dependencies")
 	ErrProcessNotRunning     = errors.New("process not running")
 	ErrInvalidPattern        = errors.New("invalid filter pattern")
 	ErrShutdownInProgress    = errors.New("shutdown in progress")
@@ -83,6 +88,7 @@ func (e *ProcessStopError) Unwrap() []error {
 const (
 	ErrCodeProcessNotFound       = "PROCESS_NOT_FOUND"
 	ErrCodeProcessAlreadyRunning = "PROCESS_ALREADY_RUNNING"
+	ErrCodeProcessAlreadyWaiting = "PROCESS_ALREADY_WAITING"
 	ErrCodeProcessNotRunning     = "PROCESS_NOT_RUNNING"
 	ErrCodeInvalidPattern        = "INVALID_PATTERN"
 	ErrCodeShutdownInProgress    = "SHUTDOWN_IN_PROGRESS"
@@ -113,6 +119,8 @@ func ErrorCode(err error) string {
 		return ErrCodeProcessNotFound
 	case errors.Is(err, ErrProcessAlreadyRunning):
 		return ErrCodeProcessAlreadyRunning
+	case errors.Is(err, ErrProcessAlreadyWaiting):
+		return ErrCodeProcessAlreadyWaiting
 	case errors.Is(err, ErrProcessNotRunning):
 		return ErrCodeProcessNotRunning
 	case errors.Is(err, ErrInvalidPattern):

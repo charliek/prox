@@ -332,6 +332,12 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 		code = domain.ErrCodeProcessAlreadyRunning
 		message = err.Error()
+	case errors.Is(err, domain.ErrProcessAlreadyWaiting):
+		// A gated process already scheduled and waiting on its dependencies;
+		// the manual start is a no-op (plan 013 D4). Same 409 as already-running.
+		status = http.StatusConflict
+		code = domain.ErrCodeProcessAlreadyWaiting
+		message = err.Error()
 	case errors.Is(err, domain.ErrProcessNotRunning):
 		status = http.StatusConflict
 		code = domain.ErrCodeProcessNotRunning

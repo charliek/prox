@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -188,6 +189,36 @@ type ManagedProcess struct {
 	// fallback window; production code and computeDeadlines both go through
 	// the locked StopTimeout() accessor.
 	shutdownTimeout time.Duration
+
+	// --- gated-launch orchestration (plan 013 D4) ---
+	//
+	// A process with a non-empty depends_on is "gated": Supervisor.Start does not
+	// launch it directly but registers it in state `waiting` and hands it to the
+	// graph coordinator (see coordinator.go), which resolves its dependency
+	// targets in a background goroutine and then drives it to running (all
+	// satisfied) or blocked (a required target failed). These fields carry the
+	// per-process state that orchestration needs.
+
+	// waitGen is the launch generation for gated orchestration. A coordinator
+	// goroutine captures it when it begins resolving; the launch is committed only
+	// if it still matches at the final gate (startWithConfigLocked, under p.mu),
+	// so a stop/restart/re-demand that bumped it supersedes a stale completion
+	// (constraint: an atomic checked at the final gate). Every mutation happens
+	// under p.mu; the final-gate read is under p.mu too, but the field stays an
+	// atomic to match the launch-gate's lock-free-read discipline.
+	waitGen atomic.Uint64
+
+	// waitCancel cancels THIS process's pending dependency wait (the coordinator's
+	// per-process context). StopProcess of a waiting process calls it to unblock
+	// the coordinator's Demand joins without aborting the shared dependency
+	// resolution other processes depend on. Guarded by p.mu; nil when no wait is
+	// in flight.
+	waitCancel context.CancelFunc
+
+	// blockedBy records, in declaration order, the depends_on targets that failed
+	// and left this process blocked (plan 013 D4). Stored for status surfacing in
+	// C5; read via BlockedBy. Guarded by p.mu.
+	blockedBy []string
 }
 
 // NewManagedProcess creates a new managed process
@@ -269,6 +300,91 @@ func (p *ManagedProcess) State() domain.ProcessState {
 	return p.state
 }
 
+// BlockedBy returns the depends_on targets that failed and left this process
+// blocked, in declaration order (plan 013 D4). Empty unless the process is in
+// the blocked state. The slice is cloned so callers cannot mutate live state.
+func (p *ManagedProcess) BlockedBy() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return slices.Clone(p.blockedBy)
+}
+
+// gated reports whether this process has a non-empty depends_on and must go
+// through the graph coordinator rather than launching directly (plan 013 D4).
+func (p *ManagedProcess) gated() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.config.DependsOn) > 0
+}
+
+// beginWaiting CONDITIONALLY starts a gated orchestration episode (plan 013 D4).
+// It admits a new episode only from a non-active state -- stopped, crashed,
+// blocked, or completed -- and, atomically under p.mu, bumps the launch
+// generation, moves the process to waiting, clears prior blocked reasons, and
+// stores the per-process wait cancel so StopProcess can unblock this process's
+// Demand joins. It returns (gen, true) on admission.
+//
+// From an ACTIVE state (running/starting/stopping) or an already-waiting one it
+// makes NO change and returns (prev, false) so the caller can map the correct
+// already-running / already-waiting error. Making admission conditional and
+// atomic with the state read is what guarantees EXACTLY ONE episode per process:
+// two concurrent starts that both observed `stopped` cannot both flip the
+// process to waiting -- the first admits, the second sees `waiting` and is
+// refused (findings 1/2).
+func (p *ManagedProcess) beginWaiting(cancel context.CancelFunc) (uint64, domain.ProcessState, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch p.state {
+	case domain.ProcessStateStopped, domain.ProcessStateCrashed,
+		domain.ProcessStateBlocked, domain.ProcessStateCompleted:
+		// Admissible: fall through and start a fresh episode.
+	default:
+		return 0, p.state, false
+	}
+	gen := p.waitGen.Add(1)
+	p.state = domain.ProcessStateWaiting
+	p.blockedBy = nil
+	p.waitCancel = cancel
+	p.startedAt = time.Time{}
+	return gen, domain.ProcessStateWaiting, true
+}
+
+// failWaitingLaunch settles a gated process into crashed after its launch failed
+// for a genuine reason -- most importantly a surviving previous group that the
+// launch guard refused (ErrProcessGroupNotReaped) -- but only if this episode is
+// still current AND the process is still waiting, so a superseded or
+// already-stopped episode is never clobbered (plan 013 D4, finding 3). It
+// deliberately RETAINS p.current: a surviving group must stay reapable by Stop's
+// crashed path. Without this, a refused gated launch would strand the process in
+// waiting, where Stop's no-instance shortcut skips the live group and shutdown
+// could drop the orphan ledger while the group survives.
+func (p *ManagedProcess) failWaitingLaunch(gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waitGen.Load() != gen || p.state != domain.ProcessStateWaiting {
+		return false
+	}
+	p.state = domain.ProcessStateCrashed
+	p.waitCancel = nil
+	return true
+}
+
+// markBlocked moves the process to the terminal blocked state, recording the
+// failed targets, but only if gen still matches the current launch generation --
+// a stop/restart/re-demand that bumped the generation supersedes this stale
+// completion (returns false, no state change). Plan 013 D4.
+func (p *ManagedProcess) markBlocked(targets []string, gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waitGen.Load() != gen {
+		return false
+	}
+	p.state = domain.ProcessStateBlocked
+	p.blockedBy = slices.Clone(targets)
+	p.waitCancel = nil
+	return true
+}
+
 // StopTimeout returns the effective per-process stop budget used as the
 // no-context-deadline fallback in computeDeadlines.
 func (p *ManagedProcess) StopTimeout() time.Duration {
@@ -322,7 +438,25 @@ func (p *ManagedProcess) Start(ctx context.Context) error {
 // (Start, Restart, and the supervisor's direct startWithConfig calls), so no
 // path can forget to persist and a future path inherits it for free.
 func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingConfig) error {
-	err := p.startWithConfigLocked(ctx, pending)
+	return p.startWithConfigGen(ctx, pending, nil)
+}
+
+// startGated launches a gated process whose dependency wait completed (plan 013
+// D4). It is the coordinator's launch path: expectGen is the generation the
+// coordinator captured when it began resolving; the launch commits only if it
+// still matches at the final gate, so a stop/restart/re-demand that superseded
+// this completion refuses the launch (errLaunchSuperseded) rather than racing a
+// stale process into existence.
+func (p *ManagedProcess) startGated(ctx context.Context, expectGen uint64) error {
+	return p.startWithConfigGen(ctx, nil, &expectGen)
+}
+
+// startWithConfigGen is the shared launch wrapper: it runs the locked launch
+// (optionally reloading pending config and/or enforcing a launch generation) and
+// persists the orphan-reaping ledger via onLaunched AFTER p.mu is released (see
+// startWithConfigLocked's comment on the s.mu -> p.mu ordering).
+func (p *ManagedProcess) startWithConfigGen(ctx context.Context, pending *pendingConfig, expectGen *uint64) error {
+	err := p.startWithConfigLocked(ctx, pending, expectGen)
 	if err == nil && p.onLaunched != nil {
 		p.onLaunched()
 	}
@@ -341,9 +475,20 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 // If the runner (or the post-swap env reload) fails AFTER the swap was applied,
 // the new config stays in place (state Crashed; the next start uses it) -- "the
 // file is the truth".
-func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pendingConfig) error {
+func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pendingConfig, expectGen *uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Generation guard (plan 013 D4). For a coordinator-driven gated launch,
+	// commit only if the process is still on the generation the coordinator
+	// captured when it began resolving. A stop/restart/re-demand that superseded
+	// this completion bumped waitGen (under p.mu), so this stale launch is refused
+	// with no state change -- checked under p.mu, an atomic read only, before any
+	// state guard so it can never race a launch into a stopped/blocked process
+	// that a concurrent stop already settled. Ungated launches pass expectGen=nil.
+	if expectGen != nil && p.waitGen.Load() != *expectGen {
+		return errLaunchSuperseded
+	}
 
 	// Reject starting over an active run. `stopping` is included so a Start
 	// racing an in-flight Stop is refused rather than launching a duplicate
@@ -530,6 +675,30 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 	p.mu.Lock()
 
 	switch p.state {
+	case domain.ProcessStateWaiting:
+		// Gated process whose dependency wait is still pending (or just resolved
+		// but not yet launched). Supersede any resolved-but-unlaunched coordinator
+		// completion (bump the generation so its final gate refuses), cancel this
+		// process's wait so the coordinator's Demand joins unblock, and settle in
+		// stopped. There is no process group to reap. Plan 013 D4.
+		p.waitGen.Add(1)
+		cancel := p.waitCancel
+		p.waitCancel = nil
+		p.state = domain.ProcessStateStopped
+		p.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		// A real transition happened (the scheduled launch was canceled), so this
+		// is a clean stop, not an ErrProcessNotRunning no-op.
+		return nil
+	case domain.ProcessStateBlocked:
+		// Terminal gated state, no wait in flight and no group. Settle in stopped
+		// so a later start can re-schedule it. Plan 013 D4.
+		p.state = domain.ProcessStateStopped
+		p.blockedBy = nil
+		p.mu.Unlock()
+		return nil
 	case domain.ProcessStateStopped, domain.ProcessStateCrashed:
 		// Nothing running, unless a group survived a prior stop / unexpected
 		// leader exit -- in which case fall through and reap it (retry path),

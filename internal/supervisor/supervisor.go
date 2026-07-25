@@ -112,6 +112,31 @@ type Supervisor struct {
 	// detect and safely discard a cross-boot ledger. Empty on Darwin/others (not
 	// needed) and on a Linux boot_id read failure (degrades to markerless).
 	bootMarker string
+
+	// --- dependency graph coordination (plan 013 D4) ---
+	//
+	// resolver drives depends_on dependency targets through their readiness state
+	// machine (deps.go). It is rebuilt on every Supervisor.Start (a Close is
+	// terminal, so a stop->start cycle needs a fresh one) via newResolver, and
+	// Close()d at shutdown. Guarded by s.mu.
+	resolver *Resolver
+	// newResolver builds the resolver for a fresh run. It is a seam: production
+	// builds the real resolver from config dependencies (buildDefaultResolver);
+	// tests replace it to inject scripted prober/clock/start seams. Set once in
+	// New; never mutated after, so it is read without the lock.
+	newResolver func() *Resolver
+	// coordCtx/coordCancel bound the lifetime of the coordinator's gated-launch
+	// orchestration goroutines. coordCtx is derived from s.ctx on each Start;
+	// coordCancel is invoked at the very start of shutdown (RefuseLaunches or the
+	// top of Stop) so pending dependency waits unblock immediately, distinct from
+	// s.cancel which fires only at the END of Stop. Guarded by s.mu.
+	coordCtx    context.Context
+	coordCancel context.CancelFunc
+	// coordWg tracks the in-flight coordinator goroutines (one per gated process,
+	// each fanning out to its targets). Stop waits on it -- after canceling
+	// coordCtx and Close()ing the resolver -- so orchestration has fully quiesced
+	// before the process set is stopped. Its own synchronization; not s.mu-guarded.
+	coordWg sync.WaitGroup
 }
 
 // SupervisorEvent represents a supervisor event
@@ -148,6 +173,10 @@ func New(cfg *config.Config, logManager *logs.Manager, runner ProcessRunner, sup
 		state:      "stopped",
 	}
 	s.bootMarker = s.readBootMarker()
+	// Default resolver factory: build the real dependency resolver from config
+	// (plan 013 D4). Tests override s.newResolver before Start to inject scripted
+	// resolver seams (fake prober/clock).
+	s.newResolver = s.buildDefaultResolver
 
 	return s
 }
@@ -212,6 +241,12 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 	// Reopen the launch gate. This also covers a stop->start cycle (Stop flipped
 	// it false): the fresh run must accept launches again (#32/#36, D2).
 	s.launchable.Store(true)
+	// Build a fresh dependency resolver and a coordinator context for this run
+	// (plan 013 D4). The resolver is rebuilt every Start because Close is terminal;
+	// coordCtx is a child of s.ctx canceled EARLY at shutdown so pending dependency
+	// waits release before the process set is stopped.
+	s.resolver = s.newResolver()
+	s.coordCtx, s.coordCancel = context.WithCancel(s.ctx)
 	s.startedAt = time.Now()
 	s.mu.Unlock()
 
@@ -312,6 +347,9 @@ func (s *Supervisor) buildProcessRuntime(name string, cfg *config.Config, procCo
 		Cmd:         procConfig.Cmd,
 		EnvFile:     procConfig.EnvFile,
 		StopTimeout: stopTimeout,
+		// depends_on drives gated-launch orchestration (plan 013 D4). Carried onto
+		// the domain config so ManagedProcess.gated() and the coordinator see it.
+		DependsOn: procConfig.DependsOn,
 	}
 	if procConfig.Healthcheck != nil {
 		hc, err := procConfig.Healthcheck.ToDomain()
@@ -395,12 +433,35 @@ func (s *Supervisor) prepareReload(name string) (*pendingConfig, error) {
 	return &pendingConfig{config: domainConfig, loadEnv: loadEnv, env: env, stopTimeout: effective}, nil
 }
 
-// startProcessesConcurrently starts all managed processes concurrently and updates the result.
+// startProcessesConcurrently starts all managed processes and updates the
+// result. UNGATED processes launch concurrently and synchronously exactly as
+// before -- their StartResult semantics (Started on success, Failed on error)
+// are unchanged. GATED processes (a non-empty depends_on, plan 013 D4) are NOT
+// launched here: they are registered in the waiting state and handed to the
+// coordinator, which resolves their dependency targets asynchronously and then
+// drives them to running or blocked. A gated process is recorded in
+// result.Started to mean SCHEDULED (accepted, resolution ongoing), not yet
+// running -- Supervisor.Start deliberately returns without waiting on resolution
+// (constraint: Start must not block on dependency resolution).
 func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 	var wg sync.WaitGroup
 	var resultMu sync.Mutex
 
 	for name, mp := range s.processes {
+		if mp.gated() {
+			// Schedule async orchestration and count it as scheduled; do not wait.
+			// Admission only fails if shutdown raced this Start (or the pointer was
+			// superseded) -- record that as a start failure rather than Started.
+			err := s.scheduleGated(mp)
+			resultMu.Lock()
+			if err != nil {
+				result.Failed[name] = err
+			} else {
+				result.Started = append(result.Started, name)
+			}
+			resultMu.Unlock()
+			continue
+		}
 		wg.Add(1)
 		go func(name string, mp *ManagedProcess) {
 			defer wg.Done()
@@ -567,6 +628,20 @@ func stopEvent(err error) (EventType, bool) {
 // about to stop that process anyway (#36, D4).
 func (s *Supervisor) RefuseLaunches() {
 	s.launchable.Store(false)
+	// Cancel gated-launch orchestration immediately too (plan 013 D4): pending
+	// dependency waits must release the moment shutdown begins, not only when Stop
+	// runs. Close()ing the resolver aborts its in-flight resolutions (and any
+	// prox-owned dependency start: helpers); canceling coordCtx unblocks the
+	// coordinator goroutines' Demand joins. Both are idempotent with Stop, which
+	// repeats them. Held under s.mu because coordCancel/resolver are s.mu-guarded.
+	s.mu.Lock()
+	if s.coordCancel != nil {
+		s.coordCancel()
+	}
+	if s.resolver != nil {
+		s.resolver.Close()
+	}
+	s.mu.Unlock()
 }
 
 // Stop stops all processes and the supervisor.
@@ -589,6 +664,32 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	// the gate (the check/use window) is reaped by this process's stop goroutine --
 	// which is queued on p.mu behind that very launch -- before Stop returns (D2).
 	s.launchable.Store(false)
+	// Cancel gated-launch orchestration and abort in-flight dependency resolutions
+	// (plan 013 D4). Canceling coordCtx unblocks the coordinator goroutines'
+	// Demand joins; Close()ing the resolver aborts its own resolutions and any
+	// prox-owned dependency start: helpers. Both are idempotent with RefuseLaunches.
+	// We snapshot the coordinator handles here (under s.mu) and quiesce AFTER
+	// releasing s.mu -- coordWg.Wait() must not run under s.mu because a
+	// coordinator goroutine finishing a launch calls onLaunched (persistChildren),
+	// which itself takes s.mu, so waiting under s.mu would deadlock.
+	coordCancel := s.coordCancel
+	resolver := s.resolver
+	s.mu.Unlock()
+
+	if coordCancel != nil {
+		coordCancel()
+	}
+	if resolver != nil {
+		resolver.Close()
+	}
+	// Wait for all coordinator goroutines to quiesce before snapshotting the
+	// process set: after this, no gated process can still transition to running,
+	// so the set stopped below is final. A process whose wait was canceled here
+	// stays in the waiting state and is settled to stopped by its per-process Stop
+	// below (NOT blocked/crashed) -- a shutdown-canceled wait is never a failure.
+	s.coordWg.Wait()
+
+	s.mu.Lock()
 	processes := make([]*ManagedProcess, 0, len(s.processes))
 	for _, mp := range s.processes {
 		processes = append(processes, mp)
@@ -737,6 +838,13 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
+	// Gated processes (a non-empty depends_on) go through the coordinator rather
+	// than launching directly (plan 013 D4): a manual start (re-)demands their
+	// dependency targets and schedules orchestration.
+	if mp.gated() {
+		return s.startProcessGated(mp)
+	}
+
 	// Re-read the config and prepare the fresh runtime BEFORE launching, so a
 	// `stop`+`start` picks up a changed cmd/env/healthcheck/stop_timeout exactly
 	// like `restart` does (#33, D3). Any reload failure leaves the process
@@ -820,6 +928,13 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
+	// Gated processes re-resolve their dependency targets BEFORE stopping the
+	// running instance (fail-before-stop), so a dependency that has since gone
+	// unready leaves the running process untouched (plan 013 D4).
+	if mp.gated() {
+		return s.restartProcessGated(ctx, mp, supCtx)
+	}
+
 	// Re-read + validate the whole file and preflight the target's fresh env
 	// BEFORE the stop, so an invalid file, a removed process, or a missing new
 	// env_file fails with the running process untouched (#33, D3). pending is nil
@@ -901,9 +1016,17 @@ type SupervisorStatus struct {
 	StartedAt time.Time
 }
 
-// StartResult contains information about process startup results
+// StartResult contains information about process startup results.
+//
+// Started carries two meanings since plan 013 D4. For an UNGATED process it
+// means "launched and running", as before. For a GATED process (a non-empty
+// depends_on) it means "SCHEDULED": Start registered it in the waiting state and
+// handed it to the coordinator, which resolves its dependency targets
+// asynchronously and then drives it to running or blocked. Start does not block
+// on that resolution, so a gated process listed in Started may still be waiting
+// or become blocked -- callers that need its live state must consult Process().
 type StartResult struct {
-	Started []string         // Names of processes that started successfully
+	Started []string         // Names of processes started (ungated) or scheduled (gated)
 	Failed  map[string]error // Names and errors of processes that failed to start
 }
 

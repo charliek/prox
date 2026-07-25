@@ -17,6 +17,9 @@ func TestProcessState_String(t *testing.T) {
 		{ProcessStateStarting, "starting"},
 		{ProcessStateStopping, "stopping"},
 		{ProcessStateCrashed, "crashed"},
+		{ProcessStateWaiting, "waiting"},
+		{ProcessStateBlocked, "blocked"},
+		{ProcessStateCompleted, "completed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
@@ -35,6 +38,11 @@ func TestProcessState_IsRunning(t *testing.T) {
 		{ProcessStateStarting, false},
 		{ProcessStateStopping, false},
 		{ProcessStateCrashed, false},
+		// A waiting process is NOT running (no live instance yet); blocked and
+		// completed are terminal, also not running (plan 013 D4).
+		{ProcessStateWaiting, false},
+		{ProcessStateBlocked, false},
+		{ProcessStateCompleted, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.state.String(), func(t *testing.T) {
@@ -53,6 +61,11 @@ func TestProcessState_IsStopped(t *testing.T) {
 		{ProcessStateStarting, false},
 		{ProcessStateStopping, false},
 		{ProcessStateCrashed, true},
+		// waiting is deliberately NOT stopped (it is scheduled to launch);
+		// blocked and completed are terminal not-running states (plan 013 D4).
+		{ProcessStateWaiting, false},
+		{ProcessStateBlocked, true},
+		{ProcessStateCompleted, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.state.String(), func(t *testing.T) {
