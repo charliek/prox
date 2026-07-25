@@ -170,19 +170,36 @@ func Validate(config *Config) error {
 }
 
 // validateRedactHeaderName checks a redact_headers entry is a usable HTTP field
-// name (plan 012 D4): non-empty and free of spaces, colons, control characters,
-// and DEL — the bytes that cannot appear in a header field name and that make
-// http.CanonicalHeaderKey refuse to canonicalize the value.
+// name (plan 012 D4): non-empty and composed entirely of RFC 7230 "tchar"
+// token characters (ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" / "*" /
+// "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"). Anything else — commas,
+// slashes, non-ASCII bytes, spaces, colons, control characters — is rejected:
+// those bytes can slip past a naive check yet still make
+// http.CanonicalHeaderKey refuse to canonicalize the value, so the configured
+// header would silently never match at redaction time.
 func validateRedactHeaderName(name string) error {
 	if name == "" {
 		return fmt.Errorf("entry cannot be empty")
 	}
 	for _, r := range name {
-		if r <= ' ' || r == ':' || r == 0x7f {
-			return fmt.Errorf("invalid header name %q (no spaces, colons, or control characters)", name)
+		if !isTokenChar(r) {
+			return fmt.Errorf("invalid header name %q (must be a valid HTTP token: letters, digits, or !#$%%&'*+-.^_`|~)", name)
 		}
 	}
 	return nil
+}
+
+// isTokenChar reports whether r is an RFC 7230 "tchar" (the character class
+// allowed in HTTP token productions such as header field names).
+func isTokenChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		return true
+	default:
+		return false
+	}
 }
 
 // validateServiceName checks if a service name is valid as a subdomain

@@ -109,6 +109,63 @@ proxy:
 		assert.Contains(t, err.Error(), "redact_headers")
 	})
 
+	t.Run("header name with comma rejected", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.dev
+  https_port: 8443
+  capture:
+    enabled: true
+    redact_headers:
+      - "X-Bad,Name"
+`
+		_, err := Parse([]byte(yaml))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redact_headers")
+	})
+
+	t.Run("header name with slash rejected", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.dev
+  https_port: 8443
+  capture:
+    enabled: true
+    redact_headers:
+      - "X-Bad/Name"
+`
+		_, err := Parse([]byte(yaml))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redact_headers")
+	})
+
+	t.Run("header name with non-ASCII byte rejected", func(t *testing.T) {
+		yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.dev
+  https_port: 8443
+  capture:
+    enabled: true
+    redact_headers:
+      - "X-Badé"
+`
+		_, err := Parse([]byte(yaml))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redact_headers")
+	})
+
 	t.Run("empty query param rejected", func(t *testing.T) {
 		yaml := `
 processes:

@@ -26,8 +26,25 @@ func newRedactProxy(t *testing.T, reg *Registry, ms *Managers, cm *proxy.Capture
 }
 
 func serveRedactHost(dp *DynamicProxy, host, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+	return serveRedactHostOpts(dp, host, method, target, bytes.NewReader([]byte(body)), headers)
+}
+
+// serveRedactHostNilBody is like serveRedactHost but genuinely exercises
+// CaptureRequest's r.Body == nil branch. httptest.NewRequest never leaves
+// req.Body nil on its own — even passing a nil io.Reader still leaves in
+// place the non-nil Body that http.ReadRequest attached while parsing the
+// synthesized request line — so callers must clear it explicitly to reach
+// that branch.
+func serveRedactHostNilBody(dp *DynamicProxy, host, method, target string, headers map[string]string) *httptest.ResponseRecorder {
+	return serveRedactHostOpts(dp, host, method, target, nil, headers)
+}
+
+func serveRedactHostOpts(dp *DynamicProxy, host, method, target string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 	handler := dp.handler(80)
-	req := httptest.NewRequest(method, target, bytes.NewReader([]byte(body)))
+	req := httptest.NewRequest(method, target, body)
+	if body == nil {
+		req.Body = nil
+	}
 	req.Host = host
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -89,8 +106,10 @@ func TestDynamicProxy_Redaction_EndToEnd(t *testing.T) {
 }
 
 // TestDynamicProxy_Redaction_BodylessGET is the panel's critical finding at the
-// daemon level: a GET (r.Body nil) still records Details, and its sensitive
-// headers must be redacted (plan 012 D4).
+// daemon level: a GET with a genuinely nil r.Body (via serveRedactHostNilBody)
+// still records Details, and its sensitive headers must be redacted (plan 012
+// D4) — exercising CaptureRequest's `r.Body == nil` early-return branch, which
+// a request built with a non-nil (even empty) body reader never reaches.
 func TestDynamicProxy_Redaction_BodylessGET(t *testing.T) {
 	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -108,7 +127,7 @@ func TestDynamicProxy_Redaction_BodylessGET(t *testing.T) {
 	req.Redact = true
 	dp := newRedactProxy(t, reg, ms, cm, req)
 
-	rec := serveRedactHost(dp, "api.local.dev", "GET", "http://api.local.dev/me", "",
+	rec := serveRedactHostNilBody(dp, "api.local.dev", "GET", "http://api.local.dev/me",
 		map[string]string{"Authorization": "Bearer secret", "Cookie": "s=1"})
 	require.Equal(t, http.StatusOK, rec.Code)
 
