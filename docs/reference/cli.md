@@ -36,7 +36,8 @@ prox up [processes...]
 | `--http-port` | Override proxy HTTP port |
 | `--https-port` | Override proxy HTTPS port |
 | `--no-proxy` | Disable proxy even if configured |
-| `--capture` | Enable request/response body capture for proxied requests |
+| `--capture` | Force request/response body capture on for this run. Capture is already on by default whenever the proxy is enabled, so this flag is kept for explicitness/compatibility; mutually exclusive with `--no-capture` |
+| `--no-capture` | Disable request/response body capture for this run (config-level opt-out: `proxy.capture.enabled: false`) |
 
 **Examples:**
 
@@ -68,8 +69,11 @@ prox up --http-port 6788
 # Start with dual-stack proxy
 prox up --http-port 6788 --https-port 6789
 
-# Enable request/response body capture
+# Body capture is already on by default; --capture is kept for explicitness
 prox up --capture
+
+# Disable body capture for this run
+prox up --no-capture
 ```
 
 **Dynamic Port Allocation:**
@@ -342,7 +346,9 @@ prox requests abc1234def56 --body
 
 Each request is assigned a short hash ID (12 characters, git-style). These IDs are displayed in the output and can be used to reference specific requests.
 
-Body output requires request capture to be enabled with `prox up --capture` or `proxy.capture.enabled: true`. Capture applies in both standalone and shared-daemon mode — the enablement is propagated to the daemon at registration, and a daemon captures bodies only for the projects that opted in. When a request has no captured detail, `prox requests <id>` shows `(capture not enabled - use 'prox up --capture' to enable)`; if the body was captured but has since been evicted from the request buffer, it shows `(body no longer available)` instead. See [Request Capture](configuration.md#request-capture) for capture directories and daemon-upgrade notes.
+Body output works out of the box: capture is on by default whenever the proxy is enabled, so `--body` just works without any config. Header/query-param values matching the built-in (or configured) redaction sets show as `[REDACTED]`/`REDACTED` rather than the real value — see [Request Capture](configuration.md#request-capture) for the full list and its limits (bodies are captured verbatim; redaction does not cover them). Capture applies in both standalone and shared-daemon mode — the effective policy is propagated to the daemon at registration, and a daemon captures bodies only for the projects that have not opted out.
+
+When a request has no captured detail, `prox requests <id>` shows one of three hints depending on what's known: a `101`/WebSocket-upgrade record always shows `(metadata only - WebSocket/101 upgrade traffic is never captured, regardless of capture config)`; a project whose static config has capture off shows `(capture not enabled - proxy.capture.enabled is false or --no-capture was used; run 'prox up --capture' or drop --no-capture to enable)`; otherwise a neutral catch-all names every real possibility — `--no-capture` for this run, a metadata-only non-101 record (e.g. a routing error), or the daemon's capture manager being unavailable — and points at `prox proxy status` to check. See [Request Capture](configuration.md#request-capture) for capture directories, the disk budget, and daemon-upgrade notes.
 
 **In-flight requests:** a request whose response is still streaming (headers received, body not yet finished) shows `...` in the DURATION column of the table, `(in flight)` instead of `(Nms)` in `-f/--follow` output, and `Duration: (in flight)` with `(request in flight — details arrive on completion)` in the detail view. Table and TUI rows update in place once the request completes; `-f/--follow` output is a stream, so it prints a second line for the completion event (same ID, no `in_flight`). `--json` carries this as `"in_flight": true`, omitted once done.
 
@@ -358,12 +364,14 @@ prox proxy <command>
 
 | Command | Description |
 |---------|-------------|
-| `prox proxy status` | Show daemon version, PID, uptime, projects, routes, and listener ports |
+| `prox proxy status` | Show daemon version, PID, uptime, projects, routes, listener ports, and capture disk usage |
 | `prox proxy status --json` | Output daemon status as JSON |
 | `prox proxy routes` | List registered routes |
 | `prox proxy routes --json` | Output registered routes as JSON |
 | `prox proxy stop` | Stop the daemon when no active routes are registered |
 | `prox proxy stop --force` | Stop the daemon even with active routes |
+
+**Capture line:** human output prints a `Capture:` line reporting the daemon-wide capture disk budget (see [Request Capture](configuration.md#request-capture)) — `Capture:    <used> used / <budget> budget on disk`, or `Capture:    unavailable (<reason>)` when the daemon's own capture manager failed to initialize at startup (distinct from any project simply choosing capture off, which never shows up here). `--json` carries the same information as `capture_disk_used`/`capture_disk_budget` (bytes, both `0` when the daemon has no capture manager) and `capture_available`/`capture_error`.
 
 **Examples:**
 

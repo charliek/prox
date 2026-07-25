@@ -281,7 +281,7 @@ certs:
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
 | `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
-| `proxy.capture.enabled` | bool | `false` | Capture request/response headers and bodies for proxied requests |
+| `proxy.capture.enabled` | bool | `true` | Capture request/response headers and bodies for proxied requests (see [Request Capture](#request-capture) for the full field list) |
 | `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
 
 ### Shared Proxy Daemon
@@ -324,25 +324,93 @@ services:
 
 ### Request Capture
 
-Request capture records request and response headers and bodies for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated. This cap is enforced per project: when several projects share one proxy daemon, each project's `max_body_size` (sent to the daemon at registration) governs only that project's captures — one project cannot inflate or shrink another's capture limit.
+**Capture is on by default whenever the proxy is enabled.** A proxy-enabled project records request/response headers and bodies for the `prox requests <id>` detail view with no extra config — set `enabled: false` (or pass `--no-capture`) to opt out. Capture works identically in standalone and shared-daemon mode: the effective policy is sent to the shared proxy daemon when the project registers, so a capture-disabled project sharing a daemon with capture-enabled projects still has its own requests recorded as metadata only (no headers/bodies), and no project can see another project's captured records.
 
 ```yaml
 proxy:
   https_port: 6789
   domain: local.myapp.dev
   capture:
-    enabled: true
+    enabled: true       # default; omit the whole capture: block to get this
     max_body_size: 1MB
+    disk_budget: 1GB
+    redact: true
+    redact_headers: []
+    redact_query_params: []
 ```
 
-Capture is enabled per project, either with `proxy.capture.enabled: true` in config or with the `prox up --capture` flag.
+#### Capture Fields
 
-**Capture works in both standalone and shared-daemon mode.** The enablement (config or `--capture`) is sent to the shared proxy daemon when the project registers, so it applies whether prox runs a standalone proxy or routes through the per-user daemon. Capture is scoped per project: on a shared daemon, only capture-enabled projects have their bodies captured — a capture-disabled project sharing the same daemon has its requests recorded as metadata only (headers and bodies are not retained), and no project can see another project's captured records or bodies.
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` when `proxy.enabled` is true | Master switch for this project's capture. `false` records metadata only (method, URL, status, timing) — no headers or bodies |
+| `max_body_size` | string | `1MB` | Maximum request or response body size to capture per record; larger bodies are truncated. Enforced per project, even on a shared daemon |
+| `disk_budget` | string | `1GB` (1 GiB) | Ceiling on total spilled body bytes on disk; see "How eviction works" below |
+| `redact` | bool | `true` | Redact sensitive headers and query params at the moment of capture; see "Redaction behavior" below |
+| `redact_headers` | []string | — | Extra header names to redact. **Extends**, never replaces, the built-in list |
+| `redact_query_params` | []string | — | Extra query-param names to redact. **Extends**, never replaces, the built-in list |
+
+Sizes use binary suffixes — `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`, each 1024× the previous — so `1GB` means 1 GiB (1,073,741,824 bytes), matching `max_body_size`'s existing units.
+
+#### How eviction works
+
+Only bodies larger than the 64KB inline threshold spill to a file on disk; smaller bodies live inline with the record and are never subject to the disk budget. Every spilled body file counts against **one** budget:
+
+- **Standalone mode:** the project's own `disk_budget` (or the `1GB` default).
+- **Shared daemon:** there is only one physical capture directory (`~/.prox/capture`) for every registered project, so the daemon computes a single effective budget — the **minimum**, across every capture-enabled project, of that project's `disk_budget` (or the `1GB` default for a project that left it unset). An explicit value can only **lower** the shared bound; raising it above the default requires **every** capture-enabled project on the daemon to opt into a larger value.
+
+  Worked example: project A sets `disk_budget: 2GB`; project B leaves `disk_budget` unset. B contributes the `1GB` default to the minimum, so the effective daemon-wide budget is `min(2GB, 1GB)` = **1GB** — A's larger value does not raise the shared bound. If B also sets `disk_budget: 2GB` (both projects opt in), the effective budget becomes `min(2GB, 2GB)` = **2GB**.
+
+When the effective budget is exceeded, prox evicts the **oldest record group first** — a record's request and response body files age together as one group, keyed by whichever of the two spilled to disk first. Eviction is strict FIFO by first-spill time, deliberately **not** LRU: fetching an old body does not protect it from eviction. It runs across **every** project sharing the daemon — the oldest group anywhere is evicted first, regardless of which project it belongs to. Only the spilled body **files** are removed; the in-memory ring record and its metadata (method, URL, status, timing, headers) are untouched, and fetching an evicted body (`prox requests <id> --body`) reports it as no longer available rather than erroring.
+
+#### Redaction behavior
+
+Redaction runs at the moment of capture — before a record reaches disk, the daemon's request stream, the API, or the TUI — so every downstream surface is covered by construction.
+
+**Built-in header redaction** always replaces these header values with `[REDACTED]`, verbatim, regardless of `redact_headers`: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`.
+
+**Built-in query-param redaction** always replaces the *value* of these query params with `REDACTED` (unbracketed, since it sits inside a URL): `access_token`, `refresh_token`, `id_token`, `token`, `api_key`, `apikey`, `client_secret`, `code`. This applies to:
+
+- the request URL's own query string (`&`- or `;`-separated pairs);
+- query params inside a `Location` or `Referer` response header value — the OAuth-redirect leak path;
+- query-shaped params inside a URL **fragment** (`#...`) — the OAuth implicit-flow token leak path.
+
+Any **userinfo password** embedded in a URL is also redacted — `https://user:pass@host/path` becomes `https://user:REDACTED@host/path` — with the username preserved.
+
+`redact_headers`/`redact_query_params` **extend**, never replace, the built-in lists; entries are canonicalized (header names) or lowercased (query params) and de-duplicated at parse time. The `[REDACTED]`/`REDACTED` markers are deliberately visible rather than the field being omitted — seeing the marker confirms an `Authorization` header or a token was present, which is useful when debugging auth failures, without exposing the secret itself.
+
+> **Limitation: bodies are NOT redacted.** Redaction covers headers and URLs only. Request/response **bodies are captured and stored verbatim** — inline in memory or in `~/.prox/capture` spill files — including any tokens, API keys, or PII embedded in JSON or form payloads. Neither `redact_headers` nor a smaller `max_body_size` prevents this (`max_body_size` only truncates by length; it never inspects content). If a project's bodies carry secrets, the only reliable per-project opt-out is `enabled: false` — turning capture off entirely, not relying on redaction.
+
+#### Opting out
+
+Disable capture for a project in config:
+
+```yaml
+proxy:
+  capture:
+    enabled: false
+```
+
+or for a single run, without touching config:
+
+```bash
+prox up --no-capture
+```
+
+`--capture` still exists (kept for explicitness/compatibility — it forces capture on, which a proxy-enabled project already gets by default) and is mutually exclusive with `--no-capture`.
+
+#### Where capture files live
 
 Captured body files are stored under the capture directory and cleaned up as request records age out of the in-memory request buffer:
 
-- **Standalone proxy** (`prox up --no-proxy` disabled, i.e. an in-process proxy): `.prox/capture/` within the project directory.
-- **Shared daemon**: `~/.prox/capture/` (the per-user daemon's capture directory). The directory is removed when the daemon shuts down.
+- **Standalone proxy** (`prox up --no-proxy` disabled, i.e. an in-process proxy): `<project>/.prox/capture/` within the project directory.
+- **Shared daemon**: `~/.prox/capture/` — one flat directory shared by every registered project. Removed when the daemon shuts down.
+
+> `.prox/` should already be in your project's `.gitignore` (see [Runtime State](#runtime-state) above) — worth double-checking now that capture is on by default and its spill files may contain secrets embedded in bodies.
+
+#### Daemon-wide capture status
+
+`prox proxy status --json` reports `capture_available` (bool) and `capture_error` (string, empty when available): whether the **daemon itself** managed to initialize a capture manager at startup, independent of any individual project's `proxy.capture.enabled`. `capture_available: false` means capture cannot work for *any* project on that daemon regardless of their own config; `capture_error` explains why (e.g. home directory unresolved, capture dir uncreatable). The same response also carries `capture_disk_used`/`capture_disk_budget`, the effective daemon-wide totals described above. See [`prox proxy status`](cli.md#proxy).
 
 > **Upgrading a running daemon:** daemon-mode capture requires a daemon built with this feature. A long-running daemon started before the upgrade must be restarted (`prox proxy stop --force`, then `prox up`) to pick up capture support; the daemon version gate makes the mismatch loud rather than silently dropping capture.
 

@@ -34,9 +34,12 @@ type RegisterRequest struct {
 	// populated from cfg.Proxy.Capture.DiskBudget; 0 means "use the daemon
 	// default" (DefaultCaptureDiskBudget). The daemon folds every registered
 	// capture-enabled project's budget into a single effective daemon-wide bound
-	// (the min, clamped to never exceed the default) for the one shared capture
-	// dir. Wire-compatible in both directions: an older daemon ignores the unknown
-	// field, and an omitted field decodes to 0.
+	// for the one shared capture dir: the min of each project's budget-or-default
+	// (an unset project contributes the default, so one project can never raise
+	// another's bound; raising above the default takes every enabled project
+	// opting in — see EffectiveCaptureDiskBudget). Wire-compatible in both
+	// directions: an older daemon ignores the unknown field, and an omitted field
+	// decodes to 0.
 	DiskBudget int64 `json:"disk_budget,omitempty"`
 	// Redact, RedactHeaders, and RedactQueryParams carry the project's
 	// capture-time redaction policy (plan 012 D4). Redact is consulted per request
