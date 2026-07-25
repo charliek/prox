@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"os/exec"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -208,8 +209,8 @@ func (p *ManagedProcess) Name() string {
 
 // Config returns a deep copy of the process configuration. It takes the read
 // lock (config is swappable on a reload -- #33, D3) and clones the reference
-// fields (Healthcheck pointer, Env map) so callers cannot observe a torn value
-// or mutate the live config.
+// fields (Healthcheck pointer, Env map, DependsOn slice) so callers cannot
+// observe a torn value or mutate the live config.
 func (p *ManagedProcess) Config() domain.ProcessConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -219,8 +220,10 @@ func (p *ManagedProcess) Config() domain.ProcessConfig {
 		hc := *p.config.Healthcheck
 		cfg.Healthcheck = &hc
 	}
-	// maps.Clone returns nil for a nil map, preserving the nil-vs-empty distinction.
+	// maps.Clone / slices.Clone return nil for a nil input, preserving the
+	// nil-vs-empty distinction.
 	cfg.Env = maps.Clone(p.config.Env)
+	cfg.DependsOn = slices.Clone(p.config.DependsOn)
 	return cfg
 }
 

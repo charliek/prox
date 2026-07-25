@@ -46,6 +46,11 @@ type ProcessConfig struct {
 	// means unset: the effective budget resolution (proc > global > default)
 	// happens in supervisor.createManagedProcess, not here.
 	StopTimeout time.Duration
+	// DependsOn lists the dependencies and/or tasks that must be ready before
+	// this process starts (plan 013 D1). Entries reference dependencies: or
+	// tasks: names only -- never other processes (validation enforces this).
+	// The supervisor wiring that consumes this lands in a later commit.
+	DependsOn []string
 }
 
 // ProcessInfo represents the runtime state of a process
