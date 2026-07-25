@@ -111,6 +111,23 @@ func Validate(config *Config) error {
 				errs = append(errs, fmt.Sprintf("proxy.capture.disk_budget: must be positive, got %q", config.Proxy.Capture.DiskBudget))
 			}
 		}
+
+		// Validate the redaction extension lists (plan 012 D4). Both extend the
+		// built-in sets, so entries must be non-empty; redact_headers entries must
+		// additionally be usable HTTP field names (no spaces/colons/control chars)
+		// so canonicalization and header matching behave.
+		if config.Proxy.Capture != nil {
+			for _, name := range config.Proxy.Capture.RedactHeaders {
+				if err := validateRedactHeaderName(name); err != nil {
+					errs = append(errs, fmt.Sprintf("proxy.capture.redact_headers: %s", err.Error()))
+				}
+			}
+			for _, name := range config.Proxy.Capture.RedactQueryParams {
+				if name == "" {
+					errs = append(errs, "proxy.capture.redact_query_params: entry cannot be empty")
+				}
+			}
+		}
 	}
 
 	// Validate certs config if present
@@ -149,6 +166,22 @@ func Validate(config *Config) error {
 		return fmt.Errorf("%w: %s", domain.ErrInvalidConfig, strings.Join(errs, "; "))
 	}
 
+	return nil
+}
+
+// validateRedactHeaderName checks a redact_headers entry is a usable HTTP field
+// name (plan 012 D4): non-empty and free of spaces, colons, control characters,
+// and DEL — the bytes that cannot appear in a header field name and that make
+// http.CanonicalHeaderKey refuse to canonicalize the value.
+func validateRedactHeaderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("entry cannot be empty")
+	}
+	for _, r := range name {
+		if r <= ' ' || r == ':' || r == 0x7f {
+			return fmt.Errorf("invalid header name %q (no spaces, colons, or control characters)", name)
+		}
+	}
 	return nil
 }
 

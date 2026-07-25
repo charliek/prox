@@ -867,6 +867,18 @@ func captureDiskBudget(cfg *config.Config) int64 {
 	return n
 }
 
+// captureRedactLists returns the project's redaction extension lists for the
+// register wire (plan 012 D4). They are already canonicalized/lowercased and
+// de-duplicated at config parse; both nil when no capture config exists. The
+// built-in redaction sets always apply on the daemon regardless of these — the
+// lists only EXTEND them.
+func captureRedactLists(cfg *config.Config) (headers, queryParams []string) {
+	if cfg.Proxy.Capture == nil {
+		return nil, nil
+	}
+	return cfg.Proxy.Capture.RedactHeaders, cfg.Proxy.Capture.RedactQueryParams
+}
+
 // startProxy attempts to register with the shared proxy daemon. If the daemon
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
@@ -938,6 +950,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		fmt.Fprintln(os.Stderr, "Warning: could not read process start token; proxy PID-reuse protection is degraded to bare-PID")
 	}
 
+	redactHeaders, redactQueryParams := captureRedactLists(cfg)
 	req := proxyd.RegisterRequest{
 		ProjectDir:     cwd,
 		PID:            os.Getpid(),
@@ -949,7 +962,13 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
 		MaxBodySize:    captureMaxBodySize(cfg),
 		DiskBudget:     captureDiskBudget(cfg),
-		StartTime:      startToken,
+		// Capture-time redaction policy (plan 012 D4). RedactEnabled is safe on a
+		// nil Capture (returns false): redaction defaults ON only when a capture
+		// config exists.
+		Redact:            cfg.Proxy.Capture.RedactEnabled(),
+		RedactHeaders:     redactHeaders,
+		RedactQueryParams: redactQueryParams,
+		StartTime:         startToken,
 	}
 
 	resp, err := client.Register(req)

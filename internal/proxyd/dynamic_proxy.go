@@ -388,6 +388,23 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// a capture manager is available and enabled.
 		captureEnabled := route.CaptureEnabled && dp.captureManager != nil && dp.captureManager.Enabled()
 
+		// Per-project capture/redaction policy (plan 012 D4), built per request
+		// from the matched route's stamped fields so two projects sharing the one
+		// daemon each redact per their OWN config (cross-project isolation). It
+		// carries the body cap (D13) and the header/URL redaction rules. URL
+		// redaction below applies whenever the route opted into redaction, even for
+		// a metadata-only (capture-disabled) route.
+		policy := proxy.CapturePolicy{
+			MaxBodySize:       route.MaxBodySize,
+			Redact:            route.Redact,
+			RedactHeaders:     route.RedactHeaders,
+			RedactQueryParams: route.RedactQueryParams,
+		}
+		// recordURL is the redacted URL stored on every record for this request;
+		// r.URL itself is never mutated (RedactURLString copies), so the reverse
+		// proxy forwards the byte-identical upstream URL.
+		recordURL := policy.RedactURLString(r.URL)
+
 		// Generate the request ID BEFORE proxying so capture files (written by
 		// FinalizeResponse) are named consistently with the recorded record,
 		// AND so the in-flight and completion records share an ID on every
@@ -422,7 +439,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		if captureEnabled {
 			// Per-project capture cap (D13, #49): the matched route carries the
 			// owning project's configured MaxBodySize; 0 means the daemon default.
-			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequestWithLimit(requestID, r, route.MaxBodySize)
+			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequest(requestID, r, policy)
 		}
 
 		originalDirector := rp.Director
@@ -439,7 +456,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		var crw *proxy.CaptureResponseWriter
 		var srw *statusResponseWriter
 		if captureEnabled {
-			crw = dp.captureManager.WrapResponseWriterWithLimit(w, route.MaxBodySize)
+			crw = dp.captureManager.WrapResponseWriter(w, policy)
 			rw = crw
 		} else {
 			srw = &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -479,7 +496,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				ID:         requestID,
 				Timestamp:  startTime,
 				Method:     r.Method,
-				URL:        r.URL.String(),
+				URL:        recordURL,
 				Subdomain:  subdomain,
 				Hostname:   hostname,
 				ProjectDir: route.ProjectDir,
@@ -546,7 +563,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 				// the wrapped body, and SSE subscribers serialize the record at
 				// notify time.
 				proxy.FinalizeRequestBody(r.Body)
-				resBody, resHeaders := dp.captureManager.FinalizeResponse(requestID, crw)
+				resBody, resHeaders := dp.captureManager.FinalizeResponse(requestID, crw, policy)
 				details = &proxy.RequestDetails{
 					RequestHeaders:  reqHeaders,
 					ResponseHeaders: resHeaders,

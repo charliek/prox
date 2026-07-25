@@ -21,10 +21,10 @@ import (
 func spillRes(t *testing.T, cm *proxy.CaptureManager, requestID string, n int) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	crw := cm.WrapResponseWriter(rec)
+	crw := cm.WrapResponseWriter(rec, proxy.CapturePolicy{})
 	_, err := crw.Write([]byte(strings.Repeat("x", n)))
 	require.NoError(t, err)
-	body, _ := cm.FinalizeResponse(requestID, crw)
+	body, _ := cm.FinalizeResponse(requestID, crw, proxy.CapturePolicy{})
 	require.NotEmpty(t, body.FilePath, "body over inline threshold must spill to disk")
 	return body.FilePath
 }

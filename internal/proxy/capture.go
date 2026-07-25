@@ -384,9 +384,10 @@ func (cm *CaptureManager) DiskStats() (used, budget int64) {
 // effectiveLimit resolves a per-call capture cap: a positive limit is used
 // verbatim, and 0 (or negative) falls back to the manager's configured
 // maxBodySize (which itself defaults to DefaultCaptureMaxBodySize). The daemon
-// passes each route's own cap here (D13, #49); the standalone in-process proxy
-// passes 0, keeping the project's configured cap. maxBodySize is set once at
-// construction and never mutated, so no lock is needed.
+// passes each route's own cap here via CapturePolicy.MaxBodySize (D13, #49); the
+// standalone in-process proxy passes 0, keeping the project's configured cap.
+// maxBodySize is set once at construction and never mutated, so no lock is
+// needed.
 func (cm *CaptureManager) effectiveLimit(limit int64) int64 {
 	if limit > 0 {
 		return limit
@@ -394,30 +395,34 @@ func (cm *CaptureManager) effectiveLimit(limit int64) int64 {
 	return cm.maxBodySize
 }
 
-// CaptureRequest captures the request body using the manager's configured cap.
-// It is CaptureRequestWithLimit with a 0 (manager-default) limit — the signature
-// the standalone in-process proxy uses.
-func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request) (*CapturedBody, io.ReadCloser, http.Header) {
-	return cm.CaptureRequestWithLimit(requestID, r, 0)
-}
-
-// CaptureRequestWithLimit captures the request body using a TeeReader bounded by
-// a per-call cap (D13, #49): the daemon passes the matched route's MaxBodySize so
-// each project honors its own quota through the one shared capture dir. A limit
-// of 0 falls back to the manager's configured cap (see effectiveLimit).
-// Returns the captured body info and a new ReadCloser to use in place of the original body.
-// The original body is wrapped so that reading from the returned ReadCloser also captures the data.
-func (cm *CaptureManager) CaptureRequestWithLimit(requestID string, r *http.Request, limit int64) (*CapturedBody, io.ReadCloser, http.Header) {
-	if !cm.enabled || r.Body == nil {
+// CaptureRequest captures the request body using a TeeReader bounded by
+// policy.MaxBodySize (D13, #49) and returns the REDACTED, cloned request headers
+// per the policy (plan 012 D4): the daemon passes the matched route's policy so
+// each project honors its own cap and redaction rules through the one shared
+// capture dir; the standalone proxy passes its project policy. A MaxBodySize of
+// 0 falls back to the manager's configured cap (see effectiveLimit).
+//
+// A DISABLED manager returns the original body and a plain (unredacted) header
+// clone — nothing is stored, so there is nothing to redact. When enabled, even a
+// bodyless request (every GET/HEAD, whose headers still reach the stored
+// Details) has its headers redacted here (plan 012 D4).
+//
+// Returns the captured body info and a new ReadCloser to use in place of the
+// original body; reading the returned ReadCloser also captures the data.
+func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request, policy CapturePolicy) (*CapturedBody, io.ReadCloser, http.Header) {
+	if !cm.enabled {
 		return nil, r.Body, cloneHeaders(r.Header)
 	}
+	if r.Body == nil {
+		return nil, r.Body, policy.redactHeaders(r.Header)
+	}
 
-	headers := cloneHeaders(r.Header)
+	headers := policy.redactHeaders(r.Header)
 	contentType := r.Header.Get("Content-Type")
 
 	// Create a buffer to capture the body
 	captured := &captureBuffer{
-		maxSize:   cm.effectiveLimit(limit),
+		maxSize:   cm.effectiveLimit(policy.MaxBodySize),
 		requestID: requestID,
 		suffix:    "_req",
 		cm:        cm,
@@ -441,30 +446,27 @@ func (cm *CaptureManager) CaptureRequestWithLimit(requestID string, r *http.Requ
 	return body, wrappedBody, headers
 }
 
-// WrapResponseWriter wraps w in a CaptureResponseWriter bounded by the manager's
-// configured max body size. It is WrapResponseWriterWithLimit with a 0
-// (manager-default) limit — the signature the standalone in-process proxy uses.
-func (cm *CaptureManager) WrapResponseWriter(w http.ResponseWriter) *CaptureResponseWriter {
-	return cm.WrapResponseWriterWithLimit(w, 0)
+// WrapResponseWriter wraps w in a CaptureResponseWriter that records up to
+// policy.MaxBodySize bytes (D13, #49) while forwarding all writes downstream: the
+// daemon passes the matched route's policy so each project honors its own quota,
+// and a MaxBodySize of 0 falls back to the manager's configured cap (see
+// effectiveLimit). The policy's redaction fields are consulted later, at
+// FinalizeResponse — the writer only needs the byte cap. The returned writer
+// preserves http.Flusher/Hijacker/Pusher/Unwrap behavior.
+func (cm *CaptureManager) WrapResponseWriter(w http.ResponseWriter, policy CapturePolicy) *CaptureResponseWriter {
+	return newCaptureResponseWriter(w, cm.effectiveLimit(policy.MaxBodySize))
 }
 
-// WrapResponseWriterWithLimit wraps w in a CaptureResponseWriter that records up
-// to a per-call cap (D13, #49) while forwarding all writes downstream: the daemon
-// passes the matched route's MaxBodySize so each project honors its own quota. A
-// limit of 0 falls back to the manager's configured cap (see effectiveLimit).
-// The returned writer preserves http.Flusher/Hijacker/Pusher/Unwrap behavior.
-func (cm *CaptureManager) WrapResponseWriterWithLimit(w http.ResponseWriter, limit int64) *CaptureResponseWriter {
-	return newCaptureResponseWriter(w, cm.effectiveLimit(limit))
-}
-
-// FinalizeResponse captures the response body from a CaptureResponseWriter.
-// Should be called after the response has been fully written.
-func (cm *CaptureManager) FinalizeResponse(requestID string, crw *CaptureResponseWriter) (*CapturedBody, http.Header) {
+// FinalizeResponse captures the response body from a CaptureResponseWriter and
+// returns the REDACTED, cloned response headers per the policy (plan 012 D4).
+// Should be called after the response has been fully written. A disabled manager
+// returns a plain (unredacted) header clone — nothing is stored.
+func (cm *CaptureManager) FinalizeResponse(requestID string, crw *CaptureResponseWriter, policy CapturePolicy) (*CapturedBody, http.Header) {
 	if !cm.enabled {
 		return nil, cloneHeaders(crw.Header())
 	}
 
-	headers := cloneHeaders(crw.Header())
+	headers := policy.redactHeaders(crw.Header())
 	contentType := crw.Header().Get("Content-Type")
 	data := crw.CapturedBody()
 

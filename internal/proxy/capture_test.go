@@ -86,7 +86,7 @@ func TestCaptureRequest(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", body)
 		req.Header.Set("Content-Type", "text/plain")
 
-		capturedBody, wrappedBody, headers := cm.CaptureRequest("req1", req)
+		capturedBody, wrappedBody, headers := cm.CaptureRequest("req1", req, CapturePolicy{})
 		assert.Nil(t, capturedBody)
 		assert.Equal(t, body, wrappedBody) // same object
 		assert.Equal(t, "text/plain", headers.Get("Content-Type"))
@@ -98,7 +98,7 @@ func TestCaptureRequest(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		// httptest.NewRequest sets body to http.NoBody, so explicitly nil it
 		req.Body = nil
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req1", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req1", req, CapturePolicy{})
 		assert.Nil(t, capturedBody)
 		assert.Nil(t, wrappedBody)
 	})
@@ -110,7 +110,7 @@ func TestCaptureRequest(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
 
-		capturedBody, wrappedBody, headers := cm.CaptureRequest("req1", req)
+		capturedBody, wrappedBody, headers := cm.CaptureRequest("req1", req, CapturePolicy{})
 		require.NotNil(t, capturedBody)
 
 		// Read the wrapped body fully (this drives the TeeReader)
@@ -146,7 +146,7 @@ func TestCaptureRequest(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
 		req.Header.Set("Content-Type", "text/plain")
 
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-large", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-large", req, CapturePolicy{})
 
 		_, err = io.ReadAll(wrappedBody)
 		require.NoError(t, err)
@@ -172,7 +172,7 @@ func TestCaptureRequest(t *testing.T) {
 		payload := strings.Repeat("a", 100)
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
 
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-trunc", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-trunc", req, CapturePolicy{})
 
 		// Read and close to finalize
 		data, err := io.ReadAll(wrappedBody)
@@ -192,7 +192,7 @@ func TestCaptureRequest(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader("body"))
 		req.Header.Set("X-Custom", "original")
 
-		_, wrappedBody, headers := cm.CaptureRequest("req1", req)
+		_, wrappedBody, headers := cm.CaptureRequest("req1", req, CapturePolicy{})
 
 		// Modify the clone
 		headers.Set("X-Custom", "modified")
@@ -215,7 +215,7 @@ func TestCaptureResponse(t *testing.T) {
 		crw.Header().Set("Content-Type", "text/html")
 		crw.Write([]byte("hello"))
 
-		body, headers := cm.FinalizeResponse("req1", crw)
+		body, headers := cm.FinalizeResponse("req1", crw, CapturePolicy{})
 		assert.Nil(t, body)
 		assert.Equal(t, "text/html", headers.Get("Content-Type"))
 	})
@@ -228,7 +228,7 @@ func TestCaptureResponse(t *testing.T) {
 		crw.Header().Set("Content-Type", "application/json")
 		crw.Write([]byte(`{"ok":true}`))
 
-		body, headers := cm.FinalizeResponse("req1", crw)
+		body, headers := cm.FinalizeResponse("req1", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, int64(11), body.Size)
 		assert.False(t, body.Truncated)
@@ -253,7 +253,7 @@ func TestCaptureResponse(t *testing.T) {
 		payload := strings.Repeat("y", 100)
 		crw.Write([]byte(payload))
 
-		body, _ := cm.FinalizeResponse("req-disk", crw)
+		body, _ := cm.FinalizeResponse("req-disk", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, int64(100), body.Size)
 		assert.Nil(t, body.Data)
@@ -274,7 +274,7 @@ func TestCaptureResponse(t *testing.T) {
 		payload := strings.Repeat("z", 50)
 		crw.Write([]byte(payload))
 
-		body, _ := cm.FinalizeResponse("req-trunc", crw)
+		body, _ := cm.FinalizeResponse("req-trunc", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.True(t, body.Truncated)
 		assert.Equal(t, int64(50), body.Size)         // total bytes observed
@@ -893,7 +893,7 @@ func TestFinalizeRequestBody(t *testing.T) {
 	t.Run("forces finalize on a wrapped body before Close", func(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 		req := httptest.NewRequest("POST", "/test", strings.NewReader("payload"))
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-force", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-force", req, CapturePolicy{})
 
 		_, err := io.ReadAll(wrappedBody)
 		require.NoError(t, err)
@@ -941,7 +941,7 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		crw.Write([]byte("bbbbbb"))
 		crw.Write([]byte("cccccc"))
 
-		body, _ := cm.FinalizeResponse("req-total", crw)
+		body, _ := cm.FinalizeResponse("req-total", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, int64(18), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -958,7 +958,7 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		crw.Write([]byte("aaaaa"))
 		crw.Write([]byte("bbbbb"))
 
-		body, _ := cm.FinalizeResponse("req-exact", crw)
+		body, _ := cm.FinalizeResponse("req-exact", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, int64(10), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -976,7 +976,7 @@ func TestCapturingResponseWriter_SizeSemantics(t *testing.T) {
 		crw.Write([]byte("aaaaaaaaaa"))
 		crw.Write([]byte{})
 
-		body, _ := cm.FinalizeResponse("req-zero", crw)
+		body, _ := cm.FinalizeResponse("req-zero", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, int64(10), body.Size)
 		assert.Equal(t, int64(10), body.CapturedSize)
@@ -994,7 +994,7 @@ func TestContentEncodingCaptured(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Encoding", "gzip")
 
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-enc", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-enc", req, CapturePolicy{})
 		require.NotNil(t, capturedBody)
 
 		_, err := io.ReadAll(wrappedBody)
@@ -1013,7 +1013,7 @@ func TestContentEncodingCaptured(t *testing.T) {
 		crw.Header().Set("Content-Encoding", "gzip")
 		crw.Write([]byte("compressed-ish"))
 
-		body, _ := cm.FinalizeResponse("res-enc", crw)
+		body, _ := cm.FinalizeResponse("res-enc", crw, CapturePolicy{})
 		require.NotNil(t, body)
 		assert.Equal(t, "gzip", body.ContentEncoding)
 	})
@@ -1022,7 +1022,7 @@ func TestContentEncodingCaptured(t *testing.T) {
 		cm := newEnabledCaptureManager(t)
 
 		req := httptest.NewRequest("POST", "/test", strings.NewReader("payload"))
-		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-noenc", req)
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-noenc", req, CapturePolicy{})
 		require.NotNil(t, capturedBody)
 		_, err := io.ReadAll(wrappedBody)
 		require.NoError(t, err)
@@ -1112,9 +1112,9 @@ func TestCaptureResponseWriter_FirstResponseHook(t *testing.T) {
 	})
 }
 
-// TestPerCallCaptureLimits pins the D13 per-call caps: CaptureRequestWithLimit
-// and WrapResponseWriterWithLimit honor a positive per-call byte limit, while a
-// 0 limit falls back to the manager's configured cap (which itself defaults to
+// TestPerCallCaptureLimits pins the D13 per-call caps carried by CapturePolicy:
+// CaptureRequest and WrapResponseWriter honor a positive policy.MaxBodySize,
+// while a 0 falls back to the manager's configured cap (which itself defaults to
 // DefaultCaptureMaxBodySize). This is what lets the daemon apply each project's
 // own MaxBodySize through the one shared capture manager, and what keeps the
 // standalone in-process proxy on its project's configured cap.
@@ -1129,7 +1129,7 @@ func TestPerCallCaptureLimits(t *testing.T) {
 
 	t.Run("request tighter per-call limit wins", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
-		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-tight", req, 10)
+		captured, wrapped, _ := cm.CaptureRequest("req-tight", req, CapturePolicy{MaxBodySize: 10})
 		_, _ = io.ReadAll(wrapped)
 		require.NoError(t, wrapped.Close())
 		assert.Equal(t, int64(200), captured.Size, "total observed unchanged")
@@ -1139,7 +1139,7 @@ func TestPerCallCaptureLimits(t *testing.T) {
 
 	t.Run("request looser per-call limit wins", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
-		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-loose", req, 150)
+		captured, wrapped, _ := cm.CaptureRequest("req-loose", req, CapturePolicy{MaxBodySize: 150})
 		_, _ = io.ReadAll(wrapped)
 		require.NoError(t, wrapped.Close())
 		assert.Equal(t, int64(150), captured.CapturedSize, "per-call limit 150 overrides the 50-byte manager cap")
@@ -1148,7 +1148,7 @@ func TestPerCallCaptureLimits(t *testing.T) {
 
 	t.Run("request zero per-call limit falls back to manager cap", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
-		captured, wrapped, _ := cm.CaptureRequestWithLimit("req-zero", req, 0)
+		captured, wrapped, _ := cm.CaptureRequest("req-zero", req, CapturePolicy{MaxBodySize: 0})
 		_, _ = io.ReadAll(wrapped)
 		require.NoError(t, wrapped.Close())
 		assert.Equal(t, int64(50), captured.CapturedSize, "0 limit uses the manager's configured 50-byte cap")
@@ -1158,18 +1158,18 @@ func TestPerCallCaptureLimits(t *testing.T) {
 	t.Run("response per-call limit and zero fallback", func(t *testing.T) {
 		body := []byte(payload)
 
-		tight := cm.WrapResponseWriterWithLimit(httptest.NewRecorder(), 10)
+		tight := cm.WrapResponseWriter(httptest.NewRecorder(), CapturePolicy{MaxBodySize: 10})
 		tight.WriteHeader(http.StatusOK)
 		_, _ = tight.Write(body)
 		assert.Len(t, tight.CapturedBody(), 10, "per-call limit 10 caps response capture")
 
-		fallback := cm.WrapResponseWriterWithLimit(httptest.NewRecorder(), 0)
+		fallback := cm.WrapResponseWriter(httptest.NewRecorder(), CapturePolicy{MaxBodySize: 0})
 		fallback.WriteHeader(http.StatusOK)
 		_, _ = fallback.Write(body)
 		assert.Len(t, fallback.CapturedBody(), 50, "0 limit uses the manager's configured 50-byte cap")
 
 		// The no-limit convenience wrapper is exactly the 0-limit path.
-		def := cm.WrapResponseWriter(httptest.NewRecorder())
+		def := cm.WrapResponseWriter(httptest.NewRecorder(), CapturePolicy{})
 		def.WriteHeader(http.StatusOK)
 		_, _ = def.Write(body)
 		assert.Len(t, def.CapturedBody(), 50, "WrapResponseWriter delegates to the manager cap")
