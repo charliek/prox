@@ -216,6 +216,39 @@ func RunDaemon(ctx context.Context) error {
 	server.SetProxy(dynamicProxy)
 	server.SetManagers(managers)
 
+	// Wire the on-502 dead-owner probe's reap callback (#74). When a route's
+	// backend transport fails, the dynamic proxy probes the owning prox up
+	// process's liveness off the data plane and, if it is dead, calls this
+	// closure. It MIRRORS the stale-PID sweep's epilogue below exactly: reap via
+	// the identity-guarded removeStaleProject, and on a real removal log the
+	// cleaned-registration line and schedule the empty-daemon shutdown check —
+	// without the shutdown scheduling, probe-reaping the last project would
+	// strand an idle daemon forever (the sweep can never fire again on an empty
+	// registry). The 30s sweep remains the backstop for everything the probe
+	// can't see (backend-authored 502s, mid-stream aborts, trafficless deaths).
+	dynamicProxy.SetDeadRouteRemover(func(dir string, pid int, startTime int64) {
+		removed, hostnames, emptyPorts := server.removeStaleProject(dir, pid, startTime)
+		if !removed {
+			// Re-registered with a live generation between the 502 and the
+			// probe (DeregisterIfIdentity guard) — leave it alone.
+			return
+		}
+		logger.Warn("cleaned stale project registration",
+			"project", dir,
+			"pid", pid,
+			"start_time", startTime,
+			"removed_hostnames", hostnames,
+			"closed_ports", emptyPorts,
+			"trigger", "on-502-probe",
+		)
+		if registry.IsEmpty() {
+			// Graced (not immediate) so a crash restart landing during the probe
+			// cancels the shutdown when the re-check sees its registration.
+			logger.Info("all routes cleaned up, scheduling shutdown check")
+			server.scheduleShutdownWhenEmpty()
+		}
+	})
+
 	// Handle OS signals
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

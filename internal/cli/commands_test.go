@@ -1017,9 +1017,10 @@ func TestRunFullStop_TransportFailure(t *testing.T) {
 
 // TestRunFullStop_CleanVerdictPollTimeout: a clean verdict but the daemon's
 // state/PID files never disappear within the bounded wait -> the CLI prints a
-// Warning to stderr yet stays exit 0 (the process-stop verdict already
-// succeeded). The state + PID files are pre-created so the poll actually times
-// out under a short injected bound.
+// Warning to stderr AND returns a non-zero "shutdown incomplete" error (exit 1),
+// since the daemon's own teardown was never confirmed (plan 011 D2, #73). The
+// state + PID files are pre-created so the poll actually times out under a
+// short injected bound.
 func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 	server := shutdownStub(t, http.StatusOK, api.ShutdownResponse{
 		Success: true, Waited: true, Failures: []api.ShutdownFailureResponse{},
@@ -1043,8 +1044,11 @@ func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 	stdout, stderr := captureOutput(t, func() {
 		err = runFullStop(client, cwd, 150*time.Millisecond)
 	})
-	if err != nil {
-		t.Fatalf("poll timeout must keep exit 0, got %v", err)
+	if err == nil {
+		t.Fatal("expected a non-nil error on poll timeout (exit 1)")
+	}
+	if !strings.Contains(err.Error(), "shutdown incomplete") {
+		t.Errorf("expected a shutdown incomplete error, got %q", err.Error())
 	}
 	if !strings.Contains(stdout, "Stopped processes") {
 		t.Errorf("expected a stopped summary on stdout, got %q", stdout)
@@ -1055,12 +1059,21 @@ func TestRunFullStop_CleanVerdictPollTimeout(t *testing.T) {
 }
 
 // statusServerWithProxy starts a fake API server that returns a status response
-// carrying the given proxy block (nil = no block) plus a minimal process list,
-// and points apiAddr at it for the duration of the test.
-func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse) {
+// carrying the given proxy block (nil = no block) plus a process list, and
+// points apiAddr at it for the duration of the test. When no processes are
+// supplied it defaults to a single healthy "web" process so existing callers
+// keep their original stub; tests exercising crashed/other states pass their
+// own list.
+func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse, procs ...api.ProcessResponse) {
 	t.Helper()
 	originalApiAddr := apiAddr
 	t.Cleanup(func() { apiAddr = originalApiAddr })
+
+	if len(procs) == 0 {
+		procs = []api.ProcessResponse{
+			{Name: "web", Status: "running", PID: 1234, UptimeSeconds: 5, Health: "healthy"},
+		}
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1075,9 +1088,7 @@ func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse) {
 			})
 		case "/api/v1/processes":
 			_ = json.NewEncoder(w).Encode(api.ProcessListResponse{
-				Processes: []api.ProcessResponse{
-					{Name: "web", Status: "running", PID: 1234, UptimeSeconds: 5, Health: "healthy"},
-				},
+				Processes: procs,
 			})
 		}
 	}))
@@ -1154,5 +1165,158 @@ func TestRunStatus_SharedProxyDownJSONExits1(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "\"daemon_reachable\":false") {
 		t.Errorf("JSON output missing the proxy block; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_CrashedChildExits1 pins D1 (#72): a crashed child makes
+// `prox status` return a non-nil error (exit 1) in table mode and print the
+// Crashed line naming the process.
+func TestRunStatus_CrashedChildExits1(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "worker", Status: "crashed", PID: 0, Health: "unknown"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus returned nil, want a non-nil error (exit 1) when a child is crashed")
+	}
+	if !strings.Contains(stdout, "Crashed: worker") {
+		t.Errorf("stdout missing the Crashed line; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "prox logs worker") {
+		t.Errorf("stdout missing the logs pointer; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_CrashedChildJSONExits1 pins that JSON mode also exits 1 on a
+// crashed child while the payload still carries the per-process status verbatim
+// (schema unchanged — scripts parsing JSON still see the crash).
+func TestRunStatus_CrashedChildJSONExits1(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "worker", Status: "crashed", PID: 0, Health: "unknown"},
+	)
+	statusJSON = true
+	t.Cleanup(func() { statusJSON = false })
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus (JSON) returned nil, want a non-nil error when a child is crashed")
+	}
+	if !strings.Contains(stdout, "\"name\":\"worker\"") || !strings.Contains(stdout, "\"status\":\"crashed\"") {
+		t.Errorf("JSON output missing the crashed process; got:\n%s", stdout)
+	}
+	// The JSON path prints no extra Crashed line — the payload carries the state.
+	if strings.Contains(stdout, "Crashed:") {
+		t.Errorf("JSON output should not carry the human Crashed line; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_MultipleCrashedChildren pins that every crashed child is named
+// in the Crashed line, in the order the supervisor reported them (no sort).
+func TestRunStatus_MultipleCrashedChildren(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "beta", Status: "crashed"},
+		api.ProcessResponse{Name: "web", Status: "running", Health: "healthy"},
+		api.ProcessResponse{Name: "alpha", Status: "crashed"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil {
+		t.Fatal("runStatus returned nil, want a non-nil error when children are crashed")
+	}
+	// Response order, not alphabetical: beta before alpha.
+	if !strings.Contains(stdout, "Crashed: beta, alpha") {
+		t.Errorf("Crashed line should list both names in response order; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_NonCrashedStatesExit0 pins the exit-0 contract (D1): stopped,
+// starting, stopping, and running-but-unhealthy children — none crashed — all
+// return nil (exit 0). Health is out of the exit contract.
+func TestRunStatus_NonCrashedStatesExit0(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "seeded", Status: "stopped"},
+		api.ProcessResponse{Name: "booting", Status: "starting"},
+		api.ProcessResponse{Name: "draining", Status: "stopping"},
+		api.ProcessResponse{Name: "web", Status: "running", Health: "unhealthy"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil when no child is crashed", runErr)
+	}
+	if strings.Contains(stdout, "Crashed:") {
+		t.Errorf("no Crashed line expected when nothing crashed; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_CrashedAndProxyDownPrecedence pins that when both a crash and a
+// proxy-down hold, both signals print but the proxy sentinel is returned (table
+// mode).
+func TestRunStatus_CrashedAndProxyDownPrecedence(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	},
+		api.ProcessResponse{Name: "worker", Status: "crashed"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != errSharedProxyDown {
+		t.Fatalf("runStatus returned %v, want the proxy sentinel (precedence)", runErr)
+	}
+	if !strings.Contains(stdout, "Proxy: DOWN") {
+		t.Errorf("stdout missing the DOWN line; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Crashed: worker") {
+		t.Errorf("stdout missing the Crashed line; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_CrashedAndProxyDownPrecedenceJSON pins the same precedence in
+// JSON mode: the proxy sentinel is returned and the payload carries the crash.
+func TestRunStatus_CrashedAndProxyDownPrecedenceJSON(t *testing.T) {
+	statusServerWithProxy(t, &api.ProxyStatusResponse{
+		Mode:            proxyModeShared,
+		DaemonReachable: false,
+	},
+		api.ProcessResponse{Name: "worker", Status: "crashed"},
+	)
+	statusJSON = true
+	t.Cleanup(func() { statusJSON = false })
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != errSharedProxyDown {
+		t.Fatalf("runStatus (JSON) returned %v, want the proxy sentinel (precedence)", runErr)
+	}
+	if !strings.Contains(stdout, "\"daemon_reachable\":false") {
+		t.Errorf("JSON output missing the proxy block; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "\"status\":\"crashed\"") {
+		t.Errorf("JSON output missing the crashed process; got:\n%s", stdout)
 	}
 }

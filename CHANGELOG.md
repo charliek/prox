@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking
+
+- **`prox status` exits 1 when any child process is crashed** (#72). Previously
+  `prox status` exited 0 while the table showed a `crashed` child, so scripts
+  and coding agents keying on the exit code could miss a dead process entirely.
+  It now exits non-zero whenever any process is in the `crashed` state: the
+  table adds a `Crashed: <name>[, ...] — check 'prox logs <name>'.` line after
+  the proxy line, and stderr carries `Error: N process(es) crashed` — unless the shared
+  proxy is also down, in which case the proxy-down error takes stderr
+  precedence while both signals still print (the JSON
+  payload is unchanged — it already reports each process's `status`). The
+  exit-0 contract is now exact: `prox status` exits 0 only when the supervisor
+  query succeeded, no process is `crashed`, and any configured shared proxy is
+  reachable — it does **not** assert every process is `running` or `healthy`
+  (`starting`, `stopping`, `stopped`, and running-but-`unhealthy` all still
+  exit 0). Note the supervisor marks *any* non-Stop-driven exit as `crashed`,
+  including a one-shot child that exits 0 (a migration/seed step): such a
+  project fails `prox status` until restarted, so one-shot helpers should live
+  outside `prox.yaml` or expect a non-zero status. Scripts that need the old
+  behavior must read `prox status --json` and inspect the per-process `status`
+  they care about — not `prox status || true`, which would also mask discovery
+  errors and an unreachable supervisor. This consolidates the status
+  exit-code churn started in v0.2.1 (proxy-down → exit 1, #66) into one
+  adoption window.
+- **`prox stop`/`prox down` exit 1 when the daemon teardown wait times out**
+  (#73). Previously, once the process-stop verdict was clean, a `prox stop`
+  (or `prox down`) that then timed out waiting (up to ~15s) for the daemon's
+  own state/PID files to disappear still printed `Stopped processes` plus a
+  `Warning: the daemon is still finishing shutdown` to stderr and exited `0`.
+  It now returns a `shutdown incomplete: daemon still finishing after 15s`
+  error and exits `1`, joining the same `shutdown incomplete` family as the
+  existing survivors contract (v0.1.4, #36) — an unconfirmed daemon teardown
+  is no longer treated as a clean stop. The existing stdout/stderr messages
+  are unchanged, but stderr gains the CLI's standard
+  `Error: shutdown incomplete: …` line. Scripts that assumed `prox stop`/`prox down` always exit `0`
+  once processes are reported stopped must check the exit code (or parse
+  stderr for the `Warning:` line) if they need to distinguish a fully torn
+  down daemon from one still finishing up.
+
+### Lifecycle
+
+- **Crashed projects' routes converge in about one request instead of up to
+  30s** (#74). Previously, when a project crashed, the shared proxy kept
+  serving its routes — returning `502 Backend unavailable` — until the periodic
+  stale-PID sweep noticed the dead owner, which could take up to 30 seconds. The
+  daemon now also probes on demand: when a route's backend transport fails and
+  the proxy returns a 502, it checks that route's owning `prox up` process
+  off the request path and, if it is dead, reaps the registration right away, so
+  subsequent requests get a clean `404` (or fall through to a shared-port
+  neighbor) almost immediately. The probe is flap-safe — it keys on the
+  *owner's* identity, not the backend's, so a merely restarting or flapping
+  backend under a live `prox up` is never deregistered — and cheap under load: a
+  single in-flight probe per project, rate-limited, with a trailing probe so a
+  502 that arrives right after the crash is never missed. The 30s sweep remains
+  the backstop for cases with no live 502 to trigger on (backend-authored 502s,
+  mid-stream aborts, and dead projects receiving no traffic).
+
 ## v0.2.1
 
 A hardening pass on lifecycle signals and the requests pipeline: `prox up`/`prox status`/`prox stop` now give trustworthy exit codes and error messages instead of silently degrading, the shared proxy daemon self-heals and isolates projects from each other, and captured request/response bodies decode more content types. Plus a refreshed agent skill and docs.

@@ -102,7 +102,14 @@ prox status
 prox status --json
 ```
 
-**Proxy line and exit code:** when a proxy is configured, output includes a `Proxy:` line reporting the shared-proxy health tracked by [the `proxy` block of `GET /status`](api.md#get-status) — `Proxy: shared (running, vX.Y.Z)` when healthy, `Proxy: standalone` for an in-process proxy, or `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` when the shared daemon is unreachable. In the `DOWN` case, `prox status` **exits 1** even though the project's own processes may all be healthy — this is a breaking change from earlier versions, where `prox status` never consulted the shared proxy and always reflected only process health. The project self-heals in the background (worst case ~45s), so a brief `DOWN` reading is often transient.
+**Exit code:** `prox status` exits `0` only when the supervisor query succeeded, **and** no process is in the `crashed` state, **and** any configured shared proxy is reachable. It does **not** assert that every process is `running` or `healthy`: `starting`, `stopping`, deliberately-`stopped`, and running-but-`unhealthy` processes all still exit `0` (health is a separate axis, kept out of the exit contract). It exits `1` when:
+
+- **any child is `crashed`** — the table adds a `Crashed: <name>[, ...] — check 'prox logs <name>'.` line and stderr carries `Error: N process(es) crashed` (when the shared proxy is *also* down, the proxy-down error takes precedence on stderr; both human-readable signals still print). Note the supervisor marks *any* non-Stop-driven exit as `crashed`, including a one-shot child that exits `0` (a migration/seed step); such a project fails `prox status` until restarted, so keep one-shot helpers outside `prox.yaml` or expect a non-zero status. This is a breaking change (see [#72](https://github.com/charliek/prox/issues/72)).
+- **a configured shared proxy is unreachable** — output includes a `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` line. This is a breaking change from earlier versions where `prox status` never consulted the shared proxy. The project self-heals in the background (worst case ~45s), so a brief `DOWN` reading is often transient.
+
+When both a crash and a proxy-down hold, both signals print. Scripts that need to react to a specific condition should parse `prox status --json` (its per-process `status` is authoritative) rather than `prox status || true`, which also masks discovery errors and an unreachable supervisor.
+
+**Proxy line:** when a proxy is configured, output includes a `Proxy:` line reporting the shared-proxy health tracked by [the `proxy` block of `GET /status`](api.md#get-status) — `Proxy: shared (running, vX.Y.Z)` when healthy, `Proxy: standalone` for an in-process proxy, or the `Proxy: DOWN` line above when the shared daemon is unreachable.
 
 ### logs
 
@@ -177,11 +184,12 @@ With a process name, stops only that process while keeping prox and other proces
 
 The SIGTERM→SIGKILL timeout is configurable per process via `stop_timeout` (or globally via `shutdown_timeout`; default `10s`) — see [Stop Timeout](configuration.md#stop-timeout). A process with a large budget may make `prox stop` wait a while before returning: the server is authoritative and holds the request open until the process actually stops (up to the configured budget), so a long silent wait is expected rather than a hang. Pressing Ctrl-C on the CLI is safe — it only detaches the client; the daemon keeps stopping the process on its configured budget.
 
-**Full stop waits for the outcome.** `prox stop` (no arguments) and `prox down` block until the daemon reports the process-stop verdict, then wait briefly (up to ~15s) for the daemon's state and PID files to disappear before printing a stopped summary and exiting **0**. Exit codes:
+**Full stop waits for the outcome.** `prox stop` (no arguments) and `prox down` block until the daemon reports the process-stop verdict, then wait briefly (up to ~15s) for the daemon's state and PID files to disappear before printing a stopped summary. Exit codes:
 
-- **0** — all processes (and their process groups) stopped cleanly. A summary line is printed. If the daemon is still finishing its own exit when the bounded wait elapses, a `Warning: the daemon is still finishing shutdown` line is printed to stderr but the exit code stays `0` (the process-stop verdict already succeeded).
+- **0** — all processes (and their process groups) stopped cleanly, **and** the daemon confirmed its own teardown (state/PID files gone) within the bounded wait. A summary line is printed.
 - **1** — one or more process groups survived shutdown. Each survivor is printed as a `process: error` line, followed by a one-line summary; the group still holds whatever ports it bound.
 - **1** — the connection dropped mid-wait: the daemon may still be completing its shutdown and the outcome is unknown. When a daemon log file is present (detached mode), the message points at `.prox/prox.log` for the authoritative result.
+- **1** — the process-stop verdict was clean but the daemon didn't finish its own teardown within the bounded wait. A `Stopped processes` summary and a `Warning: the daemon is still finishing shutdown` line (stderr) are printed, and the command returns a `shutdown incomplete: daemon still finishing after 15s` error — an unconfirmed daemon exit is treated the same as a survivors failure (breaking change, [#73](https://github.com/charliek/prox/issues/73)).
 
 Against an older daemon that predates the waited protocol, `prox stop` falls back to the previous fire-and-forget behavior: it prints `Shutdown initiated` and exits `0`.
 

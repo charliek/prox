@@ -34,6 +34,8 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 
 **Never kill processes directly** (e.g., `kill <pid>`). Use prox commands so it can track state and handle restarts correctly.
 
+**`prox stop`/`prox down` exit non-zero if the daemon's own teardown doesn't finish.** They wait (up to ~15s) for the daemon to confirm it has fully exited; if that wait times out they still print the stopped summary but exit `1` with a `Warning: the daemon is still finishing shutdown` line on stderr — trust the exit code, not just the summary text. Exit `0` means the daemon is fully torn down.
+
 **Run client commands (`status`, `logs`, `requests`, etc.) from the project directory.** They auto-discover the instance via `.prox/prox.state`; outside a project directory they now error instead of silently falling back to `:5555` — pass `--addr host:port` if running from elsewhere.
 
 ## Shared Proxy and Multiple Projects
@@ -53,7 +55,9 @@ prox proxy stop --force      # Stop anyway, disconnecting all projects
 
 If a proxied request returns a connection error or an unexpected 404, check `prox proxy routes` first to confirm the target hostname is actually registered.
 
-**`prox status` now surfaces shared-proxy health itself.** When a proxy is configured, it prints a `Proxy: DOWN — shared proxy daemon unreachable` line and **exits 1** if the shared daemon is unreachable, even though every child process is still healthy — you don't need a separate check for this. The project also self-heals: it re-registers with a fresh or recovered daemon automatically (worst case ~45s), so a brief `DOWN` reading is often transient. Reach for `prox proxy status` / `prox proxy routes` for daemon-side detail `prox status` doesn't carry — which projects/routes the daemon holds, its version. (See prox#66.)
+**`prox status` exit code, precisely.** `prox status` exits `0` only when the supervisor query succeeded, **and** no process is in the `crashed` state, **and** any configured shared proxy is reachable. It does **not** assert that every process is `running` or `healthy`: `starting`, `stopping`, deliberately-`stopped`, and running-but-`unhealthy` processes all still exit `0`. It exits `1` when any child is `crashed` (the table adds a `Crashed: <name> — check 'prox logs <name>'.` line and stderr carries `Error: N process(es) crashed`) or when a configured shared proxy is unreachable (the `Proxy: DOWN — shared proxy daemon unreachable` line; if both hold, both signals print and the proxy-down error takes stderr precedence). The proxy project self-heals — it re-registers with a fresh or recovered daemon automatically (worst case ~45s), so a brief `DOWN` reading is often transient; a `crashed` child is sticky until restarted. Reach for `prox proxy status` / `prox proxy routes` for daemon-side detail `prox status` doesn't carry. (See prox#66, prox#72.)
+
+> **One-shot caveat:** the supervisor marks *any* non-Stop-driven exit as `crashed` — including a one-shot child that exits `0` (a migration or seed step). Such a project fails `prox status` until the child is restarted, so one-shot helpers should live outside `prox.yaml` or you should expect a non-zero status. To check only what you care about, parse `prox status --json` (its per-process `status` is authoritative) rather than `prox status || true`, which would also mask discovery errors and an unreachable supervisor.
 
 ## Viewing Logs
 

@@ -83,7 +83,7 @@ app.local.example.dev       443   https     localhost:5173  /projects/app       
 
 `prox status` in each project reports the shared daemon's health, not just its own process health — see the `Proxy:` line in [`prox status`](../reference/cli.md#status). If the shared daemon dies (crash, `kill -9`, a bad upgrade), every project registered with it prints `Proxy: DOWN` and exits `1` from `prox status`, even though their own processes are still running.
 
-No operator action is required to recover: each project's forwarder detects the prolonged failure and re-registers with a fresh or recovered daemon automatically, worst case within about 45 seconds. Once healed, `prox status` goes back to `Proxy: shared (running, vX.Y.Z)` and exits `0`. Treat a brief `DOWN` reading as transient rather than something to page on.
+No operator action is required to recover: each project's forwarder detects the prolonged failure and re-registers with a fresh or recovered daemon automatically, worst case within about 45 seconds. Once the proxy heals, `prox status` goes back to `Proxy: shared (running, vX.Y.Z)` — and exits `0` **provided no child process is also in the `crashed` state**, which fails `prox status` independently of proxy health (see [`prox status`](../reference/cli.md#status)). Treat a brief `DOWN` reading as transient rather than something to page on.
 
 ## Constraints
 
