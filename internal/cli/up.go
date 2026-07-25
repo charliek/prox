@@ -848,6 +848,25 @@ func captureMaxBodySize(cfg *config.Config) int64 {
 	return n
 }
 
+// captureDiskBudget resolves the project's configured capture disk budget to
+// bytes for the register wire (#69). It parses cfg.Proxy.Capture.DiskBudget with
+// the same parser the capture accountant uses. An unset or unparseable value
+// yields 0, which the daemon reads as "use the default budget" — a bad string
+// degrades gracefully rather than failing `prox up`. Validate has normally
+// already rejected an unparseable value; this is the belt-and-suspenders path.
+func captureDiskBudget(cfg *config.Config) int64 {
+	if cfg.Proxy.Capture == nil || cfg.Proxy.Capture.DiskBudget == "" {
+		return 0
+	}
+	n, err := config.ParseSize(cfg.Proxy.Capture.DiskBudget)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: invalid proxy.capture.disk_budget %q: %v — using the daemon default capture disk budget\n",
+			cfg.Proxy.Capture.DiskBudget, err)
+		return 0
+	}
+	return n
+}
+
 // startProxy attempts to register with the shared proxy daemon. If the daemon
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
@@ -929,6 +948,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		HTTPSPort:      cfg.Proxy.HTTPSPort,
 		CaptureEnabled: cfg.Proxy.Capture != nil && cfg.Proxy.Capture.Enabled,
 		MaxBodySize:    captureMaxBodySize(cfg),
+		DiskBudget:     captureDiskBudget(cfg),
 		StartTime:      startToken,
 	}
 

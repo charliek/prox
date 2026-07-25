@@ -61,6 +61,11 @@ type Server struct {
 	// lock (see Managers); the hot path reaches it via DynamicProxy, never
 	// touching lifecycleMu.
 	managers *Managers
+	// captureMgr is the daemon's single shared capture manager (the same instance
+	// held by the DynamicProxy). syncCaptureBudget pushes the registry's effective
+	// disk budget onto it after every committed registry mutation (#69). nil when
+	// capture is disabled (home dir unresolved / init failure).
+	captureMgr *proxy.CaptureManager
 }
 
 // ServerConfig holds configuration for creating a daemon server.
@@ -103,6 +108,28 @@ func (s *Server) SetProxy(p *DynamicProxy) {
 // control-plane endpoints resolve the identical per-project rings.
 func (s *Server) SetManagers(ms *Managers) {
 	s.managers = ms
+}
+
+// SetCaptureManager sets the daemon's shared capture manager (called during
+// daemon setup) so syncCaptureBudget can push the registry's effective disk
+// budget onto it (#69). It is the same instance the DynamicProxy holds.
+func (s *Server) SetCaptureManager(cm *proxy.CaptureManager) {
+	s.captureMgr = cm
+}
+
+// syncCaptureBudget recomputes the effective daemon-wide capture disk budget from
+// the current registry and pushes it onto the capture manager, which enforces it
+// immediately (evicting oldest record groups if the new bound is lower). It must
+// be called after EVERY committed registry mutation — successful register (incl.
+// changed-config and stale-replacement), rollback/restore after a failed
+// register, deregister, and stale-PID removal — so the bound converges as
+// projects come and go (#69). No-op when capture is disabled. Cheap and
+// idempotent, so over-calling within one transaction is harmless.
+func (s *Server) syncCaptureBudget() {
+	if s.captureMgr == nil || s.registry == nil {
+		return
+	}
+	s.captureMgr.SetDiskBudget(s.registry.EffectiveCaptureDiskBudget())
 }
 
 // ShutdownCh returns a channel that is closed when the daemon should exit.
@@ -310,6 +337,9 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			if restoreSnap != nil {
 				s.restoreSnapshotLocked(*restoreSnap)
 			}
+			// The prior removal (and any restore) committed a registry change;
+			// re-sync the effective capture disk budget (#69).
+			s.syncCaptureBudget()
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
 	}
@@ -374,6 +404,10 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 	)
 
 	s.lifecycleEpoch.Add(1)
+	// The registry now reflects this project; fold its capture disk budget into
+	// the effective daemon-wide bound and enforce it (#69). Covers the fresh,
+	// changed-config, and stale-replacement register arms (all reach here).
+	s.syncCaptureBudget()
 	return http.StatusOK, RegisterResponse{Registered: hostnames}
 }
 
@@ -461,6 +495,9 @@ func (s *Server) removeProject(projectDir string) (removedHostnames []string, em
 	// (config-changed / crash-replace re-register) call removeProjectLocked
 	// directly and KEEP the ring — only this top-level entry destroys it.
 	s.destroyProjectManager(projectDir)
+	// The project left the registry; recompute the effective capture disk budget
+	// (a departing project can only relax the daemon-wide min) (#69).
+	s.syncCaptureBudget()
 	return removedHostnames, emptyPorts
 }
 
@@ -498,6 +535,9 @@ func (s *Server) removeStaleProject(projectDir string, pid int, startTime int64)
 	// must leave the live generation's ring — and its records — untouched.
 	if removed {
 		s.destroyProjectManager(projectDir)
+		// A stale project left the registry; recompute the effective capture disk
+		// budget (#69).
+		s.syncCaptureBudget()
 	}
 	return removed, removedHostnames, emptyPorts
 }
@@ -577,6 +617,9 @@ func (s *Server) unwindRegistration(projectDir string, restoreSnap *projectSnaps
 	} else {
 		s.destroyProjectManager(projectDir)
 	}
+	// Registry state changed (rolled back, and possibly restored to the prior
+	// registration); recompute the effective capture disk budget (#69).
+	s.syncCaptureBudget()
 }
 
 // restoreSnapshotLocked re-injects a project snapshot into the registry and
@@ -649,6 +692,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// record counts make the N×ring memory trade-off diagnosable (D13).
 		resp.DroppedEvents = s.managers.droppedTotal()
 		resp.RecordCounts = s.managers.recordCounts()
+	}
+	if s.captureMgr != nil {
+		// Capture disk accounting for the one shared capture dir, read under a
+		// single lock so used/budget always coexisted (#69).
+		resp.CaptureDiskUsed, resp.CaptureDiskBudget = s.captureMgr.DiskStats()
 	}
 
 	writeJSON(w, http.StatusOK, resp)

@@ -215,6 +215,11 @@ func RunDaemon(ctx context.Context) error {
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
 	server.SetManagers(managers)
+	// Wire the shared capture manager so the server can push the registry's
+	// effective capture disk budget onto it after every committed registry
+	// mutation (#69). nil when capture is disabled — SetCaptureManager and
+	// syncCaptureBudget both tolerate that.
+	server.SetCaptureManager(captureMgr)
 
 	// Wire the on-502 dead-owner probe's reap callback (#74). When a route's
 	// backend transport fails, the dynamic proxy probes the owning prox up

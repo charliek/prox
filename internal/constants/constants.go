@@ -164,6 +164,15 @@ const (
 	// Bodies larger than this are stored on disk
 	DefaultCaptureInlineThreshold = 64 * 1024
 
+	// DefaultCaptureDiskBudget is the default daemon-wide (and standalone
+	// per-project) ceiling on the TOTAL bytes of spilled capture body files on
+	// disk (#69). Only bodies larger than DefaultCaptureInlineThreshold spill to
+	// disk; once their combined size would exceed this budget the capture
+	// accountant evicts the oldest record groups (oldest-first FIFO by first-spill
+	// time) until it fits. An explicit proxy.capture.disk_budget can only LOWER
+	// the effective bound, never raise it above this default. 1GiB.
+	DefaultCaptureDiskBudget = 1 * 1024 * 1024 * 1024
+
 	// CaptureDirectory is the directory name for storing captured body files
 	CaptureDirectory = ".prox/capture"
 

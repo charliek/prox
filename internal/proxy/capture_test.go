@@ -483,6 +483,7 @@ func TestCaptureBuffer_Finalize(t *testing.T) {
 			cm: &CaptureManager{
 				inlineThreshold: 5, // very low
 				captureDir:      captureDir,
+				acct:            newDiskAccountant(captureDir, constants.DefaultCaptureDiskBudget),
 			},
 		}
 		cb.Write([]byte("this is longer than threshold"))
@@ -508,6 +509,7 @@ func TestCaptureBuffer_Finalize(t *testing.T) {
 			cm: &CaptureManager{
 				inlineThreshold: 5,
 				captureDir:      "/nonexistent/directory",
+				acct:            newDiskAccountant("/nonexistent/directory", constants.DefaultCaptureDiskBudget),
 			},
 		}
 		cb.Write([]byte("some data here"))

@@ -30,6 +30,14 @@ type RegisterRequest struct {
 	// (DefaultCaptureMaxBodySize). Wire-compatible in both directions: an older
 	// daemon ignores the unknown field, and an omitted field decodes to 0.
 	MaxBodySize int64 `json:"max_body_size,omitempty"`
+	// DiskBudget is the project's configured capture disk budget in BYTES (#69),
+	// populated from cfg.Proxy.Capture.DiskBudget; 0 means "use the daemon
+	// default" (DefaultCaptureDiskBudget). The daemon folds every registered
+	// capture-enabled project's budget into a single effective daemon-wide bound
+	// (the min, clamped to never exceed the default) for the one shared capture
+	// dir. Wire-compatible in both directions: an older daemon ignores the unknown
+	// field, and an omitted field decodes to 0.
+	DiskBudget int64 `json:"disk_budget,omitempty"`
 	// StartTime is an opaque process start token (see daemon.ProcessStartTime):
 	// a generation discriminator, not a timestamp. 0 means the client could not
 	// read it, so the daemon falls back to bare-PID liveness for this holder.
@@ -77,6 +85,12 @@ type DaemonStatusResponse struct {
 	// keyed by project dir (D13). It makes the N×ring memory trade-off of the
 	// per-project rings diagnosable. Empty when no project is registered.
 	RecordCounts map[string]int `json:"record_counts,omitempty"`
+	// CaptureDiskUsed is the total logical bytes of spilled capture body files on
+	// disk across ALL projects (the daemon's flat capture dir), and
+	// CaptureDiskBudget is the effective daemon-wide ceiling enforced against it
+	// (#69). Both are 0 when the daemon has no capture manager.
+	CaptureDiskUsed   int64 `json:"capture_disk_used"`
+	CaptureDiskBudget int64 `json:"capture_disk_budget"`
 }
 
 // ErrorResponse is the standard error format for daemon API responses.

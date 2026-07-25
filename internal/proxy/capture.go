@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charliek/prox/internal/config"
@@ -28,6 +29,230 @@ type CaptureManager struct {
 	inlineThreshold int64
 	captureDir      string
 	workDir         string
+	// acct is the disk-budget accountant (#69): it is the single chokepoint every
+	// spilled body file passes through, tracking logical spill bytes and evicting
+	// the oldest record groups (oldest-first FIFO by first-spill time) whenever the
+	// daemon-wide budget would be exceeded. Always non-nil (both constructors
+	// initialize it); on a disabled manager it simply never sees a spill.
+	acct *diskAccountant
+}
+
+// spillGroup accounts one record's spilled body files (#69). A record spills its
+// request and response bodies at two INDEPENDENT times on concurrent goroutines,
+// so the group is created on whichever spills first and grows to hold both. Its
+// age is the FIRST spill time (never bumped by the second file, and never
+// promoted by reads — this is FIFO, deliberately NOT LRU), which is what
+// eviction orders by. seq is a strictly-monotonic creation stamp used only as a
+// deterministic tiebreaker when two groups share a first-spill instant.
+type spillGroup struct {
+	firstSpill time.Time
+	seq        uint64
+	files      map[string]int64 // suffix ("_req"/"_res") -> accounted byte length
+}
+
+// diskAccountant enforces the capture disk budget across ALL records sharing one
+// capture dir (the daemon's flat ~/.prox/capture, or a standalone project's dir).
+// capture_disk_used is the sum of managed file lengths; the budget bounds it.
+// Its own mutex guards every field because spills land on concurrent request
+// goroutines (#69). Ring records, in-memory metadata, and inline bodies are NEVER
+// touched here — only spilled files and their accounting.
+type diskAccountant struct {
+	mu         sync.Mutex
+	dir        string
+	budget     int64
+	diskUsed   int64
+	seqCounter uint64
+	groups     map[string]*spillGroup
+
+	// Injectable os seams so tests can force write/remove/stat failures without
+	// real permission juggling; default to the real os funcs.
+	writeFile func(name string, data []byte, perm os.FileMode) error
+	remove    func(name string) error
+	stat      func(name string) (os.FileInfo, error)
+	now       func() time.Time
+}
+
+// spillSuffixes are the two canonical spill-file suffixes for a record. Cleanup
+// and eviction unlink BOTH regardless of which are tracked (#69), so a partial
+// file that never made it into accounting is still removed.
+var spillSuffixes = []string{"_req", "_res"}
+
+// spillFilePath is the single source of truth for a spilled body file's on-disk
+// name: dir/<requestID><suffix>.bin (suffix is "_req"/"_res"). Centralizing it
+// keeps the accountant's write, delete, and error-message paths from drifting.
+func spillFilePath(dir, requestID, suffix string) string {
+	return filepath.Join(dir, requestID+suffix+".bin")
+}
+
+// newDiskAccountant builds an accountant rooted at dir with the given budget
+// (a non-positive budget falls back to the default). (#69)
+func newDiskAccountant(dir string, budget int64) *diskAccountant {
+	if budget <= 0 {
+		budget = constants.DefaultCaptureDiskBudget
+	}
+	return &diskAccountant{
+		dir:       dir,
+		budget:    budget,
+		groups:    make(map[string]*spillGroup),
+		writeFile: os.WriteFile,
+		remove:    os.Remove,
+		stat:      os.Stat,
+		now:       time.Now,
+	}
+}
+
+// ensureGroupLocked returns requestID's group, creating it (stamping the
+// first-spill time and monotonic seq) on first use. a.mu must be held.
+func (a *diskAccountant) ensureGroupLocked(requestID string) *spillGroup {
+	g := a.groups[requestID]
+	if g == nil {
+		a.seqCounter++
+		g = &spillGroup{firstSpill: a.now(), seq: a.seqCounter, files: make(map[string]int64)}
+		a.groups[requestID] = g
+	}
+	return g
+}
+
+// trackLocked records that suffix's on-disk file for requestID is size bytes,
+// adjusting diskUsed by the delta from any prior tracked size (a rewrite is not
+// double-counted). a.mu must be held.
+func (a *diskAccountant) trackLocked(requestID, suffix string, size int64) {
+	g := a.ensureGroupLocked(requestID)
+	a.diskUsed += size - g.files[suffix]
+	g.files[suffix] = size
+}
+
+// store writes data to the spill file for (requestID, suffix), updates
+// accounting, and enforces the budget, returning the file path on success. On a
+// write failure it removes any partial file so accounting still matches disk and
+// returns the error (the caller falls back to inline storage). A repeated suffix
+// (rewrite) adjusts the delta rather than double-counting. (#69)
+func (a *diskAccountant) store(requestID, suffix string, data []byte) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	path := spillFilePath(a.dir, requestID, suffix)
+	if err := a.writeFile(path, data, constants.FilePermissionPrivate); err != nil {
+		// Remove any partial write so a failed WRITE never leaves bytes on disk
+		// that accounting does not know about. If that removal ALSO fails (e.g. the
+		// partial is there but unlinkable), stat it and TRACK it into the group so
+		// budget eviction / CleanupRequest can retry the delete — otherwise the
+		// orphan is invisible to accounting and eviction forever (#69).
+		if rmErr := a.remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			if fi, statErr := a.stat(path); statErr == nil {
+				a.trackLocked(requestID, suffix, fi.Size())
+			}
+		}
+		return "", err
+	}
+
+	a.trackLocked(requestID, suffix, int64(len(data)))
+	a.enforceLocked()
+	return path, nil
+}
+
+// removeGroupLocked deletes a record's spill files and subtracts their accounted
+// bytes. Bytes are subtracted (and the file dropped from the group) only after a
+// successful delete or os.IsNotExist, so a genuinely failed delete keeps the
+// accounting matching disk. Idempotent: an absent group, or files already gone,
+// is a no-op — making a double cleanup (budget-evicted then ring-evicted/purged)
+// safe. a.mu must be held. (#69)
+func (a *diskAccountant) removeGroupLocked(requestID string) {
+	g := a.groups[requestID]
+	// Attempt to unlink BOTH canonical spill paths regardless of what is tracked,
+	// so a partial file that never made it into accounting (a failed write whose
+	// partial-cleanup also failed, then a later untracked attempt) is still
+	// cleaned. IsNotExist counts as a successful delete. Only TRACKED bytes are
+	// subtracted from accounting (#69).
+	for _, suffix := range spillSuffixes {
+		path := spillFilePath(a.dir, requestID, suffix)
+		err := a.remove(path)
+		deleted := err == nil || os.IsNotExist(err)
+		if g == nil || !deleted {
+			// A real delete failure of a tracked file keeps its byte accounting
+			// AND its group entry so diskUsed still reflects what is on disk.
+			continue
+		}
+		if size, tracked := g.files[suffix]; tracked {
+			a.diskUsed -= size
+			delete(g.files, suffix)
+		}
+	}
+	if g != nil && len(g.files) == 0 {
+		delete(a.groups, requestID)
+	}
+}
+
+// removeGroup is the lock-taking wrapper around removeGroupLocked, used by
+// CleanupRequest so the manager never reaches into a.mu itself. (#69)
+func (a *diskAccountant) removeGroup(requestID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removeGroupLocked(requestID)
+}
+
+// enforceLocked evicts the oldest record groups (by first-spill time, seq as
+// tiebreaker) until diskUsed <= budget. Oldest-record-group-first FIFO across
+// ALL records in the shared dir — a single spill larger than the whole budget is
+// evicted by this same loop as the oldest-and-only group (no special case). Only
+// spilled files + accounting are touched; a body fetch after eviction hits the
+// existing evicted-file handling. a.mu must be held. (#69)
+func (a *diskAccountant) enforceLocked() {
+	if a.budget <= 0 {
+		return
+	}
+	for a.diskUsed > a.budget && len(a.groups) > 0 {
+		var oldestID string
+		var oldest *spillGroup
+		for id, g := range a.groups {
+			if oldest == nil || g.firstSpill.Before(oldest.firstSpill) ||
+				(g.firstSpill.Equal(oldest.firstSpill) && g.seq < oldest.seq) {
+				oldestID, oldest = id, g
+			}
+		}
+		before := a.diskUsed
+		a.removeGroupLocked(oldestID)
+		if a.diskUsed >= before {
+			// No progress — every file in the oldest group failed to delete.
+			// Stop rather than spin; the bounded overshoot is acceptable and the
+			// next spill/mutation re-attempts convergence.
+			break
+		}
+	}
+}
+
+// setBudget updates the budget (a non-positive value resets to the default) and
+// enforces it immediately, so a budget-lowering re-register converges without
+// waiting for the next spill. (#69)
+func (a *diskAccountant) setBudget(budget int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if budget <= 0 {
+		budget = constants.DefaultCaptureDiskBudget
+	}
+	a.budget = budget
+	a.enforceLocked()
+}
+
+func (a *diskAccountant) used() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.diskUsed
+}
+
+func (a *diskAccountant) currentBudget() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.budget
+}
+
+// stats returns disk-used and budget read under ONE lock acquisition, so a
+// consumer (daemon /status) never publishes a used/budget pair that never
+// coexisted — e.g. a used from before an eviction with a budget from after (#69).
+func (a *diskAccountant) stats() (used, budget int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.diskUsed, a.budget
 }
 
 // NewCaptureManager creates a new capture manager.
@@ -44,6 +269,9 @@ func NewCaptureManager(cfg *config.CaptureConfig, workDir string) (*CaptureManag
 			enabled:         false,
 			maxBodySize:     constants.DefaultCaptureMaxBodySize,
 			inlineThreshold: constants.DefaultCaptureInlineThreshold,
+			// A disabled manager still carries an accountant so budget accessors
+			// are always safe; it simply never sees a spill.
+			acct: newDiskAccountant("", constants.DefaultCaptureDiskBudget),
 		}, nil
 	}
 
@@ -66,6 +294,16 @@ func NewCaptureManager(cfg *config.CaptureConfig, workDir string) (*CaptureManag
 		return nil, err
 	}
 	cm.workDir = workDir
+
+	// Standalone per-project disk budget (#69): honor the project's configured
+	// disk_budget, falling back to the default when unset or unparseable. Unlike
+	// the shared daemon's cross-project min, a single standalone project's
+	// explicit value is used as-is (it is the only writer to its own dir).
+	if cfg.DiskBudget != "" {
+		if budget, berr := config.ParseSize(cfg.DiskBudget); berr == nil && budget > 0 {
+			cm.SetDiskBudget(budget)
+		}
+	}
 	return cm, nil
 }
 
@@ -84,6 +322,7 @@ func NewCaptureManagerAt(captureDir string, maxBodySize int64) (*CaptureManager,
 		maxBodySize:     maxBodySize,
 		inlineThreshold: constants.DefaultCaptureInlineThreshold,
 		captureDir:      captureDir,
+		acct:            newDiskAccountant(captureDir, constants.DefaultCaptureDiskBudget),
 	}
 
 	// Clean up any existing capture files from a previous run.
@@ -113,6 +352,33 @@ func (cm *CaptureManager) Enabled() bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.enabled
+}
+
+// SetDiskBudget updates the capture disk budget and enforces it immediately (#69):
+// a budget-lowering re-register (or standalone construction) evicts oldest record
+// groups until the total spilled bytes fit, without waiting for the next spill. A
+// non-positive budget resets to DefaultCaptureDiskBudget.
+func (cm *CaptureManager) SetDiskBudget(budget int64) {
+	cm.acct.setBudget(budget)
+}
+
+// DiskUsed returns the total logical bytes of spilled capture body files
+// currently accounted (capture_disk_used, #69).
+func (cm *CaptureManager) DiskUsed() int64 {
+	return cm.acct.used()
+}
+
+// DiskBudget returns the current effective capture disk budget in bytes (#69).
+func (cm *CaptureManager) DiskBudget() int64 {
+	return cm.acct.currentBudget()
+}
+
+// DiskStats returns capture_disk_used and capture_disk_budget read under ONE
+// accountant lock (#69), so a consumer never publishes a used/budget pair that
+// never coexisted. The daemon /status handler uses this rather than separate
+// DiskUsed()/DiskBudget() calls.
+func (cm *CaptureManager) DiskStats() (used, budget int64) {
+	return cm.acct.stats()
 }
 
 // effectiveLimit resolves a per-call capture cap: a positive limit is used
@@ -211,18 +477,15 @@ func (cm *CaptureManager) FinalizeResponse(requestID string, crw *CaptureRespons
 		IsBinary:        isBinaryContent(data, contentType),
 	}
 
-	// Determine if we should store inline or on disk
+	// Determine if we should store inline or on disk. Spills route through the
+	// accountant (#69) so the write is byte-accounted and budget-enforced.
 	if int64(len(data)) <= cm.inlineThreshold {
 		body.Data = data
+	} else if filePath, err := cm.acct.store(requestID, "_res", data); err == nil {
+		body.FilePath = filePath
 	} else {
-		// Store on disk
-		filePath := filepath.Join(cm.captureDir, requestID+"_res.bin")
-		if err := os.WriteFile(filePath, data, constants.FilePermissionPrivate); err == nil {
-			body.FilePath = filePath
-		} else {
-			// Fall back to inline if disk write fails
-			body.Data = data
-		}
+		// Fall back to inline if disk write fails.
+		body.Data = data
 	}
 
 	return body, headers
@@ -236,23 +499,35 @@ func (cm *CaptureManager) LoadBody(body *CapturedBody) ([]byte, error) {
 	return LoadCapturedBody(body, []string{cm.CaptureDir()})
 }
 
-// CleanupRequest removes disk files associated with a specific request.
+// CleanupRequest removes disk files associated with a specific request, routing
+// through the accountant (#69) so the freed bytes are subtracted from
+// capture_disk_used. Idempotent — a record already budget-evicted is a safe
+// no-op — so a ring eviction or PurgeByProject following a budget eviction does
+// not double-count.
 func (cm *CaptureManager) CleanupRequest(requestID string) {
 	if !cm.enabled || cm.captureDir == "" {
 		return
 	}
-
-	// Remove both request and response body files
-	_ = os.Remove(filepath.Join(cm.captureDir, requestID+"_req.bin"))
-	_ = os.Remove(filepath.Join(cm.captureDir, requestID+"_res.bin"))
+	cm.acct.removeGroup(requestID)
 }
 
-// Cleanup removes the entire capture directory.
+// Cleanup removes the entire capture directory. It takes the accountant lock so
+// the whole-dir removal and the accounting reset are atomic against concurrent
+// spills (#69): a store() that raced in first is fully accounted, and one that
+// races AFTER this fails its write with ENOENT (the dir is gone) → the
+// failed-write inline fallback, never a tracked FilePath into a directory that no
+// longer exists. groups/diskUsed are reset to zero so DiskUsed() does not go
+// stale after cleanup.
 func (cm *CaptureManager) Cleanup() error {
 	if cm.captureDir == "" {
 		return nil
 	}
-	return os.RemoveAll(cm.captureDir)
+	cm.acct.mu.Lock()
+	defer cm.acct.mu.Unlock()
+	err := os.RemoveAll(cm.captureDir)
+	cm.acct.groups = make(map[string]*spillGroup)
+	cm.acct.diskUsed = 0
+	return err
 }
 
 // captureBuffer is a write buffer that captures up to maxSize bytes.
@@ -331,12 +606,14 @@ func (cb *captureBuffer) finalize() error {
 	}
 
 	if cb.cm.captureDir != "" {
-		// Store on disk
-		filePath := filepath.Join(cb.cm.captureDir, cb.requestID+cb.suffix+".bin")
-		if err := os.WriteFile(filePath, data, constants.FilePermissionPrivate); err != nil {
+		// Store on disk through the accountant (#69) so the spill is byte-accounted
+		// and budget-enforced.
+		filePath, err := cb.cm.acct.store(cb.requestID, cb.suffix, data)
+		if err != nil {
 			// Fall back to inline if disk write fails, but return error for caller awareness
 			cb.body.Data = data
-			return fmt.Errorf("failed to write capture file %s: %w", filePath, err)
+			return fmt.Errorf("failed to write capture file %s: %w",
+				spillFilePath(cb.cm.captureDir, cb.requestID, cb.suffix), err)
 		}
 		cb.body.FilePath = filePath
 		return nil

@@ -39,6 +39,14 @@ type ProxyConfig struct {
 type CaptureConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	MaxBodySize string `yaml:"max_body_size"` // e.g., "1MB", "512KB"
+	// DiskBudget is the ceiling on the TOTAL bytes of spilled capture body files
+	// on disk (#69), e.g. "512MB", "2GB". Empty means "use the default"
+	// (constants.DefaultCaptureDiskBudget, 1GiB). In the shared daemon an explicit
+	// value can only LOWER the daemon-wide effective bound, never raise it above
+	// the default; note it may legitimately be smaller than max_body_size (a
+	// single spilled body is then the oldest-and-only group and is evicted by the
+	// same loop). Parsed with ParseSize.
+	DiskBudget string `yaml:"disk_budget"`
 }
 
 // ServiceConfig represents a service routing configuration that can be either

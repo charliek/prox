@@ -97,6 +97,20 @@ func Validate(config *Config) error {
 		if config.Proxy.Domain != "" && !domainRegex.MatchString(config.Proxy.Domain) {
 			errs = append(errs, fmt.Sprintf("proxy.domain: invalid domain format %q", config.Proxy.Domain))
 		}
+
+		// Validate capture disk budget if set (#69). Empty means "use the default"
+		// (constants.DefaultCaptureDiskBudget); anything else must parse and be
+		// positive. A budget smaller than max_body_size is intentionally allowed
+		// (no warning infra exists): the accountant evicts an oversized single
+		// spill as the oldest-and-only group, so a tiny budget still converges.
+		if config.Proxy.Capture != nil && config.Proxy.Capture.DiskBudget != "" {
+			n, err := ParseSize(config.Proxy.Capture.DiskBudget)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("proxy.capture.disk_budget: %s", err.Error()))
+			} else if n <= 0 {
+				errs = append(errs, fmt.Sprintf("proxy.capture.disk_budget: must be positive, got %q", config.Proxy.Capture.DiskBudget))
+			}
+		}
 	}
 
 	// Validate certs config if present

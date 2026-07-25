@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
 )
 
@@ -57,6 +58,11 @@ type ProjectRegistration struct {
 	// MaxBodySize is the project's per-request/response capture cap in bytes
 	// (D13, #49); 0 means the daemon default. Stamped onto each Route.
 	MaxBodySize int64
+	// DiskBudget is the project's configured capture disk budget in bytes (#69);
+	// 0 means the daemon default. NOT stamped per-route (the hot path never
+	// consults it) — the daemon folds every capture-enabled project's budget into
+	// one effective daemon-wide bound via EffectiveCaptureDiskBudget.
+	DiskBudget int64
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -231,6 +237,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		RegisteredAt:   now,
 		CaptureEnabled: req.CaptureEnabled,
 		MaxBodySize:    req.MaxBodySize,
+		DiskBudget:     req.DiskBudget,
 	}
 
 	for port, proto := range portsNeeded {
@@ -301,6 +308,12 @@ func (r *Registry) registrationMatches(req RegisterRequest) bool {
 	// A changed capture cap must NOT take the no-op refresh path — the new cap
 	// has to reach the routes so subsequent captures honor it (D13).
 	if proj.MaxBodySize != req.MaxBodySize {
+		return false
+	}
+	// A changed disk budget must force a real re-register so syncCaptureBudget
+	// recomputes the effective daemon-wide bound (#69) — a no-op refresh would
+	// leave the old budget in force.
+	if proj.DiskBudget != req.DiskBudget {
 		return false
 	}
 
@@ -493,6 +506,43 @@ func (r *Registry) ListenerPorts() []int {
 	}
 	sort.Ints(ports)
 	return ports
+}
+
+// EffectiveCaptureDiskBudget computes the daemon-wide capture disk budget for the
+// one shared capture dir (#69): the MINIMUM over all registered capture-ENABLED
+// projects of that project's configured budget if set, else
+// DefaultCaptureDiskBudget for a project that left it unset. When no
+// capture-ENABLED project is registered, the default applies. Capture-DISABLED
+// projects never influence the bound.
+//
+// There is NO per-value clamp: raising the bound above the default IS allowed
+// when EVERY capture-enabled project opts in — including the single-project case
+// ({A: 2GB} alone -> 2GB). But an explicit value can never raise ANOTHER
+// project's default: an unset capture-enabled project contributes the default to
+// the min, so {A: 2GB, B: unset} -> min(2GB, 1GiB) = 1GiB.
+func (r *Registry) EffectiveCaptureDiskBudget() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	effective := int64(0)
+	seen := false
+	for _, proj := range r.projects {
+		if !proj.CaptureEnabled {
+			continue
+		}
+		budget := proj.DiskBudget
+		if budget <= 0 {
+			budget = constants.DefaultCaptureDiskBudget
+		}
+		if !seen || budget < effective {
+			effective = budget
+			seen = true
+		}
+	}
+	if !seen {
+		return constants.DefaultCaptureDiskBudget
+	}
+	return effective
 }
 
 // ProjectCount returns the number of registered projects.
