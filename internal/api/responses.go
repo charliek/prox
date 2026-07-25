@@ -83,6 +83,10 @@ type ProcessResponse struct {
 	UptimeSeconds int64  `json:"uptime_seconds"`
 	Restarts      int    `json:"restarts"`
 	Health        string `json:"health"`
+	// Kind is the child's run mode ("process" or "task"), plumbed from
+	// domain.ProcessInfo.Kind (plan 013 D3). Rendering lands in C5; here it is
+	// carried mechanically so clients can distinguish tasks.
+	Kind string `json:"kind,omitempty"`
 }
 
 // ProcessDetailResponse represents the response for GET /processes/{name}
@@ -168,6 +172,7 @@ func ToProcessResponse(info domain.ProcessInfo) ProcessResponse {
 		UptimeSeconds: info.UptimeSeconds(),
 		Restarts:      info.RestartCount,
 		Health:        string(info.Health),
+		Kind:          string(info.Kind),
 	}
 }
 

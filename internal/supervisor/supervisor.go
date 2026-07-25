@@ -137,6 +137,53 @@ type Supervisor struct {
 	// coordCtx and Close()ing the resolver -- so orchestration has fully quiesced
 	// before the process set is stopped. Its own synchronization; not s.mu-guarded.
 	coordWg sync.WaitGroup
+
+	// --- task coordination (plan 013 D3, tasks.go) ---
+	//
+	// tasks is the subset of the managed set that are run-to-completion tasks.
+	// Tasks are ALSO in s.processes (so status/shutdown/orphan-reaping flow through
+	// the existing plumbing); this map lets the coordinator find a task's
+	// ManagedProcess by name. Rebuilt on every Start. Guarded by s.mu.
+	tasks map[string]*ManagedProcess
+	// taskMu guards the task-node registry below. It is a LEAF lock: code holding
+	// taskMu never takes s.mu (startTaskEpisodeLocked reads s.ctx/coordCtx, which
+	// are stable for a run). This mirrors the resolver's own dedicated mutex.
+	taskMu sync.Mutex
+	// taskNodes is the single-flight join point per task per supervisor lifetime:
+	// the first demand of a task creates a node and launches its run; concurrent
+	// demanders join the node's done channel and receive the same terminal outcome.
+	// A settled node stays cached so a dependent's restart does NOT re-run the task
+	// (once-per-lifetime); a manual re-run replaces it. The node's launch generation
+	// AND the process's admission (beginWaiting) are established together under
+	// taskMu, so a run is admitted atomically. Guarded by taskMu.
+	taskNodes map[string]*taskNode
+	// taskClosed refuses new task demands after shutdown began (mirrors the
+	// resolver's closed flag). Guarded by taskMu.
+	taskClosed bool
+	// rerunMu serializes MANUAL task re-runs (StartProcess/RestartProcess of a task)
+	// so two concurrent re-runs cannot both admit an episode (plan 013 fix 2): the
+	// first runs the full reload/re-resolve/stop/reschedule, and any concurrent
+	// re-run then observes the fresh waiting/running state and returns a clean
+	// already-active error. It does NOT gate dependent-driven demands (which
+	// single-flight through taskNodes).
+	rerunMu sync.Mutex
+
+	// effective is the mutable depends_on CLASSIFICATION view (plan 013 fix 4/5):
+	// which names are dependencies vs tasks. It is initialized from the up-time
+	// config at Start and REPLACED wholesale (never unioned) on a successful reload
+	// (applyReloadGraph), so a reloaded/rerun episode classifies its targets
+	// against current config -- a dependency added by a reload, or a name migrated
+	// dependency->task, resolves correctly. All classification sites read it under
+	// s.mu. Guarded by s.mu.
+	effective *effectiveGraph
+}
+
+// effectiveGraph is the classification snapshot read by every depends_on
+// classification site (plan 013 fix 4/5). deps and tasks are the current
+// dependency and task name sets; a target is a dependency iff it is in deps.
+type effectiveGraph struct {
+	deps  map[string]struct{}
+	tasks map[string]struct{}
 }
 
 // SupervisorEvent represents a supervisor event
@@ -247,6 +294,17 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 	// waits release before the process set is stopped.
 	s.resolver = s.newResolver()
 	s.coordCtx, s.coordCancel = context.WithCancel(s.ctx)
+	// Fresh task-coordinator state for this run (plan 013 D3): the node registry
+	// and generation counters are per-lifetime, and the closed flag reopens on a
+	// stop->start cycle so a new run accepts task demands again.
+	s.tasks = make(map[string]*ManagedProcess)
+	// Effective classification view for this run, seeded from the up-time config
+	// (plan 013 fix 4/5); a reload replaces it via applyReloadGraph.
+	s.effective = buildEffectiveGraph(s.config)
+	s.taskMu.Lock()
+	s.taskNodes = make(map[string]*taskNode)
+	s.taskClosed = false
+	s.taskMu.Unlock()
 	s.startedAt = time.Now()
 	s.mu.Unlock()
 
@@ -273,10 +331,54 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 		s.mu.Unlock()
 	}
 
-	// Start all processes concurrently
+	// Register ALL tasks (plan 013 D3), regardless of the filter: a filtered
+	// process (or another task) may depend on a task the filter did not name, and
+	// the coordinator must be able to find that task's ManagedProcess to run it.
+	// Registration does not run a task -- scheduling below decides what runs.
+	for name, taskConfig := range s.config.Tasks {
+		mp, err := s.createManagedTask(name, taskConfig)
+		if err != nil {
+			result.Failed[name] = err
+			continue
+		}
+		s.mu.Lock()
+		s.processes[name] = mp
+		s.tasks[name] = mp
+		s.mu.Unlock()
+	}
+
+	// Start all processes concurrently (tasks are skipped here; they are
+	// demand-driven or bare-up-driven -- see scheduleTaskDemands).
 	s.startProcessesConcurrently(&result)
 
+	// Schedule task runs (plan 013 D3): bare `prox up` runs every task once (after
+	// its own deps); a subset start runs the tasks NAMED in the subset (plus any
+	// tasks pulled in transitively by a started process/task's depends_on, via the
+	// coordinator's single-flight demand). A task nothing depends on is declared
+	// work and still runs on bare up.
+	s.scheduleTaskDemands(filter)
+
 	return result, nil
+}
+
+// scheduleTaskDemands fires the initial demands that drive tasks to run (plan
+// 013 D3). Under a nil filter (bare `prox up`) every registered task is demanded;
+// under a subset start only the tasks whose names are in the filter. Closure
+// tasks (depended on by a started process or task) are run transitively by the
+// coordinator's demand fan-out, so they need no explicit demand here.
+func (s *Supervisor) scheduleTaskDemands(filter map[string]bool) {
+	s.mu.RLock()
+	names := make([]string, 0, len(s.tasks))
+	for name := range s.tasks {
+		if filter != nil && !filter[name] {
+			continue
+		}
+		names = append(names, name)
+	}
+	s.mu.RUnlock()
+	for _, name := range names {
+		s.demandTaskAsync(name)
+	}
 }
 
 // createManagedProcess creates a new managed process from configuration.
@@ -381,6 +483,83 @@ func (s *Supervisor) buildProcessRuntime(name string, cfg *config.Config, procCo
 	return domainConfig, loadEnv, effective, nil
 }
 
+// buildTaskRuntime resolves the domain config (Kind=task, with run budget), the
+// env-loader closure, and the effective stop budget for a task (plan 013 D3). It
+// mirrors buildProcessRuntime: env loading reuses process semantics (global
+// env_file + the task's own env_file/inline env), and the effective stop budget
+// is the task's own stop_timeout, else the global shutdown_timeout, else the
+// default. The run budget (Timeout/HasTimeout) rides on the domain config.
+func (s *Supervisor) buildTaskRuntime(name string, cfg *config.Config, taskConfig config.TaskConfig) (domain.ProcessConfig, func() (map[string]string, error), time.Duration, error) {
+	td, err := taskConfig.ToDomain(name)
+	if err != nil {
+		return domain.ProcessConfig{}, nil, 0, fmt.Errorf("task %q: %w", name, err)
+	}
+
+	globalEnvFile := cfg.EnvFile
+	taskEnvFile := td.EnvFile
+	inlineEnv := td.Env
+	configDir := s.supConfig.ConfigDir
+	loadEnv := func() (map[string]string, error) {
+		return config.LoadProcessEnv(globalEnvFile, taskEnvFile, inlineEnv, configDir)
+	}
+
+	domainConfig := domain.ProcessConfig{
+		Name:           name,
+		Cmd:            td.Cmd,
+		EnvFile:        td.EnvFile,
+		StopTimeout:    td.StopTimeout,
+		Kind:           domain.ProcessKindTask,
+		TaskTimeout:    td.Timeout,
+		TaskHasTimeout: td.HasTimeout,
+		DependsOn:      td.DependsOn,
+	}
+
+	// Effective stop budget: task stop_timeout, else global shutdown_timeout,
+	// else the SupervisorConfig default, else the constant (mirrors
+	// buildProcessRuntime).
+	effective := td.StopTimeout
+	if effective == 0 {
+		global, err := cfg.ShutdownTimeoutDuration()
+		if err != nil {
+			return domain.ProcessConfig{}, nil, 0, fmt.Errorf("task %q: %w", name, err)
+		}
+		effective = global
+	}
+	if effective == 0 {
+		effective = s.supConfig.ShutdownTimeout
+	}
+	if effective <= 0 {
+		effective = constants.DefaultShutdownTimeout
+	}
+
+	return domainConfig, loadEnv, effective, nil
+}
+
+// createManagedTask builds a task's ManagedProcess (Kind=task) from config,
+// wiring the same launch gate and orphan-reaping ledger callback a process gets
+// (plan 013 D3). The task is registered in the supervisor's managed set so it
+// surfaces in Processes()/status and is stopped/reaped by the normal shutdown
+// path; scheduling (running it once, on demand or on bare `prox up`) is driven by
+// the task coordinator (tasks.go), not startProcessesConcurrently.
+func (s *Supervisor) createManagedTask(name string, taskConfig config.TaskConfig) (*ManagedProcess, error) {
+	domainConfig, loadEnv, effective, err := s.buildTaskRuntime(name, s.config, taskConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := NewManagedProcess(domainConfig, nil, s.runner, s.logManager)
+	mp.loadEnv = loadEnv
+	mp.shutdownTimeout = effective
+	mp.launchGate = func() error {
+		if !s.launchable.Load() {
+			return domain.ErrShutdownInProgress
+		}
+		return nil
+	}
+	mp.onLaunched = s.persistChildren
+	return mp, nil
+}
+
 // prepareReload re-reads and validates the whole config file and resolves the
 // pending runtime (domain config + env loader + effective stop budget) for the
 // named process, to be swapped in atomically inside startWithConfig (#33, D3).
@@ -430,7 +609,57 @@ func (s *Supervisor) prepareReload(name string) (*pendingConfig, error) {
 		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
 	}
 
-	return &pendingConfig{config: domainConfig, loadEnv: loadEnv, env: env, stopTimeout: effective}, nil
+	return &pendingConfig{
+		config:      domainConfig,
+		loadEnv:     loadEnv,
+		env:         env,
+		stopTimeout: effective,
+		// Carry the reload's dependency definitions so the gated restart path can
+		// refresh the resolver and classify targets against the fresh set (D6).
+		freshDeps: s.domainDependencies(fresh),
+	}, nil
+}
+
+// prepareReloadTask is prepareReload's task-mode sibling (plan 013 D3): it
+// re-reads and validates the whole config file and resolves the pending runtime
+// (domain config with Kind=task + run budget, env loader, effective stop budget,
+// fresh dependency set) for the named task, to be applied on a manual re-run. It
+// returns (nil, nil) when reload is disabled, (nil, ErrConfigReloadFailed) for a
+// bad file, and (nil, ErrProcessNotInConfig) when the task was removed from the
+// file (the 409-analog). It touches no ManagedProcess state.
+func (s *Supervisor) prepareReloadTask(name string) (*pendingConfig, error) {
+	cfgPath := s.supConfig.ConfigPath
+	if cfgPath == "" {
+		return nil, nil
+	}
+
+	fresh, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	taskConfig, ok := fresh.Tasks[name]
+	if !ok {
+		return nil, fmt.Errorf("task %q %w; run 'prox up' to reconcile", name, domain.ErrProcessNotInConfig)
+	}
+
+	domainConfig, loadEnv, effective, err := s.buildTaskRuntime(name, fresh, taskConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	env, err := loadEnv()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrConfigReloadFailed, err)
+	}
+
+	return &pendingConfig{
+		config:      domainConfig,
+		loadEnv:     loadEnv,
+		env:         env,
+		stopTimeout: effective,
+		freshDeps:   s.domainDependencies(fresh),
+	}, nil
 }
 
 // startProcessesConcurrently starts all managed processes and updates the
@@ -448,6 +677,11 @@ func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 	var resultMu sync.Mutex
 
 	for name, mp := range s.processes {
+		if mp.isTask() {
+			// Tasks are run-to-completion children driven by the task coordinator
+			// (scheduleTaskDemands / demandTask), not launched as services here.
+			continue
+		}
 		if mp.gated() {
 			// Schedule async orchestration and count it as scheduled; do not wait.
 			// Admission only fails if shutdown raced this Start (or the pointer was
@@ -642,6 +876,9 @@ func (s *Supervisor) RefuseLaunches() {
 		s.resolver.Close()
 	}
 	s.mu.Unlock()
+	// Refuse new task demands too (plan 013 D3); coordCtx's cancel already unblocks
+	// in-flight runs. Idempotent with Stop.
+	s.closeTasks()
 }
 
 // Stop stops all processes and the supervisor.
@@ -682,6 +919,11 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	if resolver != nil {
 		resolver.Close()
 	}
+	// Refuse new task demands and unblock in-flight task runs (plan 013 D3): a
+	// runTask waiting on its deps or on its child's completion selects on the
+	// coordCtx-derived context and returns canceled, so coordWg.Wait() below can
+	// complete before the process set (tasks included) is stopped.
+	s.closeTasks()
 	// Wait for all coordinator goroutines to quiesce before snapshotting the
 	// process set: after this, no gated process can still transition to running,
 	// so the set stopped below is final. A process whose wait was canceled here
@@ -838,6 +1080,14 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 		return domain.ErrShutdownInProgress
 	}
 
+	// A task is a run-to-completion child (plan 013 D3): a manual start re-runs it
+	// (completed -> starting -> running -> completed|crashed), resetting only its
+	// once-per-lifetime flag. Checked before the gated branch because a task with
+	// depends_on is also "gated".
+	if mp.isTask() {
+		return s.rerunTask(ctx, mp, supCtx, false)
+	}
+
 	// Gated processes (a non-empty depends_on) go through the coordinator rather
 	// than launching directly (plan 013 D4): a manual start (re-)demands their
 	// dependency targets and schedules orchestration.
@@ -926,6 +1176,13 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 	// context.WithCancel (defensive; unreachable via the normal API wiring).
 	if supCtx == nil {
 		return domain.ErrShutdownInProgress
+	}
+
+	// A task restart re-runs the task (plan 013 D3), fail-before-stop: it reloads
+	// the task config and re-resolves ITS deps first, and only then (for a running
+	// task) stops the current run and re-runs. Checked before the gated branch.
+	if mp.isTask() {
+		return s.rerunTask(ctx, mp, supCtx, true)
 	}
 
 	// Gated processes re-resolve their dependency targets BEFORE stopping the

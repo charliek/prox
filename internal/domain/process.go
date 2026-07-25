@@ -2,6 +2,24 @@ package domain
 
 import "time"
 
+// ProcessKind discriminates a managed child's run mode (plan 013 D3). A plain
+// process is a long-running service supervised for the whole `prox up`
+// lifetime; a task is a run-to-completion command that executes once per
+// supervisor lifetime after its depends_on targets are satisfied. Both are
+// ManagedProcess children (they share env loading, logging, process-group
+// handling, and stop escalation); only the exit mapping and scheduling differ.
+type ProcessKind string
+
+const (
+	// ProcessKindProcess is a long-running supervised service. It is the zero
+	// value's meaning: an unset Kind is treated as a process.
+	ProcessKindProcess ProcessKind = "process"
+	// ProcessKindTask is a run-to-completion command (plan 013 D3). A natural
+	// exit 0 drives it to ProcessStateCompleted; any other exit drives it to
+	// ProcessStateCrashed.
+	ProcessKindTask ProcessKind = "task"
+)
+
 // ProcessState represents the current state of a process.
 // Processes transition through these states during their lifecycle.
 type ProcessState string
@@ -69,6 +87,17 @@ type ProcessConfig struct {
 	// means unset: the effective budget resolution (proc > global > default)
 	// happens in supervisor.createManagedProcess, not here.
 	StopTimeout time.Duration
+	// Kind is the child's run mode (plan 013 D3). The zero value ("") means a
+	// plain process; ProcessKindTask marks a run-to-completion task. Tasks carry
+	// the run-budget fields below.
+	Kind ProcessKind
+	// TaskTimeout is a task's run budget; meaningful only when Kind is
+	// ProcessKindTask and TaskHasTimeout is true (plan 013 D3). See
+	// domain.TaskConfig.Timeout/HasTimeout.
+	TaskTimeout time.Duration
+	// TaskHasTimeout distinguishes a time-bounded task from an explicitly
+	// unbounded one (timeout: 0). Only meaningful when Kind is ProcessKindTask.
+	TaskHasTimeout bool
 	// DependsOn lists the dependencies and/or tasks that must be ready before
 	// this process starts (plan 013 D1). Entries reference dependencies: or
 	// tasks: names only -- never other processes (validation enforces this).
@@ -87,6 +116,15 @@ type ProcessInfo struct {
 	HealthDetails *HealthState      `json:"healthcheck,omitempty"`
 	Cmd           string            `json:"cmd,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
+	// Kind is the child's run mode (plan 013 D3): ProcessKindProcess or
+	// ProcessKindTask. Info() always reports a concrete value (never ""), so
+	// status/API consumers can render tasks distinctly (surfacing lands in C5).
+	Kind ProcessKind `json:"kind,omitempty"`
+	// EndedAt freezes the reference time for UptimeSeconds when set (plan 013
+	// D3). It is populated for a completed task so its uptime reflects how long
+	// the task RAN (completion time - start time) rather than continuing to tick
+	// after it finished. Zero for a live process, whose uptime keeps counting.
+	EndedAt time.Time `json:"-"`
 	// StopTimeout is the effective SIGTERM->SIGKILL escalation budget in force
 	// for this process (per-process stop_timeout, else global shutdown_timeout,
 	// else the default). Surfaced so operators can see the budget governing a
@@ -94,10 +132,16 @@ type ProcessInfo struct {
 	StopTimeout time.Duration `json:"-"`
 }
 
-// UptimeSeconds returns the number of seconds the process has been running
+// UptimeSeconds returns the number of seconds the process has been running. For
+// a terminal task whose EndedAt is frozen (plan 013 D3) it reports the run
+// duration (EndedAt - StartedAt); otherwise it counts up to now.
 func (p ProcessInfo) UptimeSeconds() int64 {
 	if p.StartedAt.IsZero() {
 		return 0
 	}
-	return int64(time.Since(p.StartedAt).Seconds())
+	end := time.Now()
+	if !p.EndedAt.IsZero() {
+		end = p.EndedAt
+	}
+	return int64(end.Sub(p.StartedAt).Seconds())
 }

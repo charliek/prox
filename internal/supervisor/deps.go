@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 
@@ -611,6 +612,60 @@ func (r *Resolver) ResetIfGeneration(name string, gen uint64) bool {
 	delete(r.nodes, name)
 	r.nextGen[name]++
 	return true
+}
+
+// Redefine refreshes the stored definition for a dependency (plan 013 D6). When
+// the new config DIFFERS from the current one it swaps it in AND Resets the
+// dependency (cancels any in-flight resolution, drops the cached node, bumps the
+// generation) so the next Demand re-resolves against the fresh definition; it
+// returns whether it changed anything. An unchanged definition is a no-op, so a
+// restart that did not touch a dependency still returns its cached healthy
+// outcome without a re-probe. A name not previously known is added (a new
+// dependency introduced by a reload). Generation-safe: the Reset mirrors the
+// public primitive, so a concurrent demander of a retired generation observes a
+// canceled outcome exactly as after any Reset. Closed resolvers are a no-op.
+func (r *Resolver) Redefine(name string, cfg domain.DependencyConfig) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	if existing, ok := r.deps[name]; ok && reflect.DeepEqual(existing, cfg) {
+		return false
+	}
+	r.deps[name] = cfg
+	if node := r.nodes[name]; node != nil {
+		node.cancelNode()
+		delete(r.nodes, name)
+	}
+	r.nextGen[name]++
+	return true
+}
+
+// RetainOnly drops every dependency definition whose name is NOT in keep (plan
+// 013 fix 5): on a reload that removed a dependency, or moved a name from
+// dependency to task, the resolver must forget the stale definition so a later
+// Demand of that name no longer resolves it as a dependency. Each removed name is
+// Reset (cancel in-flight resolution, bump generation) so a concurrent demander
+// of a retired generation observes a canceled outcome, exactly as after any
+// Reset. Closed resolvers are a no-op.
+func (r *Resolver) RetainOnly(keep map[string]struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	for name := range r.deps {
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		delete(r.deps, name)
+		if node := r.nodes[name]; node != nil {
+			node.cancelNode()
+			delete(r.nodes, name)
+		}
+		r.nextGen[name]++
+	}
 }
 
 // Close cancels every in-flight resolution (supervisor shutdown). After Close,

@@ -38,6 +38,44 @@ type processInstance struct {
 	doneOnce sync.Once
 	cancel   context.CancelFunc
 	outputWg sync.WaitGroup
+
+	// exited is closed by monitor IMMEDIATELY after inst.proc.Wait() returns --
+	// BEFORE output draining (plan 013 D3, fix 6). It signals process EXIT, which
+	// can precede the monitor's state commit (done) by up to outputDrainTimeout
+	// when a grandchild holds a pipe open. The task run-budget timer watches this,
+	// not done, so a slow drain of a naturally-completed rc=0 task is not
+	// misclassified as a run-timeout crash. Closed exactly once via exitedOnce.
+	exited     chan struct{}
+	exitedOnce sync.Once
+	// claim is the single terminal-outcome commit point for a task run (plan 013
+	// D3, fix 6). The monitor CAS(none->exit)es it right after Wait; the task
+	// run-budget timer CAS(none->timeout)es it on fire. Whoever wins owns the
+	// terminal verdict, so a completed exit and a run-timeout can never both
+	// commit -- if the exit was claimed first, the timer is a no-op (completed
+	// wins, no timeout log); if the timer claimed first, the monitor defers its
+	// natural-exit commit to stopTask (which commits crashed).
+	claim atomic.Int32
+}
+
+// terminalClaim is the winner of a task run's terminal-outcome race (fix 6).
+type terminalClaim int32
+
+const (
+	claimNone    terminalClaim = 0
+	claimExit    terminalClaim = 1 // the process exited on its own (monitor)
+	claimTimeout terminalClaim = 2 // the run budget elapsed (task coordinator)
+)
+
+// claimTerminal attempts to claim the terminal outcome for a task run, returning
+// whether this caller won. Only the winner acts on the verdict.
+func (i *processInstance) claimTerminal(c terminalClaim) bool {
+	return i.claim.CompareAndSwap(int32(claimNone), int32(c))
+}
+
+// markExited closes the exited channel exactly once (called by monitor right
+// after Wait returns, before draining).
+func (i *processInstance) markExited() {
+	i.exitedOnce.Do(func() { close(i.exited) })
 }
 
 // closeDone closes the instance's done channel exactly once.
@@ -62,6 +100,16 @@ type pendingConfig struct {
 	// the #30 fresh-read-on-every-start semantics.
 	env         map[string]string
 	stopTimeout time.Duration
+	// freshDeps carries the reload's dependency definitions (converted to domain
+	// form) so the gated restart path can refresh the resolver against a reload
+	// that added or redefined a dependency, and classify depends_on targets
+	// against the fresh set (plan 013 D6). nil when reload is disabled.
+	freshDeps map[string]domain.DependencyConfig
+	// freshTasks is the reload's set of task names, used with freshDeps to REPLACE
+	// the supervisor's effective classification view on a successful reload so
+	// depends_on targets classify against current config, not the immutable
+	// startup snapshot (plan 013 fix 4/5). nil when reload is disabled.
+	freshTasks map[string]struct{}
 }
 
 // stopEpisode carries the verdict of a single in-flight Stop to any concurrent
@@ -101,10 +149,29 @@ type ManagedProcess struct {
 	// correctly attributed across a swap (#33, D3).
 	name string
 
+	// kind is the child's run mode (plan 013 D3): a plain process or a
+	// run-to-completion task. Set once at construction from the domain config's
+	// Kind (defaulted to process) and never mutated -- a reload swaps cmd/env,
+	// not the kind. Read lock-free like name; task-mode branches in monitor and
+	// stop key off it.
+	kind domain.ProcessKind
+
 	config     domain.ProcessConfig
 	env        map[string]string
 	runner     ProcessRunner
 	logManager *logs.Manager
+
+	// completedAt freezes a task's uptime at the moment it reaches
+	// ProcessStateCompleted (plan 013 D3). Info reports the frozen run duration
+	// (completedAt - startedAt) rather than letting uptime tick past completion.
+	// Guarded by p.mu; zero until a task completes.
+	completedAt time.Time
+
+	// taskTimeout / taskHasTimeout are a task's run budget (plan 013 D3),
+	// swappable on a manual re-run's reload. Meaningful only when kind is
+	// ProcessKindTask. Guarded by p.mu; read via taskBudget.
+	taskTimeout    time.Duration
+	taskHasTimeout bool
 
 	// loadEnv, if set, is called at the top of every Start to (re)load the
 	// process's environment from disk (env_file(s)) merged with inline env.
@@ -223,14 +290,33 @@ type ManagedProcess struct {
 
 // NewManagedProcess creates a new managed process
 func NewManagedProcess(config domain.ProcessConfig, env map[string]string, runner ProcessRunner, logManager *logs.Manager) *ManagedProcess {
-	return &ManagedProcess{
-		name:       config.Name,
-		config:     config,
-		env:        env,
-		runner:     runner,
-		logManager: logManager,
-		state:      domain.ProcessStateStopped,
+	kind := config.Kind
+	if kind == "" {
+		kind = domain.ProcessKindProcess
 	}
+	return &ManagedProcess{
+		name:           config.Name,
+		kind:           kind,
+		config:         config,
+		env:            env,
+		runner:         runner,
+		logManager:     logManager,
+		state:          domain.ProcessStateStopped,
+		taskTimeout:    config.TaskTimeout,
+		taskHasTimeout: config.TaskHasTimeout,
+	}
+}
+
+// isTask reports whether this managed child runs in task mode (plan 013 D3).
+// kind is immutable, so no lock is taken.
+func (p *ManagedProcess) isTask() bool { return p.kind == domain.ProcessKindTask }
+
+// taskBudget returns a task's run budget (duration, hasLimit). Meaningful only
+// for a task (plan 013 D3).
+func (p *ManagedProcess) taskBudget() (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.taskTimeout, p.taskHasTimeout
 }
 
 // Name returns the process name. Immutable, so no lock is taken.
@@ -266,6 +352,7 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 	info := domain.ProcessInfo{
 		Name:         p.config.Name,
 		State:        p.state,
+		Kind:         p.kind,
 		RestartCount: p.restartCount,
 		Health:       domain.HealthStatusUnknown,
 		Cmd:          p.config.Cmd,
@@ -281,6 +368,12 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 
 	if !p.startedAt.IsZero() {
 		info.StartedAt = p.startedAt
+	}
+
+	// A completed task freezes its uptime at completion (plan 013 D3): report
+	// the frozen end so UptimeSeconds reflects the run duration, not now-start.
+	if p.state == domain.ProcessStateCompleted && !p.completedAt.IsZero() {
+		info.EndedAt = p.completedAt
 	}
 
 	// Include health check state if checker exists
@@ -451,6 +544,48 @@ func (p *ManagedProcess) startGated(ctx context.Context, expectGen uint64) error
 	return p.startWithConfigGen(ctx, nil, &expectGen)
 }
 
+// startTask launches a task child whose own depends_on wait completed (plan 013
+// D3). Like startGated it enforces the launch generation expectGen at the final
+// gate, so a stop/restart/re-demand that superseded this run refuses the launch
+// (errLaunchSuperseded). On success it returns the launched instance so the task
+// coordinator can watch its exit (inst.exited, pre-drain) for the run-budget race
+// and its done channel for the committed terminal state.
+func (p *ManagedProcess) startTask(ctx context.Context, expectGen uint64) (*processInstance, error) {
+	if err := p.startWithConfigGen(ctx, nil, &expectGen); err != nil {
+		return nil, err
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.current, nil
+}
+
+// applyTaskReload swaps a freshly-reloaded task runtime (cmd/env/stop budget/run
+// budget) into a NON-running task before a manual re-run (plan 013 D3). It is
+// safe to mutate the stored config directly here -- the caller guarantees the
+// task is in a terminal state (completed/crashed/stopped), so no run observes a
+// torn config. The env loader closure is stored for the fresh-read-on-launch at
+// the next start.
+func (p *ManagedProcess) applyTaskReload(pending *pendingConfig) {
+	if pending == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config = pending.config
+	p.loadEnv = pending.loadEnv
+	p.shutdownTimeout = pending.stopTimeout
+	p.taskTimeout = pending.config.TaskTimeout
+	p.taskHasTimeout = pending.config.TaskHasTimeout
+}
+
+// bumpRestart increments the restart count for a manual task re-run (plan 013
+// D3), reusing the same counter surfaced for processes.
+func (p *ManagedProcess) bumpRestart() {
+	p.mu.Lock()
+	p.restartCount++
+	p.mu.Unlock()
+}
+
 // startWithConfigGen is the shared launch wrapper: it runs the locked launch
 // (optionally reloading pending config and/or enforcing a launch generation) and
 // persists the orphan-reaping ledger via onLaunched AFTER p.mu is released (see
@@ -571,7 +706,7 @@ func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pen
 	p.state = domain.ProcessStateStarting
 
 	// Build a fresh instance for this run.
-	inst := &processInstance{done: make(chan struct{})}
+	inst := &processInstance{done: make(chan struct{}), exited: make(chan struct{})}
 	processCtx, cancel := context.WithCancel(ctx)
 	inst.cancel = cancel
 
@@ -670,11 +805,44 @@ func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline
 
 // Stop stops the process gracefully, escalating to SIGKILL if the group does
 // not exit within the graceful window, and reports an error only if the group
-// truly survives. See design doc D3.
-func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
+// truly survives. See design doc D3. A clean reap settles the process in
+// stopped.
+func (p *ManagedProcess) Stop(ctx context.Context) error {
+	return p.stop(ctx, domain.ProcessStateStopped)
+}
+
+// stopTask stops a task's run and settles it in CRASHED rather than stopped
+// (plan 013 D3). It is the run-timeout escalation path: the run budget already
+// expired, so the child is signalled (SIGTERM->SIGKILL) exactly like a normal
+// stop -- reusing the group-reap machinery -- but the terminal verdict is
+// crashed, since a timed-out task did not complete.
+func (p *ManagedProcess) stopTask(ctx context.Context) error {
+	return p.stop(ctx, domain.ProcessStateCrashed)
+}
+
+// stop is the shared stop implementation. cleanState is the terminal state
+// committed when the group is confirmed reaped (stopped for a normal stop,
+// crashed for a task run-timeout). A surviving group always commits crashed
+// regardless; the error paths are unchanged.
+func (p *ManagedProcess) stop(ctx context.Context, cleanState domain.ProcessState) (retErr error) {
 	p.mu.Lock()
 
 	switch p.state {
+	case domain.ProcessStateCompleted:
+		// A finished task (plan 013 D3). Normally there is nothing to reap -- a
+		// stop/down of a completed task is a no-op success, and it must NOT be
+		// reclassified to stopped. But if a grandchild outlived the leader's exit
+		// its group may still be alive; fall through to reap it (retry path),
+		// mirroring the stopped/crashed surviving-group case below.
+		if p.current == nil || p.current.proc == nil {
+			p.mu.Unlock()
+			return nil
+		}
+		if alive, _ := p.current.proc.GroupAlive(); !alive {
+			p.mu.Unlock()
+			return nil
+		}
+		// Surviving group: fall through to reap it.
 	case domain.ProcessStateWaiting:
 		// Gated process whose dependency wait is still pending (or just resolved
 		// but not yet launched). Supersede any resolved-but-unlaunched coordinator
@@ -793,7 +961,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 
 	if inst == nil || inst.proc == nil {
 		p.mu.Lock()
-		p.state = domain.ProcessStateStopped
+		p.state = cleanState
 		p.resolveStopEpisodeLocked(ep, nil)
 		p.mu.Unlock()
 		return nil
@@ -864,7 +1032,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 			// Group survived: keep current so a later stop/restart can retry.
 			p.state = domain.ProcessStateCrashed
 		} else {
-			p.state = domain.ProcessStateStopped
+			p.state = cleanState
 		}
 	}
 	if inst.cancel != nil {
@@ -986,6 +1154,15 @@ func (p *ManagedProcess) Restart(stopCtx, startCtx context.Context, pending *pen
 func (p *ManagedProcess) monitor(inst *processInstance) {
 	err := inst.proc.Wait()
 
+	// Claim the terminal outcome and signal EXIT before draining (plan 013 D3,
+	// fix 6). claimedExit is false only when a task's run-budget timer already
+	// claimed a timeout; in that case the natural-exit commit below is skipped so
+	// stopTask (already escalating) owns the crashed verdict. markExited unblocks
+	// the run-budget timer's exit race immediately, well before a slow grandchild
+	// drain would otherwise settle done.
+	claimedExit := inst.claimTerminal(claimExit)
+	inst.markExited()
+
 	// Wait for this instance's output readers to finish draining pipes with a
 	// timeout. With manual pipes (not cmd.StdoutPipe), the pipes stay open
 	// until all processes (including grandchildren) close them, so graceful
@@ -1023,9 +1200,27 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 			// this log precedes Stop's final verdict.
 			p.logf(domain.StreamStdout, "stopped (rc=%d)", exitCode)
 		case domain.ProcessStateRunning, domain.ProcessStateStarting:
-			// Genuine unexpected exit (crash / natural exit not driven by Stop).
-			p.state = domain.ProcessStateCrashed
-			p.logf(domain.StreamStderr, "exited unexpectedly (rc=%d)", exitCode)
+			// A leader exit not driven by Stop. For a TASK (plan 013 D3), a natural
+			// exit 0 is success -> completed (uptime frozen here); any non-zero or
+			// signal exit -> crashed. A plain process ALWAYS crashes on a leader exit,
+			// rc=0 included (a service is not supposed to exit) -- this asymmetry is
+			// deliberately gated on kind so plain-process semantics are byte-for-byte
+			// unchanged. Surviving grandchildren (a group that outlives the leader)
+			// go through the existing orphan-reaping machinery via the retained
+			// p.current below and Stop's surviving-group path.
+			switch {
+			case !claimedExit:
+				// A task run-budget timer claimed a timeout before this exit was
+				// recorded (fix 6): stopTask owns the crashed verdict, so do NOT commit
+				// a natural-exit state here. Reachable only for a task.
+			case p.kind == domain.ProcessKindTask && exitCode == 0:
+				p.state = domain.ProcessStateCompleted
+				p.completedAt = time.Now()
+				p.logf(domain.StreamStdout, "task completed (rc=0)")
+			default:
+				p.state = domain.ProcessStateCrashed
+				p.logf(domain.StreamStderr, "exited unexpectedly (rc=%d)", exitCode)
+			}
 		default:
 			// State is already terminal (stopped/crashed) -- Stop committed a
 			// verdict before this monitor ran (only reachable if Stop's

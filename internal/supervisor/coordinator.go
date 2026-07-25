@@ -14,8 +14,8 @@ import (
 
 // This file is the dependency GRAPH COORDINATOR (plan 013 C3 / D4). It sits on
 // top of the resolver engine (deps.go) and gates PROCESS launches on their
-// depends_on targets. Task execution (tasks-as-children) is C4; here a task
-// target is a clearly-marked seam (see demandTarget).
+// depends_on targets. A DEPENDENCY target resolves via the resolver; a TASK
+// target resolves via the task coordinator (tasks.go) -- see demandTarget.
 //
 // # Model
 //
@@ -55,15 +55,7 @@ var errLaunchSuperseded = errors.New("gated launch superseded")
 // rather than failing the whole run. It is the default s.newResolver; tests
 // replace that seam to inject scripted seams.
 func (s *Supervisor) buildDefaultResolver() *Resolver {
-	deps := make(map[string]domain.DependencyConfig, len(s.config.Dependencies))
-	for name, dc := range s.config.Dependencies {
-		dd, err := dc.ToDomain(name)
-		if err != nil {
-			s.systemErrorf("dependency %q: invalid config, skipped: %v", name, err)
-			continue
-		}
-		deps[name] = dd
-	}
+	deps := s.domainDependencies(s.config)
 	// Dependency start:/cmd: seams run under the same environment overlay a
 	// process gets from the top-level env_file (see NewResolver). A load failure
 	// degrades to the bare os environment rather than failing startup.
@@ -74,6 +66,40 @@ func (s *Supervisor) buildDefaultResolver() *Resolver {
 		overlay = env
 	}
 	return NewResolver(deps, s.supConfig.ConfigDir, overlay, s.SystemLog)
+}
+
+// domainDependencies converts a config's dependencies: block to the resolver's
+// domain form (plan 013 D4/D6). An individual dependency whose config fails to
+// convert (already rejected by validation, so unreachable on the normal path) is
+// logged and skipped rather than failing the whole conversion. Shared by
+// buildDefaultResolver (up-time) and prepareReload (the fresh set carried on a
+// pending config for the D6 restart refresh).
+func (s *Supervisor) domainDependencies(cfg *config.Config) map[string]domain.DependencyConfig {
+	deps := make(map[string]domain.DependencyConfig, len(cfg.Dependencies))
+	for name, dc := range cfg.Dependencies {
+		dd, err := dc.ToDomain(name)
+		if err != nil {
+			s.systemErrorf("dependency %q: invalid config, skipped: %v", name, err)
+			continue
+		}
+		deps[name] = dd
+	}
+	return deps
+}
+
+// prepareRestartTargets selects the targets a gated restart / task re-run
+// re-resolves against, installing the reload's classification view and resolver
+// definitions first (plan 013 D6, fix 4/5). With a pending reload it calls
+// applyReloadGraph (replaces the effective view, Redefines changed/new
+// dependencies, prunes removed/migrated ones) and governs by the reload's
+// depends_on; without one it keeps the current targets. Classification always
+// goes through s.classifyDependency, which reads the (now fresh) effective view.
+func (s *Supervisor) prepareRestartTargets(pending *pendingConfig, current []string) ([]string, func(string) bool) {
+	if pending == nil {
+		return current, s.classifyDependency
+	}
+	s.applyReloadGraph(pending)
+	return pending.config.DependsOn, s.classifyDependency
 }
 
 // admitGated ATOMICALLY admits a gated process into a fresh orchestration
@@ -147,32 +173,8 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 	// supCtx, not procCtx, so this never disturbs it.
 	defer procCancel()
 
-	// Resolve targets concurrently -- dependencies are independent roots, so there
-	// is no reason to serialize their probes -- and aggregate in declaration order.
-	outcomes := make([]DepOutcome, len(targets))
-	var wg sync.WaitGroup
-	for i, target := range targets {
-		wg.Add(1)
-		go func(i int, target string) {
-			defer wg.Done()
-			outcomes[i] = s.demandTarget(procCtx, target)
-		}(i, target)
-	}
-	wg.Wait()
-
-	canceled := false
-	var blockedBy []string
-	for i, target := range targets {
-		switch o := outcomes[i]; {
-		case o.Canceled():
-			// A canceled resolution (shutdown or per-process stop) is NOT a failure
-			// and takes precedence over any blocking: the stopping path owns the
-			// terminal state, so we neither launch nor block.
-			canceled = true
-		case !o.Ready():
-			blockedBy = append(blockedBy, target)
-		}
-	}
+	// Resolve targets concurrently and aggregate in declaration order.
+	canceled, blockedBy := s.demandTargets(procCtx, targets, s.classifyDependency)
 
 	if canceled {
 		// A canceled wait means shutdown, a per-process stop, or a superseding
@@ -229,26 +231,140 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 	})
 }
 
+// demandTargets resolves a set of depends_on targets concurrently and aggregates
+// the outcome in declaration order (plan 013 D4/D3). Targets are independent
+// roots, so their demands run in parallel. It returns whether ANY target's
+// resolution was canceled -- shutdown or a per-process stop, which is NOT a
+// failure and takes precedence: the stopping path owns the terminal state, so the
+// caller neither launches nor blocks -- and the not-ready targets (the blockers)
+// in declaration order. Shared by orchestrate (a gated process's depends_on) and
+// executeTask (a task's own depends_on).
+func (s *Supervisor) demandTargets(ctx context.Context, targets []string, isDep func(string) bool) (canceled bool, blockedBy []string) {
+	outcomes := make([]DepOutcome, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		go func(i int, target string) {
+			defer wg.Done()
+			outcomes[i] = s.demandTarget(ctx, target, isDep)
+		}(i, target)
+	}
+	wg.Wait()
+
+	for i, target := range targets {
+		switch o := outcomes[i]; {
+		case o.Canceled():
+			canceled = true
+		case !o.Ready():
+			blockedBy = append(blockedBy, target)
+		}
+	}
+	return canceled, blockedBy
+}
+
 // demandTarget resolves a single depends_on target to a readiness outcome (plan
-// 013 D4).
+// 013 D4/D3). A DEPENDENCY target is demanded from the resolver; a TASK target is
+// demanded from the task coordinator (tasks.go), which runs the task once per
+// supervisor lifetime and resolves it to completed -> ready or crashed/blocked ->
+// failed. Config validation guarantees a target is either a dependency or a task.
 //
-// C3 supports DEPENDENCY targets only: they are demanded from the resolver. TASK
-// targets are the C4 seam -- task execution does not exist yet, so a task target
-// cannot be satisfied. Rather than hang the dependent process in waiting forever,
-// it is reported as a readiness failure so the process becomes blocked with a
-// clear reason. Config validation guarantees a target is either a dependency or a
-// task, so the else branch is always a task.
+// isDep classifies the name; classifyDependency reads the effective view, which a
+// reload replaces (plan 013 D6, fix 4/5).
 //
-// TODO(plan 013 C4): route task targets through the task coordinator (tasks run
-// as children and resolve to completed/failed) instead of this stub.
-func (s *Supervisor) demandTarget(ctx context.Context, name string) DepOutcome {
-	if _, ok := s.config.Dependencies[name]; ok {
-		return s.resolver.Demand(ctx, name)
+// Retirement re-demand (plan 013 fix 1): a canceled outcome is AMBIGUOUS. It
+// means either (a) the DEMANDER's own wait ended (shutdown / a stop of this
+// process) -- in which case the stopping path owns the state and we return the
+// cancel -- or (b) the TARGET's node/generation was RETIRED mid-flight (a task
+// re-run retiring its node, a dependency Redefine/RetainOnly cancelling a
+// generation) while this demander is still live. In case (b) returning canceled
+// would strand the demander forever (e.g. a process waiting on a task that is
+// being re-run). So: while our OWN ctx is still live, a canceled outcome means the
+// target was retired -- re-demand, joining the replacement node / fresh
+// generation. The loop blocks on each new in-flight resolution, so it cannot spin
+// (a genuinely-gone target resolves to failed/unknown, not canceled), and it is
+// bounded by ctx: once the demander's own wait is canceled, the cancel propagates.
+func (s *Supervisor) demandTarget(ctx context.Context, name string, isDep func(string) bool) DepOutcome {
+	for {
+		var out DepOutcome
+		if isDep(name) {
+			out = s.resolver.Demand(ctx, name)
+		} else {
+			out = s.demandTask(ctx, name)
+		}
+		if !out.Canceled() || ctx.Err() != nil {
+			return out
+		}
+		// Target retired while our episode is still current: re-demand.
 	}
-	return DepOutcome{
-		State: DepStateFailed,
-		Err:   fmt.Errorf("task dependency %q not yet startable (task execution lands in a later change)", name),
+}
+
+// classifyDependency is the depends_on classifier: a name is a dependency iff it
+// is in the supervisor's effective classification view (plan 013 D4, fix 4/5),
+// otherwise it is a task. The view is replaced on a successful reload
+// (applyReloadGraph), so this reflects CURRENT config -- a reloaded/rerun episode
+// classifies its targets correctly. Validation guarantees every target is one or
+// the other. Falls back to the up-time config before the first Start (view nil).
+func (s *Supervisor) classifyDependency(name string) bool {
+	s.mu.RLock()
+	eff := s.effective
+	s.mu.RUnlock()
+	if eff == nil {
+		_, ok := s.config.Dependencies[name]
+		return ok
 	}
+	_, ok := eff.deps[name]
+	return ok
+}
+
+// buildEffectiveGraph snapshots a config's dependency and task name sets for the
+// classification view (plan 013 fix 4/5).
+func buildEffectiveGraph(cfg *config.Config) *effectiveGraph {
+	eff := &effectiveGraph{
+		deps:  make(map[string]struct{}, len(cfg.Dependencies)),
+		tasks: make(map[string]struct{}, len(cfg.Tasks)),
+	}
+	for name := range cfg.Dependencies {
+		eff.deps[name] = struct{}{}
+	}
+	for name := range cfg.Tasks {
+		eff.tasks[name] = struct{}{}
+	}
+	return eff
+}
+
+// applyReloadGraph installs a reload's classification view and refreshes the
+// resolver to match (plan 013 fix 4/5). It REPLACES (never unions) the effective
+// view from the reload's fresh dependency/task sets, then refreshes the resolver:
+// Redefine every changed/new dependency and RetainOnly the fresh set so a removed
+// or migrated (dependency->task) name is forgotten. Ordering: swap the view first
+// so a concurrent classification never sees a dependency the resolver has already
+// dropped.
+func (s *Supervisor) applyReloadGraph(pending *pendingConfig) {
+	if pending == nil {
+		return
+	}
+	eff := &effectiveGraph{
+		deps:  make(map[string]struct{}, len(pending.freshDeps)),
+		tasks: make(map[string]struct{}, len(pending.freshTasks)),
+	}
+	for name := range pending.freshDeps {
+		eff.deps[name] = struct{}{}
+	}
+	for name := range pending.freshTasks {
+		eff.tasks[name] = struct{}{}
+	}
+	s.mu.Lock()
+	s.effective = eff
+	resolver := s.resolver
+	s.mu.Unlock()
+
+	if resolver == nil {
+		return
+	}
+	for name, dd := range pending.freshDeps {
+		resolver.Redefine(name, dd)
+	}
+	resolver.RetainOnly(eff.deps)
 }
 
 // startProcessGated handles a manual StartProcess for a gated process (plan 013
@@ -306,14 +422,13 @@ func (s *Supervisor) restartProcessGated(ctx context.Context, mp *ManagedProcess
 		return err
 	}
 
-	// Re-resolve every target BEFORE the stop. A failed re-resolution returns with
-	// the running process untouched. When a reload changed depends_on, the fresh
-	// config's targets govern (pending carries them); otherwise the current ones.
-	targets := mp.Config().DependsOn
-	if pending != nil {
-		targets = pending.config.DependsOn
-	}
-	if err := s.reresolveTargets(targets); err != nil {
+	// Re-resolve every target BEFORE the stop, against the reload's fresh
+	// dependency definitions (plan 013 D6): otherwise re-resolution runs against
+	// the resolver's up-time definitions and a reload that added or redefined a
+	// dependency would not be seen. A failed re-resolution returns with the running
+	// process untouched.
+	targets, isDep := s.prepareRestartTargets(pending, mp.Config().DependsOn)
+	if err := s.reresolveTargets(targets, isDep); err != nil {
 		return err
 	}
 
@@ -348,7 +463,7 @@ func (s *Supervisor) restartProcessGated(ctx context.Context, mp *ManagedProcess
 // The demand uses coordCtx (shutdown-cancelable) rather than the request context
 // so a short API deadline does not spuriously cut a dependency's readiness budget
 // short; the dependency's own timeout still bounds the wait.
-func (s *Supervisor) reresolveTargets(targets []string) error {
+func (s *Supervisor) reresolveTargets(targets []string, isDep func(string) bool) error {
 	s.mu.RLock()
 	coordCtx := s.coordCtx
 	s.mu.RUnlock()
@@ -357,10 +472,12 @@ func (s *Supervisor) reresolveTargets(targets []string) error {
 	}
 
 	for _, target := range targets {
-		s.resetFailedTarget(target)
+		if isDep(target) {
+			s.resetFailedTarget(target)
+		}
 	}
 	for _, target := range targets {
-		outcome := s.demandTarget(coordCtx, target)
+		outcome := s.demandTarget(coordCtx, target, isDep)
 		if outcome.Canceled() {
 			return fmt.Errorf("restart aborted: dependency %q resolution canceled: %w", target, outcome.Err)
 		}
