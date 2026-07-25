@@ -2,7 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.2.2
+
+An exit-contract polish pass (plan 011, PR #77): `prox status` and `prox
+stop`/`prox down` exit codes now tell the whole truth (crashed children and
+wedged daemon teardowns exit 1), a crashed project's proxied routes converge
+in about one request instead of up to 30 seconds, and the repo gained a
+CLAUDE.md for agent sessions.
+
+> **Upgrading:** as with previous releases, the shared daemon requires an
+> exact version match with its clients. After installing this release, stop
+> the old daemon and restart every project: `prox proxy stop --force`, then
+> `prox up -d` in each project — or run `prox up` in one project and let the
+> idle-daemon auto-heal replace it. Scripts keying on `prox status` /
+> `prox stop` exit codes: read the Breaking entries below.
 
 ### Breaking
 
@@ -60,6 +73,12 @@ All notable changes to this project will be documented in this file.
   502 that arrives right after the crash is never missed. The 30s sweep remains
   the backstop for cases with no live 502 to trigger on (backend-authored 502s,
   mid-stream aborts, and dead projects receiving no traffic).
+
+### Docs
+
+- **Repo CLAUDE.md** (#75): working conventions for agent-driven development
+  — per-commit gate, plans convention, the port-15561 test-fixture pitfall,
+  the daemon argv decoy, and the release convention.
 
 ## v0.2.1
 
