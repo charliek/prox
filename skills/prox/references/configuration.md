@@ -281,7 +281,7 @@ certs:
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
 | `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
-| `proxy.capture.enabled` | bool | `false` | Capture request and response body metadata for proxied requests |
+| `proxy.capture.enabled` | bool | `true` | Capture request/response headers and bodies for proxied requests (see Request Capture below for the full field list) |
 | `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
 
 ### Shared Proxy Daemon
@@ -322,18 +322,39 @@ services:
 
 ### Request Capture
 
-Request capture records request and response body metadata for the `prox requests <id>` detail view. Bodies up to `proxy.capture.max_body_size` are retained; larger bodies are truncated. This cap is enforced per project: when several projects share one proxy daemon, each project's `max_body_size` (sent to the daemon at registration) governs only that project's captures — one project cannot inflate or shrink another's capture limit.
+**Capture is on by default whenever the proxy is enabled.** A proxy-enabled project records request/response headers and bodies for the `prox requests <id>` detail view with no extra config — set `enabled: false` (or pass `--no-capture`) to opt out. Works identically standalone or through the shared daemon; a capture-disabled project sharing a daemon with capture-enabled ones still gets metadata-only records for itself.
 
 ```yaml
 proxy:
   https_port: 6789
   domain: local.myapp.dev
   capture:
-    enabled: true
+    enabled: true       # default; omit the whole capture: block to get this
     max_body_size: 1MB
+    disk_budget: 1GB
+    redact: true
+    redact_headers: []
+    redact_query_params: []
 ```
 
-Captured body files are stored under `.prox/capture/` and cleaned up as request records age out of the in-memory request buffer.
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` when `proxy.enabled` is true | Master switch. `false` records metadata only (no headers/bodies) |
+| `max_body_size` | string | `1MB` | Maximum body size to capture per record; larger bodies are truncated |
+| `disk_budget` | string | `1GB` (1 GiB) | Ceiling on total spilled body bytes on disk; see below |
+| `redact` | bool | `true` | Redact sensitive headers/query params at capture time; see below |
+| `redact_headers` | []string | — | Extra header names to redact. **Extends**, never replaces, the built-in list |
+| `redact_query_params` | []string | — | Extra query-param names to redact. **Extends**, never replaces, the built-in list |
+
+**How eviction works.** Only bodies over 64KB spill to disk; those files count against one budget — a project's own `disk_budget` in standalone mode, or, on a shared daemon, the **minimum** across every capture-enabled project's `disk_budget` (unset = `1GB` default). An explicit value can only lower the shared bound; raising it above the default needs every capture-enabled project to opt in (e.g. `{A: 2GB, B: unset}` → `min(2GB, 1GB)` = `1GB`; both set to `2GB` → `2GB`). Over budget, prox evicts the **oldest record group first** (a record's request+response spill files age together, FIFO by first-spill time, never LRU) across every project sharing the daemon. Only spilled files are removed — ring metadata survives, and a fetch for an evicted body reports it as no longer available.
+
+**Redaction behavior.** Runs at capture time, before disk/API/TUI ever see the record. Built-in header redaction always replaces `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` values with `[REDACTED]`. Built-in query-param redaction always replaces `access_token`, `refresh_token`, `id_token`, `token`, `api_key`, `apikey`, `client_secret`, `code` values with `REDACTED` — in the request URL, inside `Location`/`Referer` header values, and inside URL fragments (OAuth implicit-flow tokens). Userinfo passwords in URLs are redacted too (username kept). `redact_headers`/`redact_query_params` extend, never replace, these lists.
+
+> **Limitation: bodies are NOT redacted.** Request/response bodies are captured and stored verbatim — inline or in `~/.prox/capture` spill files — including any secrets in JSON/form payloads. Neither `redact_headers` nor a smaller `max_body_size` prevents this. The only reliable per-project opt-out for secret-carrying bodies is `enabled: false`.
+
+Captured body files are stored under `.prox/capture/` (standalone) or the shared daemon's `~/.prox/capture/` (one flat dir for every project) and cleaned up as request records age out of the in-memory request buffer. Make sure `.prox/` is in `.gitignore` (see above) — doubly important now that capture is on by default.
+
+`prox proxy status --json` reports `capture_available`/`capture_error` (whether the daemon's own capture manager initialized) and `capture_disk_used`/`capture_disk_budget` (the effective daemon-wide totals above).
 
 ### Prerequisites (HTTPS only)
 

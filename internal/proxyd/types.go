@@ -30,6 +30,27 @@ type RegisterRequest struct {
 	// (DefaultCaptureMaxBodySize). Wire-compatible in both directions: an older
 	// daemon ignores the unknown field, and an omitted field decodes to 0.
 	MaxBodySize int64 `json:"max_body_size,omitempty"`
+	// DiskBudget is the project's configured capture disk budget in BYTES (#69),
+	// populated from cfg.Proxy.Capture.DiskBudget; 0 means "use the daemon
+	// default" (DefaultCaptureDiskBudget). The daemon folds every registered
+	// capture-enabled project's budget into a single effective daemon-wide bound
+	// for the one shared capture dir: the min of each project's budget-or-default
+	// (an unset project contributes the default, so one project can never raise
+	// another's bound; raising above the default takes every enabled project
+	// opting in — see EffectiveCaptureDiskBudget). Wire-compatible in both
+	// directions: an older daemon ignores the unknown field, and an omitted field
+	// decodes to 0.
+	DiskBudget int64 `json:"disk_budget,omitempty"`
+	// Redact, RedactHeaders, and RedactQueryParams carry the project's
+	// capture-time redaction policy (plan 012 D4). Redact is consulted per request
+	// on the hot path (URL + header redaction), so unlike DiskBudget it is stamped
+	// onto every Route. The two lists EXTEND the built-in redaction sets and arrive
+	// already canonicalized/lowercased and de-duplicated from config parse.
+	// Wire-compatible in both directions: an older daemon ignores the unknown
+	// fields; omitted fields decode to the zero value (Redact=false, nil lists).
+	Redact            bool     `json:"redact,omitempty"`
+	RedactHeaders     []string `json:"redact_headers,omitempty"`
+	RedactQueryParams []string `json:"redact_query_params,omitempty"`
 	// StartTime is an opaque process start token (see daemon.ProcessStartTime):
 	// a generation discriminator, not a timestamp. 0 means the client could not
 	// read it, so the daemon falls back to bare-PID liveness for this holder.
@@ -77,6 +98,21 @@ type DaemonStatusResponse struct {
 	// keyed by project dir (D13). It makes the N×ring memory trade-off of the
 	// per-project rings diagnosable. Empty when no project is registered.
 	RecordCounts map[string]int `json:"record_counts,omitempty"`
+	// CaptureDiskUsed is the total logical bytes of spilled capture body files on
+	// disk across ALL projects (the daemon's flat capture dir), and
+	// CaptureDiskBudget is the effective daemon-wide ceiling enforced against it
+	// (#69). Both are 0 when the daemon has no capture manager.
+	CaptureDiskUsed   int64 `json:"capture_disk_used"`
+	CaptureDiskBudget int64 `json:"capture_disk_budget"`
+	// CaptureAvailable reports whether the daemon initialized a capture manager
+	// at startup (plan 012 D1, C4). false here means capture cannot work for ANY
+	// project on this daemon regardless of their own proxy.capture.enabled --
+	// distinct from a project simply choosing capture off. CaptureError carries
+	// the init failure reason (e.g. home directory unresolved, capture dir
+	// uncreatable) when CaptureAvailable is false; empty when capture is
+	// available or the daemon predates this field.
+	CaptureAvailable bool   `json:"capture_available"`
+	CaptureError     string `json:"capture_error,omitempty"`
 }
 
 // ErrorResponse is the standard error format for daemon API responses.

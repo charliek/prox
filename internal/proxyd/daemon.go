@@ -175,11 +175,18 @@ func RunDaemon(ctx context.Context) error {
 	// Create the daemon's capture manager, rooted at ~/.prox/capture. Resolve
 	// the home directory explicitly; on failure log and run without capture
 	// (nil manager, capture disabled) rather than failing the daemon.
+	// captureInitErr records the reason for /status (plan 012 D1, C4): it
+	// distinguishes "capture unavailable in the daemon" from a project's own
+	// proxy.capture.enabled: false, wired onto the server below via
+	// SetCaptureInitError.
 	var captureMgr *proxy.CaptureManager
+	var captureInitErr string
 	if homeDir, herr := os.UserHomeDir(); herr != nil {
 		logger.Warn("could not resolve home directory; running without request capture", "error", herr)
+		captureInitErr = fmt.Sprintf("could not resolve home directory: %v", herr)
 	} else if cm, cerr := proxy.NewCaptureManagerAt(constants.DaemonCaptureDir(homeDir), constants.DefaultCaptureMaxBodySize); cerr != nil {
 		logger.Warn("could not initialize capture manager; running without request capture", "error", cerr)
+		captureInitErr = cerr.Error()
 	} else {
 		captureMgr = cm
 	}
@@ -215,6 +222,12 @@ func RunDaemon(ctx context.Context) error {
 	server.SetRegistry(registry)
 	server.SetProxy(dynamicProxy)
 	server.SetManagers(managers)
+	// Wire the shared capture manager so the server can push the registry's
+	// effective capture disk budget onto it after every committed registry
+	// mutation (#69). nil when capture is disabled — SetCaptureManager and
+	// syncCaptureBudget both tolerate that.
+	server.SetCaptureManager(captureMgr)
+	server.SetCaptureInitError(captureInitErr)
 
 	// Wire the on-502 dead-owner probe's reap callback (#74). When a route's
 	// backend transport fails, the dynamic proxy probes the owning prox up

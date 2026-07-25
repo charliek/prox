@@ -97,6 +97,37 @@ func Validate(config *Config) error {
 		if config.Proxy.Domain != "" && !domainRegex.MatchString(config.Proxy.Domain) {
 			errs = append(errs, fmt.Sprintf("proxy.domain: invalid domain format %q", config.Proxy.Domain))
 		}
+
+		// Validate capture disk budget if set (#69). Empty means "use the default"
+		// (constants.DefaultCaptureDiskBudget); anything else must parse and be
+		// positive. A budget smaller than max_body_size is intentionally allowed
+		// (no warning infra exists): the accountant evicts an oversized single
+		// spill as the oldest-and-only group, so a tiny budget still converges.
+		if config.Proxy.Capture != nil && config.Proxy.Capture.DiskBudget != "" {
+			n, err := ParseSize(config.Proxy.Capture.DiskBudget)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("proxy.capture.disk_budget: %s", err.Error()))
+			} else if n <= 0 {
+				errs = append(errs, fmt.Sprintf("proxy.capture.disk_budget: must be positive, got %q", config.Proxy.Capture.DiskBudget))
+			}
+		}
+
+		// Validate the redaction extension lists (plan 012 D4). Both extend the
+		// built-in sets, so entries must be non-empty; redact_headers entries must
+		// additionally be usable HTTP field names (no spaces/colons/control chars)
+		// so canonicalization and header matching behave.
+		if config.Proxy.Capture != nil {
+			for _, name := range config.Proxy.Capture.RedactHeaders {
+				if err := validateRedactHeaderName(name); err != nil {
+					errs = append(errs, fmt.Sprintf("proxy.capture.redact_headers: %s", err.Error()))
+				}
+			}
+			for _, name := range config.Proxy.Capture.RedactQueryParams {
+				if name == "" {
+					errs = append(errs, "proxy.capture.redact_query_params: entry cannot be empty")
+				}
+			}
+		}
 	}
 
 	// Validate certs config if present
@@ -136,6 +167,39 @@ func Validate(config *Config) error {
 	}
 
 	return nil
+}
+
+// validateRedactHeaderName checks a redact_headers entry is a usable HTTP field
+// name (plan 012 D4): non-empty and composed entirely of RFC 7230 "tchar"
+// token characters (ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" / "*" /
+// "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"). Anything else — commas,
+// slashes, non-ASCII bytes, spaces, colons, control characters — is rejected:
+// those bytes can slip past a naive check yet still make
+// http.CanonicalHeaderKey refuse to canonicalize the value, so the configured
+// header would silently never match at redaction time.
+func validateRedactHeaderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("entry cannot be empty")
+	}
+	for _, r := range name {
+		if !isTokenChar(r) {
+			return fmt.Errorf("invalid header name %q (must be a valid HTTP token: letters, digits, or !#$%%&'*+-.^_`|~)", name)
+		}
+	}
+	return nil
+}
+
+// isTokenChar reports whether r is an RFC 7230 "tchar" (the character class
+// allowed in HTTP token productions such as header field names).
+func isTokenChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		return true
+	default:
+		return false
+	}
 }
 
 // validateServiceName checks if a service name is valid as a subdomain

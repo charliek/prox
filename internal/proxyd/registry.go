@@ -2,10 +2,13 @@ package proxyd
 
 import (
 	"fmt"
+	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
 )
 
@@ -40,6 +43,14 @@ type Route struct {
 	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
 	// proxy passes it as the per-call capture limit; 0 means the daemon default.
 	MaxBodySize int64
+	// Redact, RedactHeaders, and RedactQueryParams are the project's capture-time
+	// redaction policy (plan 012 D4), stamped from the registration. Unlike
+	// DiskBudget these ARE consulted per request on the hot path (the dynamic
+	// proxy folds them into a CapturePolicy), so they live on the route. The
+	// slices are deep-copied on register so no route aliases the caller's slice.
+	Redact            bool
+	RedactHeaders     []string
+	RedactQueryParams []string
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -57,6 +68,18 @@ type ProjectRegistration struct {
 	// MaxBodySize is the project's per-request/response capture cap in bytes
 	// (D13, #49); 0 means the daemon default. Stamped onto each Route.
 	MaxBodySize int64
+	// DiskBudget is the project's configured capture disk budget in bytes (#69);
+	// 0 means the daemon default. NOT stamped per-route (the hot path never
+	// consults it) — the daemon folds every capture-enabled project's budget into
+	// one effective daemon-wide bound via EffectiveCaptureDiskBudget.
+	DiskBudget int64
+	// Redact, RedactHeaders, and RedactQueryParams are the project's capture-time
+	// redaction policy (plan 012 D4), stamped onto each Route. registrationMatches
+	// compares all three (the lists as order-insensitive SETS) so a changed
+	// redaction config forces a real re-register.
+	Redact            bool
+	RedactHeaders     []string
+	RedactQueryParams []string
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -86,6 +109,39 @@ func NewRegistry() *Registry {
 // routeKey builds the map key for a route.
 func routeKey(hostname string, port int) string {
 	return fmt.Sprintf("%s:%d", hostname, port)
+}
+
+// copyStrings returns a deep copy of s (nil for empty), so a Route or snapshot
+// never aliases the caller's redaction slice (plan 012 D4).
+func copyStrings(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	return append([]string(nil), s...)
+}
+
+// stringSetsEqual reports whether a and b hold the same values as SETS
+// (order- and duplicate-insensitive) after normalizing each entry with norm.
+// registrationMatches uses it so a reordered redaction list is a no-op refresh
+// while changed content forces a real re-register (plan 012 D4).
+func stringSetsEqual(a, b []string, norm func(string) string) bool {
+	sa := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		sa[norm(s)] = struct{}{}
+	}
+	sb := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		sb[norm(s)] = struct{}{}
+	}
+	if len(sa) != len(sb) {
+		return false
+	}
+	for k := range sa {
+		if _, ok := sb[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ProjectConflictError is returned by Register when the target project dir is
@@ -195,16 +251,19 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	for _, p := range pending {
 		key := routeKey(p.hostname, p.port)
 		r.routes[key] = &Route{
-			Hostname:       p.hostname,
-			Port:           p.port,
-			Protocol:       p.protocol,
-			Target:         p.target,
-			ProjectDir:     req.ProjectDir,
-			PID:            req.PID,
-			StartTime:      req.StartTime,
-			RegisteredAt:   now,
-			CaptureEnabled: req.CaptureEnabled,
-			MaxBodySize:    req.MaxBodySize,
+			Hostname:          p.hostname,
+			Port:              p.port,
+			Protocol:          p.protocol,
+			Target:            p.target,
+			ProjectDir:        req.ProjectDir,
+			PID:               req.PID,
+			StartTime:         req.StartTime,
+			RegisteredAt:      now,
+			CaptureEnabled:    req.CaptureEnabled,
+			MaxBodySize:       req.MaxBodySize,
+			Redact:            req.Redact,
+			RedactHeaders:     copyStrings(req.RedactHeaders),
+			RedactQueryParams: copyStrings(req.RedactQueryParams),
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -223,14 +282,18 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	r.projects[req.ProjectDir] = &ProjectRegistration{
-		Dir:            req.ProjectDir,
-		PID:            req.PID,
-		Domain:         req.Domain,
-		RouteKeys:      routeKeys,
-		StartTime:      req.StartTime,
-		RegisteredAt:   now,
-		CaptureEnabled: req.CaptureEnabled,
-		MaxBodySize:    req.MaxBodySize,
+		Dir:               req.ProjectDir,
+		PID:               req.PID,
+		Domain:            req.Domain,
+		RouteKeys:         routeKeys,
+		StartTime:         req.StartTime,
+		RegisteredAt:      now,
+		CaptureEnabled:    req.CaptureEnabled,
+		MaxBodySize:       req.MaxBodySize,
+		DiskBudget:        req.DiskBudget,
+		Redact:            req.Redact,
+		RedactHeaders:     copyStrings(req.RedactHeaders),
+		RedactQueryParams: copyStrings(req.RedactQueryParams),
 	}
 
 	for port, proto := range portsNeeded {
@@ -301,6 +364,24 @@ func (r *Registry) registrationMatches(req RegisterRequest) bool {
 	// A changed capture cap must NOT take the no-op refresh path — the new cap
 	// has to reach the routes so subsequent captures honor it (D13).
 	if proj.MaxBodySize != req.MaxBodySize {
+		return false
+	}
+	// A changed disk budget must force a real re-register so syncCaptureBudget
+	// recomputes the effective daemon-wide bound (#69) — a no-op refresh would
+	// leave the old budget in force.
+	if proj.DiskBudget != req.DiskBudget {
+		return false
+	}
+	// A changed redaction policy must force a real re-register so the new policy
+	// reaches the routes (plan 012 D4). The lists compare as order-insensitive
+	// SETS: a reordered list is still a no-op refresh.
+	if proj.Redact != req.Redact {
+		return false
+	}
+	if !stringSetsEqual(proj.RedactHeaders, req.RedactHeaders, http.CanonicalHeaderKey) {
+		return false
+	}
+	if !stringSetsEqual(proj.RedactQueryParams, req.RedactQueryParams, strings.ToLower) {
 		return false
 	}
 
@@ -375,10 +456,16 @@ func (r *Registry) snapshotProject(projectDir string) (projectSnapshot, bool) {
 	}
 	projCopy := *proj
 	projCopy.RouteKeys = append([]string(nil), proj.RouteKeys...)
+	// Deep-copy the redaction slices so the snapshot never aliases the live
+	// registration's slices (plan 012 D4).
+	projCopy.RedactHeaders = copyStrings(proj.RedactHeaders)
+	projCopy.RedactQueryParams = copyStrings(proj.RedactQueryParams)
 	routes := make([]*Route, 0, len(proj.RouteKeys))
 	for _, key := range proj.RouteKeys {
 		if route, ok := r.routes[key]; ok {
 			rc := *route
+			rc.RedactHeaders = copyStrings(route.RedactHeaders)
+			rc.RedactQueryParams = copyStrings(route.RedactQueryParams)
 			routes = append(routes, &rc)
 		}
 	}
@@ -396,6 +483,8 @@ func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec)
 
 	for _, route := range snap.routes {
 		rc := *route
+		rc.RedactHeaders = copyStrings(route.RedactHeaders)
+		rc.RedactQueryParams = copyStrings(route.RedactQueryParams)
 		r.routes[routeKey(rc.Hostname, rc.Port)] = &rc
 		if li, ok := r.listeners[rc.Port]; ok {
 			li.RouteCount++
@@ -406,6 +495,8 @@ func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec)
 	}
 	projCopy := *snap.proj
 	projCopy.RouteKeys = append([]string(nil), snap.proj.RouteKeys...)
+	projCopy.RedactHeaders = copyStrings(snap.proj.RedactHeaders)
+	projCopy.RedactQueryParams = copyStrings(snap.proj.RedactQueryParams)
 	r.projects[projCopy.Dir] = &projCopy
 	return reopenPorts
 }
@@ -493,6 +584,43 @@ func (r *Registry) ListenerPorts() []int {
 	}
 	sort.Ints(ports)
 	return ports
+}
+
+// EffectiveCaptureDiskBudget computes the daemon-wide capture disk budget for the
+// one shared capture dir (#69): the MINIMUM over all registered capture-ENABLED
+// projects of that project's configured budget if set, else
+// DefaultCaptureDiskBudget for a project that left it unset. When no
+// capture-ENABLED project is registered, the default applies. Capture-DISABLED
+// projects never influence the bound.
+//
+// There is NO per-value clamp: raising the bound above the default IS allowed
+// when EVERY capture-enabled project opts in — including the single-project case
+// ({A: 2GB} alone -> 2GB). But an explicit value can never raise ANOTHER
+// project's default: an unset capture-enabled project contributes the default to
+// the min, so {A: 2GB, B: unset} -> min(2GB, 1GiB) = 1GiB.
+func (r *Registry) EffectiveCaptureDiskBudget() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	effective := int64(0)
+	seen := false
+	for _, proj := range r.projects {
+		if !proj.CaptureEnabled {
+			continue
+		}
+		budget := proj.DiskBudget
+		if budget <= 0 {
+			budget = constants.DefaultCaptureDiskBudget
+		}
+		if !seen || budget < effective {
+			effective = budget
+			seen = true
+		}
+	}
+	if !seen {
+		return constants.DefaultCaptureDiskBudget
+	}
+	return effective
 }
 
 // ProjectCount returns the number of registered projects.

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -330,6 +331,64 @@ func TestCreateRouter_StampsHostnameStripsPort(t *testing.T) {
 	records := svc.RequestManager().Recent(RequestFilter{})
 	require.Len(t, records, 1)
 	assert.Equal(t, "app.local.myapp.dev", records[0].Hostname)
+}
+
+// TestCreateRouter_Redaction_StandaloneParity mirrors the daemon end-to-end
+// redaction test on the in-process standalone proxy (plan 012 D4): a capture-
+// enabled project with redaction on (the default) redacts sensitive headers and
+// the recorded URL, while the backend still receives the raw Authorization
+// header and the original query byte-for-byte.
+func TestCreateRouter_Redaction_StandaloneParity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	var gotAuth, gotRawQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotRawQuery = r.URL.RawQuery
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Set-Cookie", "sid=SECRET")
+		w.Header().Set("Location", "https://app.example.com/cb?code=OAUTHLEAK&state=1")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer backend.Close()
+	backendPort := backend.Listener.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.ProxyConfig{
+		Enabled:  true,
+		HTTPPort: 6788,
+		Domain:   "local.myapp.dev",
+		// Capture on; Redact unset defaults ON.
+		Capture: &config.CaptureConfig{Enabled: true},
+	}
+	services := map[string]config.ServiceConfig{"app": {Port: backendPort, Host: "localhost"}}
+
+	svc, err := NewService(cfg, services, nil, logger, t.TempDir())
+	require.NoError(t, err)
+	require.True(t, svc.capturePolicy.Redact, "redaction defaults on when a capture config exists")
+
+	router := svc.createRouter()
+
+	req := httptest.NewRequest("POST", "/echo?code=SECRETCODE&keep=1", strings.NewReader("payload"))
+	req.Host = "app.local.myapp.dev:6788"
+	req.Header.Set("Authorization", "Bearer topsecret")
+	req.Header.Set("X-Public", "ok")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusFound, w.Code)
+
+	// Upstream saw the raw credential and the ORIGINAL query, unredacted.
+	assert.Equal(t, "Bearer topsecret", gotAuth)
+	assert.Equal(t, "code=SECRETCODE&keep=1", gotRawQuery)
+
+	records := svc.RequestManager().Recent(RequestFilter{})
+	require.Len(t, records, 1)
+	r0 := records[0]
+	assert.Equal(t, "/echo?code=REDACTED&keep=1", r0.URL)
+	require.NotNil(t, r0.Details)
+	assert.Equal(t, []string{"[REDACTED]"}, r0.Details.RequestHeaders["Authorization"])
+	assert.Equal(t, []string{"ok"}, r0.Details.RequestHeaders["X-Public"])
+	assert.Equal(t, []string{"[REDACTED]"}, r0.Details.ResponseHeaders["Set-Cookie"])
+	assert.Equal(t, []string{"https://app.example.com/cb?code=REDACTED&state=1"}, r0.Details.ResponseHeaders["Location"])
 }
 
 func TestPortConflictError_ErrorMessage(t *testing.T) {

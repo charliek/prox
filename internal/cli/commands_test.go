@@ -797,6 +797,185 @@ func TestShowRequestDetail_Stale(t *testing.T) {
 	}
 }
 
+// TestCaptureHint covers the two reliable tiers plus the honest catch-all
+// (plan 012 D1, C4, reworked after a Codex review found the original
+// three-way version guessing wrong for --no-capture and metadata-only
+// routing-error records): a metadata-only WebSocket/101 upgrade record, the
+// static config saying capture is disabled, and the neutral catch-all for
+// every other nil-Details case.
+func TestCaptureHint(t *testing.T) {
+	t.Run("101 upgrade: metadata only, regardless of captureEnabled", func(t *testing.T) {
+		hint := captureHint(http.StatusSwitchingProtocols, true)
+		if !strings.Contains(hint, "WebSocket/101") {
+			t.Errorf("expected a WebSocket/101 mention, got: %q", hint)
+		}
+		hint = captureHint(http.StatusSwitchingProtocols, false)
+		if !strings.Contains(hint, "WebSocket/101") {
+			t.Errorf("expected a WebSocket/101 mention regardless of captureEnabled, got: %q", hint)
+		}
+	})
+
+	t.Run("capture disabled by static config: config/flag hint", func(t *testing.T) {
+		hint := captureHint(http.StatusOK, false)
+		if !strings.Contains(hint, "capture not enabled") {
+			t.Errorf("expected the 'capture not enabled' hint, got: %q", hint)
+		}
+		if !strings.Contains(hint, "proxy.capture.enabled") || !strings.Contains(hint, "--no-capture") {
+			t.Errorf("expected the hint to name both the config key and --no-capture, got: %q", hint)
+		}
+	})
+
+	t.Run("otherwise: neutral catch-all naming every real possibility", func(t *testing.T) {
+		hint := captureHint(http.StatusOK, true)
+		if !strings.Contains(hint, "prox proxy status") {
+			t.Errorf("expected a pointer to 'prox proxy status', got: %q", hint)
+		}
+		if !strings.Contains(hint, "--no-capture") {
+			t.Errorf("expected the catch-all to name --no-capture as a possibility, got: %q", hint)
+		}
+		if !strings.Contains(hint, "routing error") {
+			t.Errorf("expected the catch-all to name a metadata-only routing-error record as a possibility, got: %q", hint)
+		}
+		// Must NOT sound like a confident diagnosis of daemon breakage -- it is
+		// one of three named possibilities, not the only one.
+		if strings.Contains(hint, "is enabled but nothing was captured") {
+			t.Errorf("expected the catch-all to stay neutral rather than confidently blame daemon unavailability, got: %q", hint)
+		}
+	})
+}
+
+// TestShowRequestDetail_WebSocketUpgrade verifies a completed 101-status
+// record with nil Details (the proxy's hijack path records metadata only,
+// see internal/proxyd/dynamic_proxy.go) prints the WebSocket/101 hint rather
+// than the generic "capture not enabled" one, even though no project config
+// is loadable in the test (which would otherwise read as case (a)).
+func TestShowRequestDetail_WebSocketUpgrade(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestDetailResponse{
+			ProxyRequestResponse: api.ProxyRequestResponse{
+				ID:         "ws1",
+				Timestamp:  time.Now().Format(time.RFC3339Nano),
+				Method:     "GET",
+				URL:        "/socket",
+				StatusCode: http.StatusSwitchingProtocols,
+				DurationMs: 5,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+
+	stdout, _ := captureOutput(t, func() {
+		if err := showRequestDetail(client, "ws1", false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, "WebSocket/101") {
+		t.Errorf("expected the WebSocket/101 hint, got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "capture not enabled") {
+		t.Errorf("expected the generic capture-not-enabled hint to be suppressed for a 101 record, got:\n%s", stdout)
+	}
+}
+
+// TestProjectCaptureEnabledHint covers projectCaptureEnabledHint's own cases:
+// a loadable config with capture effectively on/off, and a missing/unloadable
+// path degrading to false (the hint helper is not allowed to fail the whole
+// `prox requests <id>` command over a config problem).
+func TestProjectCaptureEnabledHint(t *testing.T) {
+	t.Run("missing config file degrades to false", func(t *testing.T) {
+		if projectCaptureEnabledHint(t.TempDir() + "/does-not-exist.yaml") {
+			t.Error("expected false for an unloadable config path")
+		}
+	})
+
+	t.Run("proxy enabled, capture defaults on", func(t *testing.T) {
+		path := t.TempDir() + "/prox.yaml"
+		yaml := "processes:\n  web: npm run dev\nproxy:\n  enabled: true\n  https_port: 8443\n  domain: local.dev\n"
+		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if !projectCaptureEnabledHint(path) {
+			t.Error("expected capture effectively enabled by default when the proxy is enabled")
+		}
+	})
+
+	t.Run("capture explicitly disabled in config", func(t *testing.T) {
+		path := t.TempDir() + "/prox.yaml"
+		yaml := "processes:\n  web: npm run dev\nproxy:\n  enabled: true\n  https_port: 8443\n  domain: local.dev\n  capture:\n    enabled: false\n"
+		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if projectCaptureEnabledHint(path) {
+			t.Error("expected false when the config explicitly disables capture")
+		}
+	})
+
+	t.Run("proxy disabled: capture effectively off despite defaulting on", func(t *testing.T) {
+		path := t.TempDir() + "/prox.yaml"
+		yaml := "processes:\n  web: npm run dev\nproxy:\n  enabled: false\n  https_port: 8443\n  domain: local.dev\n"
+		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if projectCaptureEnabledHint(path) {
+			t.Error("expected false when the proxy itself is disabled")
+		}
+	})
+
+	// TestProjectCaptureEnabledHint/state-recorded config path wins over the
+	// fallback: a Codex review finding was that the daemon may have been
+	// started with `-c custom.yaml`, so re-deriving from the CLI's own
+	// --config/default (fallbackConfigPath) reads the wrong file. When
+	// .prox/prox.state records a ConfigFile, that path must win.
+	t.Run("prefers the config path recorded in .prox/prox.state over the fallback", func(t *testing.T) {
+		dir := withTempCwd(t)
+
+		// The "real" config the running daemon loaded: capture explicitly off.
+		realConfigPath := dir + "/custom.yaml"
+		realYAML := "processes:\n  web: npm run dev\nproxy:\n  enabled: true\n  https_port: 8443\n  domain: local.dev\n  capture:\n    enabled: false\n"
+		if err := os.WriteFile(realConfigPath, []byte(realYAML), 0600); err != nil {
+			t.Fatalf("WriteFile real config: %v", err)
+		}
+		state := &daemon.State{
+			PID:        os.Getpid(),
+			Port:       54321,
+			Host:       "127.0.0.1",
+			StartedAt:  time.Now(),
+			ConfigFile: realConfigPath,
+		}
+		if err := state.Write(dir); err != nil {
+			t.Fatalf("writing state: %v", err)
+		}
+
+		// The fallback (CLI's own --config/default) disagrees: capture on.
+		fallbackPath := dir + "/prox.yaml"
+		fallbackYAML := "processes:\n  web: npm run dev\nproxy:\n  enabled: true\n  https_port: 8443\n  domain: local.dev\n"
+		if err := os.WriteFile(fallbackPath, []byte(fallbackYAML), 0600); err != nil {
+			t.Fatalf("WriteFile fallback config: %v", err)
+		}
+
+		if projectCaptureEnabledHint(fallbackPath) {
+			t.Error("expected the state-recorded config's capture: enabled: false to win over the fallback path's default-on config")
+		}
+	})
+
+	t.Run("no state file: falls back to the given path", func(t *testing.T) {
+		dir := withTempCwd(t)
+
+		path := dir + "/prox.yaml"
+		yaml := "processes:\n  web: npm run dev\nproxy:\n  enabled: true\n  https_port: 8443\n  domain: local.dev\n"
+		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if !projectCaptureEnabledHint(path) {
+			t.Error("expected the fallback path to be used when no .prox/prox.state exists")
+		}
+	})
+}
+
 func TestDownCmd_NoArgs(t *testing.T) {
 	// Verify downCmd has NoArgs validation
 	if downCmd.Args == nil {

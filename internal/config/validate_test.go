@@ -394,6 +394,50 @@ func TestValidateProxy(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("valid capture disk_budget passes", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled: true, HTTPSPort: 6789, Domain: "local.myapp.dev",
+			Capture: &CaptureConfig{Enabled: true, DiskBudget: "512MB"},
+		}
+		cfg.Services = map[string]ServiceConfig{"app": {Port: 3000, Host: "localhost"}}
+		assert.NoError(t, Validate(cfg))
+	})
+
+	t.Run("capture disk_budget smaller than max_body_size is allowed (#69)", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled: true, HTTPSPort: 6789, Domain: "local.myapp.dev",
+			Capture: &CaptureConfig{Enabled: true, MaxBodySize: "1MB", DiskBudget: "512KB"},
+		}
+		cfg.Services = map[string]ServiceConfig{"app": {Port: 3000, Host: "localhost"}}
+		assert.NoError(t, Validate(cfg))
+	})
+
+	t.Run("unparseable capture disk_budget fails", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled: true, HTTPSPort: 6789, Domain: "local.myapp.dev",
+			Capture: &CaptureConfig{Enabled: true, DiskBudget: "notasize"},
+		}
+		cfg.Services = map[string]ServiceConfig{"app": {Port: 3000, Host: "localhost"}}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "proxy.capture.disk_budget")
+	})
+
+	t.Run("zero capture disk_budget fails", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Proxy = &ProxyConfig{
+			Enabled: true, HTTPSPort: 6789, Domain: "local.myapp.dev",
+			Capture: &CaptureConfig{Enabled: true, DiskBudget: "0"},
+		}
+		cfg.Services = map[string]ServiceConfig{"app": {Port: 3000, Host: "localhost"}}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "proxy.capture.disk_budget")
+	})
+
 	t.Run("proxy enabled without domain fails", func(t *testing.T) {
 		cfg := baseConfig()
 		cfg.Proxy = &ProxyConfig{

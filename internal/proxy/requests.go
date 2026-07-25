@@ -149,6 +149,14 @@ type RequestManager struct {
 	count    int
 	capacity int
 
+	// idIndex maps a record ID to its ring slot, giving Upsert/GetByID/anchor
+	// resolution O(1) lookups instead of the newest→oldest linear scan (#71).
+	// Invariant: it points at the NEWEST copy of each live ID (Record permits
+	// duplicate explicit IDs) and holds no entry for a slot that isn't live.
+	// Every ring mutation (both append paths, slot overwrite, replace-in-place,
+	// PurgeByProject compaction) maintains it in lock-step with buffer/head/count.
+	idIndex map[string]int
+
 	subMu  sync.RWMutex
 	subs   map[string]*RequestSubscription
 	nextID int
@@ -182,6 +190,7 @@ func NewRequestManager(capacity int) *RequestManager {
 		buffer:   make([]RequestRecord, capacity),
 		capacity: capacity,
 		subs:     make(map[string]*RequestSubscription),
+		idIndex:  make(map[string]int, capacity),
 	}
 }
 
@@ -204,9 +213,6 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
 
-	var evictedID string
-	var onEvict EvictionCallback
-
 	m.mu.Lock()
 	// Re-check the latch under mu: Close does not hold the ring lock, so a
 	// writer that passed the pre-lock check can otherwise commit after the
@@ -217,20 +223,7 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 		m.mu.Unlock()
 		return false
 	}
-	// Check if we're about to overwrite an existing record
-	if m.count == m.capacity {
-		evicted := m.buffer[m.head]
-		if evicted.ID != "" && evicted.Details != nil {
-			evictedID = evicted.ID
-			onEvict = m.onEvict
-		}
-	}
-
-	m.buffer[m.head] = record
-	m.head = (m.head + 1) % m.capacity
-	if m.count < m.capacity {
-		m.count++
-	}
+	evictedID, onEvict := m.appendRecord(record)
 	m.mu.Unlock()
 
 	// Call eviction callback outside of lock
@@ -241,6 +234,48 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 	// Notify subscribers
 	m.notifySubscribers(record)
 	return true
+}
+
+// evictIndex drops the index entry for a slot about to be overwritten. It
+// deletes ONLY when the entry still points at that slot (#71): Record permits
+// duplicate explicit IDs, and overwriting an OLDER duplicate must not erase the
+// NEWER copy's mapping (which points elsewhere) so GetByID keeps returning the
+// newest. Deliberately NOT gated on evicted.Details — the eviction *callback*
+// is Details-gated, but index maintenance must run for every overwrite. Caller
+// holds m.mu.
+func (m *RequestManager) evictIndex(id string, slot int) {
+	if id == "" {
+		return
+	}
+	if m.idIndex[id] == slot {
+		delete(m.idIndex, id)
+	}
+}
+
+// appendRecord writes record into the newest ring slot and advances head,
+// evicting the oldest record when the ring is full. It maintains idIndex on
+// both the overwrite (evictIndex) and the insert (#71), so the map stays in
+// lock-step on both append paths. When the evicted record carried Details it
+// returns that record's ID and the eviction callback so the caller can invoke
+// onEvict after releasing m.mu (disk IO must not run under the lock); both are
+// zero otherwise. This is the shared append arm behind Record and Upsert's
+// insert case. Caller holds m.mu.
+func (m *RequestManager) appendRecord(record RequestRecord) (evictedID string, onEvict EvictionCallback) {
+	if m.count == m.capacity {
+		evicted := m.buffer[m.head]
+		if evicted.ID != "" && evicted.Details != nil {
+			evictedID = evicted.ID
+			onEvict = m.onEvict
+		}
+		m.evictIndex(evicted.ID, m.head)
+	}
+	m.buffer[m.head] = record
+	m.idIndex[record.ID] = m.head // newest copy of this ID lives here (#71)
+	m.head = (m.head + 1) % m.capacity
+	if m.count < m.capacity {
+		m.count++
+	}
+	return evictedID, onEvict
 }
 
 // Upsert applies a record as a monotonic two-state transition keyed by ID:
@@ -283,37 +318,21 @@ func (m *RequestManager) Upsert(record RequestRecord) bool {
 		m.mu.Unlock()
 		return false
 	}
-	// Scan newest→oldest: in-flight records live in the newest slots.
-	idx := -1
-	for i := 0; i < m.count; i++ {
-		j := (m.head - 1 - i + m.capacity) % m.capacity
-		if m.buffer[j].ID == record.ID {
-			idx = j
-			break
-		}
-	}
+	// O(1) lookup of the newest slot holding this ID (#71). The index points
+	// at the newest copy, matching the old newest→oldest scan's result.
+	idx, exists := m.idIndex[record.ID]
 
 	switch {
-	case idx >= 0 && (!m.buffer[idx].InFlight || record.InFlight):
+	case exists && (!m.buffer[idx].InFlight || record.InFlight):
 		// Terminal existing record, or duplicate in-flight delivery.
 		m.mu.Unlock()
 		return true
-	case idx >= 0:
-		// In-flight → final: replace in place, ring position preserved.
+	case exists:
+		// In-flight → final: replace in place, ring position (and its index
+		// entry, same ID/slot) preserved.
 		m.buffer[idx] = record
 	default:
-		if m.count == m.capacity {
-			evicted := m.buffer[m.head]
-			if evicted.ID != "" && evicted.Details != nil {
-				evictedID = evicted.ID
-				onEvict = m.onEvict
-			}
-		}
-		m.buffer[m.head] = record
-		m.head = (m.head + 1) % m.capacity
-		if m.count < m.capacity {
-			m.count++
-		}
+		evictedID, onEvict = m.appendRecord(record)
 	}
 	m.notifySubscribers(record)
 	m.mu.Unlock()
@@ -366,23 +385,18 @@ func (m *RequestManager) RecentPage(filter RequestFilter) (records []RequestReco
 	// anchor's position + 1 (strictly older) when filter.BeforeID is set.
 	startOffset := 0
 	if filter.BeforeID != "" {
-		anchorPos := -1
-		for i := 0; i < m.count; i++ {
-			idx := (m.head - 1 - i + m.capacity) % m.capacity
-			if m.buffer[idx].ID == filter.BeforeID {
-				anchorPos = i
-				break
-			}
-		}
-		if anchorPos == -1 {
+		anchorIdx, ok := m.idIndex[filter.BeforeID]
+		if !ok {
 			return nil, "", false
 		}
-		anchorIdx := (m.head - 1 - anchorPos + m.capacity) % m.capacity
 		if !m.matchesFilter(m.buffer[anchorIdx], filter) {
 			// Anchor exists but is out of the requested scope (e.g. another
 			// project). Same signal as "not found" — see doc comment.
 			return nil, "", false
 		}
+		// Convert the anchor's slot back to its newest→oldest offset (#71); the
+		// index points at a live slot, so anchorPos is in [0, count-1).
+		anchorPos := (m.head - 1 - anchorIdx + m.capacity) % m.capacity
 		startOffset = anchorPos + 1
 	}
 
@@ -416,13 +430,10 @@ func (m *RequestManager) GetByID(id string) (RequestRecord, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Search from newest to oldest for better typical case
-	for i := 0; i < m.count; i++ {
-		idx := (m.head - 1 - i + m.capacity) % m.capacity
-		record := m.buffer[idx]
-		if record.ID == id {
-			return record, true
-		}
+	// O(1) lookup; the index points at the newest copy of a duplicated ID,
+	// matching the old newest→oldest scan (#71).
+	if idx, ok := m.idIndex[id]; ok {
+		return m.buffer[idx], true
 	}
 
 	return RequestRecord{}, false
@@ -598,6 +609,15 @@ func (m *RequestManager) PurgeByProject(projectDir string) {
 	m.buffer = compacted
 	m.count = len(kept)
 	m.head = m.count % m.capacity
+
+	// Rebuild the index from the compacted buffer (#71). kept is oldest→newest,
+	// so a later assignment for a duplicated ID overwrites the earlier one,
+	// leaving the newest copy — the invariant the index promises.
+	newIndex := make(map[string]int, len(kept))
+	for p, rec := range kept {
+		newIndex[rec.ID] = p
+	}
+	m.idIndex = newIndex
 	m.mu.Unlock()
 
 	// Call eviction callbacks outside of lock

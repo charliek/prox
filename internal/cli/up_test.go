@@ -405,3 +405,36 @@ func TestForwardShutdownSignal_ExitsOnContextCancel(t *testing.T) {
 	default:
 	}
 }
+
+// TestResolveCaptureFlag_Matrix pins the --capture/--no-capture precedence
+// matrix (plan 012 D1, C4): flags win over the materialized config default,
+// passing both is an error mirroring the --tui/--detach exclusivity check,
+// and passing neither leaves the config's own value untouched (ok=false).
+func TestResolveCaptureFlag_Matrix(t *testing.T) {
+	t.Run("--capture forces on", func(t *testing.T) {
+		enabled, ok, err := resolveCaptureFlag(true, false)
+		require.NoError(t, err)
+		assert.True(t, ok)
+		assert.True(t, enabled)
+	})
+
+	t.Run("--no-capture forces off", func(t *testing.T) {
+		enabled, ok, err := resolveCaptureFlag(false, true)
+		require.NoError(t, err)
+		assert.True(t, ok)
+		assert.False(t, enabled)
+	})
+
+	t.Run("both flags is an error", func(t *testing.T) {
+		_, ok, err := resolveCaptureFlag(true, true)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mutually exclusive")
+		assert.False(t, ok)
+	})
+
+	t.Run("neither flag: config wins (ok=false)", func(t *testing.T) {
+		_, ok, err := resolveCaptureFlag(false, false)
+		require.NoError(t, err)
+		assert.False(t, ok, "caller must leave the config's own Enabled value untouched")
+	})
+}

@@ -191,6 +191,8 @@ prox proxy routes
 
 See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for multi-project routing. See the [Local DNS & Certificates](../guides/local-dns.md) guide for custom domains, certificate management, and sharing CAs across machines. See the [Configuration Reference](../reference/configuration.md#proxy-configuration) for full proxy options.
 
+Once the proxy is enabled, `prox requests` and `prox requests <id> --body` work immediately — request/response capture is on by default, with sensitive headers and query params redacted automatically. See [Request Capture](../reference/configuration.md#request-capture) for the disk budget, redaction limits, and how to opt out.
+
 ## HTTP API
 
 By default, the API binds to a dynamic (auto-assigned) localhost port chosen at startup. Run `prox status` to see the address currently in use, or pin a fixed port by adding this to `prox.yaml`:

@@ -62,6 +62,20 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 	if len(status.ListenerPorts) > 0 {
 		fmt.Printf("  Ports:      %v\n", status.ListenerPorts)
 	}
+	if !status.CaptureAvailable {
+		// The daemon's capture manager failed to initialize at startup (plan 012
+		// D1, C4) -- distinct from a project simply setting proxy.capture.enabled:
+		// false, which never shows up here (capture-off projects just don't
+		// contribute to the disk stats below).
+		if status.CaptureError != "" {
+			fmt.Printf("  Capture:    unavailable (%s)\n", status.CaptureError)
+		} else {
+			fmt.Printf("  Capture:    unavailable\n")
+		}
+	} else if status.CaptureDiskBudget > 0 {
+		fmt.Printf("  Capture:    %s used / %s budget on disk\n",
+			formatBytes(status.CaptureDiskUsed), formatBytes(status.CaptureDiskBudget))
+	}
 
 	if len(status.Routes) > 0 {
 		fmt.Println()
@@ -136,6 +150,22 @@ func connectDaemon() (*proxyd.Client, error) {
 		return nil, fmt.Errorf("proxy daemon is not running\nIt starts automatically when you run 'prox up' with proxy configured")
 	}
 	return client, nil
+}
+
+// formatBytes renders a byte count with a binary (KiB/MiB/GiB) suffix for the
+// human `prox proxy status` capture line (#69). Sub-KiB values print as raw
+// bytes; larger values use one decimal place.
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // printRoutesTable prints routes in a tabwriter table.

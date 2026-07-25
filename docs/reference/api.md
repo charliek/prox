@@ -377,7 +377,7 @@ Retrieve details for one proxied request.
 |-------|------|---------|-------------|
 | `include` | string | — | Set to `body` to include captured request and response body data |
 
-Body data is available only when capture was enabled with `prox up --capture` or `proxy.capture.enabled: true`.
+Body data is available by default whenever the project's proxy is enabled — capture is on unless the project set `proxy.capture.enabled: false` or ran with `--no-capture` — but is not guaranteed for every record: a body may be absent when capture is unavailable in the daemon (`capture_available: false` in daemon status) or after disk-budget eviction (`unavailable_reason: "evicted"`, below). Stored `request_headers`/`response_headers` values are subject to capture-time redaction: sensitive headers (`Authorization`, `Cookie`, etc.) come back as `[REDACTED]`, and sensitive query params — including inside a `Location`/`Referer` header value — come back as `REDACTED` in the `url`/header string. See [Request Capture](configuration.md#request-capture) for the full redaction rules and their limits; note bodies are captured verbatim and are **not** redacted.
 
 **Response:**
 

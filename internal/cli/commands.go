@@ -3,12 +3,14 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
 	"github.com/charliek/prox/internal/domain"
@@ -728,10 +730,74 @@ func showRequestDetail(client *Client, id string, includeBody, jsonOutput bool) 
 	} else if resp.InFlight {
 		fmt.Println("\n(request in flight — details arrive on completion)")
 	} else {
-		fmt.Println("\n(capture not enabled - use 'prox up --capture' to enable)")
+		fmt.Println("\n" + captureHint(resp.StatusCode, projectCaptureEnabledHint(configPath)))
 	}
 
 	return nil
+}
+
+// captureHint explains why a completed request record has no Details (plan
+// 012 D1, C4). It only has two RELIABLE signals to work from -- the record's
+// own status code, and a static config file read from the CLI side -- so it
+// resolves down to two confident tiers and one honest catch-all rather than
+// trying to name the exact cause (a Codex review of the original three-way
+// version found it guessing wrong in several real cases: --no-capture is an
+// in-memory-only override the static config can't see, and a legitimately
+// metadata-only routing-error record -- proxy.go's unknown-subdomain path,
+// not a capture failure -- has a non-101 status too):
+//
+//   - a metadata-only WebSocket/101 upgrade record: the proxy's hijack path
+//     (internal/proxyd/dynamic_proxy.go, internal/proxy/proxy.go) records only
+//     the protocol switch, regardless of capture config, because all traffic
+//     after the upgrade bypasses the capture writer entirely. Detected from
+//     the record itself: StatusCode == http.StatusSwitchingProtocols. Reliable.
+//   - the static config says capture is disabled: reliable ONLY in the
+//     direction "config says off" (an on-disk proxy.capture.enabled: false, or
+//     the proxy itself disabled) -- captureEnabled being true does NOT mean
+//     capture actually ran (see below), so this tier is one-way.
+//   - otherwise: a neutral catch-all naming every real possibility --
+//     --no-capture for this run, a metadata-only record that isn't a 101
+//     (e.g. a routing error), or the daemon's capture manager being
+//     unavailable -- rather than confidently misdiagnosing one of them.
+//
+// captureEnabled is the caller's best static read of whether capture is
+// configured on for this project (config.ProxyConfig.CaptureEffectivelyEnabled);
+// pass false when no project config could be loaded so the message degrades to
+// the config-disabled tier rather than the catch-all.
+func captureHint(statusCode int, captureEnabled bool) string {
+	if statusCode == http.StatusSwitchingProtocols {
+		return "(metadata only - WebSocket/101 upgrade traffic is never captured, regardless of capture config)"
+	}
+	if !captureEnabled {
+		return "(capture not enabled - proxy.capture.enabled is false or --no-capture was used; run 'prox up --capture' or drop --no-capture to enable)"
+	}
+	return "(no captured details for this record - the run may have used --no-capture, the record may be metadata-only (e.g. a proxy routing error), or capture may be unavailable in the daemon; check 'prox proxy status')"
+}
+
+// projectCaptureEnabledHint best-effort determines whether capture is
+// statically configured on for the current project, to pick the right
+// captureHint tier. It prefers the config file path recorded in
+// .prox/prox.state (daemon.State.ConfigFile) -- the actual file the RUNNING
+// daemon loaded via its own -c/--config -- over fallbackConfigPath (the CLI
+// invocation's own --config/default), because those can differ (a Codex
+// review finding: `prox requests <id> -c other.yaml` or a daemon started with
+// a non-default config would otherwise read the wrong file). Falls back to
+// fallbackConfigPath when no state file is found (mirrors discoverAPIAddress's
+// state-then-config-file priority). Any load/parse failure degrades to false
+// -- this is a hint, not a control-plane decision, so it must never fail the
+// whole `prox requests <id>` command.
+func projectCaptureEnabledHint(fallbackConfigPath string) bool {
+	path := fallbackConfigPath
+	if cwd, err := os.Getwd(); err == nil {
+		if state, serr := daemon.LoadState(cwd); serr == nil && state.ConfigFile != "" {
+			path = state.ConfigFile
+		}
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return false
+	}
+	return cfg.Proxy.CaptureEffectivelyEnabled()
 }
 
 // printCapturedBody prints one captured body section: a header line with size,
