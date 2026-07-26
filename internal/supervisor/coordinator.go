@@ -308,8 +308,8 @@ func (s *Supervisor) demandTarget(ctx context.Context, name string, isDep func(s
 // the other. Falls back to the up-time config before the first Start (view nil).
 func (s *Supervisor) classifyDependency(name string) bool {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	eff := s.effective
-	s.mu.RUnlock()
 	if eff == nil {
 		_, ok := s.config.Dependencies[name]
 		return ok

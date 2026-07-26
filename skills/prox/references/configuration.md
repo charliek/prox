@@ -147,8 +147,10 @@ script, a one-time registration call.
 | `stop_timeout` | duration | inherits `shutdown_timeout` | This task's own SIGTERM→SIGKILL escalation budget |
 
 A task exits `0` (natural) → **`completed`** (PID suppressed, uptime frozen
-at completion). Any other exit — non-zero, a signal, or a `timeout` kill —
-→ **`crashed`**, which blocks any process or task gated on it. A task runs
+at completion). An *unexpected* exit — non-zero, a signal, or a `timeout`
+kill — → **`crashed`**, which blocks any process or task gated on it. A
+user-initiated `prox stop <task>` on a running task ends it in **`stopped`**,
+not `crashed` — stopping a task is not a failure. A task runs
 **once per `prox up` lifetime**: a dependent's restart does not re-run an
 already-completed task. `prox restart <task>` (or `prox start <task>` after
 `prox stop <task>`) re-runs it manually.

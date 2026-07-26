@@ -91,14 +91,15 @@ Key rules: names must be unique across `processes`/`dependencies`/`tasks`; a `de
 
 ```text
 NAME    STATUS                  PID  UPTIME  RESTARTS  HEALTH
-api     waiting(postgres)       -    0s      0         unknown
+api     waiting(redis)          -    0s      0         unknown
 migrate blocked(postgres)       -    0s      0         unknown
 
 Blocked: migrate(postgres)
 
 Dependencies:
-NAME      STATE   CHECK               DETAIL
-postgres  failed  tcp localhost:5432  dial tcp ...: connection refused
+NAME      STATE    CHECK               DETAIL
+postgres  failed   tcp localhost:5432  dial tcp ...: connection refused
+redis     polling  tcp localhost:6379
 ```
 
 - `waiting(x, y)` — still resolving those targets; `blocked(x)` — a required target failed and this process/task will never launch on its own.

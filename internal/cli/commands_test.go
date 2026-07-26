@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1435,9 +1436,13 @@ func TestRunStatus_CompletedTaskExit0(t *testing.T) {
 	if !strings.Contains(stdout, "migrate") || !strings.Contains(stdout, "completed") {
 		t.Errorf("stdout missing the completed task row; got:\n%s", stdout)
 	}
-	// The completed task's PID must render "-", never 0.
-	if !strings.Contains(stdout, "migrate") || strings.Contains(stdout, "migrate      completed  0") {
-		t.Errorf("completed task PID should render '-', not 0; got:\n%s", stdout)
+	// The completed task's row must show PID "-", never 0. Match on
+	// whitespace-tolerant fields (name, status, PID) rather than exact
+	// tabwriter column widths, which can shift as other columns' contents
+	// change.
+	completedRow := regexp.MustCompile(`(?m)^migrate\s+completed\s+-(\s|$)`)
+	if !completedRow.MatchString(stdout) {
+		t.Errorf("completed task row should show name=migrate status=completed PID=-; got:\n%s", stdout)
 	}
 }
 

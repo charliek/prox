@@ -174,17 +174,17 @@ $ prox status
 ...
 NAME    STATUS         PID  UPTIME  RESTARTS  HEALTH
 ----    ------         ---  ------  --------  ------
-api     blocked(postgres, redis)  -  0s  0    unknown
-worker  blocked(postgres, redis, restate, register)  -  0s  0  unknown
+api     blocked(postgres)  -  0s  0    unknown
+worker  blocked(postgres)  -  0s  0  unknown
 
-Blocked: api(postgres, redis), worker(postgres, redis, restate, register)
+Blocked: api(postgres), worker(postgres)
 
 Dependencies:
-NAME      STATE   CHECK                DETAIL
-----      -----   -----                ------
-postgres  failed  tcp localhost:5432   dial tcp 127.0.0.1:5432: connect: connection refused
+NAME      STATE   CHECK                          DETAIL
+----      -----   -----                          ------
+postgres  failed  tcp localhost:5432             dial tcp 127.0.0.1:5432: connect: connection refused
 redis     healthy tcp localhost:6379
-restate   pending url ...
+restate   healthy url http://localhost:9070/health
 
 $ echo $?
 1
