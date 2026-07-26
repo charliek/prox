@@ -34,6 +34,25 @@ type StatusResponse struct {
 	// where none is set (e.g. unit-test handlers), so those consumers see no
 	// change. The CLI omits the rendered line when Mode is "disabled".
 	Proxy *ProxyStatusResponse `json:"proxy,omitempty"`
+	// Dependencies reports the resolution state of each configured dependency
+	// (plan 013 D5), extending this existing status payload rather than adding a
+	// second endpoint so `prox status` reads a consistent snapshot in one fetch.
+	// Additive: omitted (nil) when no dependencies are configured.
+	Dependencies []DependencyStatusResponse `json:"dependencies,omitempty"`
+}
+
+// DependencyStatusResponse reports one configured dependency's resolution state
+// for GET /status (plan 013 D5). State is the resolver's DepState string
+// (pending/checking/starting/polling/healthy/warned/failed/canceled), reported
+// as "pending" for a dependency the resolver has not yet begun resolving this
+// generation. Check is a one-line summary of the readiness probe
+// ("tcp host:port" / "url ..." / "cmd ...").
+type DependencyStatusResponse struct {
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	Check        string `json:"check"`
+	LastError    string `json:"last_error,omitempty"`
+	StartInvoked bool   `json:"start_invoked"`
 }
 
 // ProxyStatusResponse reports the health of this project's proxy path (D5),
@@ -87,6 +106,13 @@ type ProcessResponse struct {
 	// domain.ProcessInfo.Kind (plan 013 D3). Rendering lands in C5; here it is
 	// carried mechanically so clients can distinguish tasks.
 	Kind string `json:"kind,omitempty"`
+	// WaitingOn lists the depends_on targets a waiting process is gated on, in
+	// declaration order (plan 013 D5); empty in every other state. Additive:
+	// omitted (nil) unless the process is waiting.
+	WaitingOn []string `json:"waiting_on,omitempty"`
+	// BlockedOn lists the depends_on targets that failed and left a process
+	// blocked, in declaration order (plan 013 D5); empty in every other state.
+	BlockedOn []string `json:"blocked_on,omitempty"`
 }
 
 // ProcessDetailResponse represents the response for GET /processes/{name}
@@ -173,6 +199,8 @@ func ToProcessResponse(info domain.ProcessInfo) ProcessResponse {
 		Restarts:      info.RestartCount,
 		Health:        string(info.Health),
 		Kind:          string(info.Kind),
+		WaitingOn:     info.WaitingOn,
+		BlockedOn:     info.BlockedOn,
 	}
 }
 

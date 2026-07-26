@@ -1038,6 +1038,20 @@ func (s *Supervisor) Processes() []domain.ProcessInfo {
 	return result
 }
 
+// DependencyStatuses returns the resolution state of every configured
+// dependency for status surfacing (plan 013 D5), or nil when no resolver has
+// been built yet (before Start) or none are configured. It reads the live
+// resolver, so it reflects reloads.
+func (s *Supervisor) DependencyStatuses() []DepStatus {
+	s.mu.RLock()
+	resolver := s.resolver
+	s.mu.RUnlock()
+	if resolver == nil {
+		return nil
+	}
+	return resolver.StatusSnapshots()
+}
+
 // Process returns info for a specific process
 func (s *Supervisor) Process(name string) (domain.ProcessInfo, error) {
 	s.mu.RLock()

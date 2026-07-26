@@ -137,6 +137,37 @@ processes:
 			t.Errorf("expected nil, got %v", names)
 		}
 	})
+
+	// Tasks are start/stop/restart targets too (plan 013 D5), so their names must
+	// complete alongside process names.
+	t.Run("includes task names", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testConfigPath := filepath.Join(tmpDir, "prox.yaml")
+		err := os.WriteFile(testConfigPath, []byte(`
+processes:
+  web: npm run dev
+tasks:
+  migrate:
+    cmd: ./migrate.sh
+`), 0644)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		configPath = testConfigPath
+		names := getProcessNames()
+
+		nameSet := make(map[string]bool)
+		for _, name := range names {
+			nameSet[name] = true
+		}
+		if !nameSet["web"] {
+			t.Errorf("expected process name %q in completion, got %v", "web", names)
+		}
+		if !nameSet["migrate"] {
+			t.Errorf("expected task name %q in completion, got %v", "migrate", names)
+		}
+	})
 }
 
 // TestClientCommandsDiscoveryAllowlist pins the discovery allowlist contract:

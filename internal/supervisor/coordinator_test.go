@@ -206,11 +206,18 @@ func TestCoordinator_GatedWaitsThenLaunchesHealthy(t *testing.T) {
 	assert.Equal(t, 0, runner.count(), "no process should launch while the dependency is unresolved")
 	info, _ := sup.Process("web")
 	assert.Equal(t, 0, info.PID)
+	// Info surfaces the waiting targets in declaration order (plan 013 D5).
+	assert.Equal(t, []string{"db"}, info.WaitingOn, "Info reports depends_on targets while waiting")
+	assert.Nil(t, info.BlockedOn, "no BlockedOn while merely waiting")
 
 	prober.release("db")
 
 	waitState(t, sup, "web", domain.ProcessStateRunning)
 	assert.Equal(t, 1, runner.count())
+	// Once running, neither gated field is reported.
+	running, _ := sup.Process("web")
+	assert.Nil(t, running.WaitingOn)
+	assert.Nil(t, running.BlockedOn)
 }
 
 // A required target that never becomes ready (on_failure=fail) leaves the
@@ -240,6 +247,10 @@ func TestCoordinator_BlockedRecordsFailedTargetsInOrder(t *testing.T) {
 
 	mp := sup.processes["web"]
 	assert.Equal(t, []string{"db", "cache"}, mp.BlockedBy(), "blocking targets recorded in declaration order")
+	// Info surfaces the same blocking targets as BlockedOn (plan 013 D5).
+	info, _ := sup.Process("web")
+	assert.Equal(t, []string{"db", "cache"}, info.BlockedOn, "Info reports blocking targets in declaration order")
+	assert.Nil(t, info.WaitingOn, "no WaitingOn once blocked")
 }
 
 // A warned target (budget exhausted, on_failure=warn) counts as satisfied, so
@@ -536,6 +547,48 @@ func TestCoordinator_ManualStartOnBlockedReDemands(t *testing.T) {
 	waitState(t, sup, "web", domain.ProcessStateBlocked)
 	assert.Equal(t, []string{"db"}, sup.processes["web"].BlockedBy())
 
+	prober.set("db", "healthy")
+	require.NoError(t, sup.StartProcess(context.Background(), "web"))
+	waitState(t, sup, "web", domain.ProcessStateRunning)
+	assert.Equal(t, 1, runner.count())
+}
+
+// Plan 013 D5 finding 2: a manual start of a process blocked on a RELOAD-ADDED
+// dependency must Reset that dependency's failed generation and launch. The fix
+// classifies the blocked target via the effective graph view, NOT the immutable
+// startup s.config.Dependencies -- a dependency introduced by a reload is absent
+// from the latter, so the old code never Reset it and the process stayed blocked
+// forever, permanently reusing the failed generation.
+func TestCoordinator_ManualStartOnBlockedReloadAddedDep(t *testing.T) {
+	prober := newCoordProber()
+	prober.set("db", "fail")
+	sup, runner, logMgr := gatedSupervisor(t,
+		map[string][]string{"web": {"db"}},
+		map[string]depSpec{"db": {timeout: 40 * time.Millisecond}},
+		prober, nil)
+	defer logMgr.Close()
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+	defer stopSup(t, sup)
+
+	waitState(t, sup, "web", domain.ProcessStateBlocked)
+	assert.Equal(t, []string{"db"}, sup.processes["web"].BlockedBy())
+
+	// Simulate the post-reload classification skew: the effective view knows db as
+	// a dependency (as applyReloadGraph would install), but the immutable startup
+	// s.config.Dependencies does not. The resolver already knows db (its node is in
+	// the failed generation), so only the classification source differs.
+	sup.mu.Lock()
+	sup.effective = &effectiveGraph{
+		deps:  map[string]struct{}{"db": {}},
+		tasks: map[string]struct{}{},
+	}
+	delete(sup.config.Dependencies, "db")
+	sup.mu.Unlock()
+
+	// db is healthy now; the manual start must Reset the failed target (classified
+	// via the effective view) and re-resolve it, launching web.
 	prober.set("db", "healthy")
 	require.NoError(t, sup.StartProcess(context.Background(), "web"))
 	waitState(t, sup, "web", domain.ProcessStateRunning)

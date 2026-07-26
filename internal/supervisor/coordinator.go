@@ -275,7 +275,7 @@ func (s *Supervisor) demandTargets(ctx context.Context, targets []string, isDep 
 // means either (a) the DEMANDER's own wait ended (shutdown / a stop of this
 // process) -- in which case the stopping path owns the state and we return the
 // cancel -- or (b) the TARGET's node/generation was RETIRED mid-flight (a task
-// re-run retiring its node, a dependency Redefine/RetainOnly cancelling a
+// re-run retiring its node, a dependency Redefine/ApplyGraph cancelling a
 // generation) while this demander is still live. In case (b) returning canceled
 // would strand the demander forever (e.g. a process waiting on a task that is
 // being re-run). So: while our OWN ctx is still live, a canceled outcome means the
@@ -334,11 +334,12 @@ func buildEffectiveGraph(cfg *config.Config) *effectiveGraph {
 
 // applyReloadGraph installs a reload's classification view and refreshes the
 // resolver to match (plan 013 fix 4/5). It REPLACES (never unions) the effective
-// view from the reload's fresh dependency/task sets, then refreshes the resolver:
-// Redefine every changed/new dependency and RetainOnly the fresh set so a removed
-// or migrated (dependency->task) name is forgotten. Ordering: swap the view first
-// so a concurrent classification never sees a dependency the resolver has already
-// dropped.
+// view from the reload's fresh dependency/task sets, then refreshes the resolver
+// atomically via ApplyGraph: redefine every changed/new dependency and drop any
+// name absent from the fresh set so a removed or migrated (dependency->task) name
+// is forgotten -- all under one resolver lock (plan 013 D5 fix). Ordering: swap
+// the view first so a concurrent classification never sees a dependency the
+// resolver has already dropped.
 func (s *Supervisor) applyReloadGraph(pending *pendingConfig) {
 	if pending == nil {
 		return
@@ -361,10 +362,10 @@ func (s *Supervisor) applyReloadGraph(pending *pendingConfig) {
 	if resolver == nil {
 		return
 	}
-	for name, dd := range pending.freshDeps {
-		resolver.Redefine(name, dd)
-	}
-	resolver.RetainOnly(eff.deps)
+	// Install the fresh dependency set atomically (plan 013 D5 fix): a single
+	// ApplyGraph under one resolver lock replaces the old redefine-loop +
+	// RetainOnly, so a concurrent StatusSnapshots never sees a half-applied mix.
+	resolver.ApplyGraph(pending.freshDeps)
 }
 
 // startProcessGated handles a manual StartProcess for a gated process (plan 013
@@ -382,7 +383,13 @@ func (s *Supervisor) applyReloadGraph(pending *pendingConfig) {
 // authoritative admission still maps the correct error.
 func (s *Supervisor) startProcessGated(mp *ManagedProcess) error {
 	for _, target := range mp.BlockedBy() {
-		if _, ok := s.config.Dependencies[target]; ok {
+		// Classify via the effective graph view (s.classifyDependency), NOT the
+		// immutable startup s.config.Dependencies (plan 013 D5 fix): a reload that
+		// ADDED a dependency which then failed and blocked a process would otherwise
+		// never be Reset on re-start, permanently reusing its failed generation and
+		// stranding the process blocked. Tasks re-run through their own coordinator,
+		// so only dependency targets are Reset here.
+		if s.classifyDependency(target) {
 			s.resetFailedTarget(target)
 		}
 	}

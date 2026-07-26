@@ -130,6 +130,15 @@ type ProcessInfo struct {
 	// else the default). Surfaced so operators can see the budget governing a
 	// stop/restart. Zero only for a process built outside createManagedProcess.
 	StopTimeout time.Duration `json:"-"`
+	// WaitingOn lists the depends_on targets this process is gated on while it is
+	// in the waiting state, in declaration order (plan 013 D5). A gated process
+	// leaves waiting only once ALL its targets are satisfied, so while waiting it
+	// is genuinely still gated on this set; it is empty in every other state.
+	WaitingOn []string `json:"waiting_on,omitempty"`
+	// BlockedOn lists the depends_on targets that failed and left this process in
+	// the blocked state, in declaration order (plan 013 D5). Mirrors
+	// ManagedProcess.BlockedBy; empty in every other state.
+	BlockedOn []string `json:"blocked_on,omitempty"`
 }
 
 // UptimeSeconds returns the number of seconds the process has been running. For

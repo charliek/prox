@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/charliek/prox/internal/domain"
@@ -52,7 +54,30 @@ func processStyle(state domain.ProcessState) lipgloss.Style {
 		return startingStyle
 	case domain.ProcessStateStopping:
 		return stoppingStyle
+	case domain.ProcessStateWaiting:
+		return waitingStyle
+	case domain.ProcessStateBlocked:
+		return blockedStyle
+	case domain.ProcessStateCompleted:
+		return completedStyle
 	default:
 		return defaultProcessStyle
 	}
+}
+
+// gatedDetail returns the inline gated-launch annotation for a process (plan 013
+// D5): " (waiting on: X, Y)" while waiting, " (blocked on: X)" while blocked, and
+// "" in every other state. Targets are shown in declaration order.
+func gatedDetail(p domain.ProcessInfo) string {
+	switch p.State {
+	case domain.ProcessStateWaiting:
+		if len(p.WaitingOn) > 0 {
+			return " (waiting on: " + strings.Join(p.WaitingOn, ", ") + ")"
+		}
+	case domain.ProcessStateBlocked:
+		if len(p.BlockedOn) > 0 {
+			return " (blocked on: " + strings.Join(p.BlockedOn, ", ") + ")"
+		}
+	}
+	return ""
 }

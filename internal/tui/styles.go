@@ -5,11 +5,14 @@ import "github.com/charmbracelet/lipgloss"
 // Colors
 var (
 	// Process state colors
-	runningColor  = lipgloss.Color("10") // Green
-	stoppedColor  = lipgloss.Color("8")  // Gray
-	crashedColor  = lipgloss.Color("9")  // Red
-	startingColor = lipgloss.Color("11") // Yellow
-	stoppingColor = lipgloss.Color("11") // Yellow
+	runningColor   = lipgloss.Color("10")  // Green
+	stoppedColor   = lipgloss.Color("8")   // Gray
+	crashedColor   = lipgloss.Color("9")   // Red
+	startingColor  = lipgloss.Color("11")  // Yellow
+	stoppingColor  = lipgloss.Color("11")  // Yellow
+	waitingColor   = lipgloss.Color("214") // Amber — a distinct waiting yellow, set apart from the bright starting yellow (plan 013 D5)
+	blockedColor   = lipgloss.Color("9")   // Red — a blocked process is a launch failure, same family as crashed
+	completedColor = lipgloss.Color("8")   // Gray — a finished task rests like a stopped one
 
 	// UI colors
 	headerBg   = lipgloss.Color("235")
@@ -57,6 +60,19 @@ var (
 
 	stoppingStyle = lipgloss.NewStyle().
 			Foreground(stoppingColor)
+
+	// Gated-launch + task terminal state styles (plan 013 D5). waiting is a
+	// distinct amber; blocked shares the crashed red (bold) as a launch failure;
+	// completed rests gray like stopped.
+	waitingStyle = lipgloss.NewStyle().
+			Foreground(waitingColor)
+
+	blockedStyle = lipgloss.NewStyle().
+			Foreground(blockedColor).
+			Bold(true)
+
+	completedStyle = lipgloss.NewStyle().
+			Foreground(completedColor)
 
 	defaultProcessStyle = lipgloss.NewStyle()
 

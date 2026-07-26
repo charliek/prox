@@ -294,6 +294,128 @@ func waitOutcome(t *testing.T, ch <-chan DepOutcome) DepOutcome {
 	}
 }
 
+// TestResolverStatusSnapshots pins plan 013 D5's status source: StatusSnapshots
+// reports EVERY configured dependency (not just active nodes), carries the check
+// definition, sorts by name, and reports a never-demanded dependency as pending.
+func TestResolverStatusSnapshots(t *testing.T) {
+	deps := map[string]domain.DependencyConfig{
+		"zeta":  {Name: "zeta", Check: domain.DependencyCheck{Kind: domain.CheckKindURL, Target: "http://z/health"}, OnFailure: domain.FailurePolicyFail},
+		"alpha": {Name: "alpha", Check: domain.DependencyCheck{Kind: domain.CheckKindTCP, Target: "127.0.0.1:1", Timeout: 30 * time.Second, Interval: time.Second}, OnFailure: domain.FailurePolicyFail},
+	}
+	prober := newScriptProber()
+	clk := newFakeClock()
+	r := NewResolver(deps, "", nil, nil, WithProber(prober), WithClock(clk))
+
+	// Before any Demand: both configured deps report pending, sorted by name, with
+	// their check definitions carried through.
+	snaps := r.StatusSnapshots()
+	if len(snaps) != 2 {
+		t.Fatalf("StatusSnapshots len = %d, want 2 (every configured dependency)", len(snaps))
+	}
+	if snaps[0].Name != "alpha" || snaps[1].Name != "zeta" {
+		t.Fatalf("StatusSnapshots not sorted by name: %s, %s", snaps[0].Name, snaps[1].Name)
+	}
+	for _, s := range snaps {
+		if s.State != DepStatePending {
+			t.Errorf("%s state = %s, want pending before demand", s.Name, s.State)
+		}
+	}
+	if snaps[0].Check.Kind != domain.CheckKindTCP || snaps[0].Check.Target != "127.0.0.1:1" {
+		t.Errorf("alpha check = %+v, want tcp 127.0.0.1:1", snaps[0].Check)
+	}
+
+	// Demand alpha and drive it healthy; its snapshot then reflects the live state.
+	ch := demand(r, context.Background(), "alpha")
+	prober.nextCall(t).result <- nil
+	if o := waitOutcome(t, ch); o.State != DepStateHealthy {
+		t.Fatalf("alpha outcome = %s, want healthy", o.State)
+	}
+	snaps = r.StatusSnapshots()
+	byName := map[string]DepStatus{}
+	for _, s := range snaps {
+		byName[s.Name] = s
+	}
+	if byName["alpha"].State != DepStateHealthy {
+		t.Errorf("alpha state = %s, want healthy", byName["alpha"].State)
+	}
+	if byName["zeta"].State != DepStatePending {
+		t.Errorf("zeta state = %s, want pending (never demanded)", byName["zeta"].State)
+	}
+}
+
+// TestResolverApplyGraphAtomicSnapshots pins plan 013's D5 atomicity fix: a
+// concurrent StatusSnapshots reader, while ApplyGraph swaps the dependency set,
+// must observe either the whole old set or the whole new one -- never a mixture.
+// The two sets are disjoint so any half-applied intermediate ({a,b,c}, {a}, ...)
+// is detectable. Run under -race with many flips to exercise the window; the old
+// redefine-each-then-prune sequence (each step under its own lock) would fail
+// this because a reader could catch a partially-swapped map.
+func TestResolverApplyGraphAtomicSnapshots(t *testing.T) {
+	depCfg := func(name string) domain.DependencyConfig {
+		return domain.DependencyConfig{
+			Name:      name,
+			Check:     domain.DependencyCheck{Kind: domain.CheckKindURL, Target: "http://" + name, Timeout: time.Second, Interval: time.Second},
+			OnFailure: domain.FailurePolicyFail,
+		}
+	}
+	setA := map[string]domain.DependencyConfig{"a": depCfg("a"), "b": depCfg("b")}
+	setB := map[string]domain.DependencyConfig{"c": depCfg("c"), "d": depCfg("d")}
+	nameSet := func(m map[string]domain.DependencyConfig) map[string]bool {
+		out := make(map[string]bool, len(m))
+		for k := range m {
+			out[k] = true
+		}
+		return out
+	}
+	namesA, namesB := nameSet(setA), nameSet(setB)
+	sameSet := func(a, b map[string]bool) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k := range a {
+			if !b[k] {
+				return false
+			}
+		}
+		return true
+	}
+
+	r := NewResolver(setA, "", nil, nil, WithClock(newFakeClock()))
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				errCh <- nil
+				return
+			default:
+			}
+			got := make(map[string]bool)
+			for _, s := range r.StatusSnapshots() {
+				got[s.Name] = true
+			}
+			if !sameSet(got, namesA) && !sameSet(got, namesB) {
+				errCh <- fmt.Errorf("StatusSnapshots observed a mixed set: %v", got)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 300; i++ {
+		if i%2 == 0 {
+			r.ApplyGraph(setB)
+		} else {
+			r.ApplyGraph(setA)
+		}
+	}
+	close(stop)
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // --- state machine tests ----------------------------------------------------
 
 func TestResolverHealthyFirstTry(t *testing.T) {

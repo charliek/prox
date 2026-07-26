@@ -62,6 +62,15 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// both signals are printed but the proxy sentinel wins the return (see below).
 	crashed := crashedProcesses(processes.Processes)
 
+	// Gated-launch failure signals (plan 013 D5). A process left `blocked` by a
+	// failed dependency, and any dependency in the terminal `failed` state, each
+	// fail `prox status` too — a green table must not mask a launch that will
+	// never happen. `completed` tasks and `warned`/`waiting`/`pending`
+	// dependencies deliberately never trip exit 1. Computed once so both paths
+	// honor them.
+	blocked := blockedProcesses(processes.Processes)
+	failedDeps := failedDependencies(status.Dependencies)
+
 	if statusJSON {
 		output := map[string]interface{}{
 			"status":    status,
@@ -72,7 +81,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 		// The JSON payload already carries each process's status, so no extra
 		// line is printed here — only the exit code changes.
-		return statusExitError(proxyDown, crashed)
+		return statusExitError(proxyDown, crashed, blocked, failedDeps)
 	}
 
 	// Print status
@@ -88,8 +97,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	for _, p := range processes.Processes {
 		uptime := formatDuration(time.Duration(p.UptimeSeconds) * time.Second)
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%d\t%s\n",
-			p.Name, p.Status, p.PID, uptime, p.Restarts, p.Health)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+			p.Name, statusField(p), pidField(p), uptime, p.Restarts, p.Health)
 	}
 	w.Flush()
 
@@ -105,25 +114,113 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\nCrashed: %s — check 'prox logs %s'.\n", strings.Join(crashed, ", "), crashed[0])
 	}
 
-	// Both signals print above; the exit code follows the shared precedence.
-	return statusExitError(proxyDown, crashed)
+	// Blocked line (plan 013 D5). Mirrors the Crashed line: names each blocked
+	// process with its failed dependency targets in declaration order. Printed
+	// alongside any crashed/proxy-down signal so none is hidden.
+	if len(blocked) > 0 {
+		fmt.Printf("\nBlocked: %s\n", strings.Join(blockedSummaries(processes.Processes), ", "))
+	}
+
+	// Dependencies section (plan 013 D5). Only when dependencies are configured.
+	renderDependencies(status.Dependencies)
+
+	// All applicable signals print above; the exit code follows the shared
+	// precedence in statusExitError.
+	return statusExitError(proxyDown, crashed, blocked, failedDeps)
 }
 
-// statusExitError maps runStatus's two exit-1 conditions to the error it
-// returns (nil = exit 0), keeping the precedence in one place for both the JSON
-// and table paths. When both hold, proxy-down wins the return — existing
-// behavior wins the tie; both map to exit 1 either way, and both human-readable
-// signals are printed by the caller regardless.
-func statusExitError(proxyDown bool, crashed []string) error {
+// statusField renders the STATUS column for a process row. It shows the bare
+// state enum, except for the two gated-launch states where the unsatisfied
+// depends_on targets are appended render-side (plan 013 D5): `waiting(a, b)` and
+// `blocked(a)`, comma+space separated in declaration order. The JSON status
+// stays the bare enum; only this human table decorates it.
+func statusField(p api.ProcessResponse) string {
+	switch p.Status {
+	case string(domain.ProcessStateWaiting):
+		if len(p.WaitingOn) > 0 {
+			return fmt.Sprintf("waiting(%s)", strings.Join(p.WaitingOn, ", "))
+		}
+	case string(domain.ProcessStateBlocked):
+		if len(p.BlockedOn) > 0 {
+			return fmt.Sprintf("blocked(%s)", strings.Join(p.BlockedOn, ", "))
+		}
+	}
+	return p.Status
+}
+
+// pidField renders the PID column. A process with no live PID — a completed
+// task, or any terminal/gated state — reports "-" rather than 0 (plan 013 D5),
+// so a frozen completed task reads as finished rather than "pid 0".
+func pidField(p api.ProcessResponse) string {
+	if p.PID == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", p.PID)
+}
+
+// blockedSummaries returns one "name(target1, target2)" entry per blocked
+// process, in the order the supervisor reported them, for the Blocked line.
+func blockedSummaries(procs []api.ProcessResponse) []string {
+	var out []string
+	for _, p := range procs {
+		if p.Status == string(domain.ProcessStateBlocked) {
+			out = append(out, fmt.Sprintf("%s(%s)", p.Name, strings.Join(p.BlockedOn, ", ")))
+		}
+	}
+	return out
+}
+
+// renderDependencies prints the Dependencies section (plan 013 D5): one row per
+// configured dependency with its state, check summary, and — for a failed or
+// warned dependency — the last probe error as detail. Nothing prints when no
+// dependencies are configured.
+func renderDependencies(deps []api.DependencyStatusResponse) {
+	if len(deps) == 0 {
+		return
+	}
+	fmt.Println("\nDependencies:")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tSTATE\tCHECK\tDETAIL")
+	fmt.Fprintln(w, "----\t-----\t-----\t------")
+	for _, d := range deps {
+		detail := ""
+		if d.State == string(supervisorDepFailed) || d.State == string(supervisorDepWarned) {
+			detail = d.LastError
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", d.Name, d.State, d.Check, detail)
+	}
+	w.Flush()
+}
+
+// statusExitError maps runStatus's exit-1 conditions to the error it returns
+// (nil = exit 0), keeping the precedence in one place for both the JSON and
+// table paths (plan 013 D5). Exit 1 holds when ANY condition holds; the returned
+// (primary) error follows the precedence proxy-down > crashed > blocked >
+// failed-dependency. All applicable human-readable table lines are printed by
+// the caller regardless of which one wins the return.
+func statusExitError(proxyDown bool, crashed, blocked, failedDeps []string) error {
 	switch {
 	case proxyDown:
 		return errSharedProxyDown
 	case len(crashed) > 0:
 		return errProcessesCrashed(len(crashed))
+	case len(blocked) > 0:
+		return errProcessesBlocked(len(blocked))
+	case len(failedDeps) > 0:
+		return errDependenciesFailed(len(failedDeps))
 	default:
 		return nil
 	}
 }
+
+// supervisorDepFailed / supervisorDepWarned are the dependency states whose
+// last error is worth surfacing as row detail. They mirror the resolver's
+// terminal DepState strings without importing the supervisor package into the
+// CLI's render path.
+const (
+	supervisorDepFailed = "failed"
+	supervisorDepWarned = "warned"
+)
 
 // errSharedProxyDown is returned by runStatus when the shared proxy daemon is
 // unreachable, so `prox status` exits non-zero (D5). Its text IS user-visible:
@@ -140,13 +237,33 @@ func errProcessesCrashed(n int) error {
 	return fmt.Errorf("%d process(es) crashed", n)
 }
 
+// errProcessesBlocked is returned by runStatus when one or more child processes
+// are blocked on a failed dependency (plan 013 D5), so `prox status` exits
+// non-zero. Its text is user-visible (Execute prints `Error: %v`); the count is
+// baked in so the stderr line names how many processes are blocked.
+func errProcessesBlocked(n int) error {
+	return fmt.Errorf("%d process(es) blocked on failed dependencies", n)
+}
+
+// errDependenciesFailed is returned by runStatus when one or more dependencies
+// are in the terminal failed state (fail policy) but no crashed/blocked/proxy
+// signal outranks them (plan 013 D5). Its text is user-visible; the singular
+// "dependency" / plural "dependencies" agrees with the count.
+func errDependenciesFailed(n int) error {
+	if n == 1 {
+		return fmt.Errorf("1 dependency failed")
+	}
+	return fmt.Errorf("%d dependencies failed", n)
+}
+
 // crashedProcesses returns the names of processes in the crashed state, in the
 // order the supervisor reported them (no sort). `prox status` exits non-zero
 // when this is non-empty (D1, #72): exit 0 must not mask a dead child. Only
 // domain.ProcessStateCrashed counts — starting/stopping/deliberately-stopped
 // and running-but-unhealthy processes are NOT failures for this contract, and
-// health is a separate axis kept out of it. (Do not use ProcessState.IsStopped,
-// which collapses stopped and crashed.)
+// health is a separate axis kept out of it. A completed task is NOT crashed, so
+// it never counts here (plan 013 D5). (Do not use ProcessState.IsStopped, which
+// collapses stopped, crashed, blocked, and completed.)
 func crashedProcesses(procs []api.ProcessResponse) []string {
 	var crashed []string
 	for _, p := range procs {
@@ -155,6 +272,36 @@ func crashedProcesses(procs []api.ProcessResponse) []string {
 		}
 	}
 	return crashed
+}
+
+// blockedProcesses returns the names of processes in the blocked state, in the
+// order the supervisor reported them (plan 013 D5): a gated process a failed
+// required dependency will never let launch. Only exact
+// domain.ProcessStateBlocked counts — waiting (still resolving) is not a
+// failure.
+func blockedProcesses(procs []api.ProcessResponse) []string {
+	var blocked []string
+	for _, p := range procs {
+		if p.Status == string(domain.ProcessStateBlocked) {
+			blocked = append(blocked, p.Name)
+		}
+	}
+	return blocked
+}
+
+// failedDependencies returns the names of dependencies in the terminal failed
+// state (plan 013 D5): fail-policy dependencies that exhausted their budget.
+// Only exact "failed" counts — a warned dependency proceeded, and
+// pending/checking/polling/healthy/canceled are not failures — so those never
+// trip the exit contract.
+func failedDependencies(deps []api.DependencyStatusResponse) []string {
+	var failed []string
+	for _, d := range deps {
+		if d.State == supervisorDepFailed {
+			failed = append(failed, d.Name)
+		}
+	}
+	return failed
 }
 
 // sharedProxyDown is the single "down" predicate behind both the DOWN line and

@@ -360,9 +360,14 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		StopTimeout:  p.shutdownTimeout,
 	}
 
-	// PID is only meaningful while the process is active. Once stopped or
-	// crashed we report 0 even though current is retained for reap/retry.
-	if !p.state.IsStopped() && p.current != nil && p.current.proc != nil {
+	// PID is only meaningful while the process is actively running/starting/
+	// stopping. A stopped/crashed/blocked/completed process reports 0 even though
+	// current is retained for reap/retry. A waiting process reports 0 too: on a
+	// RE-RUN of a completed/crashed task, current still holds the reaped prior
+	// instance, so guarding on IsStopped alone would surface that dead PID while
+	// the task waits on its dependencies again (plan 013 D5 fix).
+	if !p.state.IsStopped() && p.state != domain.ProcessStateWaiting &&
+		p.current != nil && p.current.proc != nil {
 		info.PID = p.current.proc.PID()
 	}
 
@@ -374,6 +379,18 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 	// the frozen end so UptimeSeconds reflects the run duration, not now-start.
 	if p.state == domain.ProcessStateCompleted && !p.completedAt.IsZero() {
 		info.EndedAt = p.completedAt
+	}
+
+	// Gated-launch surfacing (plan 013 D5). While waiting, report the full
+	// depends_on set (declaration order) as WaitingOn: a gated process leaves
+	// waiting only when every target is satisfied, so it is still gated on the
+	// set. When blocked, report the recorded blocking targets. Both are empty in
+	// every other state.
+	switch p.state {
+	case domain.ProcessStateWaiting:
+		info.WaitingOn = slices.Clone(p.config.DependsOn)
+	case domain.ProcessStateBlocked:
+		info.BlockedOn = slices.Clone(p.blockedBy)
 	}
 
 	// Include health check state if checker exists

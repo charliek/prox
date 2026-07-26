@@ -193,15 +193,21 @@ func discoverAPIAddress() (string, error) {
 	return "", errNoRunningInstance
 }
 
-// getProcessNames returns process names from config for shell completion
+// getProcessNames returns the names that are valid targets for start/stop/restart
+// completion. It includes both processes and tasks (plan 013 D5): a task is a
+// run-to-completion child that `prox start`/`stop`/`restart` operate on exactly
+// like a process, so its name must complete too.
 func getProcessNames() []string {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil
 	}
 
-	names := make([]string, 0, len(cfg.Processes))
+	names := make([]string, 0, len(cfg.Processes)+len(cfg.Tasks))
 	for name := range cfg.Processes {
+		names = append(names, name)
+	}
+	for name := range cfg.Tasks {
 		names = append(names, name)
 	}
 	return names

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -642,21 +643,40 @@ func (r *Resolver) Redefine(name string, cfg domain.DependencyConfig) bool {
 	return true
 }
 
-// RetainOnly drops every dependency definition whose name is NOT in keep (plan
-// 013 fix 5): on a reload that removed a dependency, or moved a name from
-// dependency to task, the resolver must forget the stale definition so a later
-// Demand of that name no longer resolves it as a dependency. Each removed name is
-// Reset (cancel in-flight resolution, bump generation) so a concurrent demander
-// of a retired generation observes a canceled outcome, exactly as after any
-// Reset. Closed resolvers are a no-op.
-func (r *Resolver) RetainOnly(keep map[string]struct{}) {
+// ApplyGraph atomically installs a reload's fresh dependency set (plan 013 D6;
+// D5 atomicity fix). Under a SINGLE r.mu critical section it redefines every
+// changed or new dependency and drops every dependency whose name is absent from
+// fresh, so a concurrent StatusSnapshots (or any other reader) never observes a
+// half-applied mixture of the old and new sets -- the flaw of the old
+// redefine-each-then-prune sequence, where every step took its own lock. Per-
+// entry semantics match Redefine: an unchanged definition is left untouched (its
+// cached outcome survives a re-probe), a changed or new one is Reset (in-flight
+// resolution canceled, cached node dropped, generation bumped) so the next Demand
+// re-resolves it, and a removed/migrated name is Reset and forgotten. A
+// concurrent demander of any retired generation observes a canceled outcome
+// exactly as after any Reset. Closed resolvers are a no-op.
+func (r *Resolver) ApplyGraph(fresh map[string]domain.DependencyConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return
 	}
+	// Redefine changed definitions and add new ones.
+	for name, cfg := range fresh {
+		if existing, ok := r.deps[name]; ok && reflect.DeepEqual(existing, cfg) {
+			continue
+		}
+		r.deps[name] = cfg
+		if node := r.nodes[name]; node != nil {
+			node.cancelNode()
+			delete(r.nodes, name)
+		}
+		r.nextGen[name]++
+	}
+	// Retain only the fresh set: forget any dependency the reload removed or
+	// migrated to a task.
 	for name := range r.deps {
-		if _, ok := keep[name]; ok {
+		if _, ok := fresh[name]; ok {
 			continue
 		}
 		delete(r.deps, name)
@@ -703,6 +723,43 @@ func (r *Resolver) Snapshots() []DepSnapshot {
 		out = append(out, node.snapshot(name))
 	}
 	r.mu.Unlock()
+	return out
+}
+
+// DepStatus combines a configured dependency's stored check definition with its
+// current resolution snapshot, for status surfacing (plan 013 D5). Unlike
+// DepSnapshot (active nodes only), it is produced for EVERY configured
+// dependency: one without an active node this generation reports DepStatePending
+// with no error and StartInvoked=false.
+type DepStatus struct {
+	Name         string
+	Check        domain.DependencyCheck
+	State        DepState
+	LastError    string
+	StartInvoked bool
+}
+
+// StatusSnapshots returns a DepStatus for every configured dependency, sorted by
+// name for stable rendering (plan 013 D5). It reads the stored definitions and
+// the per-node snapshots together under r.mu so the check summary and live state
+// never race a reload -- ApplyGraph installs the fresh set under the same single
+// lock, so a reader observes either the whole old set or the whole new one, never
+// a mixture. A dependency with no node this generation is reported as pending.
+func (r *Resolver) StatusSnapshots() []DepStatus {
+	r.mu.Lock()
+	out := make([]DepStatus, 0, len(r.deps))
+	for name, cfg := range r.deps {
+		ds := DepStatus{Name: name, Check: cfg.Check, State: DepStatePending}
+		if node := r.nodes[name]; node != nil {
+			snap := node.snapshot(name)
+			ds.State = snap.State
+			ds.LastError = snap.LastError
+			ds.StartInvoked = snap.StartInvoked
+		}
+		out = append(out, ds)
+	}
+	r.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

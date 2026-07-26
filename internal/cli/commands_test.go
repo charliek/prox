@@ -1275,6 +1275,255 @@ func statusServerWithProxy(t *testing.T, proxy *api.ProxyStatusResponse, procs .
 	apiAddr = server.URL
 }
 
+// statusServerWithDeps is statusServerWithProxy plus a dependencies array on the
+// status payload (plan 013 D5), so tests can drive the Dependencies section and
+// the failed-dependency exit contract. procs defaults to a single healthy web
+// process when none are given.
+func statusServerWithDeps(t *testing.T, deps []api.DependencyStatusResponse, procs ...api.ProcessResponse) {
+	t.Helper()
+	originalApiAddr := apiAddr
+	t.Cleanup(func() { apiAddr = originalApiAddr })
+
+	if len(procs) == 0 {
+		procs = []api.ProcessResponse{
+			{Name: "web", Status: "running", PID: 1234, UptimeSeconds: 5, Health: "healthy"},
+		}
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/status":
+			_ = json.NewEncoder(w).Encode(api.StatusResponse{
+				Status:        "running",
+				UptimeSeconds: 10,
+				ConfigFile:    "prox.yaml",
+				APIVersion:    "v1",
+				Dependencies:  deps,
+			})
+		case "/api/v1/processes":
+			_ = json.NewEncoder(w).Encode(api.ProcessListResponse{Processes: procs})
+		}
+	}))
+	t.Cleanup(server.Close)
+	apiAddr = server.URL
+}
+
+// TestStatusExitError_Matrix pins the exit-contract precedence and every trip
+// condition (plan 013 D5): exit 1 holds when ANY of proxy-down, crashed,
+// blocked, or failed-dependency holds, and the returned primary error follows
+// proxy-down > crashed > blocked > failed-dependency.
+func TestStatusExitError_Matrix(t *testing.T) {
+	one := []string{"x"}
+	tests := []struct {
+		name       string
+		proxyDown  bool
+		crashed    []string
+		blocked    []string
+		failedDeps []string
+		wantErr    string // "" = nil (exit 0)
+	}{
+		{"all clear", false, nil, nil, nil, ""},
+		{"proxy down wins over all", true, one, one, one, "shared proxy daemon is unreachable"},
+		{"crashed wins over blocked+dep", false, one, one, one, "1 process(es) crashed"},
+		{"blocked wins over dep", false, nil, one, one, "1 process(es) blocked on failed dependencies"},
+		{"dep failed alone", false, nil, nil, one, "1 dependency failed"},
+		{"dep failed plural", false, nil, nil, []string{"a", "b"}, "2 dependencies failed"},
+		{"blocked alone", false, nil, []string{"p1", "p2"}, nil, "2 process(es) blocked on failed dependencies"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := statusExitError(tc.proxyDown, tc.crashed, tc.blocked, tc.failedDeps)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want nil (exit 0), got %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("want error %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestStatusField pins the STATUS-column render helper (plan 013 D5): bare enum
+// for ordinary states, decorated with the targets for waiting/blocked.
+func TestStatusField(t *testing.T) {
+	tests := []struct {
+		name string
+		p    api.ProcessResponse
+		want string
+	}{
+		{"running bare", api.ProcessResponse{Status: "running"}, "running"},
+		{"completed bare", api.ProcessResponse{Status: "completed"}, "completed"},
+		{"waiting with targets", api.ProcessResponse{Status: "waiting", WaitingOn: []string{"postgres", "redis"}}, "waiting(postgres, redis)"},
+		{"blocked with targets", api.ProcessResponse{Status: "blocked", BlockedOn: []string{"restate-register"}}, "blocked(restate-register)"},
+		{"waiting no targets falls back", api.ProcessResponse{Status: "waiting"}, "waiting"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusField(tc.p); got != tc.want {
+				t.Errorf("statusField = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPidField pins that a process with no live PID renders "-" (plan 013 D5).
+func TestPidField(t *testing.T) {
+	if got := pidField(api.ProcessResponse{PID: 4321}); got != "4321" {
+		t.Errorf("pidField(4321) = %q, want 4321", got)
+	}
+	if got := pidField(api.ProcessResponse{Status: "completed", PID: 0}); got != "-" {
+		t.Errorf("pidField(completed, 0) = %q, want -", got)
+	}
+}
+
+// TestBlockedSummaries pins the Blocked-line rendering: one name(targets) entry
+// per blocked process in response order.
+func TestBlockedSummaries(t *testing.T) {
+	procs := []api.ProcessResponse{
+		{Name: "web", Status: "running"},
+		{Name: "svc", Status: "blocked", BlockedOn: []string{"db", "cache"}},
+		{Name: "job", Status: "blocked", BlockedOn: []string{"db"}},
+	}
+	got := blockedSummaries(procs)
+	want := []string{"svc(db, cache)", "job(db)"}
+	if len(got) != len(want) {
+		t.Fatalf("blockedSummaries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("blockedSummaries[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestFailedDependencies pins that only the exact "failed" state counts (plan
+// 013 D5): warned/pending/healthy/canceled never trip the exit contract.
+func TestFailedDependencies(t *testing.T) {
+	deps := []api.DependencyStatusResponse{
+		{Name: "pg", State: "failed"},
+		{Name: "warned-dep", State: "warned"},
+		{Name: "ok", State: "healthy"},
+		{Name: "slow", State: "polling"},
+		{Name: "pg2", State: "failed"},
+	}
+	got := failedDependencies(deps)
+	if len(got) != 2 || got[0] != "pg" || got[1] != "pg2" {
+		t.Errorf("failedDependencies = %v, want [pg pg2]", got)
+	}
+}
+
+// TestRunStatus_CompletedTaskExit0 is the rc=0 retirement flagship at the CLI
+// layer: a completed task must not trip exit 1, and its PID renders "-".
+func TestRunStatus_CompletedTaskExit0(t *testing.T) {
+	statusServerWithDeps(t, nil,
+		api.ProcessResponse{Name: "migrate", Status: "completed", Kind: "task", PID: 0, UptimeSeconds: 3},
+		api.ProcessResponse{Name: "web", Status: "running", PID: 1234, Health: "healthy"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil for a completed task", runErr)
+	}
+	if !strings.Contains(stdout, "migrate") || !strings.Contains(stdout, "completed") {
+		t.Errorf("stdout missing the completed task row; got:\n%s", stdout)
+	}
+	// The completed task's PID must render "-", never 0.
+	if !strings.Contains(stdout, "migrate") || strings.Contains(stdout, "migrate      completed  0") {
+		t.Errorf("completed task PID should render '-', not 0; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_BlockedAndFailedDep pins the blocked + failed-dependency surface
+// (plan 013 D5): exit 1, the Blocked line names the process and its targets, the
+// Dependencies section shows the failed dependency with its detail, and the
+// primary error is the blocked one (blocked outranks failed-dependency).
+func TestRunStatus_BlockedAndFailedDep(t *testing.T) {
+	statusServerWithDeps(t,
+		[]api.DependencyStatusResponse{
+			{Name: "postgres", State: "failed", Check: "tcp localhost:5999", LastError: "dial tcp: connection refused"},
+		},
+		api.ProcessResponse{Name: "api", Status: "blocked", BlockedOn: []string{"postgres"}},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil || runErr.Error() != "1 process(es) blocked on failed dependencies" {
+		t.Fatalf("runStatus returned %v, want the blocked error (outranks failed-dependency)", runErr)
+	}
+	if !strings.Contains(stdout, "Blocked: api(postgres)") {
+		t.Errorf("stdout missing the Blocked line; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Dependencies:") || !strings.Contains(stdout, "postgres") ||
+		!strings.Contains(stdout, "tcp localhost:5999") || !strings.Contains(stdout, "connection refused") {
+		t.Errorf("stdout missing the Dependencies section detail; got:\n%s", stdout)
+	}
+	// The STATUS column decorates the blocked row with its target.
+	if !strings.Contains(stdout, "blocked(postgres)") {
+		t.Errorf("stdout missing the decorated blocked status; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_WarnedDepExit0 pins that a warned dependency (dependents ran)
+// never trips exit 1 and is still visible in the Dependencies section.
+func TestRunStatus_WarnedDepExit0(t *testing.T) {
+	statusServerWithDeps(t,
+		[]api.DependencyStatusResponse{
+			{Name: "cache", State: "warned", Check: "tcp localhost:6399", LastError: "not ready within budget"},
+		},
+		api.ProcessResponse{Name: "web", Status: "running", PID: 1234, Health: "healthy"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil for a warned dependency", runErr)
+	}
+	if !strings.Contains(stdout, "cache") || !strings.Contains(stdout, "warned") {
+		t.Errorf("stdout missing the warned dependency row; got:\n%s", stdout)
+	}
+}
+
+// TestRunStatus_CrashedBeatsBlocked pins that a crash and a block coexist — both
+// lines print — but the crashed error wins the primary return (precedence).
+func TestRunStatus_CrashedBeatsBlocked(t *testing.T) {
+	statusServerWithDeps(t,
+		[]api.DependencyStatusResponse{
+			{Name: "postgres", State: "failed", Check: "tcp localhost:5999", LastError: "refused"},
+		},
+		api.ProcessResponse{Name: "worker", Status: "crashed"},
+		api.ProcessResponse{Name: "api", Status: "blocked", BlockedOn: []string{"postgres"}},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+
+	if runErr == nil || runErr.Error() != "1 process(es) crashed" {
+		t.Fatalf("runStatus returned %v, want the crashed error (outranks blocked)", runErr)
+	}
+	if !strings.Contains(stdout, "Crashed: worker") {
+		t.Errorf("stdout missing the Crashed line; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Blocked: api(postgres)") {
+		t.Errorf("stdout missing the Blocked line; got:\n%s", stdout)
+	}
+}
+
 // TestRunStatus_SharedProxyDownExits1 pins D5: when the status block reports a
 // shared proxy that is unreachable, runStatus prints the DOWN line and returns a
 // non-nil error (exit 1) even though the child process is healthy.

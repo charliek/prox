@@ -641,10 +641,17 @@ func TestTask_Fix2_ConcurrentRerunsAdmitOne(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, admitted, "exactly one concurrent re-run admits an episode")
+
+	// StartProcess admits synchronously (beginWaiting under taskMu) but the LAUNCH
+	// happens in the async runTask goroutine, so the started-count is only settled
+	// once the re-run is actually running -- asserting it immediately after
+	// wg.Wait races that goroutine (a pre-existing flake). Wait for the single
+	// re-run to reach running FIRST, then assert exactly one re-run launched;
+	// admitted==1 above already bounds it to a single episode.
+	waitState(t, sup, "migrate", domain.ProcessStateRunning)
 	assert.Equal(t, 2, runner.startCount("migrate"), "exactly one re-run launched (initial + 1)")
 
 	// The re-run settles terminally.
-	waitState(t, sup, "migrate", domain.ProcessStateRunning)
 	completeTask(t, runner, "migrate")
 	waitState(t, sup, "migrate", domain.ProcessStateCompleted)
 }

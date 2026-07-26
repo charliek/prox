@@ -1533,6 +1533,12 @@ func (b *BaseModel) processPanel() string {
 			name = fmt.Sprintf("[%s]", proc.Name)
 		}
 
+		// Gated-launch detail (plan 013 D5): a waiting/blocked process shows what
+		// it is gated on inline, in declaration order, so the panel explains why it
+		// has not launched. Kept minimal — this compact panel has no separate
+		// detail area.
+		name += gatedDetail(proc)
+
 		// Show number key (only in logs view where 1-9 keys work)
 		if b.viewMode == ViewModeLogs {
 			key := fmt.Sprintf("%d:", i+1)
