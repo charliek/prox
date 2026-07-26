@@ -55,9 +55,59 @@ prox proxy stop --force      # Stop anyway, disconnecting all projects
 
 If a proxied request returns a connection error or an unexpected 404, check `prox proxy routes` first to confirm the target hostname is actually registered.
 
-**`prox status` exit code, precisely.** `prox status` exits `0` only when the supervisor query succeeded, **and** no process is in the `crashed` state, **and** any configured shared proxy is reachable. It does **not** assert that every process is `running` or `healthy`: `starting`, `stopping`, deliberately-`stopped`, and running-but-`unhealthy` processes all still exit `0`. It exits `1` when any child is `crashed` (the table adds a `Crashed: <name> — check 'prox logs <name>'.` line and stderr carries `Error: N process(es) crashed`) or when a configured shared proxy is unreachable (the `Proxy: DOWN — shared proxy daemon unreachable` line; if both hold, both signals print and the proxy-down error takes stderr precedence). The proxy project self-heals — it re-registers with a fresh or recovered daemon automatically (worst case ~45s), so a brief `DOWN` reading is often transient; a `crashed` child is sticky until restarted. Reach for `prox proxy status` / `prox proxy routes` for daemon-side detail `prox status` doesn't carry. (See prox#66, prox#72.)
+**`prox status` exit code, precisely.** `prox status` exits `0` only when the supervisor query succeeded, **and** no process is in the `crashed` or `blocked` state, **and** no `dependencies:` entry is `failed`, **and** any configured shared proxy is reachable. It does **not** assert that every process is `running` or `healthy`: `starting`, `stopping`, `waiting`, deliberately-`stopped`, `completed` (a task that ran to completion), and running-but-`unhealthy` processes all still exit `0`; a `warned` dependency also never trips it. It exits `1` when any child is `crashed` (the table adds a `Crashed: <name> — check 'prox logs <name>'.` line and stderr carries `Error: N process(es) crashed`), any process is `blocked` on a failed dependency (a `Blocked: <name>(<target>...)` line and `Error: N process(es) blocked on failed dependencies`), any dependency is `failed` (`Error: N dependencies failed`), or a configured shared proxy is unreachable (the `Proxy: DOWN — shared proxy daemon unreachable` line). All applicable lines print together; the primary stderr sentinel follows precedence **proxy-down > crashed > blocked > failed-dependency**. The proxy project self-heals — it re-registers with a fresh or recovered daemon automatically (worst case ~45s), so a brief `DOWN` reading is often transient; a `crashed`/`blocked` child is sticky until restarted. Reach for `prox proxy status` / `prox proxy routes` for daemon-side detail `prox status` doesn't carry. (See prox#66, prox#72, prox#76.)
 
-> **One-shot caveat:** the supervisor marks *any* non-Stop-driven exit as `crashed` — including a one-shot child that exits `0` (a migration or seed step). Such a project fails `prox status` until the child is restarted, so one-shot helpers should live outside `prox.yaml` or you should expect a non-zero status. To check only what you care about, parse `prox status --json` (its per-process `status` is authoritative) rather than `prox status || true`, which would also mask discovery errors and an unreachable supervisor.
+> **One-shot caveat, narrowed to plain processes:** the supervisor marks *any* non-Stop-driven exit as `crashed` for a bare `processes:` entry — including one that exits `0` (a migration or seed step). Such a project fails `prox status` until the child is restarted, so keep a one-shot command out of `processes:` — use a **`tasks:`** entry instead (see "Dependencies, Tasks, and Process Gating" below): a task's natural `exit 0` lands in the dedicated `completed` state and does **not** trip the exit contract. To check only what you care about, parse `prox status --json` (its per-process `status`, and each dependency's `state`, are authoritative) rather than `prox status || true`, which would also mask discovery errors and an unreachable supervisor.
+
+## Dependencies, Tasks, and Process Gating
+
+prox can wait on external resources, run one-shot setup commands, and gate a process's launch on either — useful for a project that needs a database or another service up before its app processes start.
+
+**Authoring.** Three config pieces work together:
+
+```yaml
+dependencies:
+  postgres:
+    check:
+      tcp: localhost:5432        # exactly one of tcp/url/cmd
+    start: docker compose up -d postgres   # runs only if the check fails; runs once
+    on_failure: fail              # fail (default) aborts dependents; warn lets them proceed
+
+tasks:
+  migrate:
+    cmd: ./scripts/migrate.sh
+    depends_on: [postgres]
+    timeout: 2m                   # 0 = unlimited; omit for the 60s default
+
+processes:
+  api:
+    cmd: go run ./cmd/server
+    depends_on: [postgres, migrate]   # targets must be dependencies/tasks, never processes
+```
+
+Key rules: names must be unique across `processes`/`dependencies`/`tasks`; a `depends_on` target must be a dependency or task (never a process — process→process ordering isn't supported); cycles among tasks are rejected at load time. Full field tables: `references/configuration.md`.
+
+**Operating.** `prox status` decorates gated states inline and adds a `Dependencies:` section:
+
+```text
+NAME    STATUS                  PID  UPTIME  RESTARTS  HEALTH
+api     waiting(postgres)       -    0s      0         unknown
+migrate blocked(postgres)       -    0s      0         unknown
+
+Blocked: migrate(postgres)
+
+Dependencies:
+NAME      STATE   CHECK               DETAIL
+postgres  failed  tcp localhost:5432  dial tcp ...: connection refused
+```
+
+- `waiting(x, y)` — still resolving those targets; `blocked(x)` — a required target failed and this process/task will never launch on its own.
+- A **task** that exits `0` lands in `completed` (PID `-`, uptime frozen) and runs only **once per `prox up` lifetime** — a dependent's restart does not re-run it.
+- **Re-demand a blocked dependency:** `prox start <name>` on a blocked, gated process resets only its *failed* targets (healthy/warned ones keep their cached result) and re-resolves.
+- **Re-run a task:** `prox restart <task>` (or `prox stop <task>` + `prox start <task>`).
+- **`prox down`/shutdown never touches external resources** a `start:` command brought up (e.g. `docker compose up -d postgres` keeps running after `prox down`) — prox only kills its own `start` helper process if it is *still running* at teardown time. Daemonizing (`up -d`-style) start commands is the intended pattern, not a workaround.
+
+See `references/configuration.md` for the full field reference and `references/api.md` for the `dependencies`/`kind`/`waiting_on`/`blocked_on` JSON fields.
 
 ## Viewing Logs
 
@@ -146,6 +196,22 @@ processes:
       timeout: 5s
       retries: 3
       start_period: 30s
+    # Gate this process on an external resource and a one-shot task (see
+    # "Dependencies, Tasks, and Process Gating" above).
+    depends_on: [postgres, migrate]
+
+# External resource with a readiness check and an optional bring-up command.
+dependencies:
+  postgres:
+    check:
+      tcp: localhost:5432
+    start: docker compose up -d postgres
+
+# Run-to-completion command; runs once per `prox up`, after its own deps are ready.
+tasks:
+  migrate:
+    cmd: ./scripts/migrate.sh
+    depends_on: [postgres]
 ```
 
 Environment variable precedence, later overrides earlier: system environment → global `env_file` → process-specific `env_file` → process-specific `env` map.

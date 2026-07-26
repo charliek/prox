@@ -93,6 +93,7 @@ nav:
   - Guides:
       - Local DNS & Certificates: guides/local-dns.md
       - Shared Proxy Across Projects: guides/shared-proxy.md
+      - Dependencies, Tasks, and Process Gating: guides/dependencies.md
   - Design Notes:
       - Shared Proxy Across Projects: discovery/shared-proxy-across-projects.md
   - Reference:

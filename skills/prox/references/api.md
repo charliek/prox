@@ -87,7 +87,15 @@ Supervisor status.
     "dropped_events": 0,
     "backfill_failures": 0,
     "heal_state": "healthy"
-  }
+  },
+  "dependencies": [
+    {
+      "name": "postgres",
+      "state": "healthy",
+      "check": "tcp localhost:5432",
+      "start_invoked": false
+    }
+  ]
 }
 ```
 
@@ -105,6 +113,18 @@ Supervisor status.
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
 
 **When `mode` is `shared` and `daemon_reachable` is `false`, proxied routes are dead** — requests through the proxy will fail even though the project's own processes may be healthy. This is not necessarily an error to act on immediately: the project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s. An agent polling status should treat a brief `daemon_reachable: false` as transient, retry rather than fail the task outright, and only surface it as a real problem if it persists past that window. `prox proxy status` gives daemon-side detail (routes, version) that this per-project block does not.
+
+`dependencies` reports the resolution state of every configured `dependencies:` entry; omitted entirely (never an empty array) when none are configured:
+
+| Field | Description |
+|-------|-------------|
+| `name` | The dependency's name |
+| `state` | `pending`, `checking`, `starting`, `polling`, `healthy`, `warned` (budget exhausted, `on_failure: warn`), `failed` (budget exhausted, `on_failure: fail`), or `canceled` (torn down by shutdown/reset, not a failure) |
+| `check` | One-line `"<kind> <target>"` summary, e.g. `tcp localhost:5432` |
+| `last_error` | Most recent probe error; omitted when none |
+| `start_invoked` | Whether `start:` was launched this generation |
+
+Only `failed` trips `prox status`'s exit-1 contract; `warned` does not (its dependents still run).
 
 ### GET /processes
 
@@ -125,19 +145,37 @@ List all processes.
     },
     {
       "name": "api",
-      "status": "running",
-      "pid": 12346,
-      "uptime_seconds": 3600,
-      "restarts": 1,
-      "health": "unhealthy"
+      "status": "waiting",
+      "pid": 0,
+      "uptime_seconds": 0,
+      "restarts": 0,
+      "health": "unknown",
+      "waiting_on": ["postgres", "redis"]
+    },
+    {
+      "name": "migrate",
+      "status": "completed",
+      "pid": 0,
+      "uptime_seconds": 9,
+      "restarts": 0,
+      "health": "unknown",
+      "kind": "task"
     }
   ]
 }
 ```
 
-**Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`
+**Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`, `waiting`, `blocked`, `completed` (task exited `0`)
 
-**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured)
+**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured — always `unknown` for a task)
+
+| Field | Description |
+|-------|-------------|
+| `kind` | `"task"` for a `tasks:` entry; omitted for a plain process |
+| `waiting_on` | `depends_on` targets still resolving, in declaration order; present only in the `waiting` state |
+| `blocked_on` | `depends_on` targets that failed, in declaration order; present only in the `blocked` state |
+
+`pid` is `0` (CLI table shows `-`) for any state with no live process: `waiting`, `blocked`, `stopped`, `completed`.
 
 ### GET /processes/{name}
 

@@ -79,6 +79,117 @@ processes:
 | `stop_timeout` | duration | inherits `shutdown_timeout` | This process's stop budget, overriding the global `shutdown_timeout` (see [Stop Timeout](#stop-timeout)). Must be greater than `2s` and at most `10m` |
 | `healthcheck` | object | — | Health check configuration |
 
+## Dependencies, Tasks, and Process Gating
+
+prox can wait on external resources and run one-shot setup commands before
+your processes start, and gate a process's launch on either. Three pieces
+work together:
+
+- **`dependencies:`** — external resources (a database, a cache, another
+  service) with a readiness check and an optional command to bring them up.
+- **`tasks:`** — run-to-completion commands (migrations, seeding,
+  registration) that run once per `prox up`.
+- **`processes.<name>.depends_on`** — gates a process's launch on
+  dependencies and/or tasks.
+
+```yaml
+dependencies:
+  postgres:
+    check:
+      tcp: localhost:5432
+    start: docker compose up -d postgres
+    on_failure: fail
+
+tasks:
+  migrate:
+    cmd: ./scripts/migrate.sh
+    depends_on: [postgres]
+    timeout: 2m
+
+processes:
+  api:
+    cmd: go run ./cmd/server
+    depends_on: [postgres, migrate]
+```
+
+### Dependency Fields
+
+A `dependencies:` entry describes one external resource. Dependencies are
+dependency-graph **roots**: they cannot themselves have a `depends_on` (a
+`depends_on` key on a dependency is a validation error).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `check.tcp` | string | — | Dial `host:port`; a successful connect means ready. Exactly one of `check.tcp`/`check.url`/`check.cmd` must be set |
+| `check.url` | string | — | `GET` an `http`/`https` URL; only a `2xx` response means ready. Redirects are **not** followed (a `3xx` is unhealthy); TLS uses the system trust store |
+| `check.cmd` | string | — | Run via `sh -c`; exit `0` means ready |
+| `check.timeout` | duration | `30s` | Total readiness budget for this dependency, **including** any `start` command's execution time. Must be `>=` `check.interval` |
+| `check.interval` | duration | `1s` | Spacing between readiness probes. Must be greater than `0` |
+| `start` | string | — | Command run via `sh -c` to bring the dependency up. Runs **only** when the initial check fails, and **at most once** per resolution — never when the initial check already passes |
+| `on_failure` | string | `fail` | `fail` aborts the process(es) gated on this dependency; `warn` logs and lets them proceed anyway |
+
+Each check attempt is additionally bounded by `min(2s, remaining budget)`, so
+one hung dial/`GET`/command can never eat the whole `check.timeout` window —
+the interval still governs spacing between attempts.
+
+### Task Fields
+
+A `tasks:` entry is a run-to-completion command — a migration, a seed
+script, a one-time registration call.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cmd` | string | required | Command to run |
+| `env` | map | — | Environment variables for this task |
+| `env_file` | string | — | Task-specific `.env` file |
+| `depends_on` | []string | — | Dependencies and/or other tasks that must be ready before this task runs. Processes are NOT valid targets |
+| `timeout` | duration | `60s` | Run budget. `0` (or `0s`) means **unlimited** — distinct from omitting the field, which uses the `60s` default |
+| `stop_timeout` | duration | inherits `shutdown_timeout` | This task's own SIGTERM→SIGKILL escalation budget |
+
+A task exits `0` (natural) → **`completed`** (PID suppressed, uptime frozen
+at completion). Any other exit — non-zero, a signal, or a `timeout` kill —
+→ **`crashed`**, which blocks any process or task gated on it. A task runs
+**once per `prox up` lifetime**: a dependent's restart does not re-run an
+already-completed task. `prox restart <task>` (or `prox start <task>` after
+`prox stop <task>`) re-runs it manually.
+
+Plain `processes:` are unaffected — a process that exits `0` on its own is
+still `crashed` (the pre-existing one-shot caveat — see "`prox status`
+exit code, precisely" above). Use `tasks:` for anything meant to run once
+and exit cleanly.
+
+### Process `depends_on`
+
+```yaml
+processes:
+  api:
+    cmd: go run ./cmd/server
+    depends_on: [postgres, migrate]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `depends_on` | []string | — | Dependencies and/or tasks that must be ready before this process launches. Processes are NOT valid targets (process→process ordering is not supported) |
+
+A process with a non-empty `depends_on` is **gated**: it starts in the
+`waiting` state while its targets resolve in the background (`prox up`
+returns without waiting on any of it), then either launches once every
+target is ready, or settles into the terminal `blocked` state if a required
+target failed. `prox restart <name>` on a running gated process re-resolves
+every target (against a fresh config reload) **before** touching the running
+instance — any resolution failure leaves it untouched.
+
+### Validation Rules
+
+- Names are unique across `processes`, `dependencies`, `tasks`
+  (case-sensitive).
+- Unknown keys in `dependencies:`/`tasks:`/`check:` are rejected.
+- Exactly one of `check.tcp`/`check.url`/`check.cmd` must be present.
+- `depends_on` targets must be dependencies or tasks — a process name or an
+  unknown name is a load-time error.
+- Duplicate `depends_on` entries are rejected.
+- Cycles among tasks are rejected (task→task edges only).
+
 ## Stop Timeout
 
 When prox stops a process — via `prox stop <name>`, `prox restart <name>`, or a
