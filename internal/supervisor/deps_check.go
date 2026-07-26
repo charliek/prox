@@ -185,19 +185,30 @@ func (s *execStartRunner) Run(ctx context.Context, name, cmd string) error {
 	go s.pump(&streams, name, stdout)
 	go s.pump(&streams, name, stderr)
 
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- c.Wait() }()
+	// Kill the group if the resolution is canceled. This closes the child's pipe
+	// write ends (the group dies), so the pumps reach EOF and streams.Wait() below
+	// cannot block forever -- the "bounded by ctx/kill" guarantee.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.killGroup(pgid)
+		case <-done:
+		}
+	}()
 
-	select {
-	case err := <-waitCh:
-		streams.Wait()
-		return err
-	case <-ctx.Done():
-		s.killGroup(pgid)
-		<-waitCh
-		streams.Wait()
-		return ctx.Err()
+	// Per the exec.StdoutPipe/StderrPipe contract, ALL reads must complete before
+	// c.Wait() -- Wait closes the pipes, so a Wait racing the pumps truncates
+	// output (the CI flake: a fast command's lines were dropped, logs: []). Join the
+	// pumps FIRST, then Wait: on normal exit the child closes its write ends so the
+	// pumps hit EOF promptly; on cancellation killGroup forces that EOF.
+	streams.Wait()
+	close(done)
+	runErr := c.Wait()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
+	return runErr
 }
 
 // pump streams one output pipe to the system log, one line per entry, attributed

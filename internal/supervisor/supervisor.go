@@ -614,9 +614,11 @@ func (s *Supervisor) prepareReload(name string) (*pendingConfig, error) {
 		loadEnv:     loadEnv,
 		env:         env,
 		stopTimeout: effective,
-		// Carry the reload's dependency definitions so the gated restart path can
-		// refresh the resolver and classify targets against the fresh set (D6).
-		freshDeps: s.domainDependencies(fresh),
+		// Carry the reload's dependency + task name sets so the gated restart path
+		// can refresh the resolver and REPLACE the effective classification view
+		// against current config (D6 / fix 4/5).
+		freshDeps:  s.domainDependencies(fresh),
+		freshTasks: taskNameSet(fresh),
 	}, nil
 }
 
@@ -659,6 +661,7 @@ func (s *Supervisor) prepareReloadTask(name string) (*pendingConfig, error) {
 		env:         env,
 		stopTimeout: effective,
 		freshDeps:   s.domainDependencies(fresh),
+		freshTasks:  taskNameSet(fresh),
 	}, nil
 }
 

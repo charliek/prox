@@ -780,6 +780,146 @@ func TestTask_Fix6_SlowDrainAfterExitCompletes(t *testing.T) {
 	waitState(t, sup, "migrate", domain.ProcessStateCompleted)
 }
 
+// D6 (non-running restart): a process BLOCKED on a mis-configured dependency,
+// after the dependency's check target is fixed on disk, must re-resolve against
+// the NEW definition on restart and launch.
+func TestReload_BlockedGatedRestartPicksUpFixedDependency(t *testing.T) {
+	dir := t.TempDir()
+	runner := newFakeRunner(func(call int) *fakeProcess { return newGracefulFake(1700 + call) })
+	sup := blockedGatedReloadSup(t, dir, runner)
+	prober := blockedGatedProber(sup, dir)
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+	defer stopSup(t, sup)
+
+	waitState(t, sup, "web", domain.ProcessStateBlocked)
+	require.Equal(t, []string{"kratos"}, sup.processes["web"].BlockedBy())
+
+	writeConfigFile(t, dir, gatedFixedYAML)
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	require.NoError(t, sup.RestartProcess(rctx, "web"))
+
+	waitState(t, sup, "web", domain.ProcessStateRunning)
+	assert.Greater(t, prober.probeCount("kratos-new"), 0, "restart resolved against the fixed dependency definition")
+}
+
+// D6 (start path): the SAME fix applies to StartProcess of a blocked gated
+// process -- gated start reloads exactly like ungated start (which reloads via the
+// pendingConfig machinery).
+func TestReload_BlockedGatedStartPicksUpFixedDependency(t *testing.T) {
+	dir := t.TempDir()
+	runner := newFakeRunner(func(call int) *fakeProcess { return newGracefulFake(1750 + call) })
+	sup := blockedGatedReloadSup(t, dir, runner)
+	prober := blockedGatedProber(sup, dir)
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+	defer stopSup(t, sup)
+
+	waitState(t, sup, "web", domain.ProcessStateBlocked)
+
+	writeConfigFile(t, dir, gatedFixedYAML)
+	require.NoError(t, sup.StartProcess(context.Background(), "web"))
+
+	waitState(t, sup, "web", domain.ProcessStateRunning)
+	assert.Greater(t, prober.probeCount("kratos-new"), 0, "start resolved against the fixed dependency definition")
+}
+
+// D6 (fail-before-anything): an INVALID edited config makes the restart error out
+// with the process left blocked and the resolver untouched.
+func TestReload_BlockedGatedRestartInvalidConfigLeavesBlocked(t *testing.T) {
+	dir := t.TempDir()
+	runner := newFakeRunner(func(call int) *fakeProcess { return newGracefulFake(1800 + call) })
+	sup := blockedGatedReloadSup(t, dir, runner)
+	_ = blockedGatedProber(sup, dir)
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+	defer stopSup(t, sup)
+
+	waitState(t, sup, "web", domain.ProcessStateBlocked)
+
+	// Dependency check with no kind set -> validation error.
+	badYAML := "processes:\n  web:\n    cmd: \"sleep 60\"\n    depends_on: [kratos]\n" +
+		"dependencies:\n  kratos:\n    check:\n      timeout: 80ms\n"
+	writeConfigFile(t, dir, badYAML)
+
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	err = sup.RestartProcess(rctx, "web")
+	require.Error(t, err, "an invalid reload must fail the restart")
+	assert.ErrorIs(t, err, domain.ErrConfigReloadFailed)
+
+	// State unchanged: still blocked on kratos.
+	assert.Equal(t, domain.ProcessStateBlocked, mustState(t, sup, "web"))
+	assert.Equal(t, []string{"kratos"}, sup.processes["web"].BlockedBy())
+}
+
+// D2 (warned re-resolution): a dependency that WARNED (budget exhausted,
+// on_failure=warn) must be RE-PROBED on a dependent's restart -- not accepted from
+// the stale cached warn -- so a resource that has since become healthy is seen.
+func TestReload_WarnedDependencyReProbedOnRestart(t *testing.T) {
+	prober := newCoordProber()
+	prober.set("slauth", "fail")
+	sup, _, logMgr := gatedSupervisor(t,
+		map[string][]string{"web": {"slauth"}},
+		map[string]depSpec{"slauth": {onFailure: domain.FailurePolicyWarn, timeout: 40 * time.Millisecond}},
+		prober, nil)
+	defer logMgr.Close()
+
+	_, err := sup.Start(context.Background())
+	require.NoError(t, err)
+	defer stopSup(t, sup)
+
+	// slauth warns, so web launches anyway.
+	waitState(t, sup, "web", domain.ProcessStateRunning)
+	snap, ok := sup.resolver.Snapshot("slauth")
+	require.True(t, ok)
+	require.Equal(t, DepStateWarned, snap.State)
+	warnProbes := prober.probeCount("slauth")
+
+	// The backing resource becomes healthy; a dependent restart must re-probe.
+	prober.set("slauth", "healthy")
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	require.NoError(t, sup.RestartProcess(rctx, "web"))
+	waitState(t, sup, "web", domain.ProcessStateRunning)
+
+	snap, ok = sup.resolver.Snapshot("slauth")
+	require.True(t, ok)
+	assert.Equal(t, DepStateHealthy, snap.State, "a warned dependency is re-probed on restart, not left cached-warned")
+	assert.Greater(t, prober.probeCount("slauth"), warnProbes, "the dependency was actually re-probed")
+}
+
+// gatedFixedYAML is the corrected config (kratos check target -> "kratos-new").
+const gatedFixedYAML = "processes:\n  web:\n    cmd: \"sleep 60\"\n    depends_on: [kratos]\n" +
+	"dependencies:\n  kratos:\n    check:\n      cmd: \"kratos-new\"\n      interval: 10ms\n      timeout: 2s\n"
+
+// blockedGatedReloadSup builds a reload-wired supervisor whose web process blocks
+// on a mis-configured kratos dependency (check target "kratos-old").
+func blockedGatedReloadSup(t *testing.T, dir string, runner ProcessRunner) *Supervisor {
+	t.Helper()
+	oldYAML := "processes:\n  web:\n    cmd: \"sleep 60\"\n    depends_on: [kratos]\n" +
+		"dependencies:\n  kratos:\n    check:\n      cmd: \"kratos-old\"\n      interval: 10ms\n      timeout: 80ms\n"
+	return newReloadSupervisor(t, dir, oldYAML, runner)
+}
+
+// blockedGatedProber wires a scripted prober (kratos-old fails, kratos-new
+// healthy) into a resolver built from the supervisor's live config, so a reload's
+// redefinition of the check target is honored.
+func blockedGatedProber(sup *Supervisor, dir string) *coordProber {
+	prober := newCoordProber()
+	prober.set("kratos-old", "fail")
+	prober.set("kratos-new", "healthy")
+	sup.newResolver = func() *Resolver {
+		return NewResolver(sup.domainDependencies(sup.config), dir, nil, nil,
+			WithProber(prober), WithClock(realClock{}), WithAttemptCap(60*time.Second))
+	}
+	return prober
+}
+
 // --- small helpers ----------------------------------------------------------
 
 func mustState(t *testing.T, sup *Supervisor, name string) domain.ProcessState {

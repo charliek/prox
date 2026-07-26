@@ -158,15 +158,17 @@ func (s *Supervisor) scheduleGated(mp *ManagedProcess) error {
 		return err
 	}
 	targets := mp.Config().DependsOn
-	go s.orchestrate(mp, targets, gen, procCtx, procCancel, supCtx)
+	go s.orchestrate(mp, targets, gen, procCtx, procCancel, supCtx, nil)
 	return nil
 }
 
 // orchestrate resolves a gated process's dependency targets and then launches or
 // blocks it (plan 013 D4). See the file header for the model. gen is the launch
 // generation captured for this episode; it is carried to the final gate so a
-// superseding stop/restart refuses a stale launch.
-func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint64, procCtx context.Context, procCancel context.CancelFunc, supCtx context.Context) {
+// superseding stop/restart refuses a stale launch. pending, when non-nil, is a
+// reload applied atomically at the launch gate (plan 013 D6): a blocked/stopped
+// gated (re)start reloads the child's config just like the ungated path.
+func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint64, procCtx context.Context, procCancel context.CancelFunc, supCtx context.Context, pending *pendingConfig) {
 	defer s.coordWg.Done()
 	// The wait is over once we return: cancel the per-process context so its
 	// Demand joins release and it does not leak. A launched process runs under
@@ -197,7 +199,7 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 
 	// All targets satisfied -> launch through the normal start path, under the
 	// generation guard so a stop/restart that superseded us refuses the launch.
-	if err := mp.startGated(supCtx, gen); err != nil {
+	if err := mp.startGated(supCtx, pending, gen); err != nil {
 		switch {
 		case errors.Is(err, errLaunchSuperseded), errors.Is(err, domain.ErrShutdownInProgress),
 			errors.Is(err, domain.ErrProcessAlreadyRunning):
@@ -316,6 +318,16 @@ func (s *Supervisor) classifyDependency(name string) bool {
 	return ok
 }
 
+// taskNameSet returns the set of task names in a config, for a reload's fresh
+// classification view (plan 013 fix 4/5).
+func taskNameSet(cfg *config.Config) map[string]struct{} {
+	set := make(map[string]struct{}, len(cfg.Tasks))
+	for name := range cfg.Tasks {
+		set[name] = struct{}{}
+	}
+	return set
+}
+
 // buildEffectiveGraph snapshots a config's dependency and task name sets for the
 // classification view (plan 013 fix 4/5).
 func buildEffectiveGraph(cfg *config.Config) *effectiveGraph {
@@ -368,41 +380,79 @@ func (s *Supervisor) applyReloadGraph(pending *pendingConfig) {
 	resolver.ApplyGraph(pending.freshDeps)
 }
 
-// startProcessGated handles a manual StartProcess for a gated process (plan 013
-// D4). The authoritative state check is admission (scheduleGated -> admitGated,
-// atomic under s.mu+p.mu): running/starting/stopping -> ErrProcessAlreadyRunning,
-// waiting -> ErrProcessAlreadyWaiting, and stopped/crashed/blocked/completed ->
-// a fresh orchestration episode ("scheduled", returns nil).
+// startProcessGated handles a manual StartProcess (and the non-running
+// RestartProcess) for a gated process (plan 013 D4/D6). It RELOADS the child's
+// config and refreshes the dependency graph, matching ungated StartProcess (which
+// reloads via the pendingConfig machinery): a blocked/stopped gated (re)start must
+// pick up an edited dependency definition AND the child's changed cmd/env, not
+// keep the stale resolver/effective-graph and stored config. The live D6 gap this
+// closes: a process blocked on a mis-configured dependency stayed blocked with the
+// OLD definition after the user fixed prox.yaml and ran `prox restart`.
 //
-// The one extra step for a blocked process is re-demanding its failed targets:
-// their previously-failed outcomes are Reset (generation-conditionally, see
-// resetFailedTarget) so the next Demand re-resolves them; healthy/warned targets
-// keep their cached (instant) outcomes. BlockedBy must be read here, BEFORE
-// admission, because beginWaiting clears it. When the process is not actually
-// blocked (a concurrent transition), BlockedBy is empty and this is a no-op; the
-// authoritative admission still maps the correct error.
+// Sequence (matching ungated fail-before-anything semantics):
+//   - prepareReload is a PURE read: an invalid/removed/env-broken file errors here
+//     with NOTHING changed (the process stays blocked, the resolver untouched);
+//   - admitGated is the atomic state gate BEFORE any graph/config mutation, so an
+//     active process is refused (already-running/waiting) without churning the
+//     resolver or swapping a live child's config;
+//   - only once admitted do we applyReloadGraph (redefine/add/prune deps + replace
+//     the effective view) and re-resolve the previously-failed/warned targets;
+//   - the child's own cmd/env/depends_on swap is applied ATOMICALLY at the launch
+//     gate via the pending threaded into orchestrate.
+//
+// BlockedBy must be read BEFORE admission (beginWaiting clears it). Targets are
+// Reset generation-conditionally via resetUnreadyTarget (FAILED or WARNED, plan
+// D2); classification uses the effective view so a reload-added dependency is
+// handled. Tasks re-run through their own coordinator, so only dependency targets
+// are Reset here.
 func (s *Supervisor) startProcessGated(mp *ManagedProcess) error {
-	for _, target := range mp.BlockedBy() {
-		// Classify via the effective graph view (s.classifyDependency), NOT the
-		// immutable startup s.config.Dependencies (plan 013 D5 fix): a reload that
-		// ADDED a dependency which then failed and blocked a process would otherwise
-		// never be Reset on re-start, permanently reusing its failed generation and
-		// stranding the process blocked. Tasks re-run through their own coordinator,
-		// so only dependency targets are Reset here.
+	blocked := mp.BlockedBy()
+
+	// Reload first (pure read, fail-before-anything).
+	pending, err := s.prepareReload(mp.Name())
+	if err != nil {
+		return err
+	}
+
+	// Atomic admission before any mutation; a refused start leaves the graph and
+	// stored config untouched.
+	procCtx, procCancel, supCtx, gen, err := s.admitGated(mp)
+	if err != nil {
+		return err
+	}
+
+	// Admitted (the child is now waiting). Refresh the resolver + effective view
+	// from the reload, then re-resolve the previously-unready targets fresh.
+	if pending != nil {
+		s.applyReloadGraph(pending)
+	}
+	for _, target := range blocked {
 		if s.classifyDependency(target) {
-			s.resetFailedTarget(target)
+			s.resetUnreadyTarget(target)
 		}
 	}
-	return s.scheduleGated(mp)
+	targets := mp.Config().DependsOn
+	if pending != nil {
+		targets = pending.config.DependsOn
+	}
+	go s.orchestrate(mp, targets, gen, procCtx, procCancel, supCtx, pending)
+	return nil
 }
 
-// resetFailedTarget Resets a dependency target only if it is STILL in the failed
-// generation the caller observes now (plan 013 D4, finding 4). Snapshotting the
+// resetUnreadyTarget Resets a dependency target whose cached outcome is not
+// healthy -- FAILED or WARNED -- so an explicit re-demand (restart / start-on-
+// blocked) re-probes it fresh (plan 013 D2/D4). WARNED is included per plan D2's
+// "a warned/failed dependency is re-resolved fresh the next time something demands
+// it": otherwise a dependency that warned while its backing resource was booting
+// stays cached-warned forever and a later restart accepts the stale outcome
+// without re-probing. HEALTHY stays cached (a restart never re-probes a healthy
+// dependency). The reset is generation-conditional (finding 4): snapshotting the
 // generation and passing it to ResetIfGeneration prevents an unconditional Reset
 // from cancelling a NEWER generation another process just started resolving for
 // the same shared target -- which would strand that process in waiting forever.
-func (s *Supervisor) resetFailedTarget(target string) {
-	if snap, ok := s.resolver.Snapshot(target); ok && snap.State == DepStateFailed {
+func (s *Supervisor) resetUnreadyTarget(target string) {
+	if snap, ok := s.resolver.Snapshot(target); ok &&
+		(snap.State == DepStateFailed || snap.State == DepStateWarned) {
 		s.resolver.ResetIfGeneration(target, snap.Gen)
 	}
 }
@@ -460,12 +510,13 @@ func (s *Supervisor) restartProcessGated(ctx context.Context, mp *ManagedProcess
 }
 
 // reresolveTargets demands a restart's targets fresh (plan 013 D4). It first
-// Resets any target whose current resolver outcome is FAILED so it re-resolves
-// under a new generation; healthy/warned targets keep their cached outcome and
-// return instantly (a cached healthy outcome is accepted -- restart does not
-// re-probe a healthy dependency). It returns an error if any target is not ready
-// (or its resolution was canceled), so the caller can abort the restart with the
-// running process untouched.
+// Resets any target whose current resolver outcome is FAILED or WARNED so it
+// re-resolves under a new generation (plan D2: a warned/failed dependency is
+// re-probed the next time something demands it, so a stale warn does not persist);
+// only a HEALTHY target keeps its cached outcome and returns instantly (a restart
+// does not re-probe a healthy dependency). It returns an error if any target is
+// not ready (or its resolution was canceled), so the caller can abort the restart
+// with the running process untouched.
 //
 // The demand uses coordCtx (shutdown-cancelable) rather than the request context
 // so a short API deadline does not spuriously cut a dependency's readiness budget
@@ -480,7 +531,7 @@ func (s *Supervisor) reresolveTargets(targets []string, isDep func(string) bool)
 
 	for _, target := range targets {
 		if isDep(target) {
-			s.resetFailedTarget(target)
+			s.resetUnreadyTarget(target)
 		}
 	}
 	for _, target := range targets {

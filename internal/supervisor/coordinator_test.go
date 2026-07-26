@@ -499,7 +499,7 @@ func TestCoordinator_StaleGenerationDoesNotLaunch(t *testing.T) {
 	require.True(t, ok, "a stopped process is admissible")
 	mp.waitGen.Add(1) // supersede the captured episode
 
-	err := mp.startGated(context.Background(), staleGen)
+	err := mp.startGated(context.Background(), nil, staleGen)
 	require.ErrorIs(t, err, errLaunchSuperseded)
 	assert.Equal(t, 0, runner.count(), "a superseded generation must not launch")
 	assert.Equal(t, domain.ProcessStateWaiting, mp.State(), "state unchanged by the refused launch")

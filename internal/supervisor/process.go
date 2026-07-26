@@ -556,9 +556,12 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 // coordinator captured when it began resolving; the launch commits only if it
 // still matches at the final gate, so a stop/restart/re-demand that superseded
 // this completion refuses the launch (errLaunchSuperseded) rather than racing a
-// stale process into existence.
-func (p *ManagedProcess) startGated(ctx context.Context, expectGen uint64) error {
-	return p.startWithConfigGen(ctx, nil, &expectGen)
+// stale process into existence. pending, when non-nil, is a reload swapped in
+// ATOMICALLY at the launch gate (plan 013 D6) so a blocked/stopped gated (re)start
+// picks up the child's edited cmd/env/stop budget exactly as the ungated path
+// does; nil launches with the stored config.
+func (p *ManagedProcess) startGated(ctx context.Context, pending *pendingConfig, expectGen uint64) error {
+	return p.startWithConfigGen(ctx, pending, &expectGen)
 }
 
 // startTask launches a task child whose own depends_on wait completed (plan 013
