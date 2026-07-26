@@ -104,6 +104,27 @@ const (
 	// inside the window. Injectable in tests.
 	DeadRouteProbeMinInterval = 1 * time.Second
 
+	// DefaultDependencyCheckTimeout is the default readiness-probe budget for a
+	// dependencies: entry whose check block omits `timeout` (plan 013 D1). The
+	// resolver treats it as the overall window a dependency's check may keep
+	// failing before the dependency is declared not-ready. Unlike a stop budget,
+	// an explicit zero is NOT special here -- validation requires timeout >=
+	// interval, so a dependency can never be configured with a zero timeout.
+	DefaultDependencyCheckTimeout = 30 * time.Second
+
+	// DefaultDependencyCheckInterval is the default spacing between readiness
+	// probes for a dependencies: entry whose check block omits `interval` (plan
+	// 013 D1). Validation requires interval > 0 and timeout >= interval.
+	DefaultDependencyCheckInterval = 1 * time.Second
+
+	// DefaultTaskTimeout is the default run budget for a tasks: entry whose
+	// `timeout` is unset (plan 013 D1). It is DISTINCT from an explicit
+	// `timeout: 0`, which means "no limit" -- the config layer models the
+	// difference with a has-limit flag (see config.TaskConfig.ToDomain and
+	// domain.TaskConfig.HasTimeout), so unset resolves to this default while an
+	// explicit zero resolves to unbounded.
+	DefaultTaskTimeout = 60 * time.Second
+
 	// InFlightStaleAfter is how long a request record may sit in-flight before
 	// it is reported as stale (D8, #53). Stale does NOT mean broken: SSE
 	// streams, WebSocket upgrades, and large transfers can legitimately stay

@@ -9,6 +9,7 @@ import (
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/supervisor"
 )
 
 func TestFilterSensitiveEnv(t *testing.T) {
@@ -274,6 +275,92 @@ func TestToProcessResponse(t *testing.T) {
 	// UptimeSeconds should be approximately 10
 	if resp.UptimeSeconds < 9 || resp.UptimeSeconds > 11 {
 		t.Errorf("expected UptimeSeconds around 10, got %d", resp.UptimeSeconds)
+	}
+}
+
+// TestToProcessResponse_GatedFields pins that the waiting_on/blocked_on and kind
+// fields plumb through ToProcessResponse (plan 013 D5).
+func TestToProcessResponse_GatedFields(t *testing.T) {
+	waiting := ToProcessResponse(domain.ProcessInfo{
+		Name:      "api",
+		State:     domain.ProcessStateWaiting,
+		WaitingOn: []string{"postgres", "redis"},
+	})
+	if waiting.Status != "waiting" {
+		t.Errorf("Status = %q, want waiting", waiting.Status)
+	}
+	if len(waiting.WaitingOn) != 2 || waiting.WaitingOn[0] != "postgres" || waiting.WaitingOn[1] != "redis" {
+		t.Errorf("WaitingOn = %v, want [postgres redis]", waiting.WaitingOn)
+	}
+	if waiting.BlockedOn != nil {
+		t.Errorf("BlockedOn = %v, want nil for a waiting process", waiting.BlockedOn)
+	}
+
+	blocked := ToProcessResponse(domain.ProcessInfo{
+		Name:      "api",
+		State:     domain.ProcessStateBlocked,
+		Kind:      domain.ProcessKindTask,
+		BlockedOn: []string{"migrate"},
+	})
+	if len(blocked.BlockedOn) != 1 || blocked.BlockedOn[0] != "migrate" {
+		t.Errorf("BlockedOn = %v, want [migrate]", blocked.BlockedOn)
+	}
+	if blocked.Kind != "task" {
+		t.Errorf("Kind = %q, want task", blocked.Kind)
+	}
+}
+
+// TestToDependencyStatusResponse pins the check-summary formatting for the
+// status Dependencies array (plan 013 D5).
+func TestToDependencyStatusResponse(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    supervisor.DepStatus
+		check string
+	}{
+		{"tcp", supervisor.DepStatus{Name: "pg", Check: domain.DependencyCheck{Kind: domain.CheckKindTCP, Target: "localhost:5435"}}, "tcp localhost:5435"},
+		{"url", supervisor.DepStatus{Name: "web", Check: domain.DependencyCheck{Kind: domain.CheckKindURL, Target: "http://x/health"}}, "url http://x/health"},
+		{"cmd", supervisor.DepStatus{Name: "c", Check: domain.DependencyCheck{Kind: domain.CheckKindCmd, Target: "pg_isready"}}, "cmd pg_isready"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := toDependencyStatusResponse(tc.in)
+			if got.Check != tc.check {
+				t.Errorf("Check = %q, want %q", got.Check, tc.check)
+			}
+			if got.Name != tc.in.Name {
+				t.Errorf("Name = %q, want %q", got.Name, tc.in.Name)
+			}
+		})
+	}
+}
+
+// TestSummarizeCheck pins the single-line collapse + truncation of check
+// summaries (plan 013 D5 fix): a multi-line block-style cmd must render as one
+// tabwriter-safe line, and an over-long summary is truncated with an ellipsis.
+func TestSummarizeCheck(t *testing.T) {
+	// Multi-line / tab-laden command collapses to one line.
+	multiline := summarizeCheck("cmd", "sh -c '\n  test -f /tmp/ready\n\tsleep 1\n'")
+	if strings.ContainsAny(multiline, "\n\t") {
+		t.Errorf("summary still contains newlines/tabs: %q", multiline)
+	}
+	if strings.Contains(multiline, "  ") {
+		t.Errorf("summary still contains collapsed double spaces: %q", multiline)
+	}
+
+	// Over-long summary is truncated on a rune boundary with an ellipsis, never
+	// exceeding the cap.
+	long := summarizeCheck("cmd", strings.Repeat("x", 200))
+	if r := []rune(long); len(r) != checkSummaryMaxLen {
+		t.Errorf("truncated summary len = %d runes, want %d", len(r), checkSummaryMaxLen)
+	}
+	if !strings.HasSuffix(long, "…") {
+		t.Errorf("truncated summary should end with ellipsis; got %q", long)
+	}
+
+	// Short summaries pass through unchanged.
+	if got := summarizeCheck("tcp", "localhost:5435"); got != "tcp localhost:5435" {
+		t.Errorf("short summary = %q, want %q", got, "tcp localhost:5435")
 	}
 }
 

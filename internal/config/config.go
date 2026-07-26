@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,13 @@ type Config struct {
 	Proxy     *ProxyConfig             `yaml:"proxy,omitempty"`
 	Services  map[string]ServiceConfig `yaml:"services,omitempty"`
 	Certs     *CertsConfig             `yaml:"certs,omitempty"`
+	// Dependencies are external readiness gates (plan 013 D1): each is probed
+	// (tcp/url/cmd) until ready, optionally after running a start command.
+	// Dependencies are dependency-graph roots -- they carry no depends_on.
+	Dependencies map[string]DependencyConfig `yaml:"dependencies,omitempty"`
+	// Tasks are run-to-completion commands (plan 013 D1) that may depend on
+	// dependencies and other tasks. See TaskConfig.
+	Tasks map[string]TaskConfig `yaml:"tasks,omitempty"`
 	// ShutdownTimeout is the default SIGTERM->SIGKILL escalation budget for
 	// every process that does not set its own stop_timeout. Empty means
 	// "use constants.DefaultShutdownTimeout". See stopBudgetOptions.
@@ -129,6 +137,12 @@ type ProcessConfig struct {
 	// means "use the global shutdown_timeout, else the constant default".
 	// See stopBudgetOptions.
 	StopTimeout string `yaml:"stop_timeout"`
+	// DependsOn lists dependencies: and/or tasks: names that must be ready
+	// before this process starts (plan 013 D1). Process names are NOT valid
+	// targets; validation rejects them. Unlike dependency/task blocks (which
+	// reject unknown keys), a process's other fields still follow the lenient
+	// re-marshal parse path, so depends_on is simply another known field here.
+	DependsOn []string `yaml:"depends_on"`
 }
 
 // HealthcheckConfig defines health check configuration in YAML
@@ -192,12 +206,19 @@ func materializeCapture(raw *rawCaptureConfig) *CaptureConfig {
 
 // rawConfig is used for initial YAML parsing to handle the flexible process/service format
 type rawConfig struct {
-	API             APIConfig              `yaml:"api"`
-	EnvFile         string                 `yaml:"env_file"`
-	Processes       map[string]interface{} `yaml:"processes"`
-	Proxy           *rawProxyConfig        `yaml:"proxy,omitempty"`
-	Services        map[string]interface{} `yaml:"services,omitempty"`
-	Certs           *CertsConfig           `yaml:"certs,omitempty"`
+	API       APIConfig              `yaml:"api"`
+	EnvFile   string                 `yaml:"env_file"`
+	Processes map[string]interface{} `yaml:"processes"`
+	Proxy     *rawProxyConfig        `yaml:"proxy,omitempty"`
+	Services  map[string]interface{} `yaml:"services,omitempty"`
+	Certs     *CertsConfig           `yaml:"certs,omitempty"`
+	// Dependencies and Tasks are held as raw maps so parseDependencies /
+	// parseTasks can reject unknown keys precisely (plan 013 D1, C1): the
+	// re-marshal parse path used for processes/services silently DROPS unknown
+	// fields, which would let a typo'd key pass unnoticed. The strict parsers
+	// inspect the raw map form directly to name the offending key.
+	Dependencies    map[string]interface{} `yaml:"dependencies,omitempty"`
+	Tasks           map[string]interface{} `yaml:"tasks,omitempty"`
 	ShutdownTimeout string                 `yaml:"shutdown_timeout"`
 }
 
@@ -236,6 +257,8 @@ func Parse(data []byte) (*Config, error) {
 		EnvFile:         raw.EnvFile,
 		Processes:       make(map[string]ProcessConfig),
 		Services:        make(map[string]ServiceConfig),
+		Dependencies:    make(map[string]DependencyConfig),
+		Tasks:           make(map[string]TaskConfig),
 		Certs:           raw.Certs,
 		ShutdownTimeout: raw.ShutdownTimeout,
 	}
@@ -277,6 +300,30 @@ func Parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("service %q: %w", name, err)
 		}
 		config.Services[name] = svc
+	}
+
+	// Parse dependencies and tasks with STRICT unknown-key rejection (plan 013
+	// D1, C1). These are structural errors (malformed shape / unknown keys):
+	// they must be reported before semantic Validate runs, because a
+	// half-formed check block cannot be meaningfully validated. Collected across
+	// both blocks and sorted so the report is deterministic regardless of Go's
+	// map iteration order.
+	//
+	// Accepted limitation (plan 013 D1, C1): the strict parsers inspect the
+	// generic map[string]interface{} form, which yaml.v3 has already produced --
+	// so a YAML anchor/alias or a `<<` merge key that resolves to a key already
+	// present is collapsed into one map entry BEFORE we see it, and a duplicate
+	// logical key can slip past unknown-key/duplicate detection. Detecting that
+	// would require re-parsing at the yaml.Node level. We accept it: this is the
+	// same behavior the legacy processes:/services: re-marshal path has always
+	// had, prox config is local developer-authored input (not a security
+	// boundary), and the failure mode is a last-write-wins merge, not a crash.
+	var structuralErrs []string
+	structuralErrs = append(structuralErrs, parseDependencies(raw.Dependencies, config.Dependencies)...)
+	structuralErrs = append(structuralErrs, parseTasks(raw.Tasks, config.Tasks)...)
+	if len(structuralErrs) > 0 {
+		sort.Strings(structuralErrs)
+		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidConfig, strings.Join(structuralErrs, "; "))
 	}
 
 	// Apply proxy defaults and auto-enable logic

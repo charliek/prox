@@ -31,10 +31,17 @@ prox up
 
 ## Current Scope
 
-prox is designed for local development. It intentionally does not include:
+prox is designed for local development. It supports external-resource
+dependencies (`dependencies:`, with readiness checks and an optional start
+command), one-shot setup tasks (`tasks:`), and gating a process's launch on
+either (`depends_on`) — see the
+[Dependencies, Tasks, and Process Gating guide](guides/dependencies.md). It
+intentionally does not include:
 
 - Log persistence to disk
-- Process dependencies or startup ordering
+- Process-to-process ordering (one process launching only after another
+  process, as opposed to a dependency or task) or cross-project startup
+  ordering
 - Distributed or multi-machine operation
 
 See the [Roadmap](https://github.com/charliek/prox/blob/main/ROADMAP.md) for planned features.

@@ -68,6 +68,9 @@ func (m ClientModel) fetchProcesses() tea.Cmd {
 				PID:          p.PID,
 				RestartCount: p.Restarts,
 				Health:       domain.HealthStatus(p.Health),
+				Kind:         domain.ProcessKind(p.Kind),
+				WaitingOn:    p.WaitingOn,
+				BlockedOn:    p.BlockedOn,
 			}
 		}
 		return ProcessesMsg(processes)

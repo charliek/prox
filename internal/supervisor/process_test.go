@@ -147,6 +147,40 @@ func TestManagedProcess_Info(t *testing.T) {
 	assert.Equal(t, domain.HealthStatusUnknown, info.Health)
 }
 
+// TestManagedProcess_Info_WaitingReportsNoPID pins the plan 013 D5 fix: a gated
+// child re-run into the waiting state must report PID 0 (renders "-"), even
+// though `current` still holds the reaped instance from its prior run. Guarding
+// on IsStopped alone would surface that dead PID because waiting is not stopped.
+func TestManagedProcess_Info_WaitingReportsNoPID(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	mp := NewManagedProcess(domain.ProcessConfig{
+		Name:      "migrate",
+		Cmd:       "true",
+		Kind:      domain.ProcessKindTask,
+		DependsOn: []string{"db"},
+	}, nil, NewExecRunner(), logMgr)
+
+	// Simulate a completed prior run that left a reaped instance with a live PID.
+	mp.current = &processInstance{proc: newFakeProcess(4321)}
+	mp.state = domain.ProcessStateCompleted
+	// A completed process would report PID 0 (IsStopped), but confirm the retained
+	// instance really carries the stale PID so the waiting assertion is meaningful.
+	require.Equal(t, 4321, mp.current.proc.PID())
+
+	// Re-run: admit a fresh gated episode, moving the task to waiting while current
+	// still points at the reaped prior instance.
+	_, _, ok := mp.beginWaiting(func() {})
+	require.True(t, ok, "completed task must admit a fresh waiting episode")
+	require.Equal(t, domain.ProcessStateWaiting, mp.State())
+
+	info := mp.Info()
+	assert.Equal(t, domain.ProcessStateWaiting, info.State)
+	assert.Equal(t, 0, info.PID, "a waiting re-run must report PID 0, not the reaped prior PID")
+	assert.Equal(t, []string{"db"}, info.WaitingOn)
+}
+
 func TestManagedProcess_StopLogsExitCode(t *testing.T) {
 	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
 	defer logMgr.Close()

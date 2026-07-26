@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"maps"
 	"os/exec"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +38,44 @@ type processInstance struct {
 	doneOnce sync.Once
 	cancel   context.CancelFunc
 	outputWg sync.WaitGroup
+
+	// exited is closed by monitor IMMEDIATELY after inst.proc.Wait() returns --
+	// BEFORE output draining (plan 013 D3, fix 6). It signals process EXIT, which
+	// can precede the monitor's state commit (done) by up to outputDrainTimeout
+	// when a grandchild holds a pipe open. The task run-budget timer watches this,
+	// not done, so a slow drain of a naturally-completed rc=0 task is not
+	// misclassified as a run-timeout crash. Closed exactly once via exitedOnce.
+	exited     chan struct{}
+	exitedOnce sync.Once
+	// claim is the single terminal-outcome commit point for a task run (plan 013
+	// D3, fix 6). The monitor CAS(none->exit)es it right after Wait; the task
+	// run-budget timer CAS(none->timeout)es it on fire. Whoever wins owns the
+	// terminal verdict, so a completed exit and a run-timeout can never both
+	// commit -- if the exit was claimed first, the timer is a no-op (completed
+	// wins, no timeout log); if the timer claimed first, the monitor defers its
+	// natural-exit commit to stopTask (which commits crashed).
+	claim atomic.Int32
+}
+
+// terminalClaim is the winner of a task run's terminal-outcome race (fix 6).
+type terminalClaim int32
+
+const (
+	claimNone    terminalClaim = 0
+	claimExit    terminalClaim = 1 // the process exited on its own (monitor)
+	claimTimeout terminalClaim = 2 // the run budget elapsed (task coordinator)
+)
+
+// claimTerminal attempts to claim the terminal outcome for a task run, returning
+// whether this caller won. Only the winner acts on the verdict.
+func (i *processInstance) claimTerminal(c terminalClaim) bool {
+	return i.claim.CompareAndSwap(int32(claimNone), int32(c))
+}
+
+// markExited closes the exited channel exactly once (called by monitor right
+// after Wait returns, before draining).
+func (i *processInstance) markExited() {
+	i.exitedOnce.Do(func() { close(i.exited) })
 }
 
 // closeDone closes the instance's done channel exactly once.
@@ -60,6 +100,16 @@ type pendingConfig struct {
 	// the #30 fresh-read-on-every-start semantics.
 	env         map[string]string
 	stopTimeout time.Duration
+	// freshDeps carries the reload's dependency definitions (converted to domain
+	// form) so the gated restart path can refresh the resolver against a reload
+	// that added or redefined a dependency, and classify depends_on targets
+	// against the fresh set (plan 013 D6). nil when reload is disabled.
+	freshDeps map[string]domain.DependencyConfig
+	// freshTasks is the reload's set of task names, used with freshDeps to REPLACE
+	// the supervisor's effective classification view on a successful reload so
+	// depends_on targets classify against current config, not the immutable
+	// startup snapshot (plan 013 fix 4/5). nil when reload is disabled.
+	freshTasks map[string]struct{}
 }
 
 // stopEpisode carries the verdict of a single in-flight Stop to any concurrent
@@ -99,10 +149,29 @@ type ManagedProcess struct {
 	// correctly attributed across a swap (#33, D3).
 	name string
 
+	// kind is the child's run mode (plan 013 D3): a plain process or a
+	// run-to-completion task. Set once at construction from the domain config's
+	// Kind (defaulted to process) and never mutated -- a reload swaps cmd/env,
+	// not the kind. Read lock-free like name; task-mode branches in monitor and
+	// stop key off it.
+	kind domain.ProcessKind
+
 	config     domain.ProcessConfig
 	env        map[string]string
 	runner     ProcessRunner
 	logManager *logs.Manager
+
+	// completedAt freezes a task's uptime at the moment it reaches
+	// ProcessStateCompleted (plan 013 D3). Info reports the frozen run duration
+	// (completedAt - startedAt) rather than letting uptime tick past completion.
+	// Guarded by p.mu; zero until a task completes.
+	completedAt time.Time
+
+	// taskTimeout / taskHasTimeout are a task's run budget (plan 013 D3),
+	// swappable on a manual re-run's reload. Meaningful only when kind is
+	// ProcessKindTask. Guarded by p.mu; read via taskBudget.
+	taskTimeout    time.Duration
+	taskHasTimeout bool
 
 	// loadEnv, if set, is called at the top of every Start to (re)load the
 	// process's environment from disk (env_file(s)) merged with inline env.
@@ -187,18 +256,67 @@ type ManagedProcess struct {
 	// fallback window; production code and computeDeadlines both go through
 	// the locked StopTimeout() accessor.
 	shutdownTimeout time.Duration
+
+	// --- gated-launch orchestration (plan 013 D4) ---
+	//
+	// A process with a non-empty depends_on is "gated": Supervisor.Start does not
+	// launch it directly but registers it in state `waiting` and hands it to the
+	// graph coordinator (see coordinator.go), which resolves its dependency
+	// targets in a background goroutine and then drives it to running (all
+	// satisfied) or blocked (a required target failed). These fields carry the
+	// per-process state that orchestration needs.
+
+	// waitGen is the launch generation for gated orchestration. A coordinator
+	// goroutine captures it when it begins resolving; the launch is committed only
+	// if it still matches at the final gate (startWithConfigLocked, under p.mu),
+	// so a stop/restart/re-demand that bumped it supersedes a stale completion
+	// (constraint: an atomic checked at the final gate). Every mutation happens
+	// under p.mu; the final-gate read is under p.mu too, but the field stays an
+	// atomic to match the launch-gate's lock-free-read discipline.
+	waitGen atomic.Uint64
+
+	// waitCancel cancels THIS process's pending dependency wait (the coordinator's
+	// per-process context). StopProcess of a waiting process calls it to unblock
+	// the coordinator's Demand joins without aborting the shared dependency
+	// resolution other processes depend on. Guarded by p.mu; nil when no wait is
+	// in flight.
+	waitCancel context.CancelFunc
+
+	// blockedBy records, in declaration order, the depends_on targets that failed
+	// and left this process blocked (plan 013 D4). Stored for status surfacing in
+	// C5; read via BlockedBy. Guarded by p.mu.
+	blockedBy []string
 }
 
 // NewManagedProcess creates a new managed process
 func NewManagedProcess(config domain.ProcessConfig, env map[string]string, runner ProcessRunner, logManager *logs.Manager) *ManagedProcess {
-	return &ManagedProcess{
-		name:       config.Name,
-		config:     config,
-		env:        env,
-		runner:     runner,
-		logManager: logManager,
-		state:      domain.ProcessStateStopped,
+	kind := config.Kind
+	if kind == "" {
+		kind = domain.ProcessKindProcess
 	}
+	return &ManagedProcess{
+		name:           config.Name,
+		kind:           kind,
+		config:         config,
+		env:            env,
+		runner:         runner,
+		logManager:     logManager,
+		state:          domain.ProcessStateStopped,
+		taskTimeout:    config.TaskTimeout,
+		taskHasTimeout: config.TaskHasTimeout,
+	}
+}
+
+// isTask reports whether this managed child runs in task mode (plan 013 D3).
+// kind is immutable, so no lock is taken.
+func (p *ManagedProcess) isTask() bool { return p.kind == domain.ProcessKindTask }
+
+// taskBudget returns a task's run budget (duration, hasLimit). Meaningful only
+// for a task (plan 013 D3).
+func (p *ManagedProcess) taskBudget() (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.taskTimeout, p.taskHasTimeout
 }
 
 // Name returns the process name. Immutable, so no lock is taken.
@@ -208,8 +326,8 @@ func (p *ManagedProcess) Name() string {
 
 // Config returns a deep copy of the process configuration. It takes the read
 // lock (config is swappable on a reload -- #33, D3) and clones the reference
-// fields (Healthcheck pointer, Env map) so callers cannot observe a torn value
-// or mutate the live config.
+// fields (Healthcheck pointer, Env map, DependsOn slice) so callers cannot
+// observe a torn value or mutate the live config.
 func (p *ManagedProcess) Config() domain.ProcessConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -219,8 +337,10 @@ func (p *ManagedProcess) Config() domain.ProcessConfig {
 		hc := *p.config.Healthcheck
 		cfg.Healthcheck = &hc
 	}
-	// maps.Clone returns nil for a nil map, preserving the nil-vs-empty distinction.
+	// maps.Clone / slices.Clone return nil for a nil input, preserving the
+	// nil-vs-empty distinction.
 	cfg.Env = maps.Clone(p.config.Env)
+	cfg.DependsOn = slices.Clone(p.config.DependsOn)
 	return cfg
 }
 
@@ -232,6 +352,7 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 	info := domain.ProcessInfo{
 		Name:         p.config.Name,
 		State:        p.state,
+		Kind:         p.kind,
 		RestartCount: p.restartCount,
 		Health:       domain.HealthStatusUnknown,
 		Cmd:          p.config.Cmd,
@@ -239,14 +360,37 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		StopTimeout:  p.shutdownTimeout,
 	}
 
-	// PID is only meaningful while the process is active. Once stopped or
-	// crashed we report 0 even though current is retained for reap/retry.
-	if !p.state.IsStopped() && p.current != nil && p.current.proc != nil {
+	// PID is only meaningful while the process is actively running/starting/
+	// stopping. A stopped/crashed/blocked/completed process reports 0 even though
+	// current is retained for reap/retry. A waiting process reports 0 too: on a
+	// RE-RUN of a completed/crashed task, current still holds the reaped prior
+	// instance, so guarding on IsStopped alone would surface that dead PID while
+	// the task waits on its dependencies again (plan 013 D5 fix).
+	if !p.state.IsStopped() && p.state != domain.ProcessStateWaiting &&
+		p.current != nil && p.current.proc != nil {
 		info.PID = p.current.proc.PID()
 	}
 
 	if !p.startedAt.IsZero() {
 		info.StartedAt = p.startedAt
+	}
+
+	// A completed task freezes its uptime at completion (plan 013 D3): report
+	// the frozen end so UptimeSeconds reflects the run duration, not now-start.
+	if p.state == domain.ProcessStateCompleted && !p.completedAt.IsZero() {
+		info.EndedAt = p.completedAt
+	}
+
+	// Gated-launch surfacing (plan 013 D5). While waiting, report the full
+	// depends_on set (declaration order) as WaitingOn: a gated process leaves
+	// waiting only when every target is satisfied, so it is still gated on the
+	// set. When blocked, report the recorded blocking targets. Both are empty in
+	// every other state.
+	switch p.state {
+	case domain.ProcessStateWaiting:
+		info.WaitingOn = slices.Clone(p.config.DependsOn)
+	case domain.ProcessStateBlocked:
+		info.BlockedOn = slices.Clone(p.blockedBy)
 	}
 
 	// Include health check state if checker exists
@@ -264,6 +408,91 @@ func (p *ManagedProcess) State() domain.ProcessState {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.state
+}
+
+// BlockedBy returns the depends_on targets that failed and left this process
+// blocked, in declaration order (plan 013 D4). Empty unless the process is in
+// the blocked state. The slice is cloned so callers cannot mutate live state.
+func (p *ManagedProcess) BlockedBy() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return slices.Clone(p.blockedBy)
+}
+
+// gated reports whether this process has a non-empty depends_on and must go
+// through the graph coordinator rather than launching directly (plan 013 D4).
+func (p *ManagedProcess) gated() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.config.DependsOn) > 0
+}
+
+// beginWaiting CONDITIONALLY starts a gated orchestration episode (plan 013 D4).
+// It admits a new episode only from a non-active state -- stopped, crashed,
+// blocked, or completed -- and, atomically under p.mu, bumps the launch
+// generation, moves the process to waiting, clears prior blocked reasons, and
+// stores the per-process wait cancel so StopProcess can unblock this process's
+// Demand joins. It returns (gen, true) on admission.
+//
+// From an ACTIVE state (running/starting/stopping) or an already-waiting one it
+// makes NO change and returns (prev, false) so the caller can map the correct
+// already-running / already-waiting error. Making admission conditional and
+// atomic with the state read is what guarantees EXACTLY ONE episode per process:
+// two concurrent starts that both observed `stopped` cannot both flip the
+// process to waiting -- the first admits, the second sees `waiting` and is
+// refused (findings 1/2).
+func (p *ManagedProcess) beginWaiting(cancel context.CancelFunc) (uint64, domain.ProcessState, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch p.state {
+	case domain.ProcessStateStopped, domain.ProcessStateCrashed,
+		domain.ProcessStateBlocked, domain.ProcessStateCompleted:
+		// Admissible: fall through and start a fresh episode.
+	default:
+		return 0, p.state, false
+	}
+	gen := p.waitGen.Add(1)
+	p.state = domain.ProcessStateWaiting
+	p.blockedBy = nil
+	p.waitCancel = cancel
+	p.startedAt = time.Time{}
+	return gen, domain.ProcessStateWaiting, true
+}
+
+// failWaitingLaunch settles a gated process into crashed after its launch failed
+// for a genuine reason -- most importantly a surviving previous group that the
+// launch guard refused (ErrProcessGroupNotReaped) -- but only if this episode is
+// still current AND the process is still waiting, so a superseded or
+// already-stopped episode is never clobbered (plan 013 D4, finding 3). It
+// deliberately RETAINS p.current: a surviving group must stay reapable by Stop's
+// crashed path. Without this, a refused gated launch would strand the process in
+// waiting, where Stop's no-instance shortcut skips the live group and shutdown
+// could drop the orphan ledger while the group survives.
+func (p *ManagedProcess) failWaitingLaunch(gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waitGen.Load() != gen || p.state != domain.ProcessStateWaiting {
+		return false
+	}
+	p.state = domain.ProcessStateCrashed
+	p.waitCancel = nil
+	return true
+}
+
+// markBlocked moves the process to the terminal blocked state, recording the
+// failed targets, but only if gen still matches the current launch generation --
+// a stop/restart/re-demand that bumped the generation supersedes this stale
+// completion (returns false, no state change). Plan 013 D4.
+func (p *ManagedProcess) markBlocked(targets []string, gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waitGen.Load() != gen {
+		return false
+	}
+	p.state = domain.ProcessStateBlocked
+	p.blockedBy = slices.Clone(targets)
+	p.waitCancel = nil
+	return true
 }
 
 // StopTimeout returns the effective per-process stop budget used as the
@@ -319,7 +548,70 @@ func (p *ManagedProcess) Start(ctx context.Context) error {
 // (Start, Restart, and the supervisor's direct startWithConfig calls), so no
 // path can forget to persist and a future path inherits it for free.
 func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingConfig) error {
-	err := p.startWithConfigLocked(ctx, pending)
+	return p.startWithConfigGen(ctx, pending, nil)
+}
+
+// startGated launches a gated process whose dependency wait completed (plan 013
+// D4). It is the coordinator's launch path: expectGen is the generation the
+// coordinator captured when it began resolving; the launch commits only if it
+// still matches at the final gate, so a stop/restart/re-demand that superseded
+// this completion refuses the launch (errLaunchSuperseded) rather than racing a
+// stale process into existence. pending, when non-nil, is a reload swapped in
+// ATOMICALLY at the launch gate (plan 013 D6) so a blocked/stopped gated (re)start
+// picks up the child's edited cmd/env/stop budget exactly as the ungated path
+// does; nil launches with the stored config.
+func (p *ManagedProcess) startGated(ctx context.Context, pending *pendingConfig, expectGen uint64) error {
+	return p.startWithConfigGen(ctx, pending, &expectGen)
+}
+
+// startTask launches a task child whose own depends_on wait completed (plan 013
+// D3). Like startGated it enforces the launch generation expectGen at the final
+// gate, so a stop/restart/re-demand that superseded this run refuses the launch
+// (errLaunchSuperseded). On success it returns the launched instance so the task
+// coordinator can watch its exit (inst.exited, pre-drain) for the run-budget race
+// and its done channel for the committed terminal state.
+func (p *ManagedProcess) startTask(ctx context.Context, expectGen uint64) (*processInstance, error) {
+	if err := p.startWithConfigGen(ctx, nil, &expectGen); err != nil {
+		return nil, err
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.current, nil
+}
+
+// applyTaskReload swaps a freshly-reloaded task runtime (cmd/env/stop budget/run
+// budget) into a NON-running task before a manual re-run (plan 013 D3). It is
+// safe to mutate the stored config directly here -- the caller guarantees the
+// task is in a terminal state (completed/crashed/stopped), so no run observes a
+// torn config. The env loader closure is stored for the fresh-read-on-launch at
+// the next start.
+func (p *ManagedProcess) applyTaskReload(pending *pendingConfig) {
+	if pending == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config = pending.config
+	p.loadEnv = pending.loadEnv
+	p.shutdownTimeout = pending.stopTimeout
+	p.taskTimeout = pending.config.TaskTimeout
+	p.taskHasTimeout = pending.config.TaskHasTimeout
+}
+
+// bumpRestart increments the restart count for a manual task re-run (plan 013
+// D3), reusing the same counter surfaced for processes.
+func (p *ManagedProcess) bumpRestart() {
+	p.mu.Lock()
+	p.restartCount++
+	p.mu.Unlock()
+}
+
+// startWithConfigGen is the shared launch wrapper: it runs the locked launch
+// (optionally reloading pending config and/or enforcing a launch generation) and
+// persists the orphan-reaping ledger via onLaunched AFTER p.mu is released (see
+// startWithConfigLocked's comment on the s.mu -> p.mu ordering).
+func (p *ManagedProcess) startWithConfigGen(ctx context.Context, pending *pendingConfig, expectGen *uint64) error {
+	err := p.startWithConfigLocked(ctx, pending, expectGen)
 	if err == nil && p.onLaunched != nil {
 		p.onLaunched()
 	}
@@ -338,9 +630,20 @@ func (p *ManagedProcess) startWithConfig(ctx context.Context, pending *pendingCo
 // If the runner (or the post-swap env reload) fails AFTER the swap was applied,
 // the new config stays in place (state Crashed; the next start uses it) -- "the
 // file is the truth".
-func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pendingConfig) error {
+func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pendingConfig, expectGen *uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Generation guard (plan 013 D4). For a coordinator-driven gated launch,
+	// commit only if the process is still on the generation the coordinator
+	// captured when it began resolving. A stop/restart/re-demand that superseded
+	// this completion bumped waitGen (under p.mu), so this stale launch is refused
+	// with no state change -- checked under p.mu, an atomic read only, before any
+	// state guard so it can never race a launch into a stopped/blocked process
+	// that a concurrent stop already settled. Ungated launches pass expectGen=nil.
+	if expectGen != nil && p.waitGen.Load() != *expectGen {
+		return errLaunchSuperseded
+	}
 
 	// Reject starting over an active run. `stopping` is included so a Start
 	// racing an in-flight Stop is refused rather than launching a duplicate
@@ -423,7 +726,7 @@ func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pen
 	p.state = domain.ProcessStateStarting
 
 	// Build a fresh instance for this run.
-	inst := &processInstance{done: make(chan struct{})}
+	inst := &processInstance{done: make(chan struct{}), exited: make(chan struct{})}
 	processCtx, cancel := context.WithCancel(ctx)
 	inst.cancel = cancel
 
@@ -522,11 +825,68 @@ func (p *ManagedProcess) computeDeadlines(ctx context.Context) (gracefulDeadline
 
 // Stop stops the process gracefully, escalating to SIGKILL if the group does
 // not exit within the graceful window, and reports an error only if the group
-// truly survives. See design doc D3.
-func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
+// truly survives. See design doc D3. A clean reap settles the process in
+// stopped.
+func (p *ManagedProcess) Stop(ctx context.Context) error {
+	return p.stop(ctx, domain.ProcessStateStopped)
+}
+
+// stopTask stops a task's run and settles it in CRASHED rather than stopped
+// (plan 013 D3). It is the run-timeout escalation path: the run budget already
+// expired, so the child is signalled (SIGTERM->SIGKILL) exactly like a normal
+// stop -- reusing the group-reap machinery -- but the terminal verdict is
+// crashed, since a timed-out task did not complete.
+func (p *ManagedProcess) stopTask(ctx context.Context) error {
+	return p.stop(ctx, domain.ProcessStateCrashed)
+}
+
+// stop is the shared stop implementation. cleanState is the terminal state
+// committed when the group is confirmed reaped (stopped for a normal stop,
+// crashed for a task run-timeout). A surviving group always commits crashed
+// regardless; the error paths are unchanged.
+func (p *ManagedProcess) stop(ctx context.Context, cleanState domain.ProcessState) (retErr error) {
 	p.mu.Lock()
 
 	switch p.state {
+	case domain.ProcessStateCompleted:
+		// A finished task (plan 013 D3). Normally there is nothing to reap -- a
+		// stop/down of a completed task is a no-op success, and it must NOT be
+		// reclassified to stopped. But if a grandchild outlived the leader's exit
+		// its group may still be alive; fall through to reap it (retry path),
+		// mirroring the stopped/crashed surviving-group case below.
+		if p.current == nil || p.current.proc == nil {
+			p.mu.Unlock()
+			return nil
+		}
+		if alive, _ := p.current.proc.GroupAlive(); !alive {
+			p.mu.Unlock()
+			return nil
+		}
+		// Surviving group: fall through to reap it.
+	case domain.ProcessStateWaiting:
+		// Gated process whose dependency wait is still pending (or just resolved
+		// but not yet launched). Supersede any resolved-but-unlaunched coordinator
+		// completion (bump the generation so its final gate refuses), cancel this
+		// process's wait so the coordinator's Demand joins unblock, and settle in
+		// stopped. There is no process group to reap. Plan 013 D4.
+		p.waitGen.Add(1)
+		cancel := p.waitCancel
+		p.waitCancel = nil
+		p.state = domain.ProcessStateStopped
+		p.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		// A real transition happened (the scheduled launch was canceled), so this
+		// is a clean stop, not an ErrProcessNotRunning no-op.
+		return nil
+	case domain.ProcessStateBlocked:
+		// Terminal gated state, no wait in flight and no group. Settle in stopped
+		// so a later start can re-schedule it. Plan 013 D4.
+		p.state = domain.ProcessStateStopped
+		p.blockedBy = nil
+		p.mu.Unlock()
+		return nil
 	case domain.ProcessStateStopped, domain.ProcessStateCrashed:
 		// Nothing running, unless a group survived a prior stop / unexpected
 		// leader exit -- in which case fall through and reap it (retry path),
@@ -621,7 +981,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 
 	if inst == nil || inst.proc == nil {
 		p.mu.Lock()
-		p.state = domain.ProcessStateStopped
+		p.state = cleanState
 		p.resolveStopEpisodeLocked(ep, nil)
 		p.mu.Unlock()
 		return nil
@@ -692,7 +1052,7 @@ func (p *ManagedProcess) Stop(ctx context.Context) (retErr error) {
 			// Group survived: keep current so a later stop/restart can retry.
 			p.state = domain.ProcessStateCrashed
 		} else {
-			p.state = domain.ProcessStateStopped
+			p.state = cleanState
 		}
 	}
 	if inst.cancel != nil {
@@ -814,6 +1174,15 @@ func (p *ManagedProcess) Restart(stopCtx, startCtx context.Context, pending *pen
 func (p *ManagedProcess) monitor(inst *processInstance) {
 	err := inst.proc.Wait()
 
+	// Claim the terminal outcome and signal EXIT before draining (plan 013 D3,
+	// fix 6). claimedExit is false only when a task's run-budget timer already
+	// claimed a timeout; in that case the natural-exit commit below is skipped so
+	// stopTask (already escalating) owns the crashed verdict. markExited unblocks
+	// the run-budget timer's exit race immediately, well before a slow grandchild
+	// drain would otherwise settle done.
+	claimedExit := inst.claimTerminal(claimExit)
+	inst.markExited()
+
 	// Wait for this instance's output readers to finish draining pipes with a
 	// timeout. With manual pipes (not cmd.StdoutPipe), the pipes stay open
 	// until all processes (including grandchildren) close them, so graceful
@@ -851,9 +1220,27 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 			// this log precedes Stop's final verdict.
 			p.logf(domain.StreamStdout, "stopped (rc=%d)", exitCode)
 		case domain.ProcessStateRunning, domain.ProcessStateStarting:
-			// Genuine unexpected exit (crash / natural exit not driven by Stop).
-			p.state = domain.ProcessStateCrashed
-			p.logf(domain.StreamStderr, "exited unexpectedly (rc=%d)", exitCode)
+			// A leader exit not driven by Stop. For a TASK (plan 013 D3), a natural
+			// exit 0 is success -> completed (uptime frozen here); any non-zero or
+			// signal exit -> crashed. A plain process ALWAYS crashes on a leader exit,
+			// rc=0 included (a service is not supposed to exit) -- this asymmetry is
+			// deliberately gated on kind so plain-process semantics are byte-for-byte
+			// unchanged. Surviving grandchildren (a group that outlives the leader)
+			// go through the existing orphan-reaping machinery via the retained
+			// p.current below and Stop's surviving-group path.
+			switch {
+			case !claimedExit:
+				// A task run-budget timer claimed a timeout before this exit was
+				// recorded (fix 6): stopTask owns the crashed verdict, so do NOT commit
+				// a natural-exit state here. Reachable only for a task.
+			case p.kind == domain.ProcessKindTask && exitCode == 0:
+				p.state = domain.ProcessStateCompleted
+				p.completedAt = time.Now()
+				p.logf(domain.StreamStdout, "task completed (rc=0)")
+			default:
+				p.state = domain.ProcessStateCrashed
+				p.logf(domain.StreamStderr, "exited unexpectedly (rc=%d)", exitCode)
+			}
 		default:
 			// State is already terminal (stopped/crashed) -- Stop committed a
 			// verdict before this monitor ran (only reachable if Stop's

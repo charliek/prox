@@ -10,6 +10,58 @@ bounded by the disk-budget accounting from #69 and covered by capture-time
 header/query-param redaction. Bodies are captured verbatim, though — see the
 Breaking entry.
 
+Dependencies, tasks, and process gating (plan 013, #76): prox can now wait
+on external resources, run one-shot setup commands, and gate a process's
+launch on either.
+
+### Added
+
+- **`dependencies:`, `tasks:`, and `processes.<name>.depends_on`** (#76, plan
+  013). `dependencies:` describes an external resource (a database, cache,
+  or other service) with a readiness `check` (`tcp`/`url`/`cmd`, 30s total
+  budget by default including any `start:` command's execution time, 1s poll
+  interval) and an optional `start:` command that runs at most once — only
+  when the initial check fails — to bring it up (daemonizing commands like
+  `docker compose up -d` are the intended pattern; prox never tears down the
+  external resource itself, though it does kill its own still-running
+  `start:` helper on teardown). `tasks:` describes a run-to-completion
+  command (a migration, a seed script) that runs once per `prox up`
+  lifetime, gated on its own `depends_on`, with a 60s default run budget (`0`
+  = unlimited). A process's `depends_on` gates its launch on dependencies
+  and/or tasks (never other processes): the process starts in a new
+  `waiting` state while its targets resolve asynchronously in the
+  background (`prox up`/`prox up -d` never block on this), then either
+  launches normally or settles into a new terminal `blocked` state if a
+  required target failed. `prox restart` on a running gated process/task
+  re-resolves every target — against a fresh config reload — before
+  touching the running instance (fail-before-stop). See the new
+  [Dependencies and Tasks guide](docs/guides/dependencies.md) and the
+  [configuration reference](docs/reference/configuration.md#dependencies-tasks-and-process-gating).
+- **Status/exit-contract extension for dependencies and tasks** (#76, plan
+  013). `prox status` gains a `Dependencies:` table (state, one-line check
+  summary, last error) and decorates the STATUS column with
+  `waiting(x, y)`/`blocked(x)` naming the unresolved/failed targets; a new
+  `Blocked:` line mirrors the existing `Crashed:` line. The exit-1 contract
+  extends to: any process left `blocked`, and any `dependencies:` entry in
+  the terminal `failed` state (a `warned` dependency does not count — its
+  dependents still run). Precedence for the primary stderr message is
+  `proxy-down > crashed > blocked > failed-dependency`; all applicable lines
+  still print regardless. `GET /status` gains a `dependencies` array; each
+  process response gains `kind` (`"task"` when applicable), `waiting_on`,
+  and `blocked_on`. The TUI colors `waiting` (amber), `blocked` (red, bold),
+  and `completed` (gray), with an inline `(waiting on: ...)`/`(blocked on:
+  ...)` annotation.
+
+### Changed
+
+- **One-shot `rc=0` caveat narrowed to plain processes** (#76, plan 013). A
+  bare `processes:` entry that exits `0` on its own is still marked
+  `crashed` — that behavior (plan 011) is unchanged. A **`tasks:`** entry,
+  by contrast, maps a natural `exit 0` to the new dedicated `completed`
+  terminal state, which does **not** trip `prox status`'s exit-1 contract.
+  Use `tasks:` rather than a plain process for anything meant to run once
+  and exit cleanly.
+
 ### Breaking
 
 - **Capture is on by default whenever the proxy is enabled** (plan 012).

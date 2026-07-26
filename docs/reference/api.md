@@ -87,7 +87,15 @@ Supervisor status.
     "dropped_events": 0,
     "backfill_failures": 0,
     "heal_state": "healthy"
-  }
+  },
+  "dependencies": [
+    {
+      "name": "postgres",
+      "state": "healthy",
+      "check": "tcp localhost:5432",
+      "start_invoked": false
+    }
+  ]
 }
 ```
 
@@ -105,6 +113,18 @@ Supervisor status.
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
 
 `prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
+
+`dependencies` reports the resolution state of every configured `dependencies:` entry; the field is omitted entirely when no dependencies are configured (it is never an empty array):
+
+| Field | Description |
+|-------|-------------|
+| `name` | The dependency's name |
+| `state` | `pending` (no resolution started yet this generation), `checking`, `starting`, `polling`, `healthy`, `warned` (budget exhausted, `on_failure: warn`), `failed` (budget exhausted, `on_failure: fail`), or `canceled` (a resolution torn down by shutdown/reset, not a readiness failure) |
+| `check` | A one-line `"<kind> <target>"` summary of the readiness probe, e.g. `tcp localhost:5432`, `url http://localhost:9070/health`, or `cmd ...` (truncated with `…` past 60 characters) |
+| `last_error` | The most recent probe error as a string; omitted when there is none |
+| `start_invoked` | Whether the `start:` command was launched this generation (always `false` when the initial check already passed) |
+
+Only `failed` trips the exit-1 contract (see [`prox status`](cli.md#status) for the full precedence); `warned`/`pending`/`checking`/`polling`/`healthy`/`canceled` do not.
 
 ### GET /processes
 
@@ -125,19 +145,37 @@ List all processes.
     },
     {
       "name": "api",
-      "status": "running",
-      "pid": 12346,
-      "uptime_seconds": 3600,
-      "restarts": 1,
-      "health": "unhealthy"
+      "status": "waiting",
+      "pid": 0,
+      "uptime_seconds": 0,
+      "restarts": 0,
+      "health": "unknown",
+      "waiting_on": ["postgres", "redis"]
+    },
+    {
+      "name": "migrate",
+      "status": "completed",
+      "pid": 0,
+      "uptime_seconds": 9,
+      "restarts": 0,
+      "health": "unknown",
+      "kind": "task"
     }
   ]
 }
 ```
 
-**Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`
+**Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`, `waiting` (a gated process/task whose `depends_on` targets are still resolving), `blocked` (a gated process/task left terminal when a required target failed), `completed` (a task that exited `0`)
 
-**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured)
+**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured — always `unknown` for a task)
+
+| Field | Description |
+|-------|-------------|
+| `kind` | `"task"` for a `tasks:` entry; omitted (meaning a plain process) otherwise |
+| `waiting_on` | The `depends_on` targets a `waiting` process/task is still resolving, in declaration order. Omitted (never an empty array) outside the `waiting` state |
+| `blocked_on` | The `depends_on` targets that failed and left this process/task `blocked`, in declaration order. Omitted outside the `blocked` state |
+
+`pid` is `0` for any state with no live process — `waiting`, `blocked`, `stopped`, and `completed` all report `0` here (the CLI table renders this as `-`).
 
 ### GET /processes/{name}
 

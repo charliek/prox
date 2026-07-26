@@ -57,6 +57,23 @@ The TUI has two views you can switch between with `Tab`:
 
 Status codes are color-coded: green (2xx), cyan (3xx), yellow (4xx), red (5xx), gray (0/unknown).
 
+## Process State Colors
+
+The processes panel color-codes each process name by its state, including the states introduced by [dependencies and tasks](../guides/dependencies.md):
+
+| State | Color |
+| ----- | ----- |
+| `running` | green |
+| `stopped` | gray |
+| `crashed` | red |
+| `starting` | yellow |
+| `stopping` | yellow |
+| `waiting` | amber (distinct from the starting yellow) |
+| `blocked` | red, bold (a launch failure, same family as crashed) |
+| `completed` | gray (a finished task rests like a stopped process) |
+
+A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on, appended directly to its name in the panel: `web (waiting on: postgres, redis)` or `web (blocked on: postgres)`, in declaration order. There's no separate detail area for this in the compact processes panel — it's shown inline because that's all the space there is.
+
 A request whose response is still streaming shows its real header-time status but `...` in place of the duration until it completes; the row then updates in place (same position, no duplicate) rather than adding a new line.
 
 ## Keybindings

@@ -98,8 +98,45 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	if h.proxyStatus != nil {
 		resp.Proxy = h.proxyStatus.ProxyStatus()
 	}
+	if deps := h.supervisor.DependencyStatuses(); len(deps) > 0 {
+		resp.Dependencies = make([]DependencyStatusResponse, len(deps))
+		for i, d := range deps {
+			resp.Dependencies[i] = toDependencyStatusResponse(d)
+		}
+	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// toDependencyStatusResponse converts a resolver dependency status to its API
+// form (plan 013 D5), rendering the check as a one-line "<kind> <target>"
+// summary (e.g. "tcp localhost:5435", "url http://...", "cmd ...").
+func toDependencyStatusResponse(d supervisor.DepStatus) DependencyStatusResponse {
+	return DependencyStatusResponse{
+		Name:         d.Name,
+		State:        string(d.State),
+		Check:        summarizeCheck(string(d.Check.Kind), d.Check.Target),
+		LastError:    d.LastError,
+		StartInvoked: d.StartInvoked,
+	}
+}
+
+// checkSummaryMaxLen bounds the rendered check summary so a long (or block-style,
+// multi-line) cmd: target cannot blow out the CLI's Dependencies tabwriter row.
+const checkSummaryMaxLen = 60
+
+// summarizeCheck renders a dependency check as a single-line "<kind> <target>"
+// summary for status surfacing (plan 013 D5 fix). strings.Fields collapses EVERY
+// run of whitespace -- including the embedded newlines and tabs of a block-style
+// cmd: check -- to a single space, so the summary is always one tabwriter-safe
+// line; it is then truncated (on a rune boundary, with an ellipsis) to
+// checkSummaryMaxLen so a pathologically long command cannot break the layout.
+func summarizeCheck(kind, target string) string {
+	summary := strings.Join(strings.Fields(kind+" "+target), " ")
+	if r := []rune(summary); len(r) > checkSummaryMaxLen {
+		summary = string(r[:checkSummaryMaxLen-1]) + "…"
+	}
+	return summary
 }
 
 // GetProcesses handles GET /api/v1/processes
@@ -331,6 +368,12 @@ func writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrProcessAlreadyRunning):
 		status = http.StatusConflict
 		code = domain.ErrCodeProcessAlreadyRunning
+		message = err.Error()
+	case errors.Is(err, domain.ErrProcessAlreadyWaiting):
+		// A gated process already scheduled and waiting on its dependencies;
+		// the manual start is a no-op (plan 013 D4). Same 409 as already-running.
+		status = http.StatusConflict
+		code = domain.ErrCodeProcessAlreadyWaiting
 		message = err.Error()
 	case errors.Is(err, domain.ErrProcessNotRunning):
 		status = http.StatusConflict
