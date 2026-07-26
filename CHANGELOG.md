@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.2.3
 
 Capture-by-default (plan 012): a proxy-enabled project now records
 request/response headers and bodies through the proxy with no extra config,
