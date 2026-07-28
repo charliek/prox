@@ -200,9 +200,32 @@ and returns an error.
 - **Names are unique across all three namespaces** — a name may appear in at
   most one of `processes`, `dependencies`, `tasks` (case-sensitive); a
   collision names every namespace it appears in.
-- **Unknown keys are rejected** in `dependencies:`/`tasks:` entries and
-  `check:` blocks (a typo like `on_faliure` is a load-time error, not a
-  silently-ignored field).
+- **Unknown keys are load-time errors everywhere in `prox.yaml`** — not just
+  `dependencies:`/`tasks:`. This covers the top level, `proxy:`,
+  `proxy.capture:`, `api:`, `certs:`, every `processes.<name>` entry
+  (including its nested `healthcheck:` block), every `services.<name>`
+  entry, and `dependencies:`/`tasks:` entries (including their `check:`
+  blocks). A typo like `stop_timout:` on a process fails with:
+
+  ```text
+  invalid configuration: processes.web: unknown field "stop_timout"
+  ```
+
+  A top-level typo uses the `config:` prefix instead of a dotted path (e.g.
+  `config: unknown field "prxoy"`). All structural errors found in one file
+  — across every block, not just the first one hit — are collected, sorted,
+  and reported together in a single `invalid configuration:` report.
+  (YAML-level defects — malformed syntax, literal duplicate keys — surface
+  immediately as a `parsing yaml:` error instead, since the document can't
+  be analyzed further.)
+- **Duplicate keys are rejected too, by two different layers.** A literal
+  duplicate key (the same key spelled twice in one mapping) is rejected by
+  the YAML parser itself, with a line number, before prox's own validation
+  ever runs. A duplicate created by *aliasing* a key node so it resolves to
+  the same value as an existing sibling key is also rejected — usually as
+  `<path>: duplicate key "<key>"`, though when the alias duplicates a known
+  field of a typed block the YAML decoder reports it first (as a
+  `parsing yaml:` error). Either way it never silently collapses.
 - **Exactly one of `check.tcp`/`check.url`/`check.cmd`** must be present —
   zero or more than one is an error. A key that is present but empty (e.g.
   `tcp: ""`) is its own distinct error, not silently treated as absent.
@@ -215,6 +238,40 @@ and returns an error.
   strongly-connected-components analysis, naming every task in the cycle.
   Dependencies are graph roots and processes are leaves, so only task→task
   edges can participate in a cycle.
+
+### YAML anchors and merge keys
+
+Strict key-checking does not give up standard YAML reuse — anchors,
+aliases, and `<<` merge keys are fully supported everywhere, including
+inside typed blocks like `processes.<name>` or `proxy:`. A merge cannot be
+used to smuggle an unknown key past a block's schema: the keys a merge
+brings in are validated against the schema of the block they land in, at
+the point they take effect.
+
+The standard "defaults" idiom works as YAML defines it:
+
+- `<<: *base` plus explicit keys in the same mapping — the explicit keys
+  win over anything the merge brought in.
+- `<<: [*a, *b]` — on overlap between sources, the first one wins.
+
+What is **not** supported is a separate top-level container built only to
+hold anchors (an `x-defaults:`/`_defaults:` idiom some other YAML-based
+tools allow). Every top-level key is checked against the fixed schema, so a
+scratch key like `x-defaults:` fails the same as any other unknown
+top-level key — there is no `x-` escape hatch. Instead, define each anchor
+at its first natural occurrence in the document and alias it from later
+occurrences:
+
+```yaml
+processes:
+  web:
+    cmd: ./web
+    env: &common
+      FOO: bar
+  worker:
+    cmd: ./worker
+    env: *common
+```
 
 ### Dependency Check and Start Semantics
 

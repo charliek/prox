@@ -217,6 +217,8 @@ tasks:
 
 Environment variable precedence, later overrides earlier: system environment → global `env_file` → process-specific `env_file` → process-specific `env` map.
 
+**Unknown or typo'd keys anywhere in `prox.yaml` fail at load** with a precise per-key error (e.g. `processes.web: unknown field "stop_timout"`) — if a project won't start, check for a rejected config before looking elsewhere.
+
 For the full configuration reference including all proxy, service, and certificate fields, read `references/configuration.md`.
 
 ## CLI Help
