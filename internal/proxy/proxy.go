@@ -39,10 +39,6 @@ type Service struct {
 
 	// Request/response capture
 	captureManager *CaptureManager
-	// capturePolicy is the project's capture/redaction policy (plan 012 D4), built
-	// once from the capture config and applied to every recorded request: header +
-	// URL redaction and (via MaxBodySize=0) the manager's configured body cap.
-	capturePolicy CapturePolicy
 }
 
 // NewService creates a new proxy service.
@@ -99,7 +95,6 @@ func NewService(cfg *config.ProxyConfig, services map[string]config.ServiceConfi
 		transport:      transport,
 		requestManager: requestMgr,
 		captureManager: captureMgr,
-		capturePolicy:  CapturePolicyFromCaptureConfig(captureCfg),
 	}, nil
 }
 
@@ -345,7 +340,8 @@ func (s *Service) createRouter() http.Handler {
 		var reqBody *CapturedBody
 		var reqHeaders http.Header
 		if s.captureManager != nil && s.captureManager.Enabled() {
-			reqBody, r.Body, reqHeaders = s.captureManager.CaptureRequest(requestID, r, s.capturePolicy)
+			// A 0 cap keeps the manager's configured max_body_size (effectiveLimit).
+			reqBody, r.Body, reqHeaders = s.captureManager.CaptureRequest(requestID, r, 0)
 		} else {
 			reqHeaders = cloneHeaders(r.Header)
 		}
@@ -371,7 +367,7 @@ func (s *Service) createRouter() http.Handler {
 		var crw *CaptureResponseWriter
 		var brw *responseWriter
 		if s.captureManager != nil && s.captureManager.Enabled() {
-			crw = s.captureManager.WrapResponseWriter(w, s.capturePolicy)
+			crw = s.captureManager.WrapResponseWriter(w, 0)
 			rw = crw
 		} else {
 			brw = &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -434,7 +430,7 @@ func (s *Service) createRouter() http.Handler {
 				// Freeze the request-body capture before the record is published
 				// (see FinalizeRequestBody).
 				FinalizeRequestBody(r.Body)
-				resBody, resHeaders := s.captureManager.FinalizeResponse(requestID, crw, s.capturePolicy)
+				resBody, resHeaders := s.captureManager.FinalizeResponse(requestID, crw)
 				details = &RequestDetails{
 					RequestHeaders:  reqHeaders,
 					ResponseHeaders: resHeaders,
@@ -509,10 +505,9 @@ func (s *Service) buildRecord(r *http.Request, subdomain string, statusCode int,
 		ID:        requestID,
 		Timestamp: startTime,
 		Method:    r.Method,
-		// Redact sensitive query params in the stored URL (plan 012 D4). r.URL is
-		// never mutated — RedactURLString works on a copy — so the reverse proxy
-		// still forwards the byte-identical upstream URL.
-		URL:        s.capturePolicy.RedactURLString(r.URL),
+		// The stored URL is the request URL verbatim; r.URL is never mutated, so
+		// the reverse proxy still forwards the byte-identical upstream URL.
+		URL:        r.URL.String(),
 		Subdomain:  subdomain,
 		Hostname:   stripHostPort(r.Host),
 		StatusCode: statusCode,

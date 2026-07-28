@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -80,30 +79,6 @@ type CaptureConfig struct {
 	// single spilled body is then the oldest-and-only group and is evicted by the
 	// same loop). Parsed with ParseSize.
 	DiskBudget string `yaml:"disk_budget"`
-	// Redact controls capture-time redaction of sensitive headers and query
-	// params (plan 012 D4). It is a tri-state pointer: nil (key absent) and
-	// explicit true both mean redaction ON — redaction defaults on whenever a
-	// capture config exists — and only an explicit false disables it. See
-	// RedactEnabled.
-	Redact *bool `yaml:"redact,omitempty"`
-	// RedactHeaders and RedactQueryParams EXTEND (never replace) the built-in
-	// redaction sets in internal/proxy (plan 012 D4). Header names are canonical-
-	// ized (http.CanonicalHeaderKey) and query-param names lowercased, both
-	// de-duplicated, at parse time (see normalizeCaptureRedaction). Validation
-	// rejects malformed header names.
-	RedactHeaders     []string `yaml:"redact_headers,omitempty"`
-	RedactQueryParams []string `yaml:"redact_query_params,omitempty"`
-}
-
-// RedactEnabled reports whether capture-time redaction is on for this config
-// (plan 012 D4). A nil config (no capture config at all) is off; otherwise nil
-// or true Redact means on (the default whenever a capture config exists) and
-// only an explicit false disables it. Safe to call on a nil receiver.
-func (c *CaptureConfig) RedactEnabled() bool {
-	if c == nil {
-		return false
-	}
-	return c.Redact == nil || *c.Redact
 }
 
 // ServiceConfig represents a service routing configuration that can be either
@@ -170,12 +145,9 @@ type rawProxyConfig struct {
 // used to live directly on CaptureConfig, which stops doubling as its own raw
 // parse type.
 type rawCaptureConfig struct {
-	Enabled           *bool    `yaml:"enabled,omitempty"`
-	MaxBodySize       string   `yaml:"max_body_size"`
-	DiskBudget        string   `yaml:"disk_budget"`
-	Redact            *bool    `yaml:"redact,omitempty"`
-	RedactHeaders     []string `yaml:"redact_headers,omitempty"`
-	RedactQueryParams []string `yaml:"redact_query_params,omitempty"`
+	Enabled     *bool  `yaml:"enabled,omitempty"`
+	MaxBodySize string `yaml:"max_body_size"`
+	DiskBudget  string `yaml:"disk_budget"`
 }
 
 // materializeCapture builds the CaptureConfig for a proxy block (plan 012 D1,
@@ -198,9 +170,6 @@ func materializeCapture(raw *rawCaptureConfig) *CaptureConfig {
 	}
 	cfg.MaxBodySize = raw.MaxBodySize
 	cfg.DiskBudget = raw.DiskBudget
-	cfg.Redact = raw.Redact
-	cfg.RedactHeaders = raw.RedactHeaders
-	cfg.RedactQueryParams = raw.RedactQueryParams
 	return cfg
 }
 
@@ -356,43 +325,7 @@ func Parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 
-	// Normalize the redaction extension lists AFTER validation (which reports on
-	// the raw entries) so the canonical/deduped form is what reaches the register
-	// wire and the standalone capture policy (plan 012 D4).
-	if config.Proxy != nil && config.Proxy.Capture != nil {
-		normalizeCaptureRedaction(config.Proxy.Capture)
-	}
-
 	return config, nil
-}
-
-// normalizeCaptureRedaction canonicalizes and de-duplicates the redaction
-// extension lists in place (plan 012 D4): header names to http.CanonicalHeaderKey
-// form, query-param names to lowercase, both order-preserving and duplicate-free.
-// Validation has already rejected malformed entries; this only tidies valid ones
-// so registrationMatches can set-compare a stable form. Empty lists become nil.
-func normalizeCaptureRedaction(c *CaptureConfig) {
-	c.RedactHeaders = dedupeNormalized(c.RedactHeaders, http.CanonicalHeaderKey)
-	c.RedactQueryParams = dedupeNormalized(c.RedactQueryParams, strings.ToLower)
-}
-
-// dedupeNormalized applies norm to every entry and drops later duplicates,
-// preserving first-seen order. Returns nil for an empty input.
-func dedupeNormalized(in []string, norm func(string) string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		n := norm(s)
-		if _, ok := seen[n]; ok {
-			continue
-		}
-		seen[n] = struct{}{}
-		out = append(out, n)
-	}
-	return out
 }
 
 // parseProcessConfig handles both simple and expanded process definitions

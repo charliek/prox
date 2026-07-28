@@ -2,9 +2,7 @@ package proxyd
 
 import (
 	"fmt"
-	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,14 +41,6 @@ type Route struct {
 	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
 	// proxy passes it as the per-call capture limit; 0 means the daemon default.
 	MaxBodySize int64
-	// Redact, RedactHeaders, and RedactQueryParams are the project's capture-time
-	// redaction policy (plan 012 D4), stamped from the registration. Unlike
-	// DiskBudget these ARE consulted per request on the hot path (the dynamic
-	// proxy folds them into a CapturePolicy), so they live on the route. The
-	// slices are deep-copied on register so no route aliases the caller's slice.
-	Redact            bool
-	RedactHeaders     []string
-	RedactQueryParams []string
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -73,13 +63,6 @@ type ProjectRegistration struct {
 	// consults it) — the daemon folds every capture-enabled project's budget into
 	// one effective daemon-wide bound via EffectiveCaptureDiskBudget.
 	DiskBudget int64
-	// Redact, RedactHeaders, and RedactQueryParams are the project's capture-time
-	// redaction policy (plan 012 D4), stamped onto each Route. registrationMatches
-	// compares all three (the lists as order-insensitive SETS) so a changed
-	// redaction config forces a real re-register.
-	Redact            bool
-	RedactHeaders     []string
-	RedactQueryParams []string
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -109,39 +92,6 @@ func NewRegistry() *Registry {
 // routeKey builds the map key for a route.
 func routeKey(hostname string, port int) string {
 	return fmt.Sprintf("%s:%d", hostname, port)
-}
-
-// copyStrings returns a deep copy of s (nil for empty), so a Route or snapshot
-// never aliases the caller's redaction slice (plan 012 D4).
-func copyStrings(s []string) []string {
-	if len(s) == 0 {
-		return nil
-	}
-	return append([]string(nil), s...)
-}
-
-// stringSetsEqual reports whether a and b hold the same values as SETS
-// (order- and duplicate-insensitive) after normalizing each entry with norm.
-// registrationMatches uses it so a reordered redaction list is a no-op refresh
-// while changed content forces a real re-register (plan 012 D4).
-func stringSetsEqual(a, b []string, norm func(string) string) bool {
-	sa := make(map[string]struct{}, len(a))
-	for _, s := range a {
-		sa[norm(s)] = struct{}{}
-	}
-	sb := make(map[string]struct{}, len(b))
-	for _, s := range b {
-		sb[norm(s)] = struct{}{}
-	}
-	if len(sa) != len(sb) {
-		return false
-	}
-	for k := range sa {
-		if _, ok := sb[k]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // ProjectConflictError is returned by Register when the target project dir is
@@ -251,19 +201,16 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	for _, p := range pending {
 		key := routeKey(p.hostname, p.port)
 		r.routes[key] = &Route{
-			Hostname:          p.hostname,
-			Port:              p.port,
-			Protocol:          p.protocol,
-			Target:            p.target,
-			ProjectDir:        req.ProjectDir,
-			PID:               req.PID,
-			StartTime:         req.StartTime,
-			RegisteredAt:      now,
-			CaptureEnabled:    req.CaptureEnabled,
-			MaxBodySize:       req.MaxBodySize,
-			Redact:            req.Redact,
-			RedactHeaders:     copyStrings(req.RedactHeaders),
-			RedactQueryParams: copyStrings(req.RedactQueryParams),
+			Hostname:       p.hostname,
+			Port:           p.port,
+			Protocol:       p.protocol,
+			Target:         p.target,
+			ProjectDir:     req.ProjectDir,
+			PID:            req.PID,
+			StartTime:      req.StartTime,
+			RegisteredAt:   now,
+			CaptureEnabled: req.CaptureEnabled,
+			MaxBodySize:    req.MaxBodySize,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -282,18 +229,15 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	r.projects[req.ProjectDir] = &ProjectRegistration{
-		Dir:               req.ProjectDir,
-		PID:               req.PID,
-		Domain:            req.Domain,
-		RouteKeys:         routeKeys,
-		StartTime:         req.StartTime,
-		RegisteredAt:      now,
-		CaptureEnabled:    req.CaptureEnabled,
-		MaxBodySize:       req.MaxBodySize,
-		DiskBudget:        req.DiskBudget,
-		Redact:            req.Redact,
-		RedactHeaders:     copyStrings(req.RedactHeaders),
-		RedactQueryParams: copyStrings(req.RedactQueryParams),
+		Dir:            req.ProjectDir,
+		PID:            req.PID,
+		Domain:         req.Domain,
+		RouteKeys:      routeKeys,
+		StartTime:      req.StartTime,
+		RegisteredAt:   now,
+		CaptureEnabled: req.CaptureEnabled,
+		MaxBodySize:    req.MaxBodySize,
+		DiskBudget:     req.DiskBudget,
 	}
 
 	for port, proto := range portsNeeded {
@@ -372,18 +316,6 @@ func (r *Registry) registrationMatches(req RegisterRequest) bool {
 	if proj.DiskBudget != req.DiskBudget {
 		return false
 	}
-	// A changed redaction policy must force a real re-register so the new policy
-	// reaches the routes (plan 012 D4). The lists compare as order-insensitive
-	// SETS: a reordered list is still a no-op refresh.
-	if proj.Redact != req.Redact {
-		return false
-	}
-	if !stringSetsEqual(proj.RedactHeaders, req.RedactHeaders, http.CanonicalHeaderKey) {
-		return false
-	}
-	if !stringSetsEqual(proj.RedactQueryParams, req.RedactQueryParams, strings.ToLower) {
-		return false
-	}
 
 	// Build the descriptor set the request would register (mirrors Register's
 	// pending-route construction).
@@ -455,17 +387,13 @@ func (r *Registry) snapshotProject(projectDir string) (projectSnapshot, bool) {
 		return projectSnapshot{}, false
 	}
 	projCopy := *proj
+	// RouteKeys is the only slice on either struct, so the plain struct copies
+	// here and below are complete deep copies once it is explicitly copied.
 	projCopy.RouteKeys = append([]string(nil), proj.RouteKeys...)
-	// Deep-copy the redaction slices so the snapshot never aliases the live
-	// registration's slices (plan 012 D4).
-	projCopy.RedactHeaders = copyStrings(proj.RedactHeaders)
-	projCopy.RedactQueryParams = copyStrings(proj.RedactQueryParams)
 	routes := make([]*Route, 0, len(proj.RouteKeys))
 	for _, key := range proj.RouteKeys {
 		if route, ok := r.routes[key]; ok {
 			rc := *route
-			rc.RedactHeaders = copyStrings(route.RedactHeaders)
-			rc.RedactQueryParams = copyStrings(route.RedactQueryParams)
 			routes = append(routes, &rc)
 		}
 	}
@@ -483,8 +411,6 @@ func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec)
 
 	for _, route := range snap.routes {
 		rc := *route
-		rc.RedactHeaders = copyStrings(route.RedactHeaders)
-		rc.RedactQueryParams = copyStrings(route.RedactQueryParams)
 		r.routes[routeKey(rc.Hostname, rc.Port)] = &rc
 		if li, ok := r.listeners[rc.Port]; ok {
 			li.RouteCount++
@@ -495,8 +421,6 @@ func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec)
 	}
 	projCopy := *snap.proj
 	projCopy.RouteKeys = append([]string(nil), snap.proj.RouteKeys...)
-	projCopy.RedactHeaders = copyStrings(snap.proj.RedactHeaders)
-	projCopy.RedactQueryParams = copyStrings(snap.proj.RedactQueryParams)
 	r.projects[projCopy.Dir] = &projCopy
 	return reopenPorts
 }

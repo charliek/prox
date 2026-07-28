@@ -512,57 +512,56 @@ func TestRegistry_DifferentPorts(t *testing.T) {
 	}
 }
 
-// TestRegistrationMatches_Redaction pins the plan 012 D4 no-op-refresh
-// discriminator for the redaction policy: a reordered list is still a match
-// (set-compare, order-insensitive), but a changed Redact flag or changed list
-// content forces a real re-register.
-func TestRegistrationMatches_Redaction(t *testing.T) {
+// TestRegistrationMatches_Capture pins the no-op-refresh discriminator for the
+// capture fields: an identical capture config is a no-op refresh, while a
+// changed capture_enabled, max_body_size (D13), or disk_budget (#69) each force
+// a real re-register so the new value reaches the routes / the daemon-wide
+// budget.
+func TestRegistrationMatches_Capture(t *testing.T) {
 	reg := NewRegistry()
 	base := newTestRequest("/projects/a", "local.dev",
 		map[string]ServiceTarget{"api": {Host: "localhost", Port: 3000}}, 0, 443)
-	base.Redact = true
-	base.RedactHeaders = []string{"X-One", "X-Two"}
-	base.RedactQueryParams = []string{"alpha", "beta"}
+	base.CaptureEnabled = true
+	base.MaxBodySize = 1024
+	base.DiskBudget = 4096
 	if _, _, err := reg.Register(base); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	t.Run("reordered lists still match", func(t *testing.T) {
-		reordered := base
-		reordered.RedactHeaders = []string{"X-Two", "X-One"}
-		reordered.RedactQueryParams = []string{"beta", "alpha"}
-		if !reg.registrationMatches(reordered) {
-			t.Error("reordered redaction lists should be a no-op refresh (set-compare)")
-		}
-	})
+	tests := []struct {
+		name   string
+		mutate func(*RegisterRequest)
+		want   bool
+	}{
+		{
+			name:   "identical capture config is a no-op refresh",
+			mutate: func(*RegisterRequest) {},
+			want:   true,
+		},
+		{
+			name:   "changed capture_enabled forces re-register",
+			mutate: func(r *RegisterRequest) { r.CaptureEnabled = false },
+			want:   false,
+		},
+		{
+			name:   "changed max_body_size forces re-register",
+			mutate: func(r *RegisterRequest) { r.MaxBodySize = 2048 },
+			want:   false,
+		},
+		{
+			name:   "changed disk_budget forces re-register",
+			mutate: func(r *RegisterRequest) { r.DiskBudget = 8192 },
+			want:   false,
+		},
+	}
 
-	t.Run("changed Redact flag forces re-register", func(t *testing.T) {
-		off := base
-		off.Redact = false
-		if reg.registrationMatches(off) {
-			t.Error("changed Redact flag must not match")
-		}
-	})
-
-	t.Run("changed header content forces re-register", func(t *testing.T) {
-		changed := base
-		changed.RedactHeaders = []string{"X-One", "X-Three"}
-		if reg.registrationMatches(changed) {
-			t.Error("changed redact_headers content must not match")
-		}
-	})
-
-	t.Run("changed query-param content forces re-register", func(t *testing.T) {
-		changed := base
-		changed.RedactQueryParams = []string{"alpha", "gamma"}
-		if reg.registrationMatches(changed) {
-			t.Error("changed redact_query_params content must not match")
-		}
-	})
-
-	t.Run("identical config is a no-op refresh", func(t *testing.T) {
-		if !reg.registrationMatches(base) {
-			t.Error("identical redaction config should match")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := base
+			tt.mutate(&req)
+			if got := reg.registrationMatches(req); got != tt.want {
+				t.Errorf("registrationMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
