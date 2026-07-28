@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -83,11 +85,30 @@ func startProx(t *testing.T, binary string, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// syncBuffer is a goroutine-safe bytes.Buffer: the exec copier goroutines
+// write while tests poll Output() before the process has exited.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // proxWithOutput holds a prox command and its captured output
 type proxWithOutput struct {
 	cmd    *exec.Cmd
-	stdout *bytes.Buffer
-	stderr *bytes.Buffer
+	stdout *syncBuffer
+	stderr *syncBuffer
 }
 
 // startProxWithOutput starts prox and captures its stdout/stderr
@@ -104,9 +125,10 @@ func startProxWithOutput(t *testing.T, binary string, args ...string) *proxWithO
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = projectRoot
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &syncBuffer{}
+	stderr := &syncBuffer{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start prox: %v", err)
@@ -114,14 +136,35 @@ func startProxWithOutput(t *testing.T, binary string, args ...string) *proxWithO
 
 	return &proxWithOutput{
 		cmd:    cmd,
-		stdout: &stdout,
-		stderr: &stderr,
+		stdout: stdout,
+		stderr: stderr,
 	}
 }
 
 // Output returns the combined stdout and stderr
 func (p *proxWithOutput) Output() string {
 	return p.stdout.String() + p.stderr.String()
+}
+
+// waitForOutputContains polls the captured combined output until it contains
+// substr, or fails the test after timeout.
+func waitForOutputContains(t *testing.T, prox *proxWithOutput, substr string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		last = prox.Output()
+		if strings.Contains(last, substr) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Final sample: the marker may have arrived during the last sleep.
+	if last = prox.Output(); strings.Contains(last, substr) {
+		return
+	}
+	t.Fatalf("output did not contain %q within %v; captured output: %s", substr, timeout, last)
 }
 
 // stopProx sends shutdown request to prox via API
