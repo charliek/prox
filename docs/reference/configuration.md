@@ -495,9 +495,6 @@ proxy:
     enabled: true       # default; omit the whole capture: block to get this
     max_body_size: 1MB
     disk_budget: 1GB
-    redact: true
-    redact_headers: []
-    redact_query_params: []
 ```
 
 #### Capture Fields
@@ -507,9 +504,6 @@ proxy:
 | `enabled` | bool | `true` when `proxy.enabled` is true | Master switch for this project's capture. `false` records metadata only (method, URL, status, timing) — no headers or bodies |
 | `max_body_size` | string | `1MB` | Maximum request or response body size to capture per record; larger bodies are truncated. Enforced per project, even on a shared daemon |
 | `disk_budget` | string | `1GB` (1 GiB) | Ceiling on total spilled body bytes on disk; see "How eviction works" below |
-| `redact` | bool | `true` | Redact sensitive headers and query params at the moment of capture; see "Redaction behavior" below |
-| `redact_headers` | []string | — | Extra header names to redact. **Extends**, never replaces, the built-in list |
-| `redact_query_params` | []string | — | Extra query-param names to redact. **Extends**, never replaces, the built-in list |
 
 Sizes use binary suffixes — `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`, each 1024× the previous — so `1GB` means 1 GiB (1,073,741,824 bytes), matching `max_body_size`'s existing units.
 
@@ -524,23 +518,7 @@ Only bodies larger than the 64KB inline threshold spill to a file on disk; small
 
 When the effective budget is exceeded, prox evicts the **oldest record group first** — a record's request and response body files age together as one group, keyed by whichever of the two spilled to disk first. Eviction is strict FIFO by first-spill time, deliberately **not** LRU: fetching an old body does not protect it from eviction. It runs across **every** project sharing the daemon — the oldest group anywhere is evicted first, regardless of which project it belongs to. Only the spilled body **files** are removed; the in-memory ring record and its metadata (method, URL, status, timing, headers) are untouched, and fetching an evicted body (`prox requests <id> --body`) reports it as no longer available rather than erroring.
 
-#### Redaction behavior
-
-Redaction runs at the moment of capture — before a record reaches disk, the daemon's request stream, the API, or the TUI — so every downstream surface is covered by construction.
-
-**Built-in header redaction** always replaces these header values with `[REDACTED]`, verbatim, regardless of `redact_headers`: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`.
-
-**Built-in query-param redaction** always replaces the *value* of these query params with `REDACTED` (unbracketed, since it sits inside a URL): `access_token`, `refresh_token`, `id_token`, `token`, `api_key`, `apikey`, `client_secret`, `code`. This applies to:
-
-- the request URL's own query string (`&`- or `;`-separated pairs);
-- query params inside a `Location` or `Referer` response header value — the OAuth-redirect leak path;
-- query-shaped params inside a URL **fragment** (`#...`) — the OAuth implicit-flow token leak path.
-
-Any **userinfo password** embedded in a URL is also redacted — `https://user:pass@host/path` becomes `https://user:REDACTED@host/path` — with the username preserved.
-
-`redact_headers`/`redact_query_params` **extend**, never replace, the built-in lists; entries are canonicalized (header names) or lowercased (query params) and de-duplicated at parse time. The `[REDACTED]`/`REDACTED` markers are deliberately visible rather than the field being omitted — seeing the marker confirms an `Authorization` header or a token was present, which is useful when debugging auth failures, without exposing the secret itself.
-
-> **Limitation: bodies are NOT redacted.** Redaction covers headers and URLs only. Request/response **bodies are captured and stored verbatim** — inline in memory or in `~/.prox/capture` spill files — including any tokens, API keys, or PII embedded in JSON or form payloads. Neither `redact_headers` nor a smaller `max_body_size` prevents this (`max_body_size` only truncates by length; it never inspects content). If a project's bodies carry secrets, the only reliable per-project opt-out is `enabled: false` — turning capture off entirely, not relying on redaction.
+> **Captured data is stored in cleartext.** Request URLs and request/response headers are retained **verbatim** in in-memory capture records — including `Authorization` and `Cookie` headers, sensitive query parameters, URL fragments/userinfo, and URL-bearing `Location`/`Referer` values. No value is altered or hidden. Captured body bytes are also verbatim up to `max_body_size`; truncation is length-only and never content-inspecting. Bodies over the 64KB inline threshold spill to `.prox/capture` (project) / `~/.prox/capture` (shared daemon). Capture directories are created mode `0700` and spill files `0600`, so captures are private to your user. If a project's traffic carries secrets you don't want recorded at all, the reliable opt-out is `enabled: false` — turning capture off entirely.
 
 #### Opting out
 
