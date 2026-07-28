@@ -278,13 +278,25 @@ func Parse(data []byte) (*Config, error) {
 	// report is deterministic regardless of Go's map iteration order -- each
 	// parser also walks its own entries in sorted order.
 	//
-	// Accepted limitation: the strict parsers inspect the generic
-	// map[string]interface{} form, which yaml.v3 has already produced -- so a
-	// YAML alias key or a `<<` merge that resolves to a key already present is
-	// collapsed into one map entry BEFORE we see it, and a duplicate logical key
-	// can slip past duplicate detection here. Detecting that requires inspecting
-	// the yaml.Node tree.
+	// The strict parsers below inspect the generic map[string]interface{} form,
+	// which cannot show duplicate keys (yaml.v3 has already collapsed them) and
+	// covers only the name-keyed blocks. checkDocumentStructure closes both gaps
+	// from the yaml.Node tree (plan 016 W2), and it runs FIRST here purely for
+	// readability -- the batch is sorted before it is reported. Together the
+	// layers guarantee, for every key in prox.yaml:
+	//   - literal duplicate keys anywhere are rejected by the raw decode above,
+	//     with the offending line numbers, before any of this runs;
+	//   - an alias key that resolves onto a sibling key -- the case a generic map
+	//     silently collapses, last write winning -- is a `duplicate key` error;
+	//   - unknown keys in the fixed-schema blocks (top level, proxy,
+	//     proxy.capture, api, certs) are rejected, including keys smuggled in
+	//     through a `<<` merge, which is validated against the DESTINATION's
+	//     schema;
+	//   - spec-valid merges still parse: `<<: *base` with an explicit override
+	//     (explicit wins) and `<<: [*a, *b]` overlap (first wins) are legitimate
+	//     YAML, never duplicates.
 	var structuralErrs []string
+	structuralErrs = append(structuralErrs, checkDocumentStructure(data)...)
 
 	// Processes (can be a command string or an expanded mapping)
 	for _, name := range sortedMapKeys(raw.Processes) {
