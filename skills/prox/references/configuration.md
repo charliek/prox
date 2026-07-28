@@ -196,7 +196,8 @@ instance — any resolution failure leaves it untouched.
 - Duplicate keys are rejected too: a literal duplicate is a YAML parse error
   (line-numbered); a duplicate created by an *aliased* key node is caught
   as `<path>: duplicate key "<key>"` (or by the YAML decoder itself when it
-  duplicates a known typed-block field) — never silently collapsed.
+  duplicates a known typed-block field) — never silently collapsed. A
+  prox.yaml must be a single YAML document (a stray `---` is an error).
 - Anchors/aliases/`<<` merges are fully supported, including into typed
   blocks — a merge can't smuggle an unknown key past the destination's
   schema, and explicit keys win over merged ones (standard defaults idiom).

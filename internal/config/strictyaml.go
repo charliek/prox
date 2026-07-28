@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 
 	"gopkg.in/yaml.v3"
@@ -57,8 +58,10 @@ const maxAliasHops = 100
 //  1. Aliased duplicate keys, ANYWHERE in the document: a key node that is an
 //     alias resolves to its anchor's scalar value, and a generic map silently
 //     collapses it onto an existing sibling (last write wins). Reported as
-//     `<path>: duplicate key %q`. Literal duplicates never reach here -- the
-//     raw decode already rejected them with a line number.
+//     `<path>: duplicate key %q`. Literal duplicates in decoded regions are
+//     rejected earlier by the raw decode (with a line number); inside regions
+//     the raw decode skips -- the value of an unknown field -- this pass is
+//     the layer that catches them.
 //  2. Unknown keys in the five fixed-schema blocks (see schemaAllowedKeys),
 //     reported as `<path>: unknown field %q` in dependency.go's exact format.
 //     Keys are checked wherever they take effect, so a `<<` merge is expanded
@@ -69,25 +72,33 @@ const maxAliasHops = 100
 // structural errors. A yaml.Node decode failure returns no errors rather than a
 // second opinion on YAML syntax: the raw decode owns that error (W0).
 func checkDocumentStructure(data []byte) []string {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var doc yaml.Node
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil
-	}
-	root := &doc
-	if root.Kind == yaml.DocumentNode {
-		if len(root.Content) == 0 {
-			return nil
-		}
-		root = root.Content[0]
-	}
-	// An empty document (or a comment-only one) decodes to the zero Node.
-	if root.Kind == 0 {
+	if err := dec.Decode(&doc); err != nil {
 		return nil
 	}
 	w := &structuralWalker{
 		active:     make(map[*yaml.Node]bool),
 		merging:    make(map[*yaml.Node]bool),
 		dupChecked: make(map[*yaml.Node]bool),
+	}
+	// A prox.yaml is one YAML document. The raw decode reads only the first,
+	// so a stray `---` would otherwise silently disable everything below it --
+	// the exact silent-ignore class this pass exists to close.
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err == nil {
+		w.errs = append(w.errs, "config: multiple YAML documents are not supported")
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode {
+		if len(root.Content) == 0 {
+			return w.errs
+		}
+		root = root.Content[0]
+	}
+	// An empty document (or a comment-only one) decodes to the zero Node.
+	if root.Kind == 0 {
+		return w.errs
 	}
 	w.walkValue(root, "")
 	return w.errs
@@ -111,6 +122,29 @@ type structuralWalker struct {
 	active     map[*yaml.Node]bool
 	merging    map[*yaml.Node]bool
 	dupChecked map[*yaml.Node]bool
+	// visits counts every walkValue/expandMerge entry. The active/merging sets
+	// break true cycles, but an alias DAG (each level aliasing the previous
+	// twice) is walked once per reference -- 2^N visits -- and yaml.v3's own
+	// alias-expansion guard never sees it when the fan-out hides under an
+	// unknown key (the struct decoder skips unknown fields entirely). Past the
+	// budget the walk stops with a single error instead of spinning; real
+	// configs are a few thousand nodes at most.
+	visits int
+}
+
+// maxWalkVisits bounds the structural walk. Generous: ~three orders of
+// magnitude above any real prox.yaml, small enough that a pathological alias
+// DAG errors in milliseconds instead of hanging `prox up` or a daemon reload.
+const maxWalkVisits = 1 << 20
+
+// spendVisit consumes one unit of walk budget; the first exhaustion appends
+// the diagnostic. Callers return immediately on false.
+func (w *structuralWalker) spendVisit() bool {
+	w.visits++
+	if w.visits == maxWalkVisits {
+		w.errs = append(w.errs, "config: excessive YAML aliasing")
+	}
+	return w.visits < maxWalkVisits
 }
 
 // keyIdent is the identity of a mapping key for duplicate detection: the
@@ -134,6 +168,9 @@ func (w *structuralWalker) errf(format string, args ...interface{}) {
 // alias. That is never a meaningful config (and its contents could not be
 // schema-checked), so it is an error rather than a silent skip.
 func (w *structuralWalker) walkValue(node *yaml.Node, path string) {
+	if !w.spendVisit() {
+		return
+	}
 	target, ok := derefAlias(node)
 	if !ok || (target.Kind != yaml.MappingNode && target.Kind != yaml.SequenceNode) {
 		return
@@ -192,8 +229,11 @@ func (w *structuralWalker) walkMapping(node *yaml.Node, path string) {
 			continue
 		}
 		if _, dup := claimed[ident]; dup {
-			// Only reachable when one of the two keys is an alias: literal
-			// duplicates errored at the raw decode (W0). The schema check is
+			// Reached for alias-key duplicates anywhere, AND for literal
+			// duplicates inside regions the raw decode skipped (the struct
+			// decoder never unmarshals an unknown field's value, so W0's
+			// duplicate check does not run there) -- this branch is what
+			// keeps those from silently collapsing. The schema check is
 			// skipped here because the first occurrence already made it -- one
 			// report per distinct defect.
 			if reportDupes {
@@ -224,6 +264,9 @@ func (w *structuralWalker) walkMapping(node *yaml.Node, path string) {
 // are reported (at the destination path, where the collapse is felt), since a
 // merge source is otherwise never scanned for aliased duplicate keys.
 func (w *structuralWalker) expandMerge(node *yaml.Node, path string, claimed map[keyIdent]struct{}, allowed map[string]struct{}, schema bool) {
+	if !w.spendVisit() {
+		return
+	}
 	target, ok := derefAlias(node)
 	if !ok || w.merging[target] {
 		return

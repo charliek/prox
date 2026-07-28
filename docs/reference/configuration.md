@@ -217,11 +217,14 @@ and returns an error.
   and reported together in a single `invalid configuration:` report.
   (YAML-level defects — malformed syntax, literal duplicate keys — surface
   immediately as a `parsing yaml:` error instead, since the document can't
-  be analyzed further.)
+  be analyzed further.) A `prox.yaml` must be a single YAML document: a
+  stray `---` starting a second document is an error rather than silently
+  disabling everything below it.
 - **Duplicate keys are rejected too, by two different layers.** A literal
-  duplicate key (the same key spelled twice in one mapping) is rejected by
-  the YAML parser itself, with a line number, before prox's own validation
-  ever runs. A duplicate created by *aliasing* a key node so it resolves to
+  duplicate key (the same key spelled twice in one mapping) is normally
+  rejected by the YAML parser itself, with a line number, before prox's own
+  validation ever runs; one spelled inside a region the decoder skips (the
+  value of an unknown key) is caught by prox's structural pass instead. A duplicate created by *aliasing* a key node so it resolves to
   the same value as an existing sibling key is also rejected — usually as
   `<path>: duplicate key "<key>"`, though when the alias duplicates a known
   field of a typed block the YAML decoder reports it first (as a

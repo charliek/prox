@@ -1,7 +1,10 @@
 package config
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
@@ -372,4 +375,46 @@ func TestParse_CyclicAlias_Rejected(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `proxy.capture: circular alias`)
 	})
+}
+
+// TestParse_AliasFanOut_BudgetedNotHung pins the walk's visit budget: an alias
+// DAG that doubles per level (2^N visits under the pre-budget walk) hides
+// under an unknown key, so yaml.v3's own alias-expansion guard never sees it
+// (the struct decoder skips unknown fields). The walk must error quickly, not
+// spin. Depth 40 would be ~2^18x the measured 2.4s at depth 22 without the
+// budget -- an effective hang on `prox up` and the daemon reload path.
+func TestParse_AliasFanOut_BudgetedNotHung(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("processes: {web: ./web}\n")
+	b.WriteString("z0: &a0 [1, 2]\n")
+	depth := 40
+	for i := 1; i <= depth; i++ {
+		fmt.Fprintf(&b, "z%d: &a%d [*a%d, *a%d]\n", i, i, i-1, i-1)
+	}
+	start := time.Now()
+	_, err := Parse([]byte(b.String()))
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config: excessive YAML aliasing")
+	assert.Less(t, elapsed, 5*time.Second, "budget must stop the walk quickly")
+}
+
+// TestParse_MultipleDocuments_Rejected pins that a stray `---` starting a
+// second YAML document is an error rather than silently disabling everything
+// below it (both decode layers read only the first document).
+func TestParse_MultipleDocuments_Rejected(t *testing.T) {
+	_, err := Parse([]byte("processes: {web: ./web}\n---\nporxy: {enabled: true}\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config: multiple YAML documents are not supported")
+}
+
+// TestParse_LiteralDupeUnderUnknownKey pins the walker's ownership of literal
+// duplicates inside regions the raw decode skips: the struct decoder never
+// unmarshals an unknown field's value, so W0's duplicate check does not run
+// there and the structural walk is what stops the silent collapse.
+func TestParse_LiteralDupeUnderUnknownKey(t *testing.T) {
+	_, err := Parse([]byte("processes: {web: ./web}\nnope: {a: 1, a: 2}\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `config: unknown field "nope"`)
+	assert.Contains(t, err.Error(), `nope: duplicate key "a"`)
 }
