@@ -114,11 +114,28 @@ type ProcessConfig struct {
 	StopTimeout string `yaml:"stop_timeout"`
 	// DependsOn lists dependencies: and/or tasks: names that must be ready
 	// before this process starts (plan 013 D1). Process names are NOT valid
-	// targets; validation rejects them. Unlike dependency/task blocks (which
-	// reject unknown keys), a process's other fields still follow the lenient
-	// re-marshal parse path, so depends_on is simply another known field here.
+	// targets; validation rejects them. Like every other process field it is
+	// listed in processAllowedKeys, the source of truth for what a process entry
+	// may contain -- anything else is a load error.
 	DependsOn []string `yaml:"depends_on"`
 }
+
+// Allowed key sets for strict unknown-key rejection on processes: and
+// services: entries (plan 016 W1), mirroring dependency.go's sets. Kept as
+// package vars so the parsers and their error messages share one source of
+// truth; each must stay in step with the struct tags above.
+var (
+	// env: is an open map -- its keys are user-defined environment variable
+	// names, so it is a known field here and is never itself key-checked.
+	processAllowedKeys = map[string]struct{}{
+		"cmd": {}, "env": {}, "env_file": {}, "healthcheck": {},
+		"stop_timeout": {}, "depends_on": {},
+	}
+	healthcheckAllowedKeys = map[string]struct{}{
+		"cmd": {}, "interval": {}, "timeout": {}, "retries": {}, "start_period": {},
+	}
+	serviceAllowedKeys = map[string]struct{}{"port": {}, "host": {}}
+)
 
 // HealthcheckConfig defines health check configuration in YAML
 type HealthcheckConfig struct {
@@ -253,41 +270,48 @@ func Parse(data []byte) (*Config, error) {
 		config.API.Host = constants.DefaultAPIHost
 	}
 
-	// Parse processes (can be string or expanded form)
-	for name, value := range raw.Processes {
-		proc, err := parseProcessConfig(name, value)
-		if err != nil {
-			return nil, fmt.Errorf("process %q: %w", name, err)
-		}
+	// Parse every block with STRICT unknown-key rejection (plan 013 D1, C1 for
+	// dependencies/tasks; plan 016 W1 for processes/services). These are
+	// structural errors (malformed shape / unknown keys): they must be reported
+	// before semantic Validate runs, because a half-formed entry cannot be
+	// meaningfully validated. Collected across all four blocks and sorted so the
+	// report is deterministic regardless of Go's map iteration order -- each
+	// parser also walks its own entries in sorted order.
+	//
+	// The strict parsers below inspect the generic map[string]interface{} form,
+	// which cannot show duplicate keys (yaml.v3 has already collapsed them) and
+	// covers only the name-keyed blocks. checkDocumentStructure closes both gaps
+	// from the yaml.Node tree (plan 016 W2), and it runs FIRST here purely for
+	// readability -- the batch is sorted before it is reported. Together the
+	// layers guarantee, for every key in prox.yaml:
+	//   - literal duplicate keys anywhere are rejected by the raw decode above,
+	//     with the offending line numbers, before any of this runs;
+	//   - an alias key that resolves onto a sibling key -- the case a generic map
+	//     silently collapses, last write winning -- is a `duplicate key` error;
+	//   - unknown keys in the fixed-schema blocks (top level, proxy,
+	//     proxy.capture, api, certs) are rejected, including keys smuggled in
+	//     through a `<<` merge, which is validated against the DESTINATION's
+	//     schema;
+	//   - spec-valid merges still parse: `<<: *base` with an explicit override
+	//     (explicit wins) and `<<: [*a, *b]` overlap (first wins) are legitimate
+	//     YAML, never duplicates.
+	var structuralErrs []string
+	structuralErrs = append(structuralErrs, checkDocumentStructure(data)...)
+
+	// Processes (can be a command string or an expanded mapping)
+	for _, name := range sortedMapKeys(raw.Processes) {
+		proc, errs := parseProcessConfig(name, raw.Processes[name])
+		structuralErrs = append(structuralErrs, errs...)
 		config.Processes[name] = proc
 	}
 
-	// Parse services (can be int port or expanded form)
-	for name, value := range raw.Services {
-		svc, err := parseServiceConfig(name, value)
-		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", name, err)
-		}
+	// Services (can be a port number or an expanded mapping)
+	for _, name := range sortedMapKeys(raw.Services) {
+		svc, errs := parseServiceConfig(name, raw.Services[name])
+		structuralErrs = append(structuralErrs, errs...)
 		config.Services[name] = svc
 	}
 
-	// Parse dependencies and tasks with STRICT unknown-key rejection (plan 013
-	// D1, C1). These are structural errors (malformed shape / unknown keys):
-	// they must be reported before semantic Validate runs, because a
-	// half-formed check block cannot be meaningfully validated. Collected across
-	// both blocks and sorted so the report is deterministic regardless of Go's
-	// map iteration order.
-	//
-	// Accepted limitation (plan 013 D1, C1): the strict parsers inspect the
-	// generic map[string]interface{} form, which yaml.v3 has already produced --
-	// so a YAML anchor/alias or a `<<` merge key that resolves to a key already
-	// present is collapsed into one map entry BEFORE we see it, and a duplicate
-	// logical key can slip past unknown-key/duplicate detection. Detecting that
-	// would require re-parsing at the yaml.Node level. We accept it: this is the
-	// same behavior the legacy processes:/services: re-marshal path has always
-	// had, prox config is local developer-authored input (not a security
-	// boundary), and the failure mode is a last-write-wins merge, not a crash.
-	var structuralErrs []string
 	structuralErrs = append(structuralErrs, parseDependencies(raw.Dependencies, config.Dependencies)...)
 	structuralErrs = append(structuralErrs, parseTasks(raw.Tasks, config.Tasks)...)
 	if len(structuralErrs) > 0 {
@@ -328,54 +352,73 @@ func Parse(data []byte) (*Config, error) {
 	return config, nil
 }
 
-// parseProcessConfig handles both simple and expanded process definitions
-func parseProcessConfig(name string, value interface{}) (ProcessConfig, error) {
+// parseProcessConfig handles both simple and expanded process definitions,
+// rejecting unknown keys in the expanded form (plan 016 W1). Like the
+// dependency/task parsers it returns structural error strings rather than a
+// fatal first error, so Parse can batch every structural problem in the config
+// into one sorted report. The entry is still populated best-effort when errors
+// are returned; Parse discards it by returning before Validate.
+func parseProcessConfig(name string, value interface{}) (ProcessConfig, []string) {
 	switch v := value.(type) {
 	case string:
 		// Simple form: web: npm run dev
 		return ProcessConfig{Cmd: v}, nil
 	case map[string]interface{}:
-		// Expanded form: re-marshal and unmarshal to struct
-		data, err := yaml.Marshal(v)
-		if err != nil {
-			return ProcessConfig{}, fmt.Errorf("marshaling process config: %w", err)
+		prefix := "processes." + name
+		errs := rejectUnknownKeys(prefix, v, processAllowedKeys)
+		// healthcheck: is the one nested schema block under a process, so it
+		// gets its own key check; a non-mapping value is named explicitly rather
+		// than left to the re-marshal path's opaque type error. An explicit null
+		// (a bare `healthcheck:` key, e.g. with all subfields commented out)
+		// means "absent", exactly as before strict parsing.
+		if hcRaw, ok := v["healthcheck"]; ok && hcRaw != nil {
+			if hcMap, ok := hcRaw.(map[string]interface{}); ok {
+				errs = append(errs, rejectUnknownKeys(prefix+".healthcheck", hcMap, healthcheckAllowedKeys)...)
+			} else {
+				// Return without re-marshalling: the round-trip would choke on
+				// the same bad value and add a second, opaque error for the
+				// one defect. Parse discards the config on structural errors.
+				errs = append(errs, fmt.Sprintf("%s.healthcheck: must be a mapping", prefix))
+				return ProcessConfig{}, errs
+			}
 		}
+		// Expanded form: re-marshal to coerce values into the typed struct.
+		// Unknown-key rejection has already happened above.
 		var proc ProcessConfig
-		if err := yaml.Unmarshal(data, &proc); err != nil {
-			return ProcessConfig{}, fmt.Errorf("unmarshaling process config: %w", err)
+		if err := remarshal(v, &proc); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %s", prefix, err))
 		}
-		return proc, nil
+		return proc, errs
 	default:
-		return ProcessConfig{}, fmt.Errorf("invalid process configuration type: %T", value)
+		return ProcessConfig{}, []string{fmt.Sprintf("processes.%s: must be a command string or a mapping", name)}
 	}
 }
 
-// parseServiceConfig handles both simple (port only) and expanded service definitions
-func parseServiceConfig(name string, value interface{}) (ServiceConfig, error) {
+// parseServiceConfig handles both simple (port only) and expanded service
+// definitions, rejecting unknown keys in the expanded form (plan 016 W1). Same
+// structural-error contract as parseProcessConfig.
+func parseServiceConfig(name string, value interface{}) (ServiceConfig, []string) {
 	switch v := value.(type) {
 	case int:
 		// Simple form: app: 3000
 		return ServiceConfig{Port: v, Host: "localhost"}, nil
 	case float64:
-		// YAML may parse integers as float64
+		// YAML may parse integers as float64 (e.g. `3000.0`)
 		return ServiceConfig{Port: int(v), Host: "localhost"}, nil
 	case map[string]interface{}:
-		// Expanded form: re-marshal and unmarshal to struct
-		data, err := yaml.Marshal(v)
-		if err != nil {
-			return ServiceConfig{}, fmt.Errorf("marshaling service config: %w", err)
-		}
+		prefix := "services." + name
+		errs := rejectUnknownKeys(prefix, v, serviceAllowedKeys)
 		var svc ServiceConfig
-		if err := yaml.Unmarshal(data, &svc); err != nil {
-			return ServiceConfig{}, fmt.Errorf("unmarshaling service config: %w", err)
+		if err := remarshal(v, &svc); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %s", prefix, err))
 		}
 		// Apply default host if not specified
 		if svc.Host == "" {
 			svc.Host = "localhost"
 		}
-		return svc, nil
+		return svc, errs
 	default:
-		return ServiceConfig{}, fmt.Errorf("invalid service configuration type: %T", value)
+		return ServiceConfig{}, []string{fmt.Sprintf("services.%s: must be a port number or a mapping", name)}
 	}
 }
 

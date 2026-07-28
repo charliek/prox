@@ -185,7 +185,26 @@ instance — any resolution failure leaves it untouched.
 
 - Names are unique across `processes`, `dependencies`, `tasks`
   (case-sensitive).
-- Unknown keys in `dependencies:`/`tasks:`/`check:` are rejected.
+- **Unknown keys error everywhere in `prox.yaml`**, not just
+  `dependencies:`/`tasks:`/`check:` — top level, `proxy:`, `proxy.capture:`,
+  `api:`, `certs:`, every `processes.<name>` (incl. `healthcheck:`), every
+  `services.<name>`. Format: `<path>: unknown field "<key>"`, e.g.
+  `processes.web: unknown field "stop_timout"` (top level uses `config:` as
+  the path). All structural errors in a file batch together under one
+  `invalid configuration:` report; YAML-level defects (syntax, literal
+  duplicate keys) surface immediately as `parsing yaml:` instead.
+- Duplicate keys are rejected too: a literal duplicate is a YAML parse error
+  (line-numbered); a duplicate created by an *aliased* key node is caught
+  as `<path>: duplicate key "<key>"` (or by the YAML decoder itself when it
+  duplicates a known typed-block field) — never silently collapsed. A
+  prox.yaml must be a single YAML document (a stray `---` is an error).
+- Anchors/aliases/`<<` merges are fully supported, including into typed
+  blocks — a merge can't smuggle an unknown key past the destination's
+  schema, and explicit keys win over merged ones (standard defaults idiom).
+  Define an anchor at its first natural occurrence, not in a top-level
+  `x-defaults:`-style container (top-level keys are schema-checked too, so
+  that idiom is rejected) — e.g. `processes.a.env: &common {...}` then
+  `processes.b.env: *common`.
 - Exactly one of `check.tcp`/`check.url`/`check.cmd` must be present.
 - `depends_on` targets must be dependencies or tasks — a process name or an
   unknown name is a load-time error.

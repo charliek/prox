@@ -714,6 +714,201 @@ services:
 	})
 }
 
+// --- Strict processes: / services: parsing (plan 016 W1) -------------------
+
+// TestParse_NullHealthcheckMeansAbsent pins that a bare `healthcheck:` key
+// (explicit YAML null, e.g. every subfield commented out) still parses as "no
+// healthcheck" rather than tripping the strict must-be-a-mapping error.
+func TestParse_NullHealthcheckMeansAbsent(t *testing.T) {
+	cfg, err := Parse([]byte("processes:\n  web:\n    cmd: ./web\n    healthcheck:\n"))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.Processes["web"].Healthcheck)
+}
+
+func TestParse_Processes_Errors(t *testing.T) {
+	cases := []struct {
+		name      string
+		yaml      string
+		wantSub   string
+		wantExact string
+	}{
+		{
+			name: "typo'd process field",
+			yaml: `
+processes:
+  web:
+    cmd: ./web
+    stop_timout: 5s
+`,
+			wantSub: `processes.web: unknown field "stop_timout"`,
+		},
+		{
+			name: "unknown healthcheck subfield",
+			yaml: `
+processes:
+  web:
+    cmd: ./web
+    healthcheck:
+      cmd: ./check
+      intervall: 10s
+`,
+			wantSub: `processes.web.healthcheck: unknown field "intervall"`,
+		},
+		{
+			name: "healthcheck is not a mapping",
+			yaml: `
+processes:
+  web:
+    cmd: ./web
+    healthcheck: ./check
+`,
+			// Exact match: the shape defect must yield exactly this one error,
+			// not a second opaque re-marshal error for the same value.
+			wantExact: `invalid configuration: processes.web.healthcheck: must be a mapping`,
+		},
+		{
+			name: "process entry is a list",
+			yaml: `
+processes:
+  web:
+    - ./web
+`,
+			wantSub: "processes.web: must be a command string or a mapping",
+		},
+		{
+			name: "process entry has a non-string key",
+			yaml: `
+processes:
+  web:
+    cmd: ./web
+    3: oops
+`,
+			wantSub: "processes.web: must be a command string or a mapping",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			require.Error(t, err)
+			if tc.wantExact != "" {
+				assert.Equal(t, tc.wantExact, err.Error())
+			} else {
+				assert.Contains(t, err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestParse_Services_Errors(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantSub string
+	}{
+		{
+			name: "typo'd service field",
+			yaml: `
+processes: {web: ./web}
+proxy: {enabled: true, domain: local.test.dev}
+services:
+  app:
+    prot: 3000
+`,
+			wantSub: `services.app: unknown field "prot"`,
+		},
+		{
+			name: "service entry is a list",
+			yaml: `
+processes: {web: ./web}
+proxy: {enabled: true, domain: local.test.dev}
+services:
+  app:
+    - 3000
+`,
+			wantSub: "services.app: must be a port number or a mapping",
+		},
+		{
+			name: "service entry is a string",
+			yaml: `
+processes: {web: ./web}
+proxy: {enabled: true, domain: local.test.dev}
+services:
+  app: "3000"
+`,
+			wantSub: "services.app: must be a port number or a mapping",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantSub)
+		})
+	}
+}
+
+// TestParse_StructuralErrors_BatchedDeterministically pins that unknown keys
+// from every strict block (processes, services, dependencies, tasks) are
+// reported TOGETHER, once each, in sorted order under ErrInvalidConfig -- not
+// one fatal first error per block.
+func TestParse_StructuralErrors_BatchedDeterministically(t *testing.T) {
+	yaml := `
+processes:
+  web:
+    cmd: ./web
+    stop_timout: 5s
+proxy: {enabled: true, domain: local.test.dev}
+services:
+  app:
+    port: 3000
+    prot: 8080
+dependencies:
+  redis:
+    check:
+      tcp: localhost:6379
+    on_failur: warn
+tasks:
+  build:
+    cmd: ./build
+    timeut: 5s
+`
+	_, err := Parse([]byte(yaml))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrInvalidConfig)
+	assert.Equal(t,
+		`invalid configuration: dependencies.redis: unknown field "on_failur"; `+
+			`processes.web: unknown field "stop_timout"; `+
+			`services.app: unknown field "prot"; tasks.build: unknown field "timeut"`,
+		err.Error())
+
+	_, err2 := Parse([]byte(yaml))
+	require.Error(t, err2)
+	assert.Equal(t, err.Error(), err2.Error(), "error string must not depend on map iteration order")
+}
+
+// TestParse_ServiceShorthand_Float64Port covers the float64 branch of
+// parseServiceConfig for real: `3000.0` decodes to float64, unlike the plain
+// `3000` case (which yaml.v3 decodes as int) exercised in TestParse_ProxyConfig.
+func TestParse_ServiceShorthand_Float64Port(t *testing.T) {
+	yaml := `
+processes:
+  web: npm run dev
+
+proxy:
+  enabled: true
+  domain: local.test.dev
+
+services:
+  app: 3000.0
+`
+	cfg, err := Parse([]byte(yaml))
+	require.NoError(t, err)
+	assert.Equal(t, 3000, cfg.Services["app"].Port)
+	assert.Equal(t, "localhost", cfg.Services["app"].Host)
+}
+
 func TestParseSize(t *testing.T) {
 	t.Run("empty string returns zero", func(t *testing.T) {
 		size, err := ParseSize("")
