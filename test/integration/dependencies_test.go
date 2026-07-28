@@ -338,6 +338,10 @@ dependencies:
 		}
 		elapsed := time.Since(start)
 		t.Cleanup(func() {
+			// Self-release the barrier so the start helper's loop exits even if
+			// the test failed before the release step or `stop` cannot reach the
+			// daemon — otherwise the loop would spin on unfailingly at 10Hz.
+			_ = os.WriteFile(release, nil, 0644)
 			stop := exec.Command(binary, "stop", "-c", configPath)
 			stop.Dir = tmpDir
 			_, _ = stop.CombinedOutput()
