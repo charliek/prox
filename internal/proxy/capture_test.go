@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1177,5 +1178,56 @@ func TestPerCallCaptureLimits(t *testing.T) {
 		fallback.WriteHeader(http.StatusOK)
 		_, _ = fallback.Write(body)
 		assert.Len(t, fallback.CapturedBody(), 50, "0 limit uses the manager's configured 50-byte cap")
+	})
+}
+
+// TestCapturePrivatePermissions pins the stated safety mechanism for
+// cleartext capture (redaction removed, #80): the capture directory and any
+// spilled body files are private to the owner. These assertions must never
+// regress silently — file permissions are now the only thing standing
+// between captured secrets (tokens, cookies, etc.) and other local users.
+func TestCapturePrivatePermissions(t *testing.T) {
+	// Clear the umask so the asserted modes are exactly what the code
+	// requested: under a restrictive umask (e.g. 0077) a regression to
+	// 0777/0666 would still stat as 0700/0600 and wrongly pass.
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	t.Run("capture directory is created 0700", func(t *testing.T) {
+		workDir := t.TempDir()
+		cfg := &config.CaptureConfig{Enabled: true}
+		cm, err := NewCaptureManager(cfg, workDir)
+		require.NoError(t, err)
+
+		captureDir := filepath.Join(workDir, constants.CaptureDirectory)
+		info, err := os.Stat(captureDir)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+		assert.Equal(t, cm.captureDir, captureDir)
+	})
+
+	t.Run("spill file is written 0600", func(t *testing.T) {
+		workDir := t.TempDir()
+		cfg := &config.CaptureConfig{Enabled: true}
+		cm, err := NewCaptureManager(cfg, workDir)
+		require.NoError(t, err)
+
+		// Set inline threshold low to force disk storage (same pattern as the
+		// "large body is written to disk" case above).
+		cm.inlineThreshold = 10
+
+		payload := strings.Repeat("x", 100)
+		req := httptest.NewRequest("POST", "/test", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "text/plain")
+
+		capturedBody, wrappedBody, _ := cm.CaptureRequest("req-perm-spill", req, 0)
+		_, err = io.ReadAll(wrappedBody)
+		require.NoError(t, err)
+		require.NoError(t, wrappedBody.Close())
+
+		require.NotEmpty(t, capturedBody.FilePath)
+		info, err := os.Stat(capturedBody.FilePath)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	})
 }
