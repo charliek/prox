@@ -320,8 +320,12 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	// Wait for API to be ready
 	waitForAPI(t, grandchildAPIAddr, 10*time.Second)
 
-	// Give the process time to print its startup message
-	time.Sleep(500 * time.Millisecond)
+	// Wait until the grandchild's startup marker is visible in the SAME
+	// captured-output surface the post-exit assertions read (the terminal
+	// echo subscription starts after process launch, so the logs API is not
+	// an equivalent surface). This 15s startup deadline is independent of
+	// the 15s shutdown wait below.
+	waitForOutputContains(t, prox, "PROCESS_STARTED_PID=", 15*time.Second)
 
 	// Request graceful shutdown via API
 	err := stopProx(t, grandchildAPIAddr)
