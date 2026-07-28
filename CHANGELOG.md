@@ -2,6 +2,74 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.4
+
+Hardening release. Capture is now visible-by-default (redaction removed —
+the ngrok/DevTools model; #80, plan 015), prox.yaml parsing is fully strict
+(a typo'd or unknown key anywhere is a precise load-time error; #83, plan
+016), and the two known integration-test flakes plus the missing PR-time
+docs build are fixed (#82, plan 014). Both behavior changes are Breaking —
+read those entries before upgrading. As always the shared daemon requires
+an exact version match: restart the daemon and every project against the
+new binary after upgrading.
+
+### Breaking
+
+- **Capture-time redaction is removed entirely** (#80, PR #85, plan 015).
+  v0.2.3's on-by-default redaction replaced `Authorization`/`Cookie`-class
+  header values and sensitive query params with `[REDACTED]`/`REDACTED` in
+  capture records. It was a half-measure — bodies were always stored
+  verbatim, so a token in a JSON payload landed on disk regardless — and it
+  fought the point of a local inspector (ngrok's inspector, Chrome DevTools,
+  Charles, Proxyman, and mitmproxy all show traffic verbatim). Captured
+  URLs, headers, query params, and bodies (up to `max_body_size`) are now
+  stored **verbatim, in cleartext**, in in-memory records with >64KB bodies
+  spilling to `.prox/capture` / `~/.prox/capture` (dirs `0700`, spill files
+  `0600` — now pinned by tests). The `redact`, `redact_headers`, and
+  `redact_query_params` keys are gone; with this release's strict parsing a
+  config still carrying them fails at load (`proxy.capture: unknown field
+  "redact"`) — delete the keys. Projects whose traffic must not be recorded
+  should opt out entirely: `proxy.capture.enabled: false` or `--no-capture`.
+- **Unknown keys anywhere in prox.yaml are load errors** (#83, PR #86, plan
+  016). The lenient re-marshal parse path silently dropped typo'd fields
+  under `processes:`/`services:` (and `healthcheck:`), unknown keys in the
+  `proxy:`/`proxy.capture:`/`api:`/`certs:` blocks, and unknown top-level
+  keys. Everything now parses strictly, matching the `dependencies:`/
+  `tasks:` precedent, with every structural error batched into one sorted
+  report: `invalid configuration: processes.web: unknown field
+  "stop_timout"; ...`. Duplicate keys are rejected too (literal ones by the
+  YAML parser with line numbers; alias-key duplicates and duplicates inside
+  decoder-skipped regions by the new structural pass), a stray `---`
+  starting a second YAML document is an error, and self-referential alias
+  cycles are rejected. YAML anchors and `<<` merge keys remain fully
+  supported — including merging into typed blocks with standard
+  explicit-key-wins override semantics — but a merge can no longer smuggle
+  an unknown key past a block's schema, and top-level anchor-container keys
+  (`x-defaults:` style) are rejected: define anchors at their first natural
+  occurrence (e.g. `env: &common {...}` on one process, `env: *common` on
+  the next). String/int shorthand forms are unchanged.
+
+### Fixed
+
+- **Two integration-test flakes** (#82, PR #84, plan 014). The grandchild
+  output-capture test polls the captured-output surface for the startup
+  marker instead of sleeping a fixed 500ms (capture buffers are now
+  goroutine-safe so polling is race-free); the detached-slow-dependency
+  test replaces its timed 5s/4s window with a deterministic three-marker
+  file barrier — the observation can no longer race convergence, and the
+  subtest got ~4x faster. Both verified 20/20 under `-race`.
+
+### CI / Docs
+
+- **`mkdocs build --strict` now gates every docs-touching PR** (#82, PR
+  #84). A build-only `Docs PR Build` workflow runs on `pull_request` for
+  `docs/**`, `mkdocs.yml`, `pyproject.toml`, and `uv.lock`, with `uv
+  --locked` so a stale lockfile fails instead of silently re-resolving, and
+  an `mkdocs` `validation:` block promoting broken anchors/absolute links
+  to build failures. (Path-filtered — deliberately not a required check.)
+- Configuration reference documents the unified strict-parsing rule, the
+  supported anchor/merge idioms, and the cleartext capture posture.
+
 ## v0.2.3
 
 Capture-by-default (plan 012): a proxy-enabled project now records
