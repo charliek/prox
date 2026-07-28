@@ -24,6 +24,12 @@ site_dir: site-build
 
 dev_addr: '127.0.0.1:7070'
 
+validation:
+  links:
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
 theme:
   name: material
   features:
