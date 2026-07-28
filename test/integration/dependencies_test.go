@@ -294,16 +294,20 @@ dependencies:
 		}
 	})
 
-	// A slow dependency (ready after ~5s via a start command) is served while
-	// resolving: `up -d` returns promptly and status observes gated waiting on
-	// slow (with waiting_on in JSON) comfortably inside the 5s window, then
-	// converges to running once the dependency is ready. The waiting observation
-	// stays in JSON so it never races the convergence the way a second table-mode
-	// request could; the STATUS-column `waiting(slow)` decoration is pinned by the
-	// statusField unit test instead.
+	// A slow dependency is held unready by a three-marker file barrier until
+	// the test has itself observed `waiting`, so that observation can never
+	// race convergence: `up -d` returns promptly while the dependency's start
+	// command blocks waiting for a release marker the test controls; the test
+	// observes gated waiting on slow (with waiting_on in JSON); the test then
+	// writes the release marker, which lets the start command touch the
+	// readiness marker the dependency's check polls for; and gated converges
+	// to running once the check passes. The STATUS-column `waiting(slow)`
+	// decoration is pinned by the statusField unit test instead.
 	t.Run("detached slow dependency: waiting then converges", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		marker := filepath.Join(tmpDir, "ready.marker")
+		invoked := filepath.Join(tmpDir, "invoked.marker")
+		release := filepath.Join(tmpDir, "release.marker")
+		ready := filepath.Join(tmpDir, "ready.marker")
 		configPath := filepath.Join(tmpDir, "prox.yaml")
 		config := fmt.Sprintf(`
 processes:
@@ -313,12 +317,15 @@ processes:
 dependencies:
   slow:
     check:
-      cmd: "test -f %s"
-      timeout: 30s
+      cmd: "test -f '%s'"
+      # Generous: the barrier holds the dependency unready until the test has
+      # observed waiting, so the budget must dominate the poll deadlines above
+      # it, not model a realistic startup time.
+      timeout: 60s
       interval: 200ms
-    start: "sh -c 'sleep 5; touch %s'"
+    start: "sh -c 'touch \"%s\"; while [ ! -f \"%s\" ]; do sleep 0.1; done; touch \"%s\"'"
     on_failure: fail
-`, marker, marker)
+`, ready, invoked, release, ready)
 		if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
@@ -337,10 +344,15 @@ dependencies:
 			time.Sleep(300 * time.Millisecond)
 		})
 		waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), 10*time.Second)
-		// Detached start returns without waiting for the ~5s dependency.
-		if elapsed > 3*time.Second {
+		// Detached start returns without waiting for the dependency.
+		if elapsed > 5*time.Second {
 			t.Errorf("`up -d` took %v; it must return promptly while the dependency resolves", elapsed)
 		}
+
+		// The dependency's start command touches this the moment it actually
+		// launches, proving the start: command ran (not just that it was
+		// scheduled).
+		waitForStateFile(t, invoked, 10*time.Second)
 
 		runStatus := func(extra ...string) (string, string, int) {
 			t.Helper()
@@ -354,14 +366,22 @@ dependencies:
 			return stdout.String(), stderr.String(), exitCodeOf(t, err)
 		}
 
-		// Observe gated waiting on slow via JSON, comfortably inside the ~5s start
-		// window (poll deadline 4s < 5s so the observation cannot race convergence).
-		waiting := pollStatusJSON(t, runStatus, 4*time.Second, func(p statusJSONPayload) bool {
+		// Observe gated waiting on slow via JSON. The dependency cannot become
+		// ready before the test writes the release marker below, so this
+		// observation is race-free by construction; the deadline is generous
+		// headroom, not a load-bearing bound.
+		waiting := pollStatusJSON(t, runStatus, 10*time.Second, func(p statusJSONPayload) bool {
 			s, w, _, ok := procState(p, "gated")
 			return ok && s == "waiting" && len(w) == 1 && w[0] == "slow"
 		})
 		if s, w, _, ok := procState(waiting, "gated"); !ok || s != "waiting" || len(w) != 1 || w[0] != "slow" {
 			t.Fatalf("gated never observed waiting on slow; status=%q waiting_on=%v", s, w)
+		}
+
+		// Release the barrier: the start helper touches the ready marker and
+		// the 200ms check poll converges.
+		if err := os.WriteFile(release, nil, 0644); err != nil {
+			t.Fatalf("write release marker: %v", err)
 		}
 
 		// Then it converges to running once the dependency becomes ready.
