@@ -350,11 +350,13 @@ api: {port: 9000}
 	})
 }
 
-// TestParse_CyclicAlias_Terminates pins that a self-referential anchor -- which
-// the raw decode accepts when it lands in a typed or ignored block -- cannot
-// hang or panic the structural walk. The exact outcome is pinned rather than
-// designed: the walk's active-node guard simply stops descending at the cycle.
-func TestParse_CyclicAlias_Terminates(t *testing.T) {
+// TestParse_CyclicAlias_Rejected pins that a self-referential anchor -- which
+// the raw decode accepts when it lands in a typed or ignored block -- is
+// rejected by the structural walk. The active set holds only the current
+// descent stack, so hitting a member is a true back-edge; such an alias is
+// never a meaningful config and its contents could not be schema-checked, so
+// reporting it beats silently skipping it (and trivially cannot hang).
+func TestParse_CyclicAlias_Rejected(t *testing.T) {
 	t.Run("cycle under an unknown top-level key", func(t *testing.T) {
 		_, err := Parse([]byte("processes: {web: ./web}\nnope: &x\n  b: *x\n"))
 		require.Error(t, err)
@@ -365,13 +367,9 @@ func TestParse_CyclicAlias_Terminates(t *testing.T) {
 		// proxy: &x { capture: *x } -- capture resolves back to the proxy
 		// mapping itself. yaml.v3 rejects a self-referential anchor when it
 		// decodes into a generic map ("anchor 'x' value contains itself"), but
-		// not when it lands in a typed block like this one, so the walk is what
-		// has to terminate. Pinned outcome: the active-node guard stops at the
-		// cycle, which also means the keys inside it are not schema-checked --
-		// termination is worth more than a check on a self-referential block.
-		cfg, err := Parse([]byte("processes: {web: ./web}\nproxy: &x\n  enabled: true\n  domain: local.test.dev\n  capture: *x\n"))
-		require.NoError(t, err)
-		require.NotNil(t, cfg.Proxy)
-		assert.True(t, cfg.Proxy.Enabled)
+		// not when it lands in a typed block like this one, so the walk owns it.
+		_, err := Parse([]byte("processes: {web: ./web}\nproxy: &x\n  enabled: true\n  domain: local.test.dev\n  capture: *x\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `proxy.capture: circular alias`)
 	})
 }

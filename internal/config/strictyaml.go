@@ -129,13 +129,17 @@ func (w *structuralWalker) errf(format string, args ...interface{}) {
 // walkValue descends into one value node at the given path, dereferencing a
 // whole-block alias (`proxy: *shared`) first so the target is checked against
 // the path it was aliased INTO. Scalars are leaves. The active-set guard is the
-// single cycle break for the whole walk.
+// single cycle break for the whole walk: `active` holds only the current
+// descent stack, so hitting a member is a true back-edge — a self-referential
+// alias. That is never a meaningful config (and its contents could not be
+// schema-checked), so it is an error rather than a silent skip.
 func (w *structuralWalker) walkValue(node *yaml.Node, path string) {
 	target, ok := derefAlias(node)
 	if !ok || (target.Kind != yaml.MappingNode && target.Kind != yaml.SequenceNode) {
 		return
 	}
 	if w.active[target] {
+		w.errf("%s: circular alias", path)
 		return
 	}
 	w.active[target] = true
