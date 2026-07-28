@@ -41,16 +41,6 @@ type RegisterRequest struct {
 	// directions: an older daemon ignores the unknown field, and an omitted field
 	// decodes to 0.
 	DiskBudget int64 `json:"disk_budget,omitempty"`
-	// Redact, RedactHeaders, and RedactQueryParams carry the project's
-	// capture-time redaction policy (plan 012 D4). Redact is consulted per request
-	// on the hot path (URL + header redaction), so unlike DiskBudget it is stamped
-	// onto every Route. The two lists EXTEND the built-in redaction sets and arrive
-	// already canonicalized/lowercased and de-duplicated from config parse.
-	// Wire-compatible in both directions: an older daemon ignores the unknown
-	// fields; omitted fields decode to the zero value (Redact=false, nil lists).
-	Redact            bool     `json:"redact,omitempty"`
-	RedactHeaders     []string `json:"redact_headers,omitempty"`
-	RedactQueryParams []string `json:"redact_query_params,omitempty"`
 	// StartTime is an opaque process start token (see daemon.ProcessStartTime):
 	// a generation discriminator, not a timestamp. 0 means the client could not
 	// read it, so the daemon falls back to bare-PID liveness for this holder.

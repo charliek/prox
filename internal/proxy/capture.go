@@ -384,10 +384,9 @@ func (cm *CaptureManager) DiskStats() (used, budget int64) {
 // effectiveLimit resolves a per-call capture cap: a positive limit is used
 // verbatim, and 0 (or negative) falls back to the manager's configured
 // maxBodySize (which itself defaults to DefaultCaptureMaxBodySize). The daemon
-// passes each route's own cap here via CapturePolicy.MaxBodySize (D13, #49); the
-// standalone in-process proxy passes 0, keeping the project's configured cap.
-// maxBodySize is set once at construction and never mutated, so no lock is
-// needed.
+// passes each route's own cap here (D13, #49); the standalone in-process proxy
+// passes 0, keeping the project's configured cap. maxBodySize is set once at
+// construction and never mutated, so no lock is needed.
 func (cm *CaptureManager) effectiveLimit(limit int64) int64 {
 	if limit > 0 {
 		return limit
@@ -396,33 +395,30 @@ func (cm *CaptureManager) effectiveLimit(limit int64) int64 {
 }
 
 // CaptureRequest captures the request body using a TeeReader bounded by
-// policy.MaxBodySize (D13, #49) and returns the REDACTED, cloned request headers
-// per the policy (plan 012 D4): the daemon passes the matched route's policy so
-// each project honors its own cap and redaction rules through the one shared
-// capture dir; the standalone proxy passes its project policy. A MaxBodySize of
-// 0 falls back to the manager's configured cap (see effectiveLimit).
+// maxBodySize (D13, #49) and returns the cloned request headers: the daemon
+// passes the matched route's cap so each project honors its own limit through
+// the one shared capture dir; the standalone proxy passes 0, which falls back to
+// the manager's configured cap (see effectiveLimit).
 //
-// A DISABLED manager returns the original body and a plain (unredacted) header
-// clone — nothing is stored, so there is nothing to redact. When enabled, even a
-// bodyless request (every GET/HEAD, whose headers still reach the stored
-// Details) has its headers redacted here (plan 012 D4).
+// Even a bodyless request (every GET/HEAD, whose headers still reach the stored
+// Details) has its headers cloned and returned here.
 //
 // Returns the captured body info and a new ReadCloser to use in place of the
 // original body; reading the returned ReadCloser also captures the data.
-func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request, policy CapturePolicy) (*CapturedBody, io.ReadCloser, http.Header) {
+func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request, maxBodySize int64) (*CapturedBody, io.ReadCloser, http.Header) {
 	if !cm.enabled {
 		return nil, r.Body, cloneHeaders(r.Header)
 	}
 	if r.Body == nil {
-		return nil, r.Body, policy.redactHeaders(r.Header)
+		return nil, r.Body, cloneHeaders(r.Header)
 	}
 
-	headers := policy.redactHeaders(r.Header)
+	headers := cloneHeaders(r.Header)
 	contentType := r.Header.Get("Content-Type")
 
 	// Create a buffer to capture the body
 	captured := &captureBuffer{
-		maxSize:   cm.effectiveLimit(policy.MaxBodySize),
+		maxSize:   cm.effectiveLimit(maxBodySize),
 		requestID: requestID,
 		suffix:    "_req",
 		cm:        cm,
@@ -447,26 +443,25 @@ func (cm *CaptureManager) CaptureRequest(requestID string, r *http.Request, poli
 }
 
 // WrapResponseWriter wraps w in a CaptureResponseWriter that records up to
-// policy.MaxBodySize bytes (D13, #49) while forwarding all writes downstream: the
-// daemon passes the matched route's policy so each project honors its own quota,
-// and a MaxBodySize of 0 falls back to the manager's configured cap (see
-// effectiveLimit). The policy's redaction fields are consulted later, at
-// FinalizeResponse — the writer only needs the byte cap. The returned writer
-// preserves http.Flusher/Hijacker/Pusher/Unwrap behavior.
-func (cm *CaptureManager) WrapResponseWriter(w http.ResponseWriter, policy CapturePolicy) *CaptureResponseWriter {
-	return newCaptureResponseWriter(w, cm.effectiveLimit(policy.MaxBodySize))
+// maxBodySize bytes (D13, #49) while forwarding all writes downstream: the
+// daemon passes the matched route's cap so each project honors its own quota,
+// and a maxBodySize of 0 falls back to the manager's configured cap (see
+// effectiveLimit). The returned writer preserves
+// http.Flusher/Hijacker/Pusher/Unwrap behavior.
+func (cm *CaptureManager) WrapResponseWriter(w http.ResponseWriter, maxBodySize int64) *CaptureResponseWriter {
+	return newCaptureResponseWriter(w, cm.effectiveLimit(maxBodySize))
 }
 
 // FinalizeResponse captures the response body from a CaptureResponseWriter and
-// returns the REDACTED, cloned response headers per the policy (plan 012 D4).
-// Should be called after the response has been fully written. A disabled manager
-// returns a plain (unredacted) header clone — nothing is stored.
-func (cm *CaptureManager) FinalizeResponse(requestID string, crw *CaptureResponseWriter, policy CapturePolicy) (*CapturedBody, http.Header) {
+// returns the cloned response headers. Should be called after the response has
+// been fully written. A disabled manager stores nothing but still returns the
+// header clone.
+func (cm *CaptureManager) FinalizeResponse(requestID string, crw *CaptureResponseWriter) (*CapturedBody, http.Header) {
 	if !cm.enabled {
 		return nil, cloneHeaders(crw.Header())
 	}
 
-	headers := policy.redactHeaders(crw.Header())
+	headers := cloneHeaders(crw.Header())
 	contentType := crw.Header().Get("Content-Type")
 	data := crw.CapturedBody()
 
