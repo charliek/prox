@@ -275,6 +275,13 @@ func (e *APIError) Error() string {
 	}
 }
 
+// StatusCode and ErrorCode expose the two discriminating fields as methods so
+// consumers that cannot name this type can still classify it structurally:
+// internal/cli imports internal/tui, so the TUI's reconnect policies match on
+// the tui.APIStatusError interface these satisfy rather than on *APIError.
+func (e *APIError) StatusCode() int   { return e.Status }
+func (e *APIError) ErrorCode() string { return e.Code }
+
 // httpStatusError builds the *APIError for a non-2xx response. errResp is nil
 // when the body was absent or unparseable.
 func httpStatusError(statusCode int, errResp *api.ErrorResponse) *APIError {
@@ -497,14 +504,21 @@ func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bo
 }
 
 // consumeSSE connects and delivers events via onEvent until the stream ends;
-// returns the terminal error (nil only on ctx cancellation).
-func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool), onEvent func(T)) error {
+// returns the terminal error (nil only on ctx cancellation). onConnect (may
+// be nil) fires exactly once, after the dial fully succeeded (headers +
+// content type validated) and before the first read — it exists so a
+// reconnect loop can mark the attempt healthy only once a connection
+// actually stands, never for a dead-on-arrival dial.
+func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool), onConnect func(), onEvent func(T)) error {
 	s, err := dialSSE(ctx, c, path)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
 		return err
+	}
+	if onConnect != nil {
+		onConnect()
 	}
 	return readSSE(ctx, s, parse, onEvent)
 }
@@ -549,6 +563,20 @@ func logsStreamPath(params domain.LogParams) string {
 // as query string.
 func proxyRequestsStreamPath(params domain.ProxyRequestParams) string {
 	return pathWithQuery("/api/v1/proxy/requests/stream", buildProxyRequestQueryParams(params))
+}
+
+// ConsumeLogs delivers streamed log entries to onEvent until the stream ends,
+// returning the error that ended it (nil on ctx cancellation). onConnect
+// (nilable) fires once after the connection is established, before the first
+// read. It is the attempt form the TUI's reconnect loop drives; the channel
+// form below serves the one-shot --follow commands.
+func (c *Client) ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error {
+	return consumeSSE(ctx, c, logsStreamPath(params), parseSSELogEntry, onConnect, onEvent)
+}
+
+// ConsumeProxyRequests is the proxy-request counterpart of ConsumeLogs.
+func (c *Client) ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
+	return consumeSSE(ctx, c, proxyRequestsStreamPath(params), parseSSEProxyRequest, onConnect, onEvent)
 }
 
 // StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.

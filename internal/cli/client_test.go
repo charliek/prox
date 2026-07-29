@@ -13,6 +13,7 @@ import (
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/tui"
 )
 
 func TestNewClient(t *testing.T) {
@@ -1013,36 +1014,72 @@ func TestClient_APIError(t *testing.T) {
 	}
 }
 
-// TestClient_StreamProxyRequestsChannel_ProxyNotEnabled proves a 503 connect
-// response is discriminable: the stream error carries Status 503 and the
-// machine-readable PROXY_NOT_ENABLED code, which the reconnect policy needs.
-func TestClient_StreamProxyRequestsChannel_ProxyNotEnabled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// proxyNotEnabledServer answers every request with the 503 the daemon sends
+// when it is running without the proxy.
+func proxyNotEnabledServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(api.ErrorResponse{
 			Error: "proxy is not enabled",
-			Code:  "PROXY_NOT_ENABLED",
+			Code:  domain.ErrCodeProxyNotEnabled,
 		})
 	}))
-	defer server.Close()
+}
 
-	client := NewClient(server.URL)
-	_, err := client.StreamProxyRequestsChannel(context.Background(), domain.ProxyRequestParams{})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
+// requireProxyNotEnabledError asserts err is the discriminable connect failure
+// the TUI's requests reconnect policy parks on: an *APIError carrying both the
+// 503 status and the machine-readable code.
+func requireProxyNotEnabledError(t *testing.T, err error) {
+	t.Helper()
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("expected *APIError, got %T: %v", err, err)
 	}
-	if apiErr.Status != http.StatusServiceUnavailable {
-		t.Errorf("expected Status 503, got %d", apiErr.Status)
+	if apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != domain.ErrCodeProxyNotEnabled {
+		t.Errorf("expected 503/%s, got %d/%s", domain.ErrCodeProxyNotEnabled, apiErr.Status, apiErr.Code)
 	}
-	if apiErr.Code != "PROXY_NOT_ENABLED" {
-		t.Errorf("expected Code PROXY_NOT_ENABLED, got %q", apiErr.Code)
+}
+
+// TestClient_StreamProxyRequestsChannel_ProxyNotEnabled proves the channel form
+// surfaces the 503 synchronously, at connect time.
+func TestClient_StreamProxyRequestsChannel_ProxyNotEnabled(t *testing.T) {
+	server := proxyNotEnabledServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamProxyRequestsChannel(context.Background(), domain.ProxyRequestParams{})
+	requireProxyNotEnabledError(t, err)
+}
+
+// TestAPIError_SatisfiesTUIStatusError pins the structural contract the TUI's
+// reconnect policies classify on: internal/tui cannot import internal/cli, so
+// it matches *APIError through this interface.
+func TestAPIError_SatisfiesTUIStatusError(t *testing.T) {
+	var statusErr tui.APIStatusError = &APIError{
+		Status: http.StatusServiceUnavailable,
+		Code:   domain.ErrCodeProxyNotEnabled,
 	}
+	if statusErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Errorf("expected StatusCode 503, got %d", statusErr.StatusCode())
+	}
+	if statusErr.ErrorCode() != domain.ErrCodeProxyNotEnabled {
+		t.Errorf("expected ErrorCode %q, got %q", domain.ErrCodeProxyNotEnabled, statusErr.ErrorCode())
+	}
+}
+
+// TestClient_ConsumeProxyRequests_ProxyNotEnabled proves the attempt form
+// returns the same discriminable error rather than swallowing it.
+func TestClient_ConsumeProxyRequests_ProxyNotEnabled(t *testing.T) {
+	server := proxyNotEnabledServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	err := client.ConsumeProxyRequests(context.Background(), domain.ProxyRequestParams{},
+		func() { t.Error("onConnect must not fire for a failed dial") },
+		func(api.ProxyRequestResponse) { t.Error("no event should be delivered") })
+	requireProxyNotEnabledError(t, err)
 }
 
 // TestClient_StreamLogsChannel_RejectsNonEventStream fails the connect when the
@@ -1096,20 +1133,25 @@ func sseHangupServer(t *testing.T) *httptest.Server {
 	}))
 }
 
-// TestConsumeSSE_ReturnsTerminalError is the attempt-level contract the
+// TestClient_ConsumeLogs_ReturnsTerminalError is the attempt-level contract the
 // reconnect loop depends on: a stream that ends surfaces the read error rather
 // than disappearing silently, and events delivered before the end are kept.
-func TestConsumeSSE_ReturnsTerminalError(t *testing.T) {
+func TestClient_ConsumeLogs_ReturnsTerminalError(t *testing.T) {
 	server := sseHangupServer(t)
 	defer server.Close()
 
 	client := NewClient(server.URL)
 	var got []api.LogEntryResponse
-	err := consumeSSE(context.Background(), client, logsStreamPath(domain.LogParams{}), parseSSELogEntry,
+	connected := false
+	err := client.ConsumeLogs(context.Background(), domain.LogParams{},
+		func() { connected = true },
 		func(entry api.LogEntryResponse) { got = append(got, entry) })
 
 	if err == nil {
 		t.Fatal("expected terminal error when the server ends the stream, got nil")
+	}
+	if !connected {
+		t.Error("onConnect must fire once the dial succeeds")
 	}
 	if len(got) != 1 {
 		t.Fatalf("expected 1 delivered event, got %d", len(got))

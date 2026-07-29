@@ -112,6 +112,9 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchRequestDetail(record.ID, m.detailFetchSeq))
 		}
 
+	case StreamStatusMsg:
+		m.handleStreamStatus(msg)
+
 	case ProcessesMsg:
 		m.processes = []domain.ProcessInfo(msg)
 		m.connectionError = nil // Clear error on successful fetch

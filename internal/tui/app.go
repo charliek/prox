@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,6 +11,7 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -40,17 +42,10 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	// Subscribe to logs before starting the forwarder
 	subID, ch, err := logMgr.Subscribe(domain.LogFilter{})
 	if err != nil {
-		// Send error as a system log entry so user sees feedback
-		// Don't cancel context here - proxy request forwarding should still work
-		p.Send(LogEntryMsg(domain.LogEntry{
-			Timestamp: time.Now(),
-			Process:   "system",
-			Stream:    domain.StreamStderr,
-			Line:      "Error subscribing to logs: " + err.Error(),
-		}))
+		// Don't cancel the context here - proxy request forwarding should still work.
+		p.Send(LogEntryMsg(systemLogEntry("Error subscribing to logs: " + err.Error())))
 	} else {
-		// Start a goroutine to forward log entries to the TUI
-		go forwardLogs(ctx, p, ch)
+		go forwardLogs(ctx, p.Send, ch)
 	}
 
 	// Subscribe to proxy requests if available
@@ -58,7 +53,7 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	if reqMgr != nil {
 		sub := reqMgr.Subscribe(proxy.RequestFilter{})
 		reqSubID = sub.ID
-		go forwardProxyRequests(ctx, p, sub.Ch)
+		go forwardProxyRequests(ctx, p.Send, sub.Ch)
 	}
 
 	_, runErr := p.Run()
@@ -75,45 +70,75 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	return runErr
 }
 
-// forwardLogs forwards log entries from the subscription channel to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardLogs(ctx context.Context, p *tea.Program, ch <-chan domain.LogEntry) {
+// systemLogEntry builds the synthetic "system" log line the TUI uses to show
+// itself a message in the log pane.
+func systemLogEntry(line string) domain.LogEntry {
+	return domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "system",
+		Stream:    domain.StreamStderr,
+		Line:      line,
+	}
+}
+
+// forwardSubscription pumps a local-mode subscription channel into the TUI. It
+// exits when the context is cancelled or the channel is closed. toMsg wraps one
+// element as the message the models expect; closedLine is the system log line
+// recorded if the channel ends on its own.
+func forwardSubscription[T any](ctx context.Context, send func(tea.Msg), ch <-chan T, id StreamID, closedLine string, toMsg func(T) tea.Msg) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case entry, ok := <-ch:
+		case v, ok := <-ch:
 			if !ok {
+				reportLocalStreamClosed(ctx, send, id, closedLine)
 				return
 			}
-			p.Send(LogEntryMsg(entry))
+			send(toMsg(v))
 		}
 	}
 }
 
-// forwardProxyRequests forwards proxy requests from the subscription channel to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardProxyRequests(ctx context.Context, p *tea.Program, ch <-chan proxy.RequestRecord) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-ch:
-			if !ok {
-				return
-			}
-			p.Send(ProxyRequestMsg(req))
-		}
+// forwardLogs forwards log entries from the subscription channel to the TUI.
+func forwardLogs(ctx context.Context, send func(tea.Msg), ch <-chan domain.LogEntry) {
+	forwardSubscription(ctx, send, ch, StreamLogs, "Log stream closed",
+		func(entry domain.LogEntry) tea.Msg { return LogEntryMsg(entry) })
+}
+
+// forwardProxyRequests forwards proxy requests from the subscription channel to
+// the TUI.
+func forwardProxyRequests(ctx context.Context, send func(tea.Msg), ch <-chan proxy.RequestRecord) {
+	forwardSubscription(ctx, send, ch, StreamRequests, "Proxy request stream closed",
+		func(req proxy.RequestRecord) tea.Msg { return ProxyRequestMsg(req) })
+}
+
+// reportLocalStreamClosed surfaces a local-mode subscription channel that ended
+// on its own. Local mode has no reconnect loop, so the feed is gone for the rest
+// of the session and the user has to be told: the status bar marks the stream
+// closed and one system log line records it. A close observed during shutdown
+// (ctx already cancelled, which the select can lose the race to) is expected and
+// stays silent.
+func reportLocalStreamClosed(ctx context.Context, send func(tea.Msg), id StreamID, line string) {
+	if ctx.Err() != nil {
+		return
 	}
+	send(StreamStatusMsg{Stream: id, Status: stream.Status{State: stream.StateClosed}})
+	send(LogEntryMsg(systemLogEntry(line)))
 }
 
 // TUIClient is the interface for TUI client mode API interactions.
 // It consolidates all API operations needed by the TUI client.
+//
+// The stream methods are attempt-shaped rather than channel-shaped: each call is
+// one connect-and-consume attempt owned by an internal/stream.Loop, which needs
+// the terminal error to classify it. The channel forms remain on *cli.Client for
+// the --follow commands.
 type TUIClient interface {
 	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
-	StreamLogsChannel(ctx context.Context, params domain.LogParams) (<-chan api.LogEntryResponse, error)
-	StreamProxyRequestsChannel(ctx context.Context, params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
+	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error
+	ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
 }
 
@@ -124,113 +149,100 @@ func RunClient(client TUIClient) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Start goroutines to stream logs and proxy requests from the API
-	go forwardClientLogs(ctx, p, client)
-	go forwardClientProxyRequests(ctx, p, client)
+	go runClientStreams(ctx, client, p.Send)
 
 	_, err := p.Run()
 
-	// Cleanup: cancel context to stop the forwarder goroutines
+	// Cleanup: cancel context to stop the stream loops
 	cancel()
 
 	return err
 }
 
-// forwardClientLogs streams log entries from the API and sends them to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardClientLogs(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamLogsChannel(ctx, domain.LogParams{})
-	if err != nil {
-		// Send error as a system log entry so user sees feedback
-		p.Send(LogEntryMsg(domain.LogEntry{
-			Timestamp: time.Now(),
-			Process:   "system",
-			Stream:    domain.StreamStderr,
-			Line:      "Error connecting to log stream: " + err.Error(),
-		}))
-		return
+// runClientStreams runs one reconnect loop per attach-mode stream and blocks
+// until every loop has ended, which happens when ctx is cancelled (on quit) or a
+// loop's error is classified terminal. send is the program's message sink,
+// injected so the wiring is testable without a live *tea.Program.
+func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg)) {
+	loops := []*stream.Loop{
+		streamLoop(StreamLogs, send, classifyStreamError, func(ctx context.Context, onConnect func()) error {
+			return client.ConsumeLogs(ctx, domain.LogParams{}, onConnect, func(entry api.LogEntryResponse) {
+				sendStreamedLogEntry(send, entry)
+			})
+		}),
+		streamLoop(StreamRequests, send, classifyRequestsStreamError, func(ctx context.Context, onConnect func()) error {
+			return client.ConsumeProxyRequests(ctx, domain.ProxyRequestParams{}, onConnect, func(req api.ProxyRequestResponse) {
+				sendStreamedProxyRequest(send, req)
+			})
+		}),
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case entry, ok := <-ch:
-			if !ok {
-				// Channel closed - connection lost
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: time.Now(),
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Log stream connection closed",
-				}))
-				return
-			}
-			// Convert API response to LogEntry
-			ts, parseErr := time.Parse(time.RFC3339Nano, entry.Timestamp)
-			if parseErr != nil {
-				ts = time.Now() // Fallback for malformed timestamps
-				// Log warning so server-side timestamp bugs are visible
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: ts,
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Warning: failed to parse log timestamp: " + parseErr.Error(),
-				}))
-			}
-			logEntry := domain.LogEntry{
-				Timestamp: ts,
-				Process:   entry.Process,
-				Stream:    domain.Stream(entry.Stream),
-				Line:      entry.Line,
-			}
-			p.Send(LogEntryMsg(logEntry))
-		}
+	var wg sync.WaitGroup
+	wg.Add(len(loops))
+	for _, l := range loops {
+		go func() {
+			defer wg.Done()
+			l.Run(ctx)
+		}()
 	}
+	wg.Wait()
 }
 
-// forwardClientProxyRequests streams proxy requests from the API and sends them to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamProxyRequestsChannel(ctx, domain.ProxyRequestParams{})
-	if err != nil {
-		// Proxy may not be enabled - this is not an error, just silently return
-		return
-	}
+// streamLoop builds one attach-mode reconnect loop: consume is a single
+// connect-and-consume attempt, classify is the stream's reconnect policy, and
+// every transition reaches the models as a StreamStatusMsg for id.
+//
+// markSynced rides the client's onConnect hook, so it fires only once a
+// connection actually stands (headers + content type validated) — a
+// dead-on-arrival dial stays in Syncing and can never flash OK or clear the
+// outage warning (codex C5 finding). For these pure stream consumers connect
+// IS sync; the requests sync protocol later moves markSynced after its
+// snapshot barrier.
+func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, consume func(ctx context.Context, onConnect func()) error) *stream.Loop {
+	return stream.NewLoop(stream.Config{
+		Attempt: func(ctx context.Context, markSynced func()) error {
+			return consume(ctx, markSynced)
+		},
+		Classify: classify,
+		OnStatus: func(s stream.Status) {
+			send(StreamStatusMsg{Stream: id, Status: s})
+		},
+	})
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-ch:
-			if !ok {
-				// Channel closed - connection lost
-				return
-			}
-			// Convert API response to RequestRecord
-			ts, parseErr := time.Parse(time.RFC3339Nano, req.Timestamp)
-			if parseErr != nil {
-				ts = time.Now() // Fallback for malformed timestamps
-				// Log warning so server-side timestamp bugs are visible
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: ts,
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Warning: failed to parse proxy request timestamp: " + parseErr.Error(),
-				}))
-			}
-			record := proxy.RequestRecord{
-				ID:         req.ID,
-				Timestamp:  ts,
-				Method:     req.Method,
-				URL:        req.URL,
-				Subdomain:  req.Subdomain,
-				StatusCode: req.StatusCode,
-				Duration:   time.Duration(req.DurationMs) * time.Millisecond,
-				RemoteAddr: req.RemoteAddr,
-				InFlight:   req.InFlight,
-			}
-			p.Send(ProxyRequestMsg(record))
-		}
+// parseStreamTimestamp parses a server-supplied event timestamp. A malformed one
+// falls back to now and emits a warning line naming what, so a server-side
+// timestamp bug stays visible instead of being papered over.
+func parseStreamTimestamp(send func(tea.Msg), what, raw string) time.Time {
+	ts, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		send(LogEntryMsg(systemLogEntry("Warning: failed to parse " + what + " timestamp: " + err.Error())))
+		return time.Now()
 	}
+	return ts
+}
+
+// sendStreamedLogEntry converts one streamed log entry and delivers it.
+func sendStreamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) {
+	send(LogEntryMsg(domain.LogEntry{
+		Timestamp: parseStreamTimestamp(send, "log", entry.Timestamp),
+		Process:   entry.Process,
+		Stream:    domain.Stream(entry.Stream),
+		Line:      entry.Line,
+	}))
+}
+
+// sendStreamedProxyRequest converts one streamed proxy request and delivers it.
+func sendStreamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) {
+	send(ProxyRequestMsg(proxy.RequestRecord{
+		ID:         req.ID,
+		Timestamp:  parseStreamTimestamp(send, "proxy request", req.Timestamp),
+		Method:     req.Method,
+		URL:        req.URL,
+		Subdomain:  req.Subdomain,
+		StatusCode: req.StatusCode,
+		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
+		RemoteAddr: req.RemoteAddr,
+		InFlight:   req.InFlight,
+	}))
 }

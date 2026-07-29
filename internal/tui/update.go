@@ -49,6 +49,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampViewportToContent()
 		}
 
+	case StreamStatusMsg:
+		m.handleStreamStatus(msg)
+
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()
 

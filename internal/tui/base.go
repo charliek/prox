@@ -19,6 +19,7 @@ import (
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 )
 
 // maxLogEntries is the maximum number of log entries to keep in memory
@@ -117,6 +118,14 @@ type BaseModel struct {
 	// on leaving the detail view (esc).
 	detailRefreshFailed bool
 
+	// Per-stream health. streamHealth holds the last status reported for each
+	// stream; a stream with no entry has reported nothing and renders nothing.
+	// streamDropped latches a stream that has been seen reconnecting, so the
+	// Syncing that follows a drop keeps rendering as "reconnecting…" while a
+	// first-connect Syncing stays silent (see handleStreamStatus).
+	streamHealth  map[StreamID]stream.Status
+	streamDropped map[StreamID]bool
+
 	// Dimensions
 	width  int
 	height int
@@ -141,6 +150,8 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		mode:            ModeNormal,
 		viewMode:        ViewModeLogs,
 		filterProcesses: make(map[string]bool),
+		streamHealth:    make(map[StreamID]stream.Status),
+		streamDropped:   make(map[StreamID]bool),
 		followMode:      true,
 		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
@@ -1640,6 +1651,13 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		left = "String filter: " + b.textInput.View()
 	default:
 		left = b.statusLeftDefault(extraInfo, requests, entries)
+	}
+
+	// Per-stream health rides on the end of the left side in every mode: a
+	// degraded stream is worth showing even while a filter prompt is open, and
+	// it is orthogonal to the overall-connection text attach mode owns.
+	if segs := b.streamHealthSegments(); len(segs) > 0 {
+		left += " | " + strings.Join(segs, " | ")
 	}
 
 	// Right side: follow mode and count

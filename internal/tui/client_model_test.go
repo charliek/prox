@@ -20,11 +20,22 @@ import (
 // responses, so ClientModel Enter/detail flows can be exercised without a live
 // daemon. Shared C2 deliverable — C4 reuses it for the attach-mode
 // detail-refresh tests.
+// The Consume* stubs block until ctx is cancelled by default — a quiet,
+// never-ending stream. Returning immediately would spin a reconnect loop, so a
+// test that wants scripted events or a specific failure sets the matching hook
+// instead.
 type stubTUIClient struct {
 	mu           sync.Mutex
 	requestedIDs []string // every GetProxyRequest id, in call order
 	detailResp   *api.ProxyRequestDetailResponse
 	detailErr    error
+
+	// Optional per-stream attempt behavior; nil means "connect successfully,
+	// then block until cancelled" (onConnect fires, no events). A scripted
+	// hook owns the onConnect call: invoke it to model an established
+	// connection, skip it to model a dead-on-arrival dial.
+	consumeLogs     func(ctx context.Context, onConnect func(), onEvent func(api.LogEntryResponse)) error
+	consumeRequests func(ctx context.Context, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
 }
 
 func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
@@ -33,16 +44,22 @@ func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
 
 func (s *stubTUIClient) RestartProcess(string) error { return nil }
 
-func (s *stubTUIClient) StreamLogsChannel(context.Context, domain.LogParams) (<-chan api.LogEntryResponse, error) {
-	ch := make(chan api.LogEntryResponse)
-	close(ch)
-	return ch, nil
+func (s *stubTUIClient) ConsumeLogs(ctx context.Context, _ domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error {
+	if s.consumeLogs != nil {
+		return s.consumeLogs(ctx, onConnect, onEvent)
+	}
+	onConnect()
+	<-ctx.Done()
+	return ctx.Err()
 }
 
-func (s *stubTUIClient) StreamProxyRequestsChannel(context.Context, domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
-	ch := make(chan api.ProxyRequestResponse)
-	close(ch)
-	return ch, nil
+func (s *stubTUIClient) ConsumeProxyRequests(ctx context.Context, _ domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
+	if s.consumeRequests != nil {
+		return s.consumeRequests(ctx, onConnect, onEvent)
+	}
+	onConnect()
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDetailResponse, error) {

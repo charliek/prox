@@ -9,6 +9,7 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -56,6 +57,12 @@ func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
 		base.filterProcesses[p.Name] = true
 	}
 	base.processes = sup.Processes()
+
+	// Local mode reads in-process subscriptions: every stream is healthy from
+	// the start and only ever changes if a subscription channel closes under it.
+	for _, id := range allStreams {
+		base.streamHealth[id] = stream.Status{State: stream.StateOK}
+	}
 
 	return Model{
 		BaseModel:  base,
