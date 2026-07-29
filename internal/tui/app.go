@@ -112,8 +112,8 @@ func forwardProxyRequests(ctx context.Context, p *tea.Program, ch <-chan proxy.R
 type TUIClient interface {
 	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
-	StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error)
-	StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
+	StreamLogsChannel(ctx context.Context, params domain.LogParams) (<-chan api.LogEntryResponse, error)
+	StreamProxyRequestsChannel(ctx context.Context, params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
 }
 
@@ -139,7 +139,7 @@ func RunClient(client TUIClient) error {
 // forwardClientLogs streams log entries from the API and sends them to the TUI program.
 // It exits when the context is cancelled or the channel is closed.
 func forwardClientLogs(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamLogsChannel(domain.LogParams{})
+	ch, err := client.StreamLogsChannel(ctx, domain.LogParams{})
 	if err != nil {
 		// Send error as a system log entry so user sees feedback
 		p.Send(LogEntryMsg(domain.LogEntry{
@@ -192,7 +192,7 @@ func forwardClientLogs(ctx context.Context, p *tea.Program, client TUIClient) {
 // forwardClientProxyRequests streams proxy requests from the API and sends them to the TUI program.
 // It exits when the context is cancelled or the channel is closed.
 func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamProxyRequestsChannel(domain.ProxyRequestParams{})
+	ch, err := client.StreamProxyRequestsChannel(ctx, domain.ProxyRequestParams{})
 	if err != nil {
 		// Proxy may not be enabled - this is not an error, just silently return
 		return

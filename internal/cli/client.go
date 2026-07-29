@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -195,14 +196,18 @@ func buildProxyRequestQueryParams(params domain.ProxyRequestParams) url.Values {
 	return query
 }
 
+// pathWithQuery appends query to path as a query string, leaving path
+// untouched when there is nothing to encode.
+func pathWithQuery(path string, query url.Values) string {
+	if len(query) == 0 {
+		return path
+	}
+	return path + "?" + query.Encode()
+}
+
 // GetLogs gets logs with optional filtering
 func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
-	query := buildLogQueryParams(params)
-
-	path := "/api/v1/logs"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
+	path := pathWithQuery("/api/v1/logs", buildLogQueryParams(params))
 
 	var resp api.LogsResponse
 	if err := c.get(path, &resp); err != nil {
@@ -213,12 +218,7 @@ func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
 
 // GetProxyRequests gets recent proxy requests with optional filtering
 func (c *Client) GetProxyRequests(params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
-	query := buildProxyRequestQueryParams(params)
-
-	path := "/api/v1/proxy/requests"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
+	path := pathWithQuery("/api/v1/proxy/requests", buildProxyRequestQueryParams(params))
 
 	var resp api.ProxyRequestsResponse
 	if err := c.get(path, &resp); err != nil {
@@ -241,26 +241,49 @@ func (c *Client) GetProxyRequest(id string, includeBody bool) (*api.ProxyRequest
 	return &resp, nil
 }
 
-// httpStatusError maps HTTP status codes to user-friendly error messages
-func httpStatusError(statusCode int, errResp *api.ErrorResponse) error {
-	if errResp != nil && errResp.Error != "" {
-		return fmt.Errorf("%s: %s", errResp.Code, errResp.Error)
+// APIError is a non-2xx API response. Status is the HTTP status; Code is the
+// machine-readable error code from the JSON error body (empty if the body
+// wasn't parseable). Callers that need to discriminate on a specific failure
+// (e.g. a 503 PROXY_NOT_ENABLED) use errors.As rather than string matching.
+type APIError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+// Error renders the daemon's own message when it sent one, and otherwise a
+// status-specific fallback. The text is user-facing: CLI commands surface it
+// verbatim through clientError.
+func (e *APIError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("%s: %s", e.Code, e.Message)
 	}
 
-	switch statusCode {
+	switch e.Status {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("authentication failed: invalid or missing token")
+		return "authentication failed: invalid or missing token"
 	case http.StatusForbidden:
-		return fmt.Errorf("access denied: insufficient permissions")
+		return "access denied: insufficient permissions"
 	case http.StatusNotFound:
-		return fmt.Errorf("not found: the requested resource does not exist")
+		return "not found: the requested resource does not exist"
 	case http.StatusInternalServerError:
-		return fmt.Errorf("server error: the prox daemon encountered an internal error")
+		return "server error: the prox daemon encountered an internal error"
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("service unavailable: the prox daemon is not ready")
+		return "service unavailable: the prox daemon is not ready"
 	default:
-		return fmt.Errorf("request failed with status %d", statusCode)
+		return fmt.Sprintf("request failed with status %d", e.Status)
 	}
+}
+
+// httpStatusError builds the *APIError for a non-2xx response. errResp is nil
+// when the body was absent or unparseable.
+func httpStatusError(statusCode int, errResp *api.ErrorResponse) *APIError {
+	e := &APIError{Status: statusCode}
+	if errResp != nil {
+		e.Code = errResp.Code
+		e.Message = errResp.Error
+	}
+	return e
 }
 
 func (c *Client) doRequest(method, path string, v interface{}) error {
@@ -341,10 +364,49 @@ func parseSSEProxyRequest(data string) (api.ProxyRequestResponse, bool) {
 	return req, true
 }
 
-// streamSSE creates an SSE connection and returns a channel of parsed events.
-// The channel is closed when the connection ends or times out.
-func streamSSE[T any](req *http.Request, parse func(string) (T, bool)) (<-chan T, error) {
-	// Custom transport to capture connection for read deadlines
+// sseErrorBodyLimit bounds how much of a non-200 SSE connect body is read
+// before parsing it as an api.ErrorResponse.
+const sseErrorBodyLimit = 8 << 10
+
+// sseContentType is the media type an SSE endpoint must answer with. The
+// response may append parameters (e.g. "; charset=utf-8"), so it is matched as
+// a prefix.
+const sseContentType = "text/event-stream"
+
+// sseStream is one dialed SSE attempt: the live response plus the conn that
+// carried it. conn is captured by the per-attempt transport so deadlineReader
+// can set a read deadline on the exact connection this response is reading
+// from -- the transport must therefore dial at most once per attempt.
+type sseStream struct {
+	resp      *http.Response
+	conn      net.Conn
+	transport *http.Transport
+}
+
+// close releases the body and the attempt's idle connections. Each attempt owns
+// its transport, so nothing is shared with a later attempt.
+func (s *sseStream) close() {
+	s.resp.Body.Close()
+	s.transport.CloseIdleConnections()
+}
+
+// dialSSE opens an SSE connection to path and validates the response. A non-200
+// answer is returned as *APIError, parsed from the (bounded) JSON error body
+// when possible.
+func dialSSE(ctx context.Context, c *Client, path string) (*sseStream, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", sseContentType)
+	c.addAuthHeader(req)
+
+	// Custom transport to capture connection for read deadlines. The capture
+	// is only sound while exactly one dial serves the response, so redirects
+	// are refused below (a redirect chain can hand the response to a reused
+	// idle connection while conn points at the redirect hop's dial — the
+	// deadline would then arm the wrong socket). An SSE endpoint never
+	// legitimately redirects; a 3xx falls through to the non-200 error path.
 	var conn net.Conn
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -356,93 +418,149 @@ func streamSSE[T any](req *http.Request, parse func(string) (T, bool)) (<-chan T
 			conn, err = dialer.DialContext(ctx, network, addr)
 			return conn, err
 		},
+		// The deadlineReader only guards body reads; without this a server
+		// that accepts TCP but never sends response headers would hang the
+		// dial forever (http.Client.Timeout is 0 for SSE by design).
+		ResponseHeaderTimeout: constants.DefaultRequestTimeout,
 	}
 
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   0, // SSE streams are long-lived
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		transport.CloseIdleConnections()
 		return nil, err
 	}
 
+	stream := &sseStream{resp: resp, conn: conn, transport: transport}
+
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
+		defer stream.close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, sseErrorBodyLimit))
+		var errResp api.ErrorResponse
+		if err := json.Unmarshal(body, &errResp); err == nil {
+			return nil, httpStatusError(resp.StatusCode, &errResp)
+		}
 		return nil, httpStatusError(resp.StatusCode, nil)
 	}
 
+	if mt, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err != nil || mt != sseContentType {
+		ct := resp.Header.Get("Content-Type")
+		stream.close()
+		return nil, fmt.Errorf("unexpected content type %q from %s (want %s)", ct, path, sseContentType)
+	}
+
+	return stream, nil
+}
+
+// readSSE reads events off a dialed stream until it ends, handing each parsed
+// event to onEvent. It returns the terminal read error, or nil when ctx was
+// cancelled. Reads carry constants.SSEReadTimeout as a deadline so a server
+// that dies without closing the connection cannot hang the reader forever.
+func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bool), onEvent func(T)) error {
+	defer s.close()
+
+	bodyReader := &deadlineReader{
+		r:       s.resp.Body,
+		conn:    s.conn,
+		timeout: constants.SSEReadTimeout,
+	}
+	reader := bufio.NewReader(bodyReader)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if item, ok := parse(data); ok {
+				onEvent(item)
+			}
+		}
+	}
+}
+
+// consumeSSE connects and delivers events via onEvent until the stream ends;
+// returns the terminal error (nil only on ctx cancellation).
+func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool), onEvent func(T)) error {
+	s, err := dialSSE(ctx, c, path)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	return readSSE(ctx, s, parse, onEvent)
+}
+
+// streamSSE is the channel form of an SSE attempt: connect-time failures come
+// back synchronously, and the channel closes when the stream ends for any reason.
+// The terminal error is dropped here on purpose -- consumers of the channel API
+// only observe the close.
+//
+// Contract: a consumer that abandons the channel MUST cancel ctx. Cancellation
+// is the only unblock for the reader once the channel buffer fills; abandoning
+// without cancelling pins the reader goroutine and its connection until the
+// buffer's next send would occur — forever, on a quiet stream.
+func streamSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool)) (<-chan T, error) {
+	s, err := dialSSE(ctx, c, path)
+	if err != nil {
+		return nil, err
+	}
+
 	ch := make(chan T, 100)
-
 	go func() {
-		defer resp.Body.Close()
 		defer close(ch)
-
-		bodyReader := &deadlineReader{
-			r:       resp.Body,
-			conn:    conn,
-			timeout: constants.SSEReadTimeout,
-		}
-		reader := bufio.NewReader(bodyReader)
-
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				return
+		_ = readSSE(ctx, s, parse, func(item T) {
+			// Never block past cancellation: a consumer that stopped reading
+			// would otherwise pin this goroutine.
+			select {
+			case ch <- item:
+			case <-ctx.Done():
 			}
-
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, ":") {
-				continue
-			}
-
-			if strings.HasPrefix(line, "data: ") {
-				data := strings.TrimPrefix(line, "data: ")
-				if item, ok := parse(data); ok {
-					ch <- item
-				}
-			}
-		}
+		})
 	}()
 
 	return ch, nil
 }
 
+// logsStreamPath builds the log SSE path with params applied as query string.
+func logsStreamPath(params domain.LogParams) string {
+	return pathWithQuery("/api/v1/logs/stream", buildLogQueryParams(params))
+}
+
+// proxyRequestsStreamPath builds the proxy-request SSE path with params applied
+// as query string.
+func proxyRequestsStreamPath(params domain.ProxyRequestParams) string {
+	return pathWithQuery("/api/v1/proxy/requests/stream", buildProxyRequestQueryParams(params))
+}
+
 // StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.
-// The channel is closed when the connection ends or the read times out.
-func (c *Client) StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
-	query := buildProxyRequestQueryParams(params)
-
-	path := "/api/v1/proxy/requests/stream"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
-
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	c.addAuthHeader(req)
-	return streamSSE(req, parseSSEProxyRequest)
+// The channel is closed when the connection ends, the read times out, or ctx is
+// cancelled.
+func (c *Client) StreamProxyRequestsChannel(ctx context.Context, params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
+	return streamSSE(ctx, c, proxyRequestsStreamPath(params), parseSSEProxyRequest)
 }
 
 // StreamLogsChannel returns a channel that streams log entries via SSE.
-// The channel is closed when the connection ends or the read times out.
-func (c *Client) StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error) {
-	query := buildLogQueryParams(params)
-
-	path := "/api/v1/logs/stream"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
-	}
-
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	c.addAuthHeader(req)
-	return streamSSE(req, parseSSELogEntry)
+// The channel is closed when the connection ends, the read times out, or ctx is
+// cancelled.
+func (c *Client) StreamLogsChannel(ctx context.Context, params domain.LogParams) (<-chan api.LogEntryResponse, error) {
+	return streamSSE(ctx, c, logsStreamPath(params), parseSSELogEntry)
 }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -32,13 +33,13 @@ func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
 
 func (s *stubTUIClient) RestartProcess(string) error { return nil }
 
-func (s *stubTUIClient) StreamLogsChannel(domain.LogParams) (<-chan api.LogEntryResponse, error) {
+func (s *stubTUIClient) StreamLogsChannel(context.Context, domain.LogParams) (<-chan api.LogEntryResponse, error) {
 	ch := make(chan api.LogEntryResponse)
 	close(ch)
 	return ch, nil
 }
 
-func (s *stubTUIClient) StreamProxyRequestsChannel(domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
+func (s *stubTUIClient) StreamProxyRequestsChannel(context.Context, domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
 	ch := make(chan api.ProxyRequestResponse)
 	close(ch)
 	return ch, nil

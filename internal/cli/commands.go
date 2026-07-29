@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -380,7 +381,7 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 	if logsFollow {
 		// Stream logs via channel
-		ch, err := client.StreamLogsChannel(params)
+		ch, err := client.StreamLogsChannel(commandContext(cmd), params)
 		if err != nil {
 			return clientError(err, "Is prox running? Try 'prox up' first.")
 		}
@@ -758,7 +759,7 @@ func runRequests(cmd *cobra.Command, args []string) error {
 
 	if requestsFollow {
 		// Stream requests via SSE
-		ch, err := client.StreamProxyRequestsChannel(params)
+		ch, err := client.StreamProxyRequestsChannel(commandContext(cmd), params)
 		if err != nil {
 			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
 		}
@@ -1090,6 +1091,16 @@ func init() {
 	_ = logsCmd.RegisterFlagCompletionFunc("process", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return getProcessNames(), cobra.ShellCompDirectiveNoFileComp
 	})
+}
+
+// commandContext returns the command's context, falling back to Background when
+// the command was invoked outside Execute (e.g. a test calling RunE directly),
+// which leaves cobra's context nil.
+func commandContext(cmd *cobra.Command) context.Context {
+	if ctx := cmd.Context(); ctx != nil {
+		return ctx
+	}
+	return context.Background()
 }
 
 // clientError wraps an error with an optional hint for the user.

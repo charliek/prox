@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -888,7 +890,7 @@ func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	_, err := client.StreamLogsChannel(domain.LogParams{
+	_, err := client.StreamLogsChannel(context.Background(), domain.LogParams{
 		Process: "web",
 		Lines:   50,
 		Pattern: "error",
@@ -914,5 +916,297 @@ func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
 	}
 	if !strings.Contains(receivedQuery, "regex=true") {
 		t.Errorf("expected regex=true in query, got %s", receivedQuery)
+	}
+}
+
+// TestClient_APIError pins the typed error surfaced for every non-2xx response:
+// callers can errors.As it for the status/code, and the rendered text still
+// matches the human-readable format the CLI printed before APIError existed.
+func TestClient_APIError(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantCode    string
+		wantMessage string
+		wantText    string
+	}{
+		{
+			name:     "unauthorized without body",
+			status:   http.StatusUnauthorized,
+			wantText: "authentication failed: invalid or missing token",
+		},
+		{
+			name:     "forbidden without body",
+			status:   http.StatusForbidden,
+			wantText: "access denied: insufficient permissions",
+		},
+		{
+			name:        "not found with error body",
+			status:      http.StatusNotFound,
+			contentType: "application/json",
+			body:        `{"error":"process not found","code":"PROCESS_NOT_FOUND"}`,
+			wantCode:    "PROCESS_NOT_FOUND",
+			wantMessage: "process not found",
+			wantText:    "PROCESS_NOT_FOUND: process not found",
+		},
+		{
+			name:        "service unavailable with proxy code",
+			status:      http.StatusServiceUnavailable,
+			contentType: "application/json",
+			body:        `{"error":"proxy is not enabled","code":"PROXY_NOT_ENABLED"}`,
+			wantCode:    "PROXY_NOT_ENABLED",
+			wantMessage: "proxy is not enabled",
+			wantText:    "PROXY_NOT_ENABLED: proxy is not enabled",
+		},
+		{
+			name:        "internal error with unparseable body",
+			status:      http.StatusInternalServerError,
+			contentType: "text/html",
+			body:        "<html>boom</html>",
+			wantText:    "server error: the prox daemon encountered an internal error",
+		},
+		{
+			name:     "unmapped status",
+			status:   http.StatusTeapot,
+			wantText: "request failed with status 418",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				if tt.body != "" {
+					w.Write([]byte(tt.body))
+				}
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL)
+			_, err := client.GetStatus()
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected *APIError, got %T: %v", err, err)
+			}
+			if apiErr.Status != tt.status {
+				t.Errorf("expected Status %d, got %d", tt.status, apiErr.Status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("expected Code %q, got %q", tt.wantCode, apiErr.Code)
+			}
+			if apiErr.Message != tt.wantMessage {
+				t.Errorf("expected Message %q, got %q", tt.wantMessage, apiErr.Message)
+			}
+			if err.Error() != tt.wantText {
+				t.Errorf("expected error text %q, got %q", tt.wantText, err.Error())
+			}
+		})
+	}
+}
+
+// TestClient_StreamProxyRequestsChannel_ProxyNotEnabled proves a 503 connect
+// response is discriminable: the stream error carries Status 503 and the
+// machine-readable PROXY_NOT_ENABLED code, which the reconnect policy needs.
+func TestClient_StreamProxyRequestsChannel_ProxyNotEnabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(api.ErrorResponse{
+			Error: "proxy is not enabled",
+			Code:  "PROXY_NOT_ENABLED",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamProxyRequestsChannel(context.Background(), domain.ProxyRequestParams{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.Status != http.StatusServiceUnavailable {
+		t.Errorf("expected Status 503, got %d", apiErr.Status)
+	}
+	if apiErr.Code != "PROXY_NOT_ENABLED" {
+		t.Errorf("expected Code PROXY_NOT_ENABLED, got %q", apiErr.Code)
+	}
+}
+
+// TestClient_StreamLogsChannel_RejectsNonEventStream fails the connect when the
+// daemon answers 200 with something that is not an SSE stream.
+func TestClient_StreamLogsChannel_RejectsNonEventStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html>not a stream</html>"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamLogsChannel(context.Background(), domain.LogParams{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "content type") || !strings.Contains(err.Error(), "text/event-stream") {
+		t.Errorf("expected descriptive content-type error, got %q", err.Error())
+	}
+}
+
+// TestDialSSE_AcceptsContentTypeParameters accepts the media type with
+// parameters appended, which is what net/http writes by default.
+func TestDialSSE_AcceptsContentTypeParameters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	s, err := dialSSE(context.Background(), client, logsStreamPath(domain.LogParams{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s.close()
+}
+
+// sseHangupServer writes one log event and then returns, ending the stream.
+func sseHangupServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": heartbeat\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\"}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+}
+
+// TestConsumeSSE_ReturnsTerminalError is the attempt-level contract the
+// reconnect loop depends on: a stream that ends surfaces the read error rather
+// than disappearing silently, and events delivered before the end are kept.
+func TestConsumeSSE_ReturnsTerminalError(t *testing.T) {
+	server := sseHangupServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var got []api.LogEntryResponse
+	err := consumeSSE(context.Background(), client, logsStreamPath(domain.LogParams{}), parseSSELogEntry,
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if err == nil {
+		t.Fatal("expected terminal error when the server ends the stream, got nil")
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 delivered event, got %d", len(got))
+	}
+	if got[0].Line != "one" {
+		t.Errorf("expected line %q, got %q", "one", got[0].Line)
+	}
+}
+
+// drainUntilClosed reads ch to completion and returns everything it delivered,
+// failing the test with failMsg if the channel is not closed within 5s.
+func drainUntilClosed(t *testing.T, ch <-chan api.LogEntryResponse, failMsg string) []api.LogEntryResponse {
+	t.Helper()
+	var got []api.LogEntryResponse
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case entry, ok := <-ch:
+			if !ok {
+				return got
+			}
+			got = append(got, entry)
+		case <-deadline:
+			t.Fatal(failMsg)
+		}
+	}
+}
+
+// TestClient_StreamLogsChannel_ClosesOnHangup keeps the existing consumer
+// contract: the channel variant only closes, it does not surface the error.
+func TestClient_StreamLogsChannel_ClosesOnHangup(t *testing.T) {
+	server := sseHangupServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	ch, err := client.StreamLogsChannel(context.Background(), domain.LogParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := drainUntilClosed(t, ch, "channel was not closed after the server ended the stream")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event before close, got %d", len(got))
+	}
+}
+
+// TestClient_StreamLogsChannel_ContextCancel proves cancellation tears the
+// stream down immediately -- well inside constants.SSEReadTimeout -- and that
+// the reader goroutine exits (it closes the channel on its way out).
+func TestClient_StreamLogsChannel_ContextCancel(t *testing.T) {
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\"}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hold the stream open until the client goes away.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := NewClient(server.URL)
+	ch, err := client.StreamLogsChannel(ctx, domain.LogParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case entry, ok := <-ch:
+		if !ok {
+			t.Fatal("channel closed before the first event")
+		}
+		if entry.Line != "one" {
+			t.Fatalf("expected line %q, got %q", "one", entry.Line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first event")
+	}
+
+	start := time.Now()
+	cancel()
+
+	drainUntilClosed(t, ch, "channel was not closed within 5s of cancellation")
+
+	if elapsed := time.Since(start); elapsed >= constants.SSEReadTimeout {
+		t.Errorf("cancellation took %v, expected well under the %v read deadline", elapsed, constants.SSEReadTimeout)
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server handler still holding the cancelled connection")
 	}
 }
