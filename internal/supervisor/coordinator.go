@@ -157,6 +157,12 @@ func (s *Supervisor) scheduleGated(mp *ManagedProcess) error {
 	if err != nil {
 		return err
 	}
+	// Admission committed the waiting state (beginWaiting), which is
+	// ProcessInfo-visible via State and WaitingOn. Lock discipline: admitGated took
+	// and RELEASED s.mu (and p.mu inside it) before returning, so this fires with no
+	// lock held -- it deliberately is NOT inside admitGated, which notifies under
+	// s.mu.
+	s.notifyChange()
 	targets := mp.Config().DependsOn
 	go s.orchestrate(mp, targets, gen, procCtx, procCancel, supCtx, nil)
 	return nil
@@ -193,6 +199,10 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 	if len(blockedBy) > 0 {
 		if mp.markBlocked(blockedBy, gen) {
 			s.SystemLog("%s blocked: dependency not ready: %s", mp.Name(), strings.Join(blockedBy, ", "))
+			// waiting -> blocked, with BlockedOn now populated. Lock discipline:
+			// markBlocked released p.mu before returning and orchestrate holds no
+			// supervisor lock.
+			s.notifyChange()
 		}
 		return
 	}
@@ -215,7 +225,11 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 			// (finding 3). failWaitingLaunch retains p.current so Stop's crashed path
 			// reaps the group. It no-ops when the runner path already committed
 			// crashed, or when a superseding episode moved the process on.
-			mp.failWaitingLaunch(gen)
+			if mp.failWaitingLaunch(gen) {
+				// waiting -> crashed, committed AFTER the launch attempt's own notify.
+				// Lock discipline: failWaitingLaunch released p.mu before returning.
+				s.notifyChange()
+			}
 			s.logManager.Write(domain.LogEntry{
 				Timestamp: time.Now(),
 				Process:   mp.Name(),
@@ -420,6 +434,9 @@ func (s *Supervisor) startProcessGated(mp *ManagedProcess) error {
 	if err != nil {
 		return err
 	}
+	// Admission committed the waiting state (see scheduleGated's note). Lock
+	// discipline: admitGated released s.mu (and p.mu) before returning.
+	s.notifyChange()
 
 	// Admitted (the child is now waiting). Refresh the resolver + effective view
 	// from the reload, then re-resolve the previously-unready targets fresh.

@@ -49,15 +49,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampViewportToContent()
 		}
 
+	case StreamStatusMsg:
+		m.handleStreamStatus(msg)
+
 	case ProcessesMsg:
 		m.processes = m.supervisor.Processes()
 
 	case TickMsg:
 		m.processes = m.supervisor.Processes()
-		cmds = append(cmds, tickCmd())
-
-	case subIDMsg:
-		m.subID = string(msg)
+		cmds = append(cmds, tickCmd(constants.TUILocalTickInterval))
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process

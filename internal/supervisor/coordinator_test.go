@@ -846,7 +846,7 @@ func TestCoordinator_RunningGatedRestartEmitsStarted(t *testing.T) {
 	waitState(t, sup, "web", domain.ProcessStateRunning)
 
 	// Subscribe AFTER the initial launch so we observe only the restart's event.
-	events := sup.Subscribe()
+	events := sup.subscribeEvents()
 	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer rcancel()
 	require.NoError(t, sup.RestartProcess(rctx, "web"))

@@ -165,7 +165,7 @@ func TestSupervisorStop_CleanEmitsStopped(t *testing.T) {
 		"beta":  newGracefulFake(5002),
 	}, "3s")
 
-	sub := sup.Subscribe()
+	sub := sup.subscribeEvents()
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 	require.NoError(t, sup.Stop(context.Background()))
@@ -184,7 +184,7 @@ func TestSupervisorStop_UnreapableEmitsCrashedNotStopped(t *testing.T) {
 		"bad":  newFastUnreapableFake(6002),
 	}, "3s")
 
-	sub := sup.Subscribe()
+	sub := sup.subscribeEvents()
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 
@@ -205,7 +205,7 @@ func TestSupervisorStop_StopProcessUnreapableEmitsCrashed(t *testing.T) {
 		"svc": newFastUnreapableFake(7001),
 	}, "5s")
 
-	sub := sup.Subscribe()
+	sub := sup.subscribeEvents()
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 
@@ -227,7 +227,7 @@ func TestSupervisorStop_CtxExpiredSecondaryNoEventStillReported(t *testing.T) {
 		"svc": newFastUnreapableFake(8001),
 	}, "5s")
 
-	sub := sup.Subscribe()
+	sub := sup.subscribeEvents()
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 

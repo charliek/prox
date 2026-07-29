@@ -5,9 +5,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -38,9 +40,6 @@ type Model struct {
 	// Dependencies
 	supervisor *supervisor.Supervisor
 	logManager *logs.Manager
-
-	// Subscription ID for log tracking
-	subID string
 }
 
 // NewModel creates a new TUI model
@@ -56,6 +55,12 @@ func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
 	}
 	base.processes = sup.Processes()
 
+	// Local mode reads in-process subscriptions: every stream is healthy from
+	// the start and only ever changes if a subscription channel closes under it.
+	for _, id := range allStreams {
+		base.streamHealth[id] = stream.Status{State: stream.StateOK}
+	}
+
 	return Model{
 		BaseModel:  base,
 		supervisor: sup,
@@ -63,12 +68,17 @@ func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
 	}
 }
 
-// Init initializes the model
+// Init initializes the model.
+//
+// It does NOT subscribe to logs itself (plan 017 C13 deleted the second,
+// leaked subscription this used to open via subscribeToLogs): the REAL local
+// log subscription is the one app.go's Run makes before starting the
+// forwarder, and its entries reach the model as LogEntryMsg regardless of
+// what Init returns.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		subscribeToLogs(m.logManager),
 		refreshProcesses(),
-		tickCmd(),
+		tickCmd(constants.TUILocalTickInterval),
 	)
 }
 
@@ -166,20 +176,6 @@ func restartResultClearCmd() tea.Cmd {
 	})
 }
 
-// subscribeToLogs starts log subscription (returns subscription ID for tracking)
-// Note: Actual log forwarding is handled by forwardLogs in app.go
-func subscribeToLogs(logMgr *logs.Manager) tea.Cmd {
-	return func() tea.Msg {
-		id, _, err := logMgr.Subscribe(domain.LogFilter{})
-		if err != nil {
-			return nil
-		}
-		return subIDMsg(id)
-	}
-}
-
-type subIDMsg string
-
 // refreshProcesses returns a command to refresh process list
 func refreshProcesses() tea.Cmd {
 	return func() tea.Msg {
@@ -187,9 +183,14 @@ func refreshProcesses() tea.Cmd {
 	}
 }
 
-// tickCmd returns a command that ticks periodically
-func tickCmd() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+// tickCmd returns a command that ticks after d, driving the periodic
+// process-list refresh. LOCAL MODE ONLY since C12: attach mode's tick was
+// deleted when the processes stream took over, so the only remaining caller
+// reads the in-process supervisor, which costs nothing. The interval stays a
+// parameter rather than being inlined so the cadence remains one named
+// constant away from the call.
+func tickCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return TickMsg(t)
 	})
 }

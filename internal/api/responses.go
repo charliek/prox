@@ -146,6 +146,20 @@ type LogsResponse struct {
 	Logs          []LogEntryResponse `json:"logs"`
 	FilteredCount int                `json:"filtered_count"`
 	TotalCount    int                `json:"total_count"`
+	// StreamID identifies the logs.Manager lifetime Logs and the two bounds
+	// below came from (plan 017 C8). A client comparing this against a
+	// StreamID it saw earlier learns whether the daemon restarted underneath
+	// it, in which case every Seq it holds belongs to a dead epoch and it must
+	// re-sync from scratch rather than ask for "everything after seq N".
+	StreamID string `json:"stream_id"`
+	// OldestSeq and LatestSeq describe the CURRENT BUFFER as a whole --
+	// ignoring both the filter and any since_seq cursor -- at the moment Logs
+	// was read, taken from the SAME buffer snapshot as Logs (see
+	// logs.Manager.QueryFromSeq). Both are 0 when the buffer is empty. They
+	// let a caller tell "caught up" apart from "the buffer rolled past me":
+	// OldestSeq > since_seq+1 means entries in between were evicted.
+	OldestSeq uint64 `json:"oldest_seq"`
+	LatestSeq uint64 `json:"latest_seq"`
 }
 
 // LogEntryResponse represents a single log entry
@@ -154,6 +168,30 @@ type LogEntryResponse struct {
 	Process   string `json:"process"`
 	Stream    string `json:"stream"`
 	Line      string `json:"line"`
+	// Seq is the server ingest sequence (domain.LogEntry.Seq), copied through
+	// unchanged so a client can resume a query or an SSE stream with
+	// since_seq=Seq (plan 017 C8). Zero on an entry that never passed through
+	// logs.Manager.Write.
+	Seq uint64 `json:"seq"`
+}
+
+// HandshakeResponse is the body of the "handshake" SSE event StreamLogs sends
+// immediately after the ": connected" comment, before any log data (plan 017
+// C8). A reconnecting client must learn the CURRENT stream epoch before it can
+// decide how to backfill: if StreamID differs from the one it last resumed
+// against, every Seq it holds belongs to a dead logs.Manager lifetime and it
+// must re-sync from scratch instead of asking for "everything after seq N".
+//
+// This rides a named "event: handshake" frame rather than a bare "data:"
+// line specifically so it is NOT mistaken for a log entry: the generic SSE
+// reader (internal/cli/client.go readSSE) ignores "event:" lines and would
+// otherwise hand this payload's "data:" line straight to parseSSELogEntry,
+// which unmarshals into LogEntryResponse leniently (unknown fields ignored)
+// and would produce a phantom empty log row. parseSSELogEntry guards against
+// exactly that by rejecting any parse whose Process, Line, and Seq are all
+// zero-valued -- a real log entry never has all three empty.
+type HandshakeResponse struct {
+	StreamID string `json:"stream_id"`
 }
 
 // SuccessResponse represents a simple success response
@@ -271,6 +309,7 @@ func ToLogEntryResponse(entry domain.LogEntry) LogEntryResponse {
 		Process:   entry.Process,
 		Stream:    string(entry.Stream),
 		Line:      entry.Line,
+		Seq:       entry.Seq,
 	}
 }
 

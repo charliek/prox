@@ -490,7 +490,7 @@ func TestStopEpisode_StopProcessNoStoppedEventOnSurvivor(t *testing.T) {
 	runner := newFakeRunner(func(call int) *fakeProcess { return newFastUnreapableFake(8000 + call) })
 	sup := New(cfg, logMgr, runner, DefaultSupervisorConfig())
 
-	events := sup.Subscribe()
+	events := sup.subscribeEvents()
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 

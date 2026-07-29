@@ -34,6 +34,35 @@ func TestNewModel(t *testing.T) {
 	assert.Empty(t, model.logEntries)
 }
 
+// TestModel_Init_DoesNotSubscribeToLogs proves the panel finding fixed by
+// plan 017 C13: local mode used to open a SECOND, leaked log subscription
+// from Model.Init (via the now-deleted subscribeToLogs/subIDMsg), on top of
+// the real one app.go's Run makes before starting the forwarder. It executes
+// every command Init returns — exactly as the bubbletea runtime would — and
+// asserts the log manager's subscriber count never moves, using
+// logs.Manager.Stats().Subscribers as the smallest available accessor.
+func TestModel_Init_DoesNotSubscribeToLogs(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	model := NewModel(sup, logMgr)
+
+	before := logMgr.Stats().Subscribers
+
+	cmd := model.Init()
+	require.NotNil(t, cmd)
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	require.True(t, ok, "expected Init to return a tea.Batch, got %T", msg)
+	for _, sub := range batch {
+		if sub != nil {
+			sub() // runs refreshProcesses and tickCmd; neither subscribes
+		}
+	}
+
+	after := logMgr.Stats().Subscribers
+	assert.Equal(t, before, after, "Model.Init must not open its own log subscription — the real one belongs to app.go Run")
+}
+
 func TestModel_HandleKey_Quit(t *testing.T) {
 	model := newTestModel()
 
@@ -310,7 +339,8 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	model := newTestModel()
 	model.ready = true
 
-	// Send a proxy request through Update()
+	// Send a proxy request through Update() — in-flight, as the live stream
+	// publishes it at response-header time.
 	req := proxy.RequestRecord{
 		ID:         "req-1",
 		Timestamp:  time.Now(),
@@ -318,8 +348,8 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 		Method:     "POST",
 		URL:        "/api/users",
 		StatusCode: 201,
-		Duration:   50 * time.Millisecond,
 		RemoteAddr: "192.168.1.1:54321",
+		InFlight:   true,
 	}
 
 	newModel, _ := model.Update(ProxyRequestMsg(req))
@@ -331,7 +361,6 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	assert.Equal(t, "POST", m.proxyRequests[0].Method)
 	assert.Equal(t, "/api/users", m.proxyRequests[0].URL)
 	assert.Equal(t, 201, m.proxyRequests[0].StatusCode)
-	assert.Equal(t, 50*time.Millisecond, m.proxyRequests[0].Duration)
 
 	// Verify request is accessible via filteredProxyRequests
 	filtered := m.filteredProxyRequests()
@@ -362,11 +391,12 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	assert.Len(t, filtered, 1)
 	assert.Equal(t, "/api/users", filtered[0].URL)
 
-	// A same-ID re-record (e.g. an in-flight row's completion event) updates
-	// the row in place rather than appending a duplicate.
+	// A same-ID re-record (the in-flight row's completion event) updates the
+	// row in place rather than appending a duplicate.
 	req1Updated := req
 	req1Updated.StatusCode = 204
 	req1Updated.Duration = 99 * time.Millisecond
+	req1Updated.InFlight = false
 
 	newModel, _ = m.Update(ProxyRequestMsg(req1Updated))
 	m = newModel.(Model)
@@ -374,6 +404,18 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	assert.Len(t, m.proxyRequests, 2, "same-ID update must not duplicate the row")
 	assert.Equal(t, 204, m.proxyRequests[0].StatusCode)
 	assert.Equal(t, 99*time.Millisecond, m.proxyRequests[0].Duration)
+
+	// Final is terminal (C6): neither a duplicate final nor a late in-flight
+	// copy of the same ID may regress the completed row.
+	regress := req1Updated
+	regress.StatusCode = 500
+	regress.InFlight = true
+	newModel, _ = m.Update(ProxyRequestMsg(regress))
+	m = newModel.(Model)
+
+	assert.Len(t, m.proxyRequests, 2)
+	assert.Equal(t, 204, m.proxyRequests[0].StatusCode, "a stale in-flight copy must not regress a final row")
+	assert.False(t, m.proxyRequests[0].InFlight)
 }
 
 // TestModel_ProxyRequestMsg_SelectionStable pins the cursor invariant (D11):
@@ -382,6 +424,11 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 // opens.
 func TestModel_ProxyRequestMsg_SelectionStable(t *testing.T) {
 	m := newRequestsModel(3, 20)
+	// The rows start in-flight: an in-place update is only ever a completion
+	// arriving for a live row (final rows are terminal — C6).
+	for i := range m.proxyRequests {
+		m.proxyRequests[i].InFlight = true
+	}
 	m = updateModel(m, keyRune('g')) // cursor row 0, follow off
 	m = updateModel(m, keyRune('j')) // cursor row 1 (req-001), not the last row
 	assert.Equal(t, "req-001", m.cursorID)
@@ -1431,7 +1478,7 @@ func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 		feed(fmt.Sprintf("flood %d", i))
 	}
 	for _, e := range m.logEntries {
-		require.NotEqual(t, needleSeq, e.Seq, "NEEDLE has been evicted")
+		require.NotEqual(t, needleSeq, e.DisplaySeq, "NEEDLE has been evicted")
 	}
 	assert.GreaterOrEqual(t, m.logCursorIdx, 0, "the evicted cursor clamps in range")
 	assert.Less(t, m.logCursorIdx, len(m.logEntries), "the evicted cursor clamps in range")

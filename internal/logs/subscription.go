@@ -62,8 +62,12 @@ func (s *Subscription) Channel() <-chan domain.LogEntry {
 	return s.ch
 }
 
-// Send attempts to send an entry to the subscriber
-// Returns false if the channel is full or closed
+// Send attempts to send an entry to the subscriber.
+// Returns false if the channel is full or closed — Broadcast turns that into
+// the subscription's removal (see its doc comment). Send deliberately does NOT
+// close the channel itself: it runs under the manager's read lock alongside
+// concurrent senders, and closing there could race a send into a closed
+// channel.
 func (s *Subscription) Send(entry domain.LogEntry) bool {
 	if s.closed.Load() {
 		return false
@@ -78,8 +82,10 @@ func (s *Subscription) Send(entry domain.LogEntry) bool {
 	case s.ch <- entry:
 		return true
 	default:
-		// Channel full, drop message - log for debugging slow clients
-		log.Printf("Subscription %s: dropped message from process %s (channel full)", s.id, entry.Process)
+		// Channel full - log for debugging slow clients. One line per
+		// subscription: Broadcast ends the subscription on this first
+		// overflow, so there is no flood to guard against.
+		log.Printf("Subscription %s: overflowed on a message from process %s and was closed (channel full)", s.id, entry.Process)
 		return false
 	}
 }
@@ -148,14 +154,55 @@ func (m *SubscriptionManager) Unsubscribe(id string) {
 	}
 }
 
-// Broadcast sends an entry to all subscribers
+// Broadcast sends an entry to all subscribers and ends the ones that
+// overflowed.
+//
+// Overflow is NOT a silent drop (C6): a subscriber whose channel is full has
+// lost a line it can never be handed later, so the subscription is closed and
+// removed. The SSE handler sees the closed channel as end-of-stream and
+// returns; the client reconnects and re-syncs. The local TUI subscribes to the
+// same manager, so a local overflow likewise ends its feed and is surfaced as
+// "logs: disconnected" — strictly better than silently showing an incomplete
+// log pane.
+//
+// The close runs after deliver has released the read lock, never inside it:
+// Send runs under the read lock alongside concurrent senders, and closing there
+// could race a send into a closed channel.
 func (m *SubscriptionManager) Broadcast(entry domain.LogEntry) {
+	for _, sub := range m.deliver(entry) {
+		m.dropSubscription(sub)
+	}
+}
+
+// deliver attempts the send to every subscription under the read lock and
+// returns those that overflowed (or were already closed).
+func (m *SubscriptionManager) deliver(entry domain.LogEntry) []*Subscription {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	var overflowed []*Subscription
 	for _, sub := range m.subscriptions {
-		sub.Send(entry)
+		if !sub.Send(entry) {
+			overflowed = append(overflowed, sub)
+		}
 	}
+	return overflowed
+}
+
+// dropSubscription removes an overflowed subscription and closes it, in that
+// order and matching Unsubscribe: removing under the write lock first means no
+// later deliver can see the subscription, so the close that follows cannot race
+// a send. The map entry is compared by pointer so a straggling drop cannot
+// evict a different subscription, and Close's latch makes a doubled drop a
+// no-op.
+func (m *SubscriptionManager) dropSubscription(sub *Subscription) {
+	m.mu.Lock()
+	if cur, ok := m.subscriptions[sub.id]; ok && cur == sub {
+		delete(m.subscriptions, sub.id)
+	}
+	m.mu.Unlock()
+
+	sub.Close()
 }
 
 // Count returns the number of active subscriptions

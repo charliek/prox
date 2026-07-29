@@ -130,11 +130,27 @@ type RequestFilter struct {
 // when notifySubscribers tried to deliver (D9). It is an atomic so
 // notifySubscribers can bump it under the manager's read lock; the first drop
 // (0→1 transition) logs once so a slow subscriber is visible without spamming.
+//
+// closed latches the channel close so the several paths that can end a
+// subscription — Unsubscribe, manager Close, and the overflow drop (C6) —
+// can never double-close it.
 type RequestSubscription struct {
 	ID      string
 	Filter  RequestFilter
 	Ch      chan RequestRecord
 	dropped atomic.Int64
+	closed  atomic.Bool
+}
+
+// closeLatched closes the subscription's channel exactly once. Every close path
+// goes through it. Callers must hold the manager's subMu WRITE lock (or own the
+// subscription outright, as Subscribe does before publishing it), so a close can
+// never race a non-blocking send in notifySubscribers — those run under the read
+// lock.
+func (s *RequestSubscription) closeLatched() {
+	if s.closed.CompareAndSwap(false, true) {
+		close(s.Ch)
+	}
 }
 
 // EvictionCallback is called when a request is evicted from the ring buffer.
@@ -293,9 +309,10 @@ func (m *RequestManager) appendRecord(record RequestRecord) (evictedID string, o
 //
 // Unlike Record, subscribers are notified INSIDE the ring critical section:
 // same-ID notifications can never be observed out of transition order.
-// notifySubscribers only performs non-blocking channel sends under subMu,
-// and no path acquires mu while holding subMu, so this cannot block or
-// deadlock. The eviction callback (disk IO) still runs after unlock.
+// notifySubscribers only performs non-blocking channel sends (plus, on
+// overflow, a subscription removal) under subMu, and no path acquires mu
+// while holding subMu, so this cannot block or deadlock. The eviction
+// callback (disk IO) still runs after unlock.
 // Upsert reports whether the record was accepted; false means the manager was
 // already Closed (writesClosed) and the caller owns capture-file cleanup.
 func (m *RequestManager) Upsert(record RequestRecord) bool {
@@ -454,7 +471,7 @@ func (m *RequestManager) Subscribe(filter RequestFilter) *RequestSubscription {
 		Ch:     make(chan RequestRecord, 100),
 	}
 	if m.closed {
-		close(sub.Ch)
+		sub.closeLatched()
 		return sub
 	}
 	m.subs[sub.ID] = sub
@@ -468,7 +485,7 @@ func (m *RequestManager) Unsubscribe(id string) {
 	defer m.subMu.Unlock()
 
 	if sub, ok := m.subs[id]; ok {
-		close(sub.Ch)
+		sub.closeLatched()
 		delete(m.subs, id)
 	}
 }
@@ -495,35 +512,84 @@ func (m *RequestManager) Close() {
 
 	m.closed = true
 	for id, sub := range m.subs {
-		close(sub.Ch)
+		sub.closeLatched()
 		delete(m.subs, id)
 	}
 }
 
+// notifySubscribers delivers record to every matching subscription and ends the
+// ones that overflowed.
+//
+// Overflow is NOT a silent drop (C6): a subscriber whose channel is full has
+// lost a record, and there is no way to hand it that record later, so the
+// subscription is closed and removed instead. The SSE handlers see the closed
+// channel as end-of-stream and return; the client reconnects and re-syncs from
+// a fresh snapshot, which is the only repair that actually restores the missing
+// record. The local TUI subscribes to the same manager, so a local overflow
+// likewise closes its feed — surfaced by the local close-reporting path as
+// "requests: disconnected", which is strictly better than silently showing an
+// incomplete list.
+//
+// The close runs OUTSIDE the read lock, under the write lock: sends happen
+// under the read lock, so taking the write lock is what guarantees no send can
+// be in flight while a channel is being closed. No path acquires the ring mutex
+// while holding subMu, so this still cannot deadlock with the Upsert caller
+// that holds it.
 func (m *RequestManager) notifySubscribers(record RequestRecord) {
+	for _, sub := range m.deliver(record) {
+		m.dropSubscription(sub)
+	}
+}
+
+// deliver performs the non-blocking sends under the read lock and returns the
+// subscriptions whose channels were full. Caller must not hold subMu.
+//
+// Sending to a subscription still present in m.subs is safe without a
+// closed check: every close path removes the subscription from the map and
+// closes it in the same write-lock critical section, so a subscription visible
+// here cannot be closed. Two concurrent deliveries may both report the same
+// overflowed subscription; dropSubscription is idempotent.
+func (m *RequestManager) deliver(record RequestRecord) []*RequestSubscription {
 	m.subMu.RLock()
 	defer m.subMu.RUnlock()
 
+	var overflowed []*RequestSubscription
 	for _, sub := range m.subs {
-		if m.matchesFilter(record, sub.Filter) {
-			select {
-			case sub.Ch <- record:
-			default:
-				// Channel full: drop the message and count it (D9). The
-				// manager-wide total feeds DroppedEvents(); the per-subscription
-				// count logs once on the first drop so a persistently slow
-				// subscriber is visible without a per-drop log flood. The log
-				// itself runs on a goroutine: notifySubscribers is called with
-				// the ring mutex held on the Upsert path (ordering guarantee),
-				// and logger I/O must not stall the SSE hot path under that
-				// lock.
-				m.droppedTotal.Add(1)
-				if sub.dropped.Add(1) == 1 {
-					go log.Printf("prox: request subscription %s is dropping events (subscriber not keeping up)", sub.ID)
-				}
+		if !m.matchesFilter(record, sub.Filter) {
+			continue
+		}
+		select {
+		case sub.Ch <- record:
+		default:
+			// Channel full: count the overflow (D9) and mark the subscription
+			// for closure. The manager-wide total feeds DroppedEvents(); the
+			// per-subscription count logs once on the first drop so a slow
+			// subscriber is visible without a per-drop log flood. The log
+			// itself runs on a goroutine: notifySubscribers is called with the
+			// ring mutex held on the Upsert path (ordering guarantee), and
+			// logger I/O must not stall the SSE hot path under that lock.
+			m.droppedTotal.Add(1)
+			if sub.dropped.Add(1) == 1 {
+				go log.Printf("prox: request subscription %s overflowed and was closed (subscriber not keeping up)", sub.ID)
 			}
+			overflowed = append(overflowed, sub)
 		}
 	}
+	return overflowed
+}
+
+// dropSubscription removes an overflowed subscription and closes its channel.
+// The map entry is compared by pointer so a re-Subscribe that reused the ID
+// (impossible today, nextID is monotonic — but cheap insurance) is not evicted
+// by a straggling drop, and the latched close makes a doubled drop a no-op.
+func (m *RequestManager) dropSubscription(sub *RequestSubscription) {
+	m.subMu.Lock()
+	defer m.subMu.Unlock()
+
+	if cur, ok := m.subs[sub.ID]; ok && cur == sub {
+		delete(m.subs, sub.ID)
+	}
+	sub.closeLatched()
 }
 
 // DroppedEvents returns the manager-wide number of subscriber notifications

@@ -138,6 +138,73 @@ const (
 	InFlightStaleAfter = 5 * time.Minute
 )
 
+// SSE (Server-Sent Events) timing
+const (
+	// SSEHeartbeatInterval is how often an idle SSE stream (StreamLogs,
+	// StreamProxyRequests) writes a ": ping" comment to keep the connection
+	// observably alive and to surface a dead client via a failed write. The
+	// server's http.Server.WriteTimeout is deliberately 0 for these routes (a
+	// long-lived stream cannot carry a fixed connection-lifetime deadline), so
+	// the heartbeat's per-write deadline (SSEWriteTimeout) is the only bound on
+	// a stalled write.
+	SSEHeartbeatInterval = 15 * time.Second
+
+	// SSEWriteTimeout is the per-write deadline for an SSE write (connect
+	// comment, data event, or heartbeat), set via
+	// http.ResponseController.SetWriteDeadline before each write. It stands in
+	// for the connection-lifetime WriteTimeout the SSE routes forgo.
+	SSEWriteTimeout = 10 * time.Second
+
+	// SSEReadTimeout is the CLI SSE client's read deadline: if no byte (data or
+	// heartbeat) arrives within this window, the connection is declared dead.
+	// Invariant: SSEReadTimeout > 3*SSEHeartbeatInterval, so the client
+	// tolerates at least 3 consecutive missed heartbeats (a transient stall,
+	// not just a single delayed tick) before giving up.
+	SSEReadTimeout = 60 * time.Second
+)
+
+// Stream reconnection
+//
+// These bound the generic SSE reconnect runner in internal/stream, which every
+// prox stream consumer (TUI attach streams, CLI --follow commands) drives. They
+// are deliberately NOT shared with the proxyd forwarder's own reconnect loop:
+// the forwarder predates this package and keeps its local constants so the two
+// can be retuned independently.
+const (
+	// StreamReconnectBaseBackoff is the wait before the first reconnect
+	// attempt after a stream ends, and the value the backoff resets to once an
+	// attempt has survived StreamReconnectFlapThreshold.
+	StreamReconnectBaseBackoff = 500 * time.Millisecond
+
+	// StreamReconnectMaxBackoff caps the exponential reconnect backoff. The
+	// wait doubles per failed cycle (500ms, 1s, 2s, 4s) and is then clamped
+	// here, so a server that is down for a long time is re-probed at a steady
+	// 5s rather than drifting toward minutes.
+	StreamReconnectMaxBackoff = 5 * time.Second
+
+	// StreamReconnectFlapThreshold is the minimum lifetime an attempt must
+	// reach before its end counts as a recovery (i.e. resets the backoff to
+	// StreamReconnectBaseBackoff). A connect that dies instantly is a flap, not
+	// a recovery: without the guard, a crash-looping server that accepts and
+	// immediately EOFs would reset the backoff on every cycle and be hammered
+	// at the base rate forever. This mirrors the proxyd forwarder's
+	// streamFlapThreshold precedent (see internal/proxyd/forwarder.go), but is
+	// a SEPARATE knob by plan decision — the forwarder keeps its own constant
+	// and does not read this one.
+	StreamReconnectFlapThreshold = 1 * time.Second
+)
+
+// TUI timing
+const (
+	// TUILocalTickInterval drives the local-mode TUI's periodic process-list
+	// refresh, and only local mode's: it reads the in-process supervisor
+	// directly, so a fast tick costs nothing. Attach mode used to share the
+	// interval for an HTTP poll; C12 deleted that poll in favor of the
+	// processes SSE stream, so nothing in attach mode ticks any more
+	// (plan 017 C12).
+	TUILocalTickInterval = 500 * time.Millisecond
+)
+
 // Log configuration
 const (
 	// DefaultLogLimit is the default number of log lines to return

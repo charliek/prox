@@ -405,6 +405,7 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 	var lifecycleBudget, defaultBudget, idBudget time.Duration
 	sseLogsSawDeadline := true
 	sseProxySawDeadline := true
+	sseProcessesSawDeadline := true
 
 	r := chi.NewRouter()
 	r.Group(func(r chi.Router) {
@@ -420,6 +421,10 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 			_, sseProxySawDeadline = r.Context().Deadline()
 			w.WriteHeader(http.StatusOK)
 		})
+		r.Get("/processes/stream", func(w http.ResponseWriter, r *http.Request) {
+			_, sseProcessesSawDeadline = r.Context().Deadline()
+			w.WriteHeader(http.StatusOK)
+		})
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Timeout(defaultRequestTimeout))
@@ -432,6 +437,7 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 		httptest.NewRequest("GET", "/status", nil),
 		httptest.NewRequest("GET", "/logs/stream", nil),
 		httptest.NewRequest("GET", "/proxy/requests/stream", nil),
+		httptest.NewRequest("GET", "/processes/stream", nil),
 	} {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
@@ -447,6 +453,7 @@ func TestRouteGroupTimeoutWiring(t *testing.T) {
 	// SSE routes carry no deadline at all (#42).
 	assert.False(t, sseLogsSawDeadline, "/logs/stream must have no context deadline")
 	assert.False(t, sseProxySawDeadline, "/proxy/requests/stream must have no context deadline")
+	assert.False(t, sseProcessesSawDeadline, "/processes/stream must have no context deadline")
 	// GET /proxy/requests/stream resolved to the SSE probe, so the {id} probe
 	// under the timed group must never have run.
 	assert.Zero(t, idBudget, "/proxy/requests/stream must not match /proxy/requests/{id}")

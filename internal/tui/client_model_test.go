@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/stream"
 )
 
 // stubTUIClient is a test double for the TUIClient interface (app.go). It
@@ -19,29 +22,154 @@ import (
 // responses, so ClientModel Enter/detail flows can be exercised without a live
 // daemon. Shared C2 deliverable — C4 reuses it for the attach-mode
 // detail-refresh tests.
+// The Consume* stubs block until ctx is cancelled by default — a quiet,
+// never-ending stream. Returning immediately would spin a reconnect loop, so a
+// test that wants scripted events or a specific failure sets the matching hook
+// instead.
 type stubTUIClient struct {
 	mu           sync.Mutex
 	requestedIDs []string // every GetProxyRequest id, in call order
 	detailResp   *api.ProxyRequestDetailResponse
 	detailErr    error
+
+	// Optional per-stream attempt behavior; nil means "connect successfully,
+	// announce the default log epoch, then block until cancelled" (onConnect
+	// and — for logs — onHandshake fire, no events). A scripted hook owns both
+	// calls: invoke onConnect to model an established connection, skip it to
+	// model a dead-on-arrival dial; invoke onHandshake to model a C8+ daemon,
+	// skip it to model an old one that sends no handshake.
+	consumeLogs      func(ctx context.Context, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error
+	consumeRequests  func(ctx context.Context, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
+	consumeProcesses func(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error
+
+	// processesN counts ConsumeProcesses attempts, so a test can watch the
+	// processes loop reconnect. getProcessesN counts REST GetProcesses calls,
+	// which C12 expects to stay at zero for the whole attach session: the
+	// method is no longer on TUIClient at all, and this counter is the
+	// runtime half of that proof.
+	processesN    int
+	requestsN     int
+	getProcessesN int
+
+	// snapshot is the requests-sync REST payload (newest-first, as the real
+	// endpoint returns). nil means an empty snapshot. snapshotErr, when set,
+	// fails every fetch; snapshotCalls counts them.
+	snapshot     []api.ProxyRequestResponse
+	snapshotErr  error
+	snapshotCall func(n int) // optional per-call hook; n is the 1-based call count
+	snapshotN    int         // number of GetProxyRequests calls made
+
+	// logsResponder backs the C9 logs-sync backfill (GetLogs): it owns the
+	// response for each call, so a test can serve a different payload per
+	// attempt (n is the 1-based call count). nil means an empty response.
+	// logsParams records every call's params, in order.
+	logsResponder func(n int, params domain.LogParams) (*api.LogsResponse, error)
+	logsParams    []domain.LogParams
 }
 
+// stubLogEpoch is the stream_id the default ConsumeLogs stub announces. Tests
+// that script their own handshake pick their own.
+const stubLogEpoch = "epoch-stub"
+
+// GetProcesses is deliberately kept on the stub even though C12 removed it from
+// the TUIClient interface: it is the tripwire for a poll creeping back in. If
+// some future code path reaches for REST process state, this counter catches it
+// (see TestClientModel_NeverPollsProcesses).
 func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getProcessesN++
 	return &api.ProcessListResponse{}, nil
+}
+
+// getProcessesCalls returns how many times the REST process poll was called.
+func (s *stubTUIClient) getProcessesCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getProcessesN
+}
+
+// ConsumeProcesses stands in for the processes stream. The default is a
+// connected, silent stream: onConnect fires (which is the whole sync barrier
+// for this stream) and nothing is ever delivered.
+func (s *stubTUIClient) ConsumeProcesses(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error {
+	s.mu.Lock()
+	s.processesN++
+	hook := s.consumeProcesses
+	s.mu.Unlock()
+
+	if hook != nil {
+		return hook(ctx, onConnect, onEvent)
+	}
+	onConnect()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// processesCalls returns how many ConsumeProcesses attempts have been made.
+func (s *stubTUIClient) processesCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processesN
 }
 
 func (s *stubTUIClient) RestartProcess(string) error { return nil }
 
-func (s *stubTUIClient) StreamLogsChannel(domain.LogParams) (<-chan api.LogEntryResponse, error) {
-	ch := make(chan api.LogEntryResponse)
-	close(ch)
-	return ch, nil
+func (s *stubTUIClient) ConsumeLogs(ctx context.Context, _ domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error {
+	if s.consumeLogs != nil {
+		return s.consumeLogs(ctx, onConnect, onHandshake, onEvent)
+	}
+	onConnect()
+	onHandshake(api.HandshakeResponse{StreamID: stubLogEpoch})
+	<-ctx.Done()
+	return ctx.Err()
 }
 
-func (s *stubTUIClient) StreamProxyRequestsChannel(domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error) {
-	ch := make(chan api.ProxyRequestResponse)
-	close(ch)
-	return ch, nil
+// GetLogs serves the logs-sync backfill. Params are recorded so tests can pin
+// the full-fetch vs since_seq-resume decision.
+func (s *stubTUIClient) GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error) {
+	s.mu.Lock()
+	s.logsParams = append(s.logsParams, params)
+	n := len(s.logsParams)
+	responder := s.logsResponder
+	s.mu.Unlock()
+
+	if responder != nil {
+		return responder(n, params)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return &api.LogsResponse{}, nil
+}
+
+// logsCalls returns the params of every GetLogs call, in order.
+func (s *stubTUIClient) logsCalls() []domain.LogParams {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.LogParams(nil), s.logsParams...)
+}
+
+func (s *stubTUIClient) ConsumeProxyRequests(ctx context.Context, _ domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
+	s.mu.Lock()
+	s.requestsN++
+	hook := s.consumeRequests
+	s.mu.Unlock()
+
+	if hook != nil {
+		return hook(ctx, onConnect, onEvent)
+	}
+	onConnect()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// requestsCalls returns how many ConsumeProxyRequests attempts have been made —
+// the observable that proves a parked requests loop was re-probed.
+func (s *stubTUIClient) requestsCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requestsN
 }
 
 func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDetailResponse, error) {
@@ -57,6 +185,32 @@ func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDet
 	return &api.ProxyRequestDetailResponse{
 		ProxyRequestResponse: api.ProxyRequestResponse{ID: id},
 	}, nil
+}
+
+func (s *stubTUIClient) GetProxyRequests(ctx context.Context, _ domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+	s.mu.Lock()
+	s.snapshotN++
+	n := s.snapshotN
+	hook, err, records := s.snapshotCall, s.snapshotErr, s.snapshot
+	s.mu.Unlock()
+
+	if hook != nil {
+		hook(n)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &api.ProxyRequestsResponse{Requests: records}, nil
+}
+
+// snapshotCalls returns how many times GetProxyRequests has been called.
+func (s *stubTUIClient) snapshotCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotN
 }
 
 // lastRequestedID returns the most recent GetProxyRequest id, or "".
@@ -82,6 +236,163 @@ func newClientRequestsModel(stub *stubTUIClient, n, viewportHeight int) ClientMo
 func clientUpdate(m ClientModel, msg tea.Msg) ClientModel {
 	nm, _ := m.Update(msg)
 	return nm.(ClientModel)
+}
+
+// --- C12: the poll is gone; process state arrives on a stream ---
+
+// TestClientModel_NeverPollsProcesses is the panel-mandated no-poll proof.
+// Init must return no command at all, and no message the model can receive —
+// including the TickMsg the deleted poll used to ride — may produce a REST
+// process fetch. The compile-level half of the proof is that
+// ClientModel.fetchProcesses and TUIClient.GetProcesses no longer exist;
+// this is the runtime half.
+func TestClientModel_NeverPollsProcesses(t *testing.T) {
+	stub := &stubTUIClient{}
+	m := NewClientModel(stub)
+
+	require.Nil(t, m.Init(), "attach mode has no periodic work left")
+
+	// A synthetic tick must be inert (the case was deleted, not repurposed).
+	_, cmd := m.Update(TickMsg(time.Now()))
+	if cmd != nil {
+		// tea.Batch of nothing can still be non-nil; running it must at least
+		// never produce a fetch.
+		cmd()
+	}
+
+	assert.Zero(t, stub.getProcessesCalls(), "nothing in attach mode may poll REST /processes")
+}
+
+// TestClientModel_ProcessesMsgUpdatesListAndFilterMap pins that a snapshot
+// delivered by the stream lands exactly as the poll's result did: the process
+// list is replaced wholesale and every new name is registered (defaulting to
+// visible) in the filter map, while an existing name's filter choice is left
+// alone.
+func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
+	m := NewClientModel(&stubTUIClient{})
+	m.filterProcesses["web"] = false // the user hid this one earlier
+
+	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{
+		{Name: "web", State: domain.ProcessState("running"), PID: 10},
+		{Name: "api", State: domain.ProcessState("starting")},
+	}))
+
+	require.Len(t, m.processes, 2)
+	assert.Equal(t, "web", m.processes[0].Name)
+	assert.Equal(t, 10, m.processes[0].PID)
+	assert.False(t, m.filterProcesses["web"], "an existing filter choice survives a snapshot")
+	assert.True(t, m.filterProcesses["api"], "a newly seen process defaults to visible")
+
+	// A later snapshot replaces the list wholesale (processes can disappear).
+	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{{Name: "api"}}))
+	require.Len(t, m.processes, 1)
+	assert.Equal(t, "api", m.processes[0].Name)
+}
+
+// TestClientModel_ConnectionErrorDerivedFromProcessesStream pins C12's derived
+// connectionError: the processes stream's health, and nothing else, drives the
+// status line's connection notice.
+func TestClientModel_ConnectionErrorDerivedFromProcessesStream(t *testing.T) {
+	m := readyClientModel()
+
+	// A drop reports the outage, carrying the loop's own error.
+	m = clientUpdate(m, StreamStatusMsg{
+		Stream: StreamProcesses,
+		Status: stream.Status{State: stream.StateReconnecting, Err: errors.New("connection refused")},
+	})
+	require.Error(t, m.connectionError)
+	assert.EqualError(t, m.connectionError, "connection refused")
+	assert.Contains(t, m.View(), "Connection error (retrying...)")
+	assert.NotContains(t, m.View(), "processes:", "the processes stream never renders its own segment")
+
+	// Recovery clears it.
+	m = clientUpdate(m, statusMsg(StreamProcesses, stream.StateOK))
+	assert.NoError(t, m.connectionError)
+	assert.NotContains(t, m.View(), "Connection error")
+}
+
+// TestClientModel_ConnectionErrorCleanDropHasGenericError covers the drop with
+// no error of its own (the daemon closed the stream cleanly): the notice still
+// has to say something.
+func TestClientModel_ConnectionErrorCleanDropHasGenericError(t *testing.T) {
+	m := clientUpdate(readyClientModel(), statusMsg(StreamProcesses, stream.StateReconnecting))
+
+	require.Error(t, m.connectionError)
+	assert.Equal(t, errProcessesStreamLost, m.connectionError)
+	assert.Contains(t, m.View(), "Connection error (retrying...)")
+}
+
+// TestClientModel_ConnectionErrorClosedStream pins the terminal case: a loop
+// that ended (auth failure, cancellation) is still an outage, not a clean state.
+func TestClientModel_ConnectionErrorClosedStream(t *testing.T) {
+	m := clientUpdate(readyClientModel(), StreamStatusMsg{
+		Stream: StreamProcesses,
+		Status: stream.Status{State: stream.StateClosed, Err: errors.New("api error 401")},
+	})
+
+	assert.EqualError(t, m.connectionError, "api error 401")
+	// Terminal means no retry will ever happen — the rendering must not
+	// promise one (codex C12 finding).
+	assert.Contains(t, m.View(), "Connection lost: api error 401")
+	assert.NotContains(t, m.View(), "retrying")
+}
+
+// TestClientModel_ConnectionErrorLatchedThroughRetrySyncing pins the outage
+// latch (codex C12 finding): the loop emits Syncing before every retry DIALS,
+// and a dial against a blackholed daemon can hang for its full header timeout
+// — the banner must keep reporting the outage until an attempt actually
+// reaches OK.
+func TestClientModel_ConnectionErrorLatchedThroughRetrySyncing(t *testing.T) {
+	m := clientUpdate(readyClientModel(), statusMsg(StreamProcesses, stream.StateReconnecting))
+	require.Error(t, m.connectionError)
+
+	m = clientUpdate(m, statusMsg(StreamProcesses, stream.StateSyncing))
+	assert.Error(t, m.connectionError, "a retry's pre-dial Syncing must not clear the outage")
+	assert.Contains(t, m.View(), "Connection error (retrying...)")
+
+	m = clientUpdate(m, statusMsg(StreamProcesses, stream.StateOK))
+	assert.NoError(t, m.connectionError, "only OK clears the outage")
+	assert.Contains(t, m.View(), "Connected via API")
+}
+
+// TestClientModel_ConnectionErrorOldDaemon pins the version-skew rendering: a
+// parked (404) processes stream reports the old daemon by name rather than
+// leaving the UI silently frozen on an empty process list.
+func TestClientModel_ConnectionErrorOldDaemon(t *testing.T) {
+	m := clientUpdate(readyClientModel(), statusMsg(StreamProcesses, stream.StateUnavailable))
+
+	require.Error(t, m.connectionError)
+	assert.Equal(t, errProcessesStreamUnsupported, m.connectionError)
+	assert.Contains(t, m.connectionError.Error(), "too old")
+	// The park never self-heals by waiting, so the actionable hint renders
+	// instead of the transient "retrying..." wording.
+	assert.Contains(t, m.View(), "too old")
+	assert.NotContains(t, m.View(), "Connection error (retrying...)")
+}
+
+// TestClientModel_ConnectionErrorIgnoresOtherStreams pins that the derivation
+// is processes-only: a dead logs or requests stream degrades its own status-bar
+// segment and must not claim the whole connection is down.
+func TestClientModel_ConnectionErrorIgnoresOtherStreams(t *testing.T) {
+	m := readyClientModel()
+	m = clientUpdate(m, statusMsg(StreamLogs, stream.StateReconnecting))
+	m = clientUpdate(m, statusMsg(StreamRequests, stream.StateUnavailable))
+
+	assert.NoError(t, m.connectionError)
+	view := m.View()
+	assert.NotContains(t, view, "Connection error")
+	assert.Contains(t, view, "⚠ logs: reconnecting…")
+}
+
+// TestClientModel_StartupIsQuiet pins that a fresh attach session shows no
+// connection error before any stream has reported anything.
+func TestClientModel_StartupIsQuiet(t *testing.T) {
+	m := readyClientModel()
+	assert.NoError(t, m.connectionError)
+	assert.NotContains(t, m.View(), "Connection error")
+
+	m = clientUpdate(m, statusMsg(StreamProcesses, stream.StateConnecting))
+	assert.NoError(t, m.connectionError)
 }
 
 // TestClientModel_EnterOpensCursorRow verifies the attach-mode Enter path opens

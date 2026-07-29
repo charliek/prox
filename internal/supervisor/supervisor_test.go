@@ -146,7 +146,7 @@ func TestSupervisor_Events(t *testing.T) {
 	})
 
 	sup := New(cfg, logMgr, nil, DefaultSupervisorConfig())
-	events := sup.Subscribe()
+	events := sup.subscribeEvents()
 
 	ctx := context.Background()
 	_, err := sup.Start(ctx)

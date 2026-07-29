@@ -32,17 +32,28 @@ type HealthChecker struct {
 	// ctx and cancel control the health check loop lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// onTransition, when set, is invoked once per health STATUS change (plan 017
+	// C10) so the supervisor's change bus wakes on a health flip -- Health is
+	// ProcessInfo-visible. It carries no payload and is deliberately a bare
+	// callback rather than a supervisor back-reference: the checker knows nothing
+	// about the supervisor. It is fired with h.mu RELEASED (see runCheck), because
+	// a woken subscriber calls back into Processes() -> Info() -> State(), which
+	// takes h.mu. Set once at construction, so it is read lock-free.
+	onTransition func()
 }
 
-// NewHealthChecker creates a new health checker
-func NewHealthChecker(process string, config domain.HealthConfig) *HealthChecker {
+// NewHealthChecker creates a new health checker. onTransition may be nil; when
+// set it fires (lock-free) on each health status change -- see the field comment.
+func NewHealthChecker(process string, config domain.HealthConfig, onTransition func()) *HealthChecker {
 	// Apply defaults
 	config = config.WithDefaults()
 
 	return &HealthChecker{
-		config:  config,
-		process: process,
-		status:  domain.HealthStatusUnknown,
+		config:       config,
+		process:      process,
+		status:       domain.HealthStatusUnknown,
+		onTransition: onTransition,
 	}
 }
 
@@ -130,7 +141,9 @@ func (h *HealthChecker) runCheck(ctx context.Context) {
 	err := cmd.Run()
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	// prev is sampled under the lock alongside the commit below so the transition
+	// test is exact; the callback itself fires after the unlock.
+	prev := h.status
 
 	h.lastCheck = time.Now()
 
@@ -159,5 +172,16 @@ func (h *HealthChecker) runCheck(ctx context.Context) {
 		// Health check passed
 		h.consecutiveFailures = 0
 		h.status = domain.HealthStatusHealthy
+	}
+	changed := h.status != prev
+	h.mu.Unlock()
+
+	// LOCK DISCIPLINE: h.mu is released above; the callback re-enters the
+	// supervisor (Processes -> Info -> State), which takes p.mu and h.mu. Fired
+	// only on a real status change, so a steady stream of passing checks does not
+	// wake subscribers on every tick (LastCheck/LastOutput churn deliberately does
+	// not notify).
+	if changed && h.onTransition != nil {
+		h.onTransition()
 	}
 }

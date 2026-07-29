@@ -46,16 +46,58 @@ type Handlers struct {
 	configFile     string
 	shutdown       ShutdownController
 	proxyStatus    ProxyStatusProvider
+
+	// sseHeartbeatInterval overrides constants.SSEHeartbeatInterval for the SSE
+	// handlers (StreamLogs, StreamProxyRequests, StreamProcesses). Zero means
+	// "use the default"; tests in this package set it directly to a short
+	// interval instead of mutating a package-level var, which would race across
+	// parallel tests (mirrors the forwarderConfig injectable-value idiom in
+	// internal/proxyd/forwarder.go).
+	sseHeartbeatInterval time.Duration
+
+	// processStreamDebounceInterval is the trailing-edge debounce window
+	// StreamProcesses waits (while absorbing further wakes) after a
+	// process-change before it snapshots and sends (plan 017 C11). Unlike
+	// sseHeartbeatInterval, this field is seeded with the production default at
+	// construction (see NewHandlers), so ZERO is unambiguous test territory: a
+	// test that wants every wake to snapshot immediately (no coalescing) sets
+	// this to 0 directly, and a test exercising the debounce itself sets it to
+	// a short interval instead of the production ~100ms.
+	processStreamDebounceInterval time.Duration
+}
+
+// processStreamDebounceDefault is the production trailing-edge debounce window
+// for StreamProcesses (plan 017 C11): a burst of rapid process transitions
+// (several processes starting together, a flapping health check, ...)
+// coalesces into one snapshot instead of one event per change.
+const processStreamDebounceDefault = 100 * time.Millisecond
+
+// heartbeatInterval returns the SSE heartbeat interval to use: the injected
+// test override if set, otherwise the production default.
+func (h *Handlers) heartbeatInterval() time.Duration {
+	if h.sseHeartbeatInterval > 0 {
+		return h.sseHeartbeatInterval
+	}
+	return constants.SSEHeartbeatInterval
+}
+
+// processStreamDebounce returns the trailing-edge debounce window
+// StreamProcesses applies after a wake, before it snapshots and sends. See the
+// processStreamDebounceInterval field comment for why 0 here is a real,
+// deliberate "no debounce" value rather than an unset sentinel.
+func (h *Handlers) processStreamDebounce() time.Duration {
+	return h.processStreamDebounceInterval
 }
 
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
 // exercise POST /shutdown; the handler guards against it.
 func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile string, shutdown ShutdownController) *Handlers {
 	return &Handlers{
-		supervisor: sup,
-		logManager: logMgr,
-		configFile: configFile,
-		shutdown:   shutdown,
+		supervisor:                    sup,
+		logManager:                    logMgr,
+		configFile:                    configFile,
+		shutdown:                      shutdown,
+		processStreamDebounceInterval: processStreamDebounceDefault,
 	}
 }
 
@@ -141,17 +183,25 @@ func summarizeCheck(kind, target string) string {
 
 // GetProcesses handles GET /api/v1/processes
 func (h *Handlers) GetProcesses(w http.ResponseWriter, r *http.Request) {
-	processes := h.supervisor.Processes()
+	writeJSON(w, http.StatusOK, processListResponse(h.supervisor))
+}
+
+// processListResponse converts the supervisor's current process set to a
+// ProcessListResponse. Factored out (plan 017 C11) so GetProcesses (REST) and
+// StreamProcesses (SSE, sse.go) share ONE conversion -- they cannot drift
+// apart, and every event on the stream is exactly what a poll of GetProcesses
+// would return at that instant.
+func processListResponse(sup *supervisor.Supervisor) ProcessListResponse {
+	processes := sup.Processes()
 
 	resp := ProcessListResponse{
 		Processes: make([]ProcessResponse, len(processes)),
 	}
-
 	for i, p := range processes {
 		resp.Processes[i] = ToProcessResponse(p)
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
 
 // GetProcess handles GET /api/v1/processes/{name}
@@ -215,18 +265,58 @@ func (h *Handlers) RestartProcess(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SuccessResponse{Success: true})
 }
 
-// GetLogs handles GET /api/v1/logs
+// GetLogs handles GET /api/v1/logs.
+//
+// Response ordering: without since_seq, Logs holds the newest `lines`
+// matching entries in the ring buffer's own chronological (oldest-first)
+// order -- unchanged from before this cursor API existed. With since_seq,
+// Logs holds every matching entry with Seq > since_seq, oldest-first BY
+// CONSTRUCTION (logs.Manager.QueryFromSeq deliberately keeps the OLDEST
+// entries when `lines` caps the result, so a resuming client advances its
+// cursor contiguously instead of being handed a slice with a gap in it). Both
+// paths therefore render oldest-first, but for different reasons -- do not
+// assume the last-N path's order is incidental.
+//
+// StreamID/OldestSeq/LatestSeq are populated on EVERY response (plan 017 C8),
+// not just since_seq requests, so a client can detect a daemon restart
+// (StreamID changed) or a buffer rollover past its held cursor (OldestSeq >
+// since_seq+1) from a plain poll. Both paths source Logs and the bounds from
+// ONE logs.Manager buffer snapshot (via QueryFromSeq) so they can never
+// describe different moments.
 func (h *Handlers) GetLogs(w http.ResponseWriter, r *http.Request) {
-	filter, limit, err := parseLogParams(r)
+	filter, limit, sinceSeq, hasSinceSeq, err := parseLogParams(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: err.Error(),
-			Code:  domain.ErrCodeInvalidPattern,
+			Code:  domain.ErrCodeInvalidSinceSeq,
 		})
 		return
 	}
 
-	entries, total, err := h.logManager.QueryLast(filter, limit)
+	var (
+		entries              []domain.LogEntry
+		total                int
+		oldestSeq, latestSeq uint64
+	)
+	if hasSinceSeq {
+		entries, oldestSeq, latestSeq, err = h.logManager.QueryFromSeq(filter, sinceSeq, limit)
+		total = len(entries)
+	} else {
+		// QueryFromSeq(sinceSeq=0) is uncapped (limit=0) here so it returns
+		// every matching entry oldest-first from ONE buffer snapshot; trimming
+		// to the newest `limit` below reproduces the historical QueryLast
+		// behavior while still sourcing entries and bounds from that same
+		// snapshot (see doc comment above).
+		var all []domain.LogEntry
+		all, oldestSeq, latestSeq, err = h.logManager.QueryFromSeq(filter, 0, 0)
+		if err == nil {
+			total = len(all)
+			entries = all
+			if limit > 0 && len(entries) > limit {
+				entries = entries[len(entries)-limit:]
+			}
+		}
+	}
 	if err != nil {
 		writeError(w, err)
 		return
@@ -236,6 +326,9 @@ func (h *Handlers) GetLogs(w http.ResponseWriter, r *http.Request) {
 		Logs:          make([]LogEntryResponse, len(entries)),
 		FilteredCount: len(entries),
 		TotalCount:    total,
+		StreamID:      h.logManager.StreamID(),
+		OldestSeq:     oldestSeq,
+		LatestSeq:     latestSeq,
 	}
 
 	for i, e := range entries {
@@ -313,10 +406,16 @@ func shutdownFailures(outcome *domain.ProcessStopError) []ShutdownFailureRespons
 	return failures
 }
 
-// parseLogParams extracts log filter parameters from request
-func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
-	filter := domain.LogFilter{}
-
+// parseLogParams extracts log filter parameters from the request: the
+// process/pattern/regex filter, the "lines" limit (default
+// constants.DefaultLogLimit, capped at constants.MaxLogLines; a malformed or
+// non-positive value silently falls back to the default -- preserved
+// unchanged for backward compatibility), and the optional "since_seq" resume
+// cursor (plan 017 C8, hasSinceSeq reports whether it was present at all).
+// Unlike "lines", a present-but-unparseable since_seq is a hard error: it
+// names a specific cursor the caller believes is valid, so silently
+// substituting a default would silently change what "resume from here" means.
+func parseLogParams(r *http.Request) (filter domain.LogFilter, limit int, sinceSeq uint64, hasSinceSeq bool, err error) {
 	// Process filter
 	if processes := r.URL.Query().Get("process"); processes != "" {
 		filter.Processes = strings.Split(processes, ",")
@@ -331,9 +430,9 @@ func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
 	}
 
 	// Lines limit (default 100, max 10000 to prevent DoS)
-	limit := constants.DefaultLogLimit
+	limit = constants.DefaultLogLimit
 	if linesStr := r.URL.Query().Get("lines"); linesStr != "" {
-		if l, err := strconv.Atoi(linesStr); err == nil && l > 0 {
+		if l, perr := strconv.Atoi(linesStr); perr == nil && l > 0 {
 			if l > constants.MaxLogLines {
 				limit = constants.MaxLogLines
 			} else {
@@ -342,7 +441,24 @@ func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
 		}
 	}
 
-	return filter, limit, nil
+	// since_seq resume cursor. Presence is checked via the query map, not a
+	// non-empty Get: an explicitly empty `?since_seq=` is a malformed resume
+	// request and must 400 rather than silently degrade to the last-N path,
+	// which could hand a resuming client a page with a hidden gap.
+	if sinceVals, present := r.URL.Query()["since_seq"]; present {
+		sinceStr := ""
+		if len(sinceVals) > 0 {
+			sinceStr = sinceVals[0]
+		}
+		v, perr := strconv.ParseUint(sinceStr, 10, 64)
+		if perr != nil {
+			return domain.LogFilter{}, 0, 0, false, fmt.Errorf("invalid since_seq %q: %w", sinceStr, perr)
+		}
+		sinceSeq = v
+		hasSinceSeq = true
+	}
+
+	return filter, limit, sinceSeq, hasSinceSeq, nil
 }
 
 // writeJSON writes a JSON response
@@ -611,8 +727,7 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error: "streaming not supported",
 			Code:  domain.ErrCodeStreamingNotSupported,
@@ -630,14 +745,25 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 	sub := h.requestManager.Subscribe(filter)
 	defer h.requestManager.Unsubscribe(sub.ID)
 
+	// rc lets each SSE write set a per-write deadline (see sseWrite in sse.go).
+	rc := http.NewResponseController(w)
+
 	// Send initial comment to establish connection
-	fmt.Fprintf(w, ": connected\n\n")
-	flusher.Flush()
+	if err := sseWrite(rc, w, []byte(": connected\n\n")); err != nil {
+		return
+	}
+
+	ticker := time.NewTicker(h.heartbeatInterval())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ticker.C:
+			if err := sseWrite(rc, w, []byte(": ping\n\n")); err != nil {
+				return
+			}
 		case req, ok := <-sub.Ch:
 			if !ok {
 				return
@@ -650,10 +776,9 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if _, err := w.Write([]byte("data: " + string(data) + "\n\n")); err != nil {
+			if err := sseWrite(rc, w, []byte("data: "), data, []byte("\n\n")); err != nil {
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 )
 
 // maxLogEntries is the maximum number of log entries to keep in memory
@@ -44,6 +45,13 @@ type BaseModel struct {
 	processes     []domain.ProcessInfo
 	logEntries    []domain.LogEntry
 	proxyRequests []proxy.RequestRecord
+
+	// staleRequests holds the IDs of in-flight rows a requests-stream sync
+	// swept as prior-epoch: the server we synchronized against does not know
+	// them, so their completion can never arrive (see sweepPriorEpochInFlight).
+	// Rebuilt from the live list on every sync, and consulted only through
+	// requestIsStale.
+	staleRequests map[string]bool
 
 	// UI components
 	viewport  viewport.Model
@@ -73,15 +81,16 @@ type BaseModel struct {
 	logSearchQuery string
 
 	// logSeq is a session-local monotonic counter stamped onto each ingested
-	// LogEntry.Seq. The logs cursor is anchored by Seq, not index, so it rides
-	// the 1000-entry front-eviction ring without drifting (a bare index would
-	// shift when old entries are dropped — see LogEntry.Seq) (D7).
+	// LogEntry.DisplaySeq. The logs cursor is anchored by DisplaySeq, not index,
+	// so it rides the 1000-entry front-eviction ring without drifting (a bare
+	// index would shift when old entries are dropped — see LogEntry.DisplaySeq).
+	// This is unrelated to LogEntry.Seq, the server ingest sequence (D7).
 	logSeq int64
 
-	// Logs-view search cursor (Seq-anchored). logCursorSeq names the line the
-	// cursor sits on; logCursorIdx is its index in the filtered list. Both are
+	// Logs-view search cursor (DisplaySeq-anchored). logCursorSeq names the line
+	// the cursor sits on; logCursorIdx is its index in the filtered list. Both are
 	// mutated ONLY through setLogCursor so they can never disagree. logCursorSeq
-	// 0 is the explicit no-cursor sentinel (ingested Seqs are always >= 1), and
+	// 0 is the explicit no-cursor sentinel (stamped DisplaySeqs are always >= 1), and
 	// logCursorIdx -1 pairs with it. Unlike the requests cursor, this one exists
 	// only while a `/`-search is active and is not scroll-coupled: j/k keep
 	// scrolling the viewport, and resolveLogCursor only re-derives the marker
@@ -117,6 +126,14 @@ type BaseModel struct {
 	// on leaving the detail view (esc).
 	detailRefreshFailed bool
 
+	// Per-stream health. streamHealth holds the last status reported for each
+	// stream; a stream with no entry has reported nothing and renders nothing.
+	// streamDropped latches a stream that has been seen reconnecting, so the
+	// Syncing that follows a drop keeps rendering as "reconnecting…" while a
+	// first-connect Syncing stays silent (see handleStreamStatus).
+	streamHealth  map[StreamID]stream.Status
+	streamDropped map[StreamID]bool
+
 	// Dimensions
 	width  int
 	height int
@@ -137,10 +154,13 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		processes:       make([]domain.ProcessInfo, 0),
 		logEntries:      make([]domain.LogEntry, 0),
 		proxyRequests:   make([]proxy.RequestRecord, 0),
+		staleRequests:   make(map[string]bool),
 		textInput:       ti,
 		mode:            ModeNormal,
 		viewMode:        ViewModeLogs,
 		filterProcesses: make(map[string]bool),
+		streamHealth:    make(map[StreamID]stream.Status),
+		streamDropped:   make(map[StreamID]bool),
 		followMode:      true,
 		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
@@ -171,15 +191,27 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	}
 }
 
-// handleLogEntry handles a new log entry message
+// handleLogEntry handles a new log entry message: one append followed by one
+// render.
 func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	// Check if we're at/near bottom BEFORE adding new content
 	wasNearBottom := b.isNearBottom()
+	b.appendLogEntry(entry)
+	b.renderAfterLogEntries(wasNearBottom)
+}
 
-	// Stamp a session-local monotonic Seq so the logs search cursor can anchor
-	// to this line's identity across the front-eviction ring below (D7).
+// appendLogEntry stamps one entry and appends it to the ring WITHOUT
+// rendering. Split out of handleLogEntry so a sync batch (C9) can apply a
+// thousand entries and render once; every arrival path — live entry, batch
+// entry, synthetic notice — goes through here, so the DisplaySeq stamping and
+// the eviction trim are identical for all of them.
+func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
+	// Stamp a session-local monotonic DisplaySeq so the logs search cursor can
+	// anchor to this line's identity across the front-eviction ring below. This
+	// overwrites nothing on the wire: the server's LogEntry.Seq is a separate
+	// field and is left untouched (D7).
 	b.logSeq++
-	entry.Seq = b.logSeq
+	entry.DisplaySeq = b.logSeq
 	b.logEntries = append(b.logEntries, entry)
 	// Keep only last entries - create new slice to release memory from old entries
 	if len(b.logEntries) > maxLogEntries {
@@ -187,6 +219,14 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 		copy(newEntries, b.logEntries[len(b.logEntries)-maxLogEntries:])
 		b.logEntries = newEntries
 	}
+}
+
+// renderAfterLogEntries is the shared render tail for log arrivals — one live
+// entry or a whole sync batch. wasNearBottom is the viewport's position
+// sampled BEFORE the entries were appended (its meaning is lost afterwards).
+// Batches deliberately share it so a 1000-entry replay costs exactly one
+// render, mirroring renderAfterProxyRequests.
+func (b *BaseModel) renderAfterLogEntries(wasNearBottom bool) {
 	b.updateViewport()
 
 	// If user was at bottom, re-enable follow mode and stay at bottom — UNLESS an
@@ -205,33 +245,89 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	}
 }
 
-// handleProxyRequest handles a new proxy request message. It upserts by ID:
-// a same-ID re-record (in-flight followed by its completion) replaces the
-// existing row in place rather than appending a duplicate, scanning from the
-// newest entry since that's where a live in-flight row lives. In-place
-// replacement keeps every other row's index stable, and the ID-anchored cursor
-// (resolveRequestCursor) rides along on its row regardless.
+// handleLogsSync applies one completed logs-stream synchronization (C9): the
+// optional notice line first, then the batch entries oldest-first, then ONE
+// render.
+//
+// The handler is deliberately dumb — append, don't merge. All the hard parts
+// (which entries to fetch, epoch changes, dropping entries this model has
+// already been shown) live in the sync layer, which excludes overlap by
+// cursor BEFORE delivery (logs_sync.go). Log lines have no identity to merge
+// on the way proxy requests do (the same line can legitimately repeat), so a
+// model-side dedupe is not available even in principle.
+//
+// Entries that predate an epoch change stay in the list as history: they are
+// what the previous daemon run printed, and the notice line marks the seam.
+func (b *BaseModel) handleLogsSync(msg LogsSyncMsg) {
+	if msg.Notice == "" && len(msg.Entries) == 0 {
+		return // nothing changed: a caught-up reconnect must not force a render
+	}
+
+	wasNearBottom := b.isNearBottom()
+	if msg.Notice != "" {
+		b.appendLogEntry(systemLogEntry(msg.Notice))
+	}
+	for _, entry := range msg.Entries {
+		b.appendLogEntry(entry)
+	}
+	b.renderAfterLogEntries(wasNearBottom)
+}
+
+// handleProxyRequest handles a new proxy request message: one monotonic merge
+// followed by one render.
 func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
-	replaced := false
+	b.mergeProxyRequest(req)
+	b.renderAfterProxyRequests()
+}
+
+// mergeProxyRequest applies one record to the list as a monotonic two-state
+// transition keyed by ID, mirroring proxy.Upsert's table:
+//
+//	absent                            → append (with the eviction trim)
+//	existing in-flight, incoming any  → replace in place
+//	existing final                    → no-op (final is terminal)
+//
+// The one deliberate difference from proxy.Upsert is the in-flight → in-flight
+// row: the ring no-ops it as a duplicate delivery, while the list takes the
+// newer copy. Both are correct (the two copies differ in nothing that matters),
+// and taking it keeps the display tracking the freshest server view.
+//
+// The terminal-final row is what makes replaying a snapshot alongside live
+// events safe in any interleaving (C6): a snapshot's stale in-flight copy can
+// never regress a completion that already arrived live, and a duplicate final
+// can never re-render one. In-place replacement keeps every other row's index
+// stable, and the ID-anchored cursor (resolveRequestCursor) rides along on its
+// row regardless. The scan runs newest-first, since that's where a live
+// in-flight row lives.
+//
+// Records with no ID (never produced by either proxy path) always append: they
+// have no identity to merge on.
+func (b *BaseModel) mergeProxyRequest(req proxy.RequestRecord) {
 	if req.ID != "" {
 		for i := len(b.proxyRequests) - 1; i >= 0; i-- {
-			if b.proxyRequests[i].ID == req.ID {
-				b.proxyRequests[i] = req
-				replaced = true
-				break
+			if b.proxyRequests[i].ID != req.ID {
+				continue
 			}
-		}
-	}
-	if !replaced {
-		b.proxyRequests = append(b.proxyRequests, req)
-		// Keep only last requests - create new slice to release memory from old requests
-		if len(b.proxyRequests) > maxProxyRequests {
-			newRequests := make([]proxy.RequestRecord, maxProxyRequests)
-			copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
-			b.proxyRequests = newRequests
+			if b.proxyRequests[i].InFlight {
+				b.proxyRequests[i] = req
+			} // else: final is terminal
+			return
 		}
 	}
 
+	b.proxyRequests = append(b.proxyRequests, req)
+	// Keep only last requests - create new slice to release memory from old requests
+	if len(b.proxyRequests) > maxProxyRequests {
+		newRequests := make([]proxy.RequestRecord, maxProxyRequests)
+		copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
+		b.proxyRequests = newRequests
+	}
+}
+
+// renderAfterProxyRequests is the shared render tail for request arrivals —
+// one live record or a whole sync batch. Batches deliberately share it so a
+// 1000-record replay costs exactly one render.
+func (b *BaseModel) renderAfterProxyRequests() {
 	// In the detail view an arrival updates only the list data: the viewport is
 	// showing the open detail, so re-rendering/scrolling it would yank the
 	// reader (today's GotoBottom wart). No follow change either. C4 layers the
@@ -261,6 +357,69 @@ func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
 	} else if b.followMode {
 		b.viewport.GotoBottom()
 	}
+}
+
+// handleRequestsSync applies one completed stream synchronization (C6): the
+// REST snapshot oldest-first, then the events buffered during the fetch in
+// arrival order, all through the monotonic merge — so any interleaving of
+// {snapshot copy, live copy, completion} converges on the final record with no
+// duplicate rows and no regressions.
+//
+// Everything renders ONCE at the end: a full 1000-record ring replay must not
+// re-render a thousand times. Cursor and follow semantics are unchanged because
+// they live in that single updateViewport — the cursor is ID-anchored, so a
+// user parked on a row keeps it, and follow mode re-pins to the newest row.
+func (b *BaseModel) handleRequestsSync(msg RequestsSyncMsg) {
+	seen := make(map[string]struct{}, len(msg.Snapshot)+len(msg.Buffered))
+	for _, req := range msg.Snapshot {
+		seen[req.ID] = struct{}{}
+		b.mergeProxyRequest(req)
+	}
+	for _, req := range msg.Buffered {
+		seen[req.ID] = struct{}{}
+		b.mergeProxyRequest(req)
+	}
+
+	b.sweepPriorEpochInFlight(seen)
+	b.renderAfterProxyRequests()
+}
+
+// sweepPriorEpochInFlight marks every still-in-flight row the sync did not
+// account for as stale. Such a row belongs to a dead epoch: the server we just
+// synchronized against has no record of it, so no completion event for it can
+// ever arrive and it would otherwise sit spinning "...ms" forever. seen holds
+// the IDs the sync batch carried (snapshot plus buffered live events), so a
+// request that legitimately started during the fetch is never swept.
+//
+// The mark is TUI-local: staleness on a proxy.RequestRecord is derived from its
+// age (StaleAt), and back-dating a record's Timestamp to force that would
+// corrupt the time column. The map is rebuilt from the live list on every sweep,
+// so it cannot grow past the list.
+func (b *BaseModel) sweepPriorEpochInFlight(seen map[string]struct{}) {
+	stale := make(map[string]bool)
+	for _, req := range b.proxyRequests {
+		if !req.InFlight || req.ID == "" {
+			continue
+		}
+		if _, ok := seen[req.ID]; ok {
+			continue
+		}
+		stale[req.ID] = true
+	}
+	b.staleRequests = stale
+}
+
+// requestIsStale reports whether a row renders as stale (D8, #53): either it
+// has been in-flight past constants.InFlightStaleAfter, or a sync batch swept
+// it as prior-epoch. Final records are never stale under either rule, which is
+// also why a swept row that later completes needs no explicit unmarking: the
+// in-flight gate below short-circuits before the map is consulted, and the next
+// sweep rebuilds the map from scratch anyway.
+func (b *BaseModel) requestIsStale(req proxy.RequestRecord) bool {
+	if !req.InFlight {
+		return false
+	}
+	return req.StaleAt(time.Now()) || b.staleRequests[req.ID]
 }
 
 // handleFilterKey handles keys in filter mode
@@ -733,7 +892,7 @@ func (b *BaseModel) seekLogSearchMatch(dir int) {
 
 // logSearchOriginIdx returns the index in entries from which a seek should
 // begin. With a cursor already anchored (logCursorSeq set), it re-resolves that
-// Seq to its current index — surviving the eviction ring — and clamps the
+// DisplaySeq to its current index — surviving the eviction ring — and clamps the
 // last-known index when the anchored line has been evicted. On the FIRST search
 // (no cursor yet), it seeds from what the user is looking at: the newest row
 // under follow, else the top visible row derived from the viewport offset, so
@@ -742,7 +901,7 @@ func (b *BaseModel) logSearchOriginIdx(entries []domain.LogEntry) int {
 	n := len(entries)
 	if b.logCursorSeq != 0 {
 		for i, e := range entries {
-			if e.Seq == b.logCursorSeq {
+			if e.DisplaySeq == b.logCursorSeq {
 				return i
 			}
 		}
@@ -791,14 +950,14 @@ func (b *BaseModel) setLogCursor(entries []domain.LogEntry, idx int) {
 	}
 	idx = clampIndex(idx, len(entries))
 	b.logCursorIdx = idx
-	b.logCursorSeq = entries[idx].Seq
+	b.logCursorSeq = entries[idx].DisplaySeq
 }
 
 // resolveLogCursor re-anchors the logs search cursor against the current
 // filtered list at render time (called from updateViewport only while a search
 // is active), so the row marker stays on the searched-to line as entries stream
 // in and the eviction ring shifts indices. Mirrors resolveRequestCursor but
-// anchors by Seq (logs have no ID) and NEVER scrolls — the logs viewport scroll
+// anchors by DisplaySeq (logs have no ID) and NEVER scrolls — the logs viewport scroll
 // stays owned by j/k, follow, and the one-shot ensureLogCursorVisible.
 //
 // Unlike the requests cursor (which always exists), the logs cursor is
@@ -822,7 +981,7 @@ func (b *BaseModel) resolveLogCursor(entries []domain.LogEntry) {
 		return
 	}
 	for i, e := range entries {
-		if e.Seq == b.logCursorSeq {
+		if e.DisplaySeq == b.logCursorSeq {
 			b.setLogCursor(entries, i)
 			return
 		}
@@ -1435,7 +1594,7 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	durationMs := req.Duration.Milliseconds()
 	var duration string
 	switch {
-	case req.StaleAt(time.Now()):
+	case b.requestIsStale(req):
 		duration = "stale?"
 	case req.InFlight:
 		duration = "  ...ms"
@@ -1640,6 +1799,13 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		left = "String filter: " + b.textInput.View()
 	default:
 		left = b.statusLeftDefault(extraInfo, requests, entries)
+	}
+
+	// Per-stream health rides on the end of the left side in every mode: a
+	// degraded stream is worth showing even while a filter prompt is open, and
+	// it is orthogonal to the overall-connection text attach mode owns.
+	if segs := b.streamHealthSegments(); len(segs) > 0 {
+		left += " | " + strings.Join(segs, " | ")
 	}
 
 	// Right side: follow mode and count

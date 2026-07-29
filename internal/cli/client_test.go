@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/tui"
 )
 
 func TestNewClient(t *testing.T) {
@@ -444,7 +447,7 @@ func TestClient_GetLogs(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	logs, err := client.GetLogs(domain.LogParams{
+	logs, err := client.GetLogs(context.Background(), domain.LogParams{
 		Process: "web",
 		Lines:   50,
 		Pattern: "error",
@@ -569,16 +572,51 @@ func TestParseSSELogEntry_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestParseSSELogEntry_EmptyObject documents the plan 017 C8 guard: an empty
+// object unmarshals into a zero-valued LogEntryResponse without a JSON error
+// (unknown/missing fields are simply left at their zero value), but a real
+// log entry can never have empty Process AND empty Line AND Seq==0 all at
+// once, so this shape is rejected rather than surfaced as a phantom log row.
 func TestParseSSELogEntry_EmptyObject(t *testing.T) {
 	data := `{}`
+
+	_, ok := parseSSELogEntry(data)
+
+	if ok {
+		t.Fatal("expected parsing to reject an empty object")
+	}
+}
+
+// TestParseSSELogEntry_HandshakePayload asserts the guard specifically
+// against the stream handshake event's body (api.HandshakeResponse): its
+// only field, stream_id, is not a LogEntryResponse field, so it unmarshals
+// the same as an empty object and must be rejected the same way (plan 017
+// C8) -- this is what keeps the "event: handshake" frame StreamLogs sends
+// from materializing as a phantom empty log row in the attach TUI.
+func TestParseSSELogEntry_HandshakePayload(t *testing.T) {
+	data := `{"stream_id":"deadbeefcafef00d"}`
+
+	_, ok := parseSSELogEntry(data)
+
+	if ok {
+		t.Fatal("expected parsing to reject a handshake-shaped payload")
+	}
+}
+
+// TestParseSSELogEntry_SeqOnlyRealEntry guards the other side of the fix: a
+// real entry with an empty Line (a blank log line is legitimate output) must
+// still be accepted as long as Process or Seq is non-zero, so the guard
+// cannot be loosened to reject on Line alone.
+func TestParseSSELogEntry_SeqOnlyRealEntry(t *testing.T) {
+	data := `{"process":"web","stream":"stdout","line":"","seq":7}`
 
 	entry, ok := parseSSELogEntry(data)
 
 	if !ok {
-		t.Fatal("expected parsing to succeed for empty object")
+		t.Fatal("expected parsing to succeed for a real entry with an empty line")
 	}
-	if entry.Process != "" || entry.Line != "" {
-		t.Errorf("expected empty fields, got process=%q, line=%q", entry.Process, entry.Line)
+	if entry.Seq != 7 {
+		t.Errorf("expected seq 7, got %d", entry.Seq)
 	}
 }
 
@@ -808,7 +846,7 @@ func TestClient_GetProxyRequests(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	resp, err := client.GetProxyRequests(domain.ProxyRequestParams{
+	resp, err := client.GetProxyRequests(context.Background(), domain.ProxyRequestParams{
 		Subdomain: "api",
 		Method:    "GET",
 		MinStatus: 400,
@@ -888,7 +926,7 @@ func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	_, err := client.StreamLogsChannel(domain.LogParams{
+	_, err := client.StreamLogsChannel(context.Background(), domain.LogParams{
 		Process: "web",
 		Lines:   50,
 		Pattern: "error",
@@ -914,5 +952,619 @@ func TestClient_StreamLogsChannel_QueryParams(t *testing.T) {
 	}
 	if !strings.Contains(receivedQuery, "regex=true") {
 		t.Errorf("expected regex=true in query, got %s", receivedQuery)
+	}
+}
+
+// TestClient_APIError pins the typed error surfaced for every non-2xx response:
+// callers can errors.As it for the status/code, and the rendered text still
+// matches the human-readable format the CLI printed before APIError existed.
+func TestClient_APIError(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantCode    string
+		wantMessage string
+		wantText    string
+	}{
+		{
+			name:     "unauthorized without body",
+			status:   http.StatusUnauthorized,
+			wantText: "authentication failed: invalid or missing token",
+		},
+		{
+			name:     "forbidden without body",
+			status:   http.StatusForbidden,
+			wantText: "access denied: insufficient permissions",
+		},
+		{
+			name:        "message without code renders bare message",
+			status:      http.StatusServiceUnavailable,
+			contentType: "application/json",
+			body:        `{"error":"proxy is not enabled"}`,
+			wantMessage: "proxy is not enabled",
+			wantText:    "proxy is not enabled",
+		},
+		{
+			name:        "not found with error body",
+			status:      http.StatusNotFound,
+			contentType: "application/json",
+			body:        `{"error":"process not found","code":"PROCESS_NOT_FOUND"}`,
+			wantCode:    "PROCESS_NOT_FOUND",
+			wantMessage: "process not found",
+			wantText:    "PROCESS_NOT_FOUND: process not found",
+		},
+		{
+			name:        "service unavailable with proxy code",
+			status:      http.StatusServiceUnavailable,
+			contentType: "application/json",
+			body:        `{"error":"proxy is not enabled","code":"PROXY_NOT_ENABLED"}`,
+			wantCode:    "PROXY_NOT_ENABLED",
+			wantMessage: "proxy is not enabled",
+			wantText:    "PROXY_NOT_ENABLED: proxy is not enabled",
+		},
+		{
+			name:        "internal error with unparseable body",
+			status:      http.StatusInternalServerError,
+			contentType: "text/html",
+			body:        "<html>boom</html>",
+			wantText:    "server error: the prox daemon encountered an internal error",
+		},
+		{
+			name:     "unmapped status",
+			status:   http.StatusTeapot,
+			wantText: "request failed with status 418",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				if tt.body != "" {
+					w.Write([]byte(tt.body))
+				}
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL)
+			_, err := client.GetStatus()
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected *APIError, got %T: %v", err, err)
+			}
+			if apiErr.Status != tt.status {
+				t.Errorf("expected Status %d, got %d", tt.status, apiErr.Status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("expected Code %q, got %q", tt.wantCode, apiErr.Code)
+			}
+			if apiErr.Message != tt.wantMessage {
+				t.Errorf("expected Message %q, got %q", tt.wantMessage, apiErr.Message)
+			}
+			if err.Error() != tt.wantText {
+				t.Errorf("expected error text %q, got %q", tt.wantText, err.Error())
+			}
+		})
+	}
+}
+
+// proxyNotEnabledServer answers every request with the 503 the daemon sends
+// when it is running without the proxy.
+func proxyNotEnabledServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(api.ErrorResponse{
+			Error: "proxy is not enabled",
+			Code:  domain.ErrCodeProxyNotEnabled,
+		})
+	}))
+}
+
+// requireProxyNotEnabledError asserts err is the discriminable connect failure
+// the TUI's requests reconnect policy parks on: an *APIError carrying both the
+// 503 status and the machine-readable code.
+func requireProxyNotEnabledError(t *testing.T, err error) {
+	t.Helper()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != domain.ErrCodeProxyNotEnabled {
+		t.Errorf("expected 503/%s, got %d/%s", domain.ErrCodeProxyNotEnabled, apiErr.Status, apiErr.Code)
+	}
+}
+
+// TestClient_StreamProxyRequestsChannel_ProxyNotEnabled proves the channel form
+// surfaces the 503 synchronously, at connect time.
+func TestClient_StreamProxyRequestsChannel_ProxyNotEnabled(t *testing.T) {
+	server := proxyNotEnabledServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamProxyRequestsChannel(context.Background(), domain.ProxyRequestParams{})
+	requireProxyNotEnabledError(t, err)
+}
+
+// TestAPIError_SatisfiesTUIStatusError pins the structural contract the TUI's
+// reconnect policies classify on: internal/tui cannot import internal/cli, so
+// it matches *APIError through this interface.
+func TestAPIError_SatisfiesTUIStatusError(t *testing.T) {
+	var statusErr tui.APIStatusError = &APIError{
+		Status: http.StatusServiceUnavailable,
+		Code:   domain.ErrCodeProxyNotEnabled,
+	}
+	if statusErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Errorf("expected StatusCode 503, got %d", statusErr.StatusCode())
+	}
+	if statusErr.ErrorCode() != domain.ErrCodeProxyNotEnabled {
+		t.Errorf("expected ErrorCode %q, got %q", domain.ErrCodeProxyNotEnabled, statusErr.ErrorCode())
+	}
+}
+
+// TestClient_ConsumeProxyRequests_ProxyNotEnabled proves the attempt form
+// returns the same discriminable error rather than swallowing it.
+func TestClient_ConsumeProxyRequests_ProxyNotEnabled(t *testing.T) {
+	server := proxyNotEnabledServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	err := client.ConsumeProxyRequests(context.Background(), domain.ProxyRequestParams{},
+		func() { t.Error("onConnect must not fire for a failed dial") },
+		func(api.ProxyRequestResponse) { t.Error("no event should be delivered") })
+	requireProxyNotEnabledError(t, err)
+}
+
+// TestClient_StreamLogsChannel_RejectsNonEventStream fails the connect when the
+// daemon answers 200 with something that is not an SSE stream.
+func TestClient_StreamLogsChannel_RejectsNonEventStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html>not a stream</html>"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	_, err := client.StreamLogsChannel(context.Background(), domain.LogParams{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "content type") || !strings.Contains(err.Error(), "text/event-stream") {
+		t.Errorf("expected descriptive content-type error, got %q", err.Error())
+	}
+}
+
+// TestDialSSE_AcceptsContentTypeParameters accepts the media type with
+// parameters appended, which is what net/http writes by default.
+func TestDialSSE_AcceptsContentTypeParameters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	s, err := dialSSE(context.Background(), client, logsStreamPath(domain.LogParams{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s.close()
+}
+
+// sseHangupServer writes one log event and then returns, ending the stream.
+// TestParseSSEProcessList_ValidSnapshot pins the processes-stream parser: a
+// full snapshot decodes field for field.
+func TestParseSSEProcessList_ValidSnapshot(t *testing.T) {
+	resp, ok := parseSSEProcessList(`{"processes":[{"name":"web","status":"running","pid":42,"restarts":1,"health":"healthy","kind":"process"}]}`)
+	if !ok {
+		t.Fatal("expected a valid snapshot to parse")
+	}
+	if len(resp.Processes) != 1 {
+		t.Fatalf("expected 1 process, got %d", len(resp.Processes))
+	}
+	if resp.Processes[0].Name != "web" || resp.Processes[0].PID != 42 {
+		t.Errorf("unexpected process %+v", resp.Processes[0])
+	}
+}
+
+// TestParseSSEProcessList_EmptyIsValid pins that an empty list is a real
+// snapshot ("nothing running"), not a frame to drop — unlike the logs parser,
+// whose all-zero guard filters non-entry payloads.
+func TestParseSSEProcessList_EmptyIsValid(t *testing.T) {
+	resp, ok := parseSSEProcessList(`{"processes":[]}`)
+	if !ok {
+		t.Fatal("an empty process list is a legitimate snapshot")
+	}
+	if len(resp.Processes) != 0 {
+		t.Errorf("expected no processes, got %d", len(resp.Processes))
+	}
+}
+
+// TestParseSSEProcessList_InvalidJSON drops the frame rather than failing the
+// stream.
+func TestParseSSEProcessList_InvalidJSON(t *testing.T) {
+	if _, ok := parseSSEProcessList("{not json"); ok {
+		t.Error("expected malformed JSON to be rejected")
+	}
+}
+
+// TestClient_ConsumeProcesses_DeliversSnapshots is the attempt-level contract
+// the attach TUI's processes loop depends on: onConnect fires once, every data
+// frame is delivered as a full snapshot, and the read error that ends the
+// stream is returned rather than swallowed.
+func TestClient_ConsumeProcesses_DeliversSnapshots(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/processes/stream" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("the processes stream takes no params, got %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": connected\n\n"))
+		w.Write([]byte("data: {\"processes\":[{\"name\":\"web\",\"status\":\"starting\"}]}\n\n"))
+		w.Write([]byte("data: {\"processes\":[{\"name\":\"web\",\"status\":\"running\"}]}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	connected := 0
+	var got []api.ProcessListResponse
+	err := client.ConsumeProcesses(context.Background(),
+		func() { connected++ },
+		func(resp api.ProcessListResponse) { got = append(got, resp) })
+
+	if err == nil {
+		t.Fatal("expected the terminal read error when the server ends the stream")
+	}
+	if connected != 1 {
+		t.Errorf("expected onConnect exactly once, got %d", connected)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(got))
+	}
+	if got[0].Processes[0].Status != "starting" || got[1].Processes[0].Status != "running" {
+		t.Errorf("snapshots delivered out of order or mangled: %+v", got)
+	}
+}
+
+// TestClient_ConsumeProcesses_NotFoundSurfacesStatus pins the version-skew
+// signal the TUI classifier keys on: a daemon without the endpoint answers 404,
+// and that status must reach the caller discriminably.
+func TestClient_ConsumeProcesses_NotFoundSurfacesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	err := client.ConsumeProcesses(context.Background(),
+		func() { t.Error("onConnect must not fire for a failed dial") },
+		func(api.ProcessListResponse) { t.Error("no event should be delivered") })
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T (%v)", err, err)
+	}
+	if apiErr.StatusCode() != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", apiErr.StatusCode())
+	}
+}
+
+func sseHangupServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": heartbeat\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\"}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+}
+
+// TestClient_ConsumeLogs_ReturnsTerminalError is the attempt-level contract the
+// reconnect loop depends on: a stream that ends surfaces the read error rather
+// than disappearing silently, and events delivered before the end are kept.
+func TestClient_ConsumeLogs_ReturnsTerminalError(t *testing.T) {
+	server := sseHangupServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var got []api.LogEntryResponse
+	connected := false
+	err := client.ConsumeLogs(context.Background(), domain.LogParams{},
+		func() { connected = true },
+		nil, // no handshake hook: this server sends none
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if err == nil {
+		t.Fatal("expected terminal error when the server ends the stream, got nil")
+	}
+	if !connected {
+		t.Error("onConnect must fire once the dial succeeds")
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 delivered event, got %d", len(got))
+	}
+	if got[0].Line != "one" {
+		t.Errorf("expected line %q, got %q", "one", got[0].Line)
+	}
+}
+
+// drainUntilClosed reads ch to completion and returns everything it delivered,
+// failing the test with failMsg if the channel is not closed within 5s.
+func drainUntilClosed(t *testing.T, ch <-chan api.LogEntryResponse, failMsg string) []api.LogEntryResponse {
+	t.Helper()
+	var got []api.LogEntryResponse
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case entry, ok := <-ch:
+			if !ok {
+				return got
+			}
+			got = append(got, entry)
+		case <-deadline:
+			t.Fatal(failMsg)
+		}
+	}
+}
+
+// TestClient_StreamLogsChannel_ClosesOnHangup keeps the existing consumer
+// contract: the channel variant only closes, it does not surface the error.
+func TestClient_StreamLogsChannel_ClosesOnHangup(t *testing.T) {
+	server := sseHangupServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	ch, err := client.StreamLogsChannel(context.Background(), domain.LogParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := drainUntilClosed(t, ch, "channel was not closed after the server ended the stream")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event before close, got %d", len(got))
+	}
+}
+
+// TestClient_StreamLogsChannel_ContextCancel proves cancellation tears the
+// stream down immediately -- well inside constants.SSEReadTimeout -- and that
+// the reader goroutine exits (it closes the channel on its way out).
+func TestClient_StreamLogsChannel_ContextCancel(t *testing.T) {
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\"}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hold the stream open until the client goes away.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := NewClient(server.URL)
+	ch, err := client.StreamLogsChannel(ctx, domain.LogParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case entry, ok := <-ch:
+		if !ok {
+			t.Fatal("channel closed before the first event")
+		}
+		if entry.Line != "one" {
+			t.Fatalf("expected line %q, got %q", "one", entry.Line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first event")
+	}
+
+	start := time.Now()
+	cancel()
+
+	drainUntilClosed(t, ch, "channel was not closed within 5s of cancellation")
+
+	if elapsed := time.Since(start); elapsed >= constants.SSEReadTimeout {
+		t.Errorf("cancellation took %v, expected well under the %v read deadline", elapsed, constants.SSEReadTimeout)
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server handler still holding the cancelled connection")
+	}
+}
+
+// sseHandshakeServer writes the exact frame sequence the logs endpoint sends
+// (plan 017 C8): the ": connected" comment, a named handshake frame, log
+// entries, and — to pin the event-name tracking — a SECOND handshake mid-stream
+// followed by one more entry. It then returns, ending the stream.
+func sseHandshakeServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": connected\n\n"))
+		w.Write([]byte("event: handshake\ndata: {\"stream_id\":\"epoch-1\"}\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\",\"seq\":1}\n\n"))
+		w.Write([]byte(": ping\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"two\",\"seq\":2}\n\n"))
+		w.Write([]byte("event: handshake\ndata: {\"stream_id\":\"epoch-1\"}\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"three\",\"seq\":3}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+}
+
+// TestClient_ConsumeLogs_HandshakeReachesHookNotEntryParser pins the C9 reader
+// contract: a handshake frame is delivered to the handshake hook and never to
+// the entry parser, the entries around it still parse (with their seq), and a
+// repeated handshake mid-stream is delivered again — harmless, and the frame
+// name must not leak into the entry that follows it.
+func TestClient_ConsumeLogs_HandshakeReachesHookNotEntryParser(t *testing.T) {
+	server := sseHandshakeServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var handshakes []api.HandshakeResponse
+	var got []api.LogEntryResponse
+	err := client.ConsumeLogs(context.Background(), domain.LogParams{},
+		nil,
+		func(hs api.HandshakeResponse) { handshakes = append(handshakes, hs) },
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if err == nil {
+		t.Fatal("expected terminal error when the server ends the stream, got nil")
+	}
+	if len(handshakes) != 2 {
+		t.Fatalf("expected 2 handshakes delivered, got %d (%v)", len(handshakes), handshakes)
+	}
+	for i, hs := range handshakes {
+		if hs.StreamID != "epoch-1" {
+			t.Errorf("handshake %d: expected stream_id %q, got %q", i, "epoch-1", hs.StreamID)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 log entries, got %d (%v)", len(got), got)
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		if got[i].Line != want {
+			t.Errorf("entry %d: expected line %q, got %q", i, want, got[i].Line)
+		}
+		if got[i].Seq != uint64(i+1) {
+			t.Errorf("entry %d: expected seq %d, got %d", i, i+1, got[i].Seq)
+		}
+	}
+}
+
+// TestClient_ConsumeLogs_NilHandshakeHookDropsFrame pins the nilable hook: a
+// consumer that does not care about the epoch (the --follow commands, the
+// channel form) sees the handshake frame dropped, never a phantom log entry.
+func TestClient_ConsumeLogs_NilHandshakeHookDropsFrame(t *testing.T) {
+	server := sseHandshakeServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var got []api.LogEntryResponse
+	_ = client.ConsumeLogs(context.Background(), domain.LogParams{}, nil, nil,
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 log entries with a nil handshake hook, got %d (%v)", len(got), got)
+	}
+}
+
+// TestClient_GetLogs_SinceSeqAndCursorMetadata covers the resume half of the
+// cursor API on the client: since_seq rides the query when set, and the
+// response's cursor metadata is decoded for the sync protocol to compare
+// against.
+func TestClient_GetLogs_SinceSeqAndCursorMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("since_seq"); got != "7" {
+			t.Errorf("expected since_seq=7, got %q", got)
+		}
+		if got := r.URL.Query().Get("lines"); got != "1000" {
+			t.Errorf("expected lines=1000, got %q", got)
+		}
+		resp := api.LogsResponse{
+			Logs:      []api.LogEntryResponse{{Line: "eight", Seq: 8}},
+			StreamID:  "epoch-1",
+			OldestSeq: 3,
+			LatestSeq: 8,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	logs, err := client.GetLogs(context.Background(), domain.LogParams{Lines: 1000, SinceSeq: 7})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if logs.StreamID != "epoch-1" {
+		t.Errorf("expected stream_id %q, got %q", "epoch-1", logs.StreamID)
+	}
+	if logs.OldestSeq != 3 || logs.LatestSeq != 8 {
+		t.Errorf("expected bounds 3..8, got %d..%d", logs.OldestSeq, logs.LatestSeq)
+	}
+	if len(logs.Logs) != 1 || logs.Logs[0].Seq != 8 {
+		t.Errorf("expected one entry with seq 8, got %v", logs.Logs)
+	}
+}
+
+// TestBuildLogQueryParams_OmitsZeroSinceSeq pins the one wire subtlety of the
+// cursor: a zero SinceSeq must not be sent, because `since_seq=0` selects the
+// server's resume path (oldest-first from the start of the ring) rather than
+// the last-`lines` path a cursorless caller wants.
+func TestBuildLogQueryParams_OmitsZeroSinceSeq(t *testing.T) {
+	query := buildLogQueryParams(domain.LogParams{Lines: 1000})
+	if _, present := query["since_seq"]; present {
+		t.Errorf("expected no since_seq for a zero cursor, got %q", query.Get("since_seq"))
+	}
+
+	query = buildLogQueryParams(domain.LogParams{Lines: 1000, SinceSeq: 1})
+	if got := query.Get("since_seq"); got != "1" {
+		t.Errorf("expected since_seq=1, got %q", got)
+	}
+}
+
+// TestClient_ConsumeLogs_DataLineConsumesEventName pins the SSE dispatch rule
+// (codex C9 review): one event: field names ONE dispatch. A data line following
+// the handshake's data line without its own event: prefix — and before any
+// blank-line frame delimiter — is a plain log entry, not a second handshake.
+func TestClient_ConsumeLogs_DataLineConsumesEventName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Deliberately NO blank line between the handshake's data and the entry.
+		w.Write([]byte("event: handshake\n"))
+		w.Write([]byte("data: {\"stream_id\":\"epoch-x\"}\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"after-handshake\",\"seq\":7}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var handshakes []api.HandshakeResponse
+	var entries []api.LogEntryResponse
+	_ = client.ConsumeLogs(context.Background(), domain.LogParams{},
+		nil,
+		func(hs api.HandshakeResponse) { handshakes = append(handshakes, hs) },
+		func(e api.LogEntryResponse) { entries = append(entries, e) })
+
+	if len(handshakes) != 1 || handshakes[0].StreamID != "epoch-x" {
+		t.Fatalf("expected exactly one handshake for epoch-x, got %+v", handshakes)
+	}
+	if len(entries) != 1 || entries[0].Line != "after-handshake" {
+		t.Fatalf("expected the follow-on data line to parse as a log entry, got %+v", entries)
 	}
 }

@@ -454,6 +454,7 @@ func TestToLogEntryResponse(t *testing.T) {
 		Process:   "web",
 		Stream:    domain.StreamStdout,
 		Line:      "Server started on port 3000",
+		Seq:       42,
 	}
 
 	resp := ToLogEntryResponse(entry)
@@ -470,6 +471,9 @@ func TestToLogEntryResponse(t *testing.T) {
 	// Verify timestamp is in RFC3339Nano format
 	if resp.Timestamp != now.Format(time.RFC3339Nano) {
 		t.Errorf("expected Timestamp %q, got %q", now.Format(time.RFC3339Nano), resp.Timestamp)
+	}
+	if resp.Seq != 42 {
+		t.Errorf("expected Seq 42, got %d", resp.Seq)
 	}
 }
 

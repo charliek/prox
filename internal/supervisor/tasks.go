@@ -124,10 +124,12 @@ func (s *Supervisor) demandTask(ctx context.Context, name string) DepOutcome {
 		return DepOutcome{State: DepStateFailed, Err: fmt.Errorf("unknown task %q", name)}
 	}
 	node := s.taskNodes[name]
+	admitted := false
 	if node == nil {
 		// A plain (dependent-driven) demand joins or starts the once-per-lifetime
 		// run with no reload/rerun intent.
 		node = s.startTaskEpisodeLocked(name, mp, nil, false)
+		admitted = node != nil
 		if node == nil {
 			// beginWaiting refused admission: the task is unexpectedly active without a
 			// tracked node. Unreachable on the normal path (an active task always has a
@@ -139,6 +141,14 @@ func (s *Supervisor) demandTask(ctx context.Context, name string) DepOutcome {
 	}
 	done := node.done
 	s.taskMu.Unlock()
+
+	// A fresh episode moved the task terminal -> waiting (beginWaiting, inside
+	// startTaskEpisodeLocked). Lock discipline: taskMu released immediately above,
+	// and the notify is deliberately NOT inside startTaskEpisodeLocked, which runs
+	// under taskMu.
+	if admitted {
+		s.notifyChange()
+	}
 
 	select {
 	case <-done:
@@ -229,6 +239,9 @@ func (s *Supervisor) executeTask(mp *ManagedProcess, node *taskNode, runCtx, sup
 	} else if len(blockedBy) > 0 {
 		if mp.markBlocked(blockedBy, gen) {
 			s.SystemLog("task %s blocked: dependency not ready: %s", mp.Name(), strings.Join(blockedBy, ", "))
+			// waiting -> blocked (BlockedOn populated). Lock discipline: markBlocked
+			// released p.mu; executeTask holds no supervisor lock.
+			s.notifyChange()
 		}
 		return DepOutcome{State: DepStateFailed, Err: fmt.Errorf("task %q blocked: %s", mp.Name(), strings.Join(blockedBy, ", "))}
 	}
@@ -246,7 +259,11 @@ func (s *Supervisor) executeTask(mp *ManagedProcess, node *taskNode, runCtx, sup
 			// A genuine launch failure (e.g. a surviving previous group, or the
 			// runner failed): settle crashed (retaining current for reap) exactly as
 			// the gated path, and report a failure so dependents are blocked.
-			mp.failWaitingLaunch(gen)
+			if mp.failWaitingLaunch(gen) {
+				// waiting -> crashed after the launch attempt. Lock discipline:
+				// failWaitingLaunch released p.mu before returning.
+				s.notifyChange()
+			}
 			mp.logf(domain.StreamStderr, "task failed to start: %v", err)
 			return DepOutcome{State: DepStateFailed, Err: err}
 		}
@@ -359,6 +376,17 @@ func (s *Supervisor) demandTaskAsync(name string) bool {
 // retirement loop. Returns an already-active error only if admission is somehow
 // refused (unreachable on the normal path given rerunMu + the prior stop).
 func (s *Supervisor) rescheduleTask(mp *ManagedProcess, pending *pendingConfig, rerun bool) error {
+	// The fresh episode's admission moves the task terminal -> waiting. Lock
+	// discipline: this defer is registered BEFORE the taskMu unlock defer, so LIFO
+	// makes it run LAST -- with taskMu already released. (rerunMu, held by the
+	// caller, is not taken by notifyChange, which is a leaf.)
+	admitted := false
+	defer func() {
+		if admitted {
+			s.notifyChange()
+		}
+	}()
+
 	s.taskMu.Lock()
 	defer s.taskMu.Unlock()
 	if s.taskClosed {
@@ -373,6 +401,7 @@ func (s *Supervisor) rescheduleTask(mp *ManagedProcess, pending *pendingConfig, 
 		// beginWaiting refused: the process is unexpectedly active. Defensive only.
 		return domain.ErrProcessAlreadyRunning
 	}
+	admitted = true
 	return nil
 }
 

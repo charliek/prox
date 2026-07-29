@@ -117,6 +117,67 @@ func TestSubscriptionManager_Broadcast(t *testing.T) {
 	assert.Equal(t, "broadcast", msg2.Line)
 }
 
+// TestSubscriptionManager_BroadcastOverflowClosesSubscription pins C6: a
+// subscriber whose channel fills has lost a line it can never be handed later,
+// so Broadcast closes and removes the subscription instead of dropping
+// silently. The SSE handler sees that close as end-of-stream and the client
+// reconnects.
+func TestSubscriptionManager_BroadcastOverflowClosesSubscription(t *testing.T) {
+	m := NewSubscriptionManager(2)
+	_, ch, err := m.Subscribe(domain.LogFilter{})
+	require.NoError(t, err)
+
+	for i := 0; i < 5; i++ {
+		m.Broadcast(makeEntry("line"))
+	}
+
+	assert.Equal(t, 0, m.Count(), "the overflowed subscription is removed")
+
+	// The buffered entries are still readable, then the channel reports
+	// end-of-stream.
+	drained := 0
+	for range ch {
+		drained++
+		require.LessOrEqual(t, drained, 5, "channel never closed")
+	}
+	assert.Equal(t, 2, drained, "the full buffer is drained before the close")
+
+	// A send on a closed channel would panic; broadcasting must stay safe.
+	m.Broadcast(makeEntry("after"))
+	// Unsubscribe/Close must not double-close the latched channel either.
+	m.Unsubscribe("sub-1")
+	m.Close()
+}
+
+// TestSubscriptionManager_BroadcastOverflowSparesOtherSubscribers pins that the
+// close is per-subscription: a healthy subscriber keeps its stream.
+func TestSubscriptionManager_BroadcastOverflowSparesOtherSubscribers(t *testing.T) {
+	m := NewSubscriptionManager(2)
+	_, slowCh, err := m.Subscribe(domain.LogFilter{Processes: []string{"web"}})
+	require.NoError(t, err)
+	// The healthy subscriber filters the burst out entirely, so only the
+	// unread one can overflow — no scheduling race.
+	_, fastCh, err := m.Subscribe(domain.LogFilter{Processes: []string{"api"}})
+	require.NoError(t, err)
+
+	for i := 0; i < 5; i++ {
+		m.Broadcast(makeEntryWithProcess("web", "burst"))
+	}
+	assert.Equal(t, 1, m.Count(), "only the overflowed subscription is removed")
+
+	for range slowCh {
+	}
+
+	m.Broadcast(makeEntryWithProcess("api", "still here"))
+	select {
+	case entry, ok := <-fastCh:
+		require.True(t, ok, "the healthy subscriber's channel was closed")
+		assert.Equal(t, "still here", entry.Line)
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy subscriber received nothing after the slow one was dropped")
+	}
+}
+
 func TestSubscriptionManager_BroadcastWithFilter(t *testing.T) {
 	m := NewSubscriptionManager(10)
 

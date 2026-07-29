@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,6 +11,7 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 	"github.com/charliek/prox/internal/supervisor"
 )
 
@@ -40,17 +42,10 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	// Subscribe to logs before starting the forwarder
 	subID, ch, err := logMgr.Subscribe(domain.LogFilter{})
 	if err != nil {
-		// Send error as a system log entry so user sees feedback
-		// Don't cancel context here - proxy request forwarding should still work
-		p.Send(LogEntryMsg(domain.LogEntry{
-			Timestamp: time.Now(),
-			Process:   "system",
-			Stream:    domain.StreamStderr,
-			Line:      "Error subscribing to logs: " + err.Error(),
-		}))
+		// Don't cancel the context here - proxy request forwarding should still work.
+		p.Send(LogEntryMsg(systemLogEntry("Error subscribing to logs: " + err.Error())))
 	} else {
-		// Start a goroutine to forward log entries to the TUI
-		go forwardLogs(ctx, p, ch)
+		go forwardLogs(ctx, p.Send, ch)
 	}
 
 	// Subscribe to proxy requests if available
@@ -58,7 +53,7 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	if reqMgr != nil {
 		sub := reqMgr.Subscribe(proxy.RequestFilter{})
 		reqSubID = sub.ID
-		go forwardProxyRequests(ctx, p, sub.Ch)
+		go forwardProxyRequests(ctx, p.Send, sub.Ch)
 	}
 
 	_, runErr := p.Run()
@@ -75,46 +70,93 @@ func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.Request
 	return runErr
 }
 
-// forwardLogs forwards log entries from the subscription channel to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardLogs(ctx context.Context, p *tea.Program, ch <-chan domain.LogEntry) {
+// systemLogEntry builds the synthetic "system" log line the TUI uses to show
+// itself a message in the log pane.
+func systemLogEntry(line string) domain.LogEntry {
+	return domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "system",
+		Stream:    domain.StreamStderr,
+		Line:      line,
+	}
+}
+
+// forwardSubscription pumps a local-mode subscription channel into the TUI. It
+// exits when the context is cancelled or the channel is closed. toMsg wraps one
+// element as the message the models expect; closedLine is the system log line
+// recorded if the channel ends on its own.
+func forwardSubscription[T any](ctx context.Context, send func(tea.Msg), ch <-chan T, id StreamID, closedLine string, toMsg func(T) tea.Msg) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case entry, ok := <-ch:
+		case v, ok := <-ch:
 			if !ok {
+				reportLocalStreamClosed(ctx, send, id, closedLine)
 				return
 			}
-			p.Send(LogEntryMsg(entry))
+			send(toMsg(v))
 		}
 	}
 }
 
-// forwardProxyRequests forwards proxy requests from the subscription channel to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardProxyRequests(ctx context.Context, p *tea.Program, ch <-chan proxy.RequestRecord) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-ch:
-			if !ok {
-				return
-			}
-			p.Send(ProxyRequestMsg(req))
-		}
+// forwardLogs forwards log entries from the subscription channel to the TUI.
+func forwardLogs(ctx context.Context, send func(tea.Msg), ch <-chan domain.LogEntry) {
+	forwardSubscription(ctx, send, ch, StreamLogs, "Log stream closed",
+		func(entry domain.LogEntry) tea.Msg { return LogEntryMsg(entry) })
+}
+
+// forwardProxyRequests forwards proxy requests from the subscription channel to
+// the TUI.
+func forwardProxyRequests(ctx context.Context, send func(tea.Msg), ch <-chan proxy.RequestRecord) {
+	forwardSubscription(ctx, send, ch, StreamRequests, "Proxy request stream closed",
+		func(req proxy.RequestRecord) tea.Msg { return ProxyRequestMsg(req) })
+}
+
+// reportLocalStreamClosed surfaces a local-mode subscription channel that ended
+// on its own. Local mode has no reconnect loop, so the feed is gone for the rest
+// of the session and the user has to be told: the status bar marks the stream
+// closed and one system log line records it. A close observed during shutdown
+// (ctx already cancelled, which the select can lose the race to) is expected and
+// stays silent.
+func reportLocalStreamClosed(ctx context.Context, send func(tea.Msg), id StreamID, line string) {
+	if ctx.Err() != nil {
+		return
 	}
+	send(StreamStatusMsg{Stream: id, Status: stream.Status{State: stream.StateClosed}})
+	send(LogEntryMsg(systemLogEntry(line)))
 }
 
 // TUIClient is the interface for TUI client mode API interactions.
 // It consolidates all API operations needed by the TUI client.
+//
+// The stream methods are attempt-shaped rather than channel-shaped: each call is
+// one connect-and-consume attempt owned by an internal/stream.Loop, which needs
+// the terminal error to classify it. The channel forms remain on *cli.Client for
+// the --follow commands.
+// GetProcesses is deliberately absent: attach mode learns process state from
+// the processes stream alone (C12), so nothing here polls REST /processes. The
+// method stays on *cli.Client for the one-shot CLI commands.
 type TUIClient interface {
-	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
-	StreamLogsChannel(params domain.LogParams) (<-chan api.LogEntryResponse, error)
-	StreamProxyRequestsChannel(params domain.ProxyRequestParams) (<-chan api.ProxyRequestResponse, error)
+	// ConsumeLogs takes an onHandshake hook alongside onConnect: the logs sync
+	// (C9) must learn the server's log epoch before it can decide how to
+	// backfill, and that epoch rides a named handshake frame on the stream
+	// itself. A daemon that sends none never fires it.
+	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error
+	ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
+	// ConsumeProcesses carries a full process-list snapshot per event, so it
+	// needs neither params nor a handshake: there is nothing to filter and
+	// nothing to resume from.
+	ConsumeProcesses(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
+
+	// GetProxyRequests and GetLogs fetch what the requests and logs streams
+	// synchronize against on every connect. They are the ctx-taking non-stream
+	// methods: each fetch is owned by a stream attempt and must be abandoned
+	// the moment that attempt ends.
+	GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error)
+	GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error)
 }
 
 // RunClient starts the TUI application in client mode (connected via API)
@@ -124,113 +166,223 @@ func RunClient(client TUIClient) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Start goroutines to stream logs and proxy requests from the API
-	go forwardClientLogs(ctx, p, client)
-	go forwardClientProxyRequests(ctx, p, client)
+	go runClientStreams(ctx, client, p.Send)
 
 	_, err := p.Run()
 
-	// Cleanup: cancel context to stop the forwarder goroutines
+	// Cleanup: cancel context to stop the stream loops
 	cancel()
 
 	return err
 }
 
-// forwardClientLogs streams log entries from the API and sends them to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardClientLogs(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamLogsChannel(domain.LogParams{})
-	if err != nil {
-		// Send error as a system log entry so user sees feedback
-		p.Send(LogEntryMsg(domain.LogEntry{
-			Timestamp: time.Now(),
-			Process:   "system",
-			Stream:    domain.StreamStderr,
-			Line:      "Error connecting to log stream: " + err.Error(),
-		}))
-		return
+// runClientStreams runs one reconnect loop per attach-mode stream and blocks
+// until every loop has ended, which happens when ctx is cancelled (on quit) or a
+// loop's error is classified terminal. send is the program's message sink,
+// injected so the wiring is testable without a live *tea.Program.
+func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg)) {
+	// One log-sync session for the whole attach run: it carries the cursor and
+	// epoch ACROSS reconnects, which is what lets attempt N+1 resume where
+	// attempt N stopped instead of re-fetching the world (C9).
+	logsSess := newLogsSyncSession()
+
+	// Re-probing is SYMMETRIC (codex C12 finding): each loop's observer wakes
+	// every OTHER loop on a reconnect. The loops slice is filled before any
+	// Run starts, and OnStatus only fires from a Run goroutine, so the
+	// closures' reads are ordered after the write by goroutine creation.
+	var loops []*stream.Loop
+	probeOthers := func(self int) func(stream.Status) {
+		return reprobeOnReconnect(func() {
+			for i, l := range loops {
+				if i != self {
+					l.Probe()
+				}
+			}
+		})
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
+	// Neither data stream is a pure stream consumer: each connect
+	// synchronizes against a REST fetch before reporting OK (C6, C9).
+	logsLoop := streamLoop(StreamLogs, send, classifyStreamError, probeOthers(0), func(ctx context.Context, markSynced func()) error {
+		return consumeLogsWithSync(ctx, client, logsSess, send, markSynced)
+	})
+	requestsLoop := streamLoop(StreamRequests, send, classifyRequestsStreamError, probeOthers(1), func(ctx context.Context, markSynced func()) error {
+		return consumeRequestsWithSync(ctx, client, send, markSynced)
+	})
+	// The processes stream IS a pure consumer (snapshot-per-event); it also
+	// doubles as the run's daemon-liveness signal (see ClientModel).
+	processesLoop := streamLoop(StreamProcesses, send, classifyProcessesStreamError,
+		probeOthers(2),
+		func(ctx context.Context, markSynced func()) error {
+			return consumeProcesses(ctx, client, send, markSynced)
+		})
+
+	loops = []*stream.Loop{logsLoop, requestsLoop, processesLoop}
+
+	var wg sync.WaitGroup
+	wg.Add(len(loops))
+	for _, l := range loops {
+		go func() {
+			defer wg.Done()
+			l.Run(ctx)
+		}()
+	}
+	wg.Wait()
+}
+
+// streamLoop builds one attach-mode reconnect loop: consume is a single
+// connect-and-consume attempt, classify is the stream's reconnect policy, and
+// every transition reaches the models as a StreamStatusMsg for id.
+//
+// markSynced is handed to the attempt rather than called for it. The two
+// synchronizing attach streams call it from inside their sync protocol, after
+// the batch barrier, so an attempt that connects but cannot synchronize stays
+// in Syncing and can never flash OK or clear the outage warning (codex C5
+// finding). The processes stream has no such barrier — see consumeProcesses.
+//
+// observe (nilable) is an extra hook run on every transition, before the
+// message is sent. It exists for the one cross-loop behavior in attach mode:
+// the processes stream's reconnect re-probing the parked loops.
+func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, observe func(stream.Status), consume func(ctx context.Context, markSynced func()) error) *stream.Loop {
+	return stream.NewLoop(stream.Config{
+		Attempt:  consume,
+		Classify: classify,
+		OnStatus: func(s stream.Status) {
+			if observe != nil {
+				observe(s)
+			}
+			send(StreamStatusMsg{Stream: id, Status: s})
+		},
+	})
+}
+
+// reprobeOnReconnect builds a stream's status observer: every OK transition
+// AFTER the first one is a RECONNECT, which is the best evidence attach mode
+// has that the daemon it lost was replaced — so it fires probe, which wakes
+// the OTHER loops. Any of them may be parked in StateUnavailable with no timer
+// of its own: a proxy-disabled requests stream, or the processes stream parked
+// on an old daemon's 404 — which is exactly why probing must be symmetric
+// rather than processes-only (codex C12 finding): the parked processes loop
+// can only be rescued by a sibling's reconnect.
+//
+// The other loops are probed unconditionally rather than only when parked:
+// Loop.Probe coalesces and never blocks, and a probe delivered to a loop that
+// is not parked at worst short-circuits one backoff wait — which, mid-daemon-
+// restart, is the desired behavior anyway.
+//
+// The bool needs no synchronization: Config.OnStatus is serialized by the
+// loop's own mutex and is never called concurrently.
+func reprobeOnReconnect(probe func()) func(stream.Status) {
+	sawOK := false
+	return func(s stream.Status) {
+		if s.State != stream.StateOK {
 			return
-		case entry, ok := <-ch:
-			if !ok {
-				// Channel closed - connection lost
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: time.Now(),
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Log stream connection closed",
-				}))
-				return
-			}
-			// Convert API response to LogEntry
-			ts, parseErr := time.Parse(time.RFC3339Nano, entry.Timestamp)
-			if parseErr != nil {
-				ts = time.Now() // Fallback for malformed timestamps
-				// Log warning so server-side timestamp bugs are visible
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: ts,
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Warning: failed to parse log timestamp: " + parseErr.Error(),
-				}))
-			}
-			logEntry := domain.LogEntry{
-				Timestamp: ts,
-				Process:   entry.Process,
-				Stream:    domain.Stream(entry.Stream),
-				Line:      entry.Line,
-			}
-			p.Send(LogEntryMsg(logEntry))
 		}
+		if !sawOK {
+			sawOK = true // the initial connect is not a reconnect
+			return
+		}
+		probe()
 	}
 }
 
-// forwardClientProxyRequests streams proxy requests from the API and sends them to the TUI program.
-// It exits when the context is cancelled or the channel is closed.
-func forwardClientProxyRequests(ctx context.Context, p *tea.Program, client TUIClient) {
-	ch, err := client.StreamProxyRequestsChannel(domain.ProxyRequestParams{})
-	if err != nil {
-		// Proxy may not be enabled - this is not an error, just silently return
-		return
-	}
+// consumeProcesses is the processes stream's single connect-and-consume
+// attempt. It is the one attach stream with no sync protocol: the endpoint
+// writes a full snapshot immediately after ": connected" and a full snapshot on
+// every later change (internal/api/sse.go), so there is no REST fetch to
+// reconcile against and no cursor to resume from — connect IS sync, and
+// markSynced rides onConnect.
+//
+// The consequence, accepted deliberately: OK can lead the first snapshot's
+// arrival by the microseconds it takes the server's initial write to land, a
+// window in which the status bar says healthy while the process list is still
+// the previous one (empty at startup). The alternative — deferring markSynced
+// to the first event — would leave the stream stuck in Syncing forever against
+// a daemon supervising nothing.
+func consumeProcesses(ctx context.Context, client TUIClient, send func(tea.Msg), markSynced func()) error {
+	return client.ConsumeProcesses(ctx, markSynced, func(resp api.ProcessListResponse) {
+		send(ProcessesMsg(streamedProcesses(resp)))
+	})
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-ch:
-			if !ok {
-				// Channel closed - connection lost
-				return
-			}
-			// Convert API response to RequestRecord
-			ts, parseErr := time.Parse(time.RFC3339Nano, req.Timestamp)
-			if parseErr != nil {
-				ts = time.Now() // Fallback for malformed timestamps
-				// Log warning so server-side timestamp bugs are visible
-				p.Send(LogEntryMsg(domain.LogEntry{
-					Timestamp: ts,
-					Process:   "system",
-					Stream:    domain.StreamStderr,
-					Line:      "Warning: failed to parse proxy request timestamp: " + parseErr.Error(),
-				}))
-			}
-			record := proxy.RequestRecord{
-				ID:         req.ID,
-				Timestamp:  ts,
-				Method:     req.Method,
-				URL:        req.URL,
-				Subdomain:  req.Subdomain,
-				StatusCode: req.StatusCode,
-				Duration:   time.Duration(req.DurationMs) * time.Millisecond,
-				RemoteAddr: req.RemoteAddr,
-				InFlight:   req.InFlight,
-			}
-			p.Send(ProxyRequestMsg(record))
+// streamedProcesses converts one full process-list snapshot to the domain
+// slice the models hold. It is the pure form of what attach mode's polling
+// fetchProcesses command used to do inline (C12 deleted the poll).
+//
+// ProcessState and the rest are cast directly from their status strings; an
+// unknown value from a newer daemon renders with default styling rather than
+// being rejected.
+func streamedProcesses(resp api.ProcessListResponse) []domain.ProcessInfo {
+	processes := make([]domain.ProcessInfo, len(resp.Processes))
+	for i, p := range resp.Processes {
+		processes[i] = domain.ProcessInfo{
+			Name:         p.Name,
+			State:        domain.ProcessState(p.Status),
+			PID:          p.PID,
+			RestartCount: p.Restarts,
+			Health:       domain.HealthStatus(p.Health),
+			Kind:         domain.ProcessKind(p.Kind),
+			WaitingOn:    p.WaitingOn,
+			BlockedOn:    p.BlockedOn,
 		}
+	}
+	return processes
+}
+
+// parseStreamTimestamp parses a server-supplied event timestamp. A malformed one
+// falls back to now and emits a warning line naming what, so a server-side
+// timestamp bug stays visible instead of being papered over.
+func parseStreamTimestamp(send func(tea.Msg), what, raw string) time.Time {
+	ts, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		send(LogEntryMsg(systemLogEntry("Warning: failed to parse " + what + " timestamp: " + err.Error())))
+		return time.Now()
+	}
+	return ts
+}
+
+// sendStreamedLogEntry converts one streamed log entry and delivers it.
+func sendStreamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) {
+	send(LogEntryMsg(streamedLogEntry(send, entry)))
+}
+
+// streamedLogEntry converts one wire log entry without delivering it, so the
+// sync protocol can buffer live entries and convert backfill entries (same wire
+// type) through exactly the same mapping. send is still needed: a malformed
+// timestamp warns through the log pane.
+//
+// Seq is carried through: it is the server ingest sequence the sync protocol's
+// cursor arithmetic runs on, and is unrelated to the TUI-local DisplaySeq that
+// BaseModel stamps on arrival (D7).
+func streamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) domain.LogEntry {
+	return domain.LogEntry{
+		Timestamp: parseStreamTimestamp(send, "log", entry.Timestamp),
+		Process:   entry.Process,
+		Stream:    domain.Stream(entry.Stream),
+		Line:      entry.Line,
+		Seq:       entry.Seq,
+	}
+}
+
+// sendStreamedProxyRequest converts one streamed proxy request and delivers it.
+func sendStreamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) {
+	send(ProxyRequestMsg(streamedProxyRequest(send, req)))
+}
+
+// streamedProxyRequest converts one wire proxy request to a record without
+// delivering it, so the sync protocol can buffer live events and convert
+// snapshot records (same wire type) through exactly the same mapping. send is
+// still needed: a malformed timestamp warns through the log pane.
+func streamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) proxy.RequestRecord {
+	return proxy.RequestRecord{
+		ID:         req.ID,
+		Timestamp:  parseStreamTimestamp(send, "proxy request", req.Timestamp),
+		Method:     req.Method,
+		URL:        req.URL,
+		Subdomain:  req.Subdomain,
+		StatusCode: req.StatusCode,
+		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
+		RemoteAddr: req.RemoteAddr,
+		InFlight:   req.InFlight,
 	}
 }
