@@ -1449,7 +1449,7 @@ func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 		feed(fmt.Sprintf("flood %d", i))
 	}
 	for _, e := range m.logEntries {
-		require.NotEqual(t, needleSeq, e.Seq, "NEEDLE has been evicted")
+		require.NotEqual(t, needleSeq, e.DisplaySeq, "NEEDLE has been evicted")
 	}
 	assert.GreaterOrEqual(t, m.logCursorIdx, 0, "the evicted cursor clamps in range")
 	assert.Less(t, m.logCursorIdx, len(m.logEntries), "the evicted cursor clamps in range")

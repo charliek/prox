@@ -81,15 +81,16 @@ type BaseModel struct {
 	logSearchQuery string
 
 	// logSeq is a session-local monotonic counter stamped onto each ingested
-	// LogEntry.Seq. The logs cursor is anchored by Seq, not index, so it rides
-	// the 1000-entry front-eviction ring without drifting (a bare index would
-	// shift when old entries are dropped — see LogEntry.Seq) (D7).
+	// LogEntry.DisplaySeq. The logs cursor is anchored by DisplaySeq, not index,
+	// so it rides the 1000-entry front-eviction ring without drifting (a bare
+	// index would shift when old entries are dropped — see LogEntry.DisplaySeq).
+	// This is unrelated to LogEntry.Seq, the server ingest sequence (D7).
 	logSeq int64
 
-	// Logs-view search cursor (Seq-anchored). logCursorSeq names the line the
-	// cursor sits on; logCursorIdx is its index in the filtered list. Both are
+	// Logs-view search cursor (DisplaySeq-anchored). logCursorSeq names the line
+	// the cursor sits on; logCursorIdx is its index in the filtered list. Both are
 	// mutated ONLY through setLogCursor so they can never disagree. logCursorSeq
-	// 0 is the explicit no-cursor sentinel (ingested Seqs are always >= 1), and
+	// 0 is the explicit no-cursor sentinel (stamped DisplaySeqs are always >= 1), and
 	// logCursorIdx -1 pairs with it. Unlike the requests cursor, this one exists
 	// only while a `/`-search is active and is not scroll-coupled: j/k keep
 	// scrolling the viewport, and resolveLogCursor only re-derives the marker
@@ -195,10 +196,12 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	// Check if we're at/near bottom BEFORE adding new content
 	wasNearBottom := b.isNearBottom()
 
-	// Stamp a session-local monotonic Seq so the logs search cursor can anchor
-	// to this line's identity across the front-eviction ring below (D7).
+	// Stamp a session-local monotonic DisplaySeq so the logs search cursor can
+	// anchor to this line's identity across the front-eviction ring below. This
+	// overwrites nothing on the wire: the server's LogEntry.Seq is a separate
+	// field and is left untouched (D7).
 	b.logSeq++
-	entry.Seq = b.logSeq
+	entry.DisplaySeq = b.logSeq
 	b.logEntries = append(b.logEntries, entry)
 	// Keep only last entries - create new slice to release memory from old entries
 	if len(b.logEntries) > maxLogEntries {
@@ -843,7 +846,7 @@ func (b *BaseModel) seekLogSearchMatch(dir int) {
 
 // logSearchOriginIdx returns the index in entries from which a seek should
 // begin. With a cursor already anchored (logCursorSeq set), it re-resolves that
-// Seq to its current index — surviving the eviction ring — and clamps the
+// DisplaySeq to its current index — surviving the eviction ring — and clamps the
 // last-known index when the anchored line has been evicted. On the FIRST search
 // (no cursor yet), it seeds from what the user is looking at: the newest row
 // under follow, else the top visible row derived from the viewport offset, so
@@ -852,7 +855,7 @@ func (b *BaseModel) logSearchOriginIdx(entries []domain.LogEntry) int {
 	n := len(entries)
 	if b.logCursorSeq != 0 {
 		for i, e := range entries {
-			if e.Seq == b.logCursorSeq {
+			if e.DisplaySeq == b.logCursorSeq {
 				return i
 			}
 		}
@@ -901,14 +904,14 @@ func (b *BaseModel) setLogCursor(entries []domain.LogEntry, idx int) {
 	}
 	idx = clampIndex(idx, len(entries))
 	b.logCursorIdx = idx
-	b.logCursorSeq = entries[idx].Seq
+	b.logCursorSeq = entries[idx].DisplaySeq
 }
 
 // resolveLogCursor re-anchors the logs search cursor against the current
 // filtered list at render time (called from updateViewport only while a search
 // is active), so the row marker stays on the searched-to line as entries stream
 // in and the eviction ring shifts indices. Mirrors resolveRequestCursor but
-// anchors by Seq (logs have no ID) and NEVER scrolls — the logs viewport scroll
+// anchors by DisplaySeq (logs have no ID) and NEVER scrolls — the logs viewport scroll
 // stays owned by j/k, follow, and the one-shot ensureLogCursorVisible.
 //
 // Unlike the requests cursor (which always exists), the logs cursor is
@@ -932,7 +935,7 @@ func (b *BaseModel) resolveLogCursor(entries []domain.LogEntry) {
 		return
 	}
 	for i, e := range entries {
-		if e.Seq == b.logCursorSeq {
+		if e.DisplaySeq == b.logCursorSeq {
 			b.setLogCursor(entries, i)
 			return
 		}
