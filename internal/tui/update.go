@@ -54,7 +54,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TickMsg:
 		m.processes = m.supervisor.Processes()
-		cmds = append(cmds, tickCmd())
+		cmds = append(cmds, tickCmd(constants.TUILocalTickInterval))
 
 	case subIDMsg:
 		m.subID = string(msg)

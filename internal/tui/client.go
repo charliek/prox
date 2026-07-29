@@ -4,6 +4,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/api"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
@@ -44,7 +45,7 @@ func NewClientModel(client TUIClient) ClientModel {
 func (m ClientModel) Init() tea.Cmd {
 	return tea.Batch(
 		m.fetchProcesses(),
-		tickCmd(),
+		tickCmd(constants.TUILocalTickInterval),
 	)
 }
 
@@ -177,7 +178,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case TickMsg:
 		// Refresh processes periodically
 		cmds = append(cmds, m.fetchProcesses())
-		cmds = append(cmds, tickCmd())
+		cmds = append(cmds, tickCmd(constants.TUILocalTickInterval))
 	}
 
 	// Handle viewport updates

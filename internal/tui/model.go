@@ -5,6 +5,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
@@ -68,7 +69,7 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		subscribeToLogs(m.logManager),
 		refreshProcesses(),
-		tickCmd(),
+		tickCmd(constants.TUILocalTickInterval),
 	)
 }
 
@@ -187,9 +188,13 @@ func refreshProcesses() tea.Cmd {
 	}
 }
 
-// tickCmd returns a command that ticks periodically
-func tickCmd() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+// tickCmd returns a command that ticks after d, driving the periodic
+// process-list refresh. The interval is a parameter because the two modes
+// pay different costs per tick: local mode reads the in-process supervisor,
+// attach mode does an HTTP round trip (until the processes stream replaces
+// it entirely).
+func tickCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return TickMsg(t)
 	})
 }

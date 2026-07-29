@@ -163,6 +163,15 @@ const (
 	SSEReadTimeout = 60 * time.Second
 )
 
+// TUI timing
+const (
+	// TUILocalTickInterval drives the local-mode TUI's periodic process-list
+	// refresh. Local mode reads the in-process supervisor directly, so a
+	// fast tick costs nothing; attach mode reuses this interval only until
+	// its poll is replaced by the processes SSE stream (plan 017 C12).
+	TUILocalTickInterval = 500 * time.Millisecond
+)
+
 // Log configuration
 const (
 	// DefaultLogLimit is the default number of log lines to return
