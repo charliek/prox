@@ -380,38 +380,25 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	printer := NewLogPrinter()
 
 	if logsFollow {
-		// Stream logs via channel
-		ch, err := client.StreamLogsChannel(commandContext(cmd), params)
-		if err != nil {
-			return clientError(err, "Is prox running? Try 'prox up' first.")
-		}
-		for entry := range ch {
-			if logsJSON {
-				if err := json.NewEncoder(os.Stdout).Encode(entry); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to encode log entry: %v\n", err)
-				}
-			} else {
-				printer.PrintAPIEntry(entry)
-			}
+		return followLogs(cmd, client, params, logsJSON, printer)
+	}
+
+	// Get logs
+	logs, err := client.GetLogs(commandContext(cmd), params)
+	if err != nil {
+		return clientError(err, "Is prox running? Try 'prox up' first.")
+	}
+
+	if logsJSON {
+		if err := json.NewEncoder(os.Stdout).Encode(logs); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to encode logs: %v\n", err)
 		}
 	} else {
-		// Get logs
-		logs, err := client.GetLogs(commandContext(cmd), params)
-		if err != nil {
-			return clientError(err, "Is prox running? Try 'prox up' first.")
+		for _, entry := range logs.Logs {
+			printer.PrintAPIEntry(entry)
 		}
-
-		if logsJSON {
-			if err := json.NewEncoder(os.Stdout).Encode(logs); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to encode logs: %v\n", err)
-			}
-		} else {
-			for _, entry := range logs.Logs {
-				printer.PrintAPIEntry(entry)
-			}
-			if logs.FilteredCount < logs.TotalCount {
-				fmt.Printf("\n(showing %d of %d entries)\n", logs.FilteredCount, logs.TotalCount)
-			}
+		if logs.FilteredCount < logs.TotalCount {
+			fmt.Printf("\n(showing %d of %d entries)\n", logs.FilteredCount, logs.TotalCount)
 		}
 	}
 	return nil
@@ -758,62 +745,49 @@ func runRequests(cmd *cobra.Command, args []string) error {
 	}
 
 	if requestsFollow {
-		// Stream requests via SSE
-		ch, err := client.StreamProxyRequestsChannel(commandContext(cmd), params)
-		if err != nil {
-			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
-		}
-		for req := range ch {
-			if requestsJSON {
-				if err := json.NewEncoder(os.Stdout).Encode(req); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to encode request: %v\n", err)
-				}
-			} else {
-				printProxyRequest(req)
-			}
+		return followRequests(cmd, client, params, requestsJSON)
+	}
+
+	// Get recent requests
+	resp, err := client.GetProxyRequests(commandContext(cmd), params)
+	if err != nil {
+		return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
+	}
+
+	if requestsJSON {
+		if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to encode requests: %v\n", err)
 		}
 	} else {
-		// Get recent requests
-		resp, err := client.GetProxyRequests(commandContext(cmd), params)
-		if err != nil {
-			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
+		if len(resp.Requests) == 0 {
+			fmt.Println("No proxy requests recorded")
+			return nil
 		}
 
-		if requestsJSON {
-			if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to encode requests: %v\n", err)
-			}
-		} else {
-			if len(resp.Requests) == 0 {
-				fmt.Println("No proxy requests recorded")
-				return nil
-			}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tTIME\tMETHOD\tSTATUS\tDURATION\tURL")
+		fmt.Fprintln(w, "-------\t--------\t------\t------\t--------\t---")
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tTIME\tMETHOD\tSTATUS\tDURATION\tURL")
-			fmt.Fprintln(w, "-------\t--------\t------\t------\t--------\t---")
-
-			for _, req := range resp.Requests {
-				ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
-				timeStr := ts.Format("15:04:05")
-				duration := fmt.Sprintf("%dms", req.DurationMs)
-				if req.InFlight {
-					duration = "..."
-					if req.Stale {
-						// Completion event may have been lost; true outcome
-						// unknown (D8, #53). Long-lived streams/transfers can
-						// legitimately still be live past this point.
-						duration = "stale?"
-					}
+		for _, req := range resp.Requests {
+			ts, _ := time.Parse(time.RFC3339Nano, req.Timestamp)
+			timeStr := ts.Format("15:04:05")
+			duration := fmt.Sprintf("%dms", req.DurationMs)
+			if req.InFlight {
+				duration = "..."
+				if req.Stale {
+					// Completion event may have been lost; true outcome
+					// unknown (D8, #53). Long-lived streams/transfers can
+					// legitimately still be live past this point.
+					duration = "stale?"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
-					req.ID, timeStr, req.Method, req.StatusCode, duration, req.URL)
 			}
-			w.Flush()
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
+				req.ID, timeStr, req.Method, req.StatusCode, duration, req.URL)
+		}
+		w.Flush()
 
-			if resp.FilteredCount < resp.TotalCount {
-				fmt.Printf("\n(showing %d of %d requests)\n", resp.FilteredCount, resp.TotalCount)
-			}
+		if resp.FilteredCount < resp.TotalCount {
+			fmt.Printf("\n(showing %d of %d requests)\n", resp.FilteredCount, resp.TotalCount)
 		}
 	}
 	return nil

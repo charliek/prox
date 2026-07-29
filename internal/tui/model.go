@@ -40,9 +40,6 @@ type Model struct {
 	// Dependencies
 	supervisor *supervisor.Supervisor
 	logManager *logs.Manager
-
-	// Subscription ID for log tracking
-	subID string
 }
 
 // NewModel creates a new TUI model
@@ -71,10 +68,15 @@ func NewModel(sup *supervisor.Supervisor, logMgr *logs.Manager) Model {
 	}
 }
 
-// Init initializes the model
+// Init initializes the model.
+//
+// It does NOT subscribe to logs itself (plan 017 C13 deleted the second,
+// leaked subscription this used to open via subscribeToLogs): the REAL local
+// log subscription is the one app.go's Run makes before starting the
+// forwarder, and its entries reach the model as LogEntryMsg regardless of
+// what Init returns.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		subscribeToLogs(m.logManager),
 		refreshProcesses(),
 		tickCmd(constants.TUILocalTickInterval),
 	)
@@ -173,20 +175,6 @@ func restartResultClearCmd() tea.Cmd {
 		return RestartResultClearMsg{}
 	})
 }
-
-// subscribeToLogs starts log subscription (returns subscription ID for tracking)
-// Note: Actual log forwarding is handled by forwardLogs in app.go
-func subscribeToLogs(logMgr *logs.Manager) tea.Cmd {
-	return func() tea.Msg {
-		id, _, err := logMgr.Subscribe(domain.LogFilter{})
-		if err != nil {
-			return nil
-		}
-		return subIDMsg(id)
-	}
-}
-
-type subIDMsg string
 
 // refreshProcesses returns a command to refresh process list
 func refreshProcesses() tea.Cmd {

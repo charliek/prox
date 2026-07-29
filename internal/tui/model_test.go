@@ -34,6 +34,35 @@ func TestNewModel(t *testing.T) {
 	assert.Empty(t, model.logEntries)
 }
 
+// TestModel_Init_DoesNotSubscribeToLogs proves the panel finding fixed by
+// plan 017 C13: local mode used to open a SECOND, leaked log subscription
+// from Model.Init (via the now-deleted subscribeToLogs/subIDMsg), on top of
+// the real one app.go's Run makes before starting the forwarder. It executes
+// every command Init returns — exactly as the bubbletea runtime would — and
+// asserts the log manager's subscriber count never moves, using
+// logs.Manager.Stats().Subscribers as the smallest available accessor.
+func TestModel_Init_DoesNotSubscribeToLogs(t *testing.T) {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	model := NewModel(sup, logMgr)
+
+	before := logMgr.Stats().Subscribers
+
+	cmd := model.Init()
+	require.NotNil(t, cmd)
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	require.True(t, ok, "expected Init to return a tea.Batch, got %T", msg)
+	for _, sub := range batch {
+		if sub != nil {
+			sub() // runs refreshProcesses and tickCmd; neither subscribes
+		}
+	}
+
+	after := logMgr.Stats().Subscribers
+	assert.Equal(t, before, after, "Model.Init must not open its own log subscription — the real one belongs to app.go Run")
+}
+
 func TestModel_HandleKey_Quit(t *testing.T) {
 	model := newTestModel()
 

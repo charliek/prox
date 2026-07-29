@@ -59,9 +59,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.processes = m.supervisor.Processes()
 		cmds = append(cmds, tickCmd(constants.TUILocalTickInterval))
 
-	case subIDMsg:
-		m.subID = string(msg)
-
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process
 		m.lastRestartError = msg.Err
