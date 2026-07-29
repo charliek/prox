@@ -774,7 +774,7 @@ func runRequests(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// Get recent requests
-		resp, err := client.GetProxyRequests(params)
+		resp, err := client.GetProxyRequests(commandContext(cmd), params)
 		if err != nil {
 			return clientError(err, "Is prox running with proxy enabled? Try 'prox up' first.")
 		}

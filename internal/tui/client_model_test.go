@@ -36,6 +36,14 @@ type stubTUIClient struct {
 	// connection, skip it to model a dead-on-arrival dial.
 	consumeLogs     func(ctx context.Context, onConnect func(), onEvent func(api.LogEntryResponse)) error
 	consumeRequests func(ctx context.Context, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
+
+	// snapshot is the requests-sync REST payload (newest-first, as the real
+	// endpoint returns). nil means an empty snapshot. snapshotErr, when set,
+	// fails every fetch; snapshotCalls counts them.
+	snapshot     []api.ProxyRequestResponse
+	snapshotErr  error
+	snapshotCall func(n int) // optional per-call hook; n is the 1-based call count
+	snapshotN    int         // number of GetProxyRequests calls made
 }
 
 func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
@@ -75,6 +83,32 @@ func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDet
 	return &api.ProxyRequestDetailResponse{
 		ProxyRequestResponse: api.ProxyRequestResponse{ID: id},
 	}, nil
+}
+
+func (s *stubTUIClient) GetProxyRequests(ctx context.Context, _ domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+	s.mu.Lock()
+	s.snapshotN++
+	n := s.snapshotN
+	hook, err, records := s.snapshotCall, s.snapshotErr, s.snapshot
+	s.mu.Unlock()
+
+	if hook != nil {
+		hook(n)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &api.ProxyRequestsResponse{Requests: records}, nil
+}
+
+// snapshotCalls returns how many times GetProxyRequests has been called.
+func (s *stubTUIClient) snapshotCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotN
 }
 
 // lastRequestedID returns the most recent GetProxyRequest id, or "".

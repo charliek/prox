@@ -46,6 +46,13 @@ type BaseModel struct {
 	logEntries    []domain.LogEntry
 	proxyRequests []proxy.RequestRecord
 
+	// staleRequests holds the IDs of in-flight rows a requests-stream sync
+	// swept as prior-epoch: the server we synchronized against does not know
+	// them, so their completion can never arrive (see sweepPriorEpochInFlight).
+	// Rebuilt from the live list on every sync, and consulted only through
+	// requestIsStale.
+	staleRequests map[string]bool
+
 	// UI components
 	viewport  viewport.Model
 	textInput textinput.Model
@@ -146,6 +153,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		processes:       make([]domain.ProcessInfo, 0),
 		logEntries:      make([]domain.LogEntry, 0),
 		proxyRequests:   make([]proxy.RequestRecord, 0),
+		staleRequests:   make(map[string]bool),
 		textInput:       ti,
 		mode:            ModeNormal,
 		viewMode:        ViewModeLogs,
@@ -216,33 +224,61 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	}
 }
 
-// handleProxyRequest handles a new proxy request message. It upserts by ID:
-// a same-ID re-record (in-flight followed by its completion) replaces the
-// existing row in place rather than appending a duplicate, scanning from the
-// newest entry since that's where a live in-flight row lives. In-place
-// replacement keeps every other row's index stable, and the ID-anchored cursor
-// (resolveRequestCursor) rides along on its row regardless.
+// handleProxyRequest handles a new proxy request message: one monotonic merge
+// followed by one render.
 func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
-	replaced := false
+	b.mergeProxyRequest(req)
+	b.renderAfterProxyRequests()
+}
+
+// mergeProxyRequest applies one record to the list as a monotonic two-state
+// transition keyed by ID, mirroring proxy.Upsert's table:
+//
+//	absent                            → append (with the eviction trim)
+//	existing in-flight, incoming any  → replace in place
+//	existing final                    → no-op (final is terminal)
+//
+// The one deliberate difference from proxy.Upsert is the in-flight → in-flight
+// row: the ring no-ops it as a duplicate delivery, while the list takes the
+// newer copy. Both are correct (the two copies differ in nothing that matters),
+// and taking it keeps the display tracking the freshest server view.
+//
+// The terminal-final row is what makes replaying a snapshot alongside live
+// events safe in any interleaving (C6): a snapshot's stale in-flight copy can
+// never regress a completion that already arrived live, and a duplicate final
+// can never re-render one. In-place replacement keeps every other row's index
+// stable, and the ID-anchored cursor (resolveRequestCursor) rides along on its
+// row regardless. The scan runs newest-first, since that's where a live
+// in-flight row lives.
+//
+// Records with no ID (never produced by either proxy path) always append: they
+// have no identity to merge on.
+func (b *BaseModel) mergeProxyRequest(req proxy.RequestRecord) {
 	if req.ID != "" {
 		for i := len(b.proxyRequests) - 1; i >= 0; i-- {
-			if b.proxyRequests[i].ID == req.ID {
-				b.proxyRequests[i] = req
-				replaced = true
-				break
+			if b.proxyRequests[i].ID != req.ID {
+				continue
 			}
-		}
-	}
-	if !replaced {
-		b.proxyRequests = append(b.proxyRequests, req)
-		// Keep only last requests - create new slice to release memory from old requests
-		if len(b.proxyRequests) > maxProxyRequests {
-			newRequests := make([]proxy.RequestRecord, maxProxyRequests)
-			copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
-			b.proxyRequests = newRequests
+			if b.proxyRequests[i].InFlight {
+				b.proxyRequests[i] = req
+			} // else: final is terminal
+			return
 		}
 	}
 
+	b.proxyRequests = append(b.proxyRequests, req)
+	// Keep only last requests - create new slice to release memory from old requests
+	if len(b.proxyRequests) > maxProxyRequests {
+		newRequests := make([]proxy.RequestRecord, maxProxyRequests)
+		copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
+		b.proxyRequests = newRequests
+	}
+}
+
+// renderAfterProxyRequests is the shared render tail for request arrivals —
+// one live record or a whole sync batch. Batches deliberately share it so a
+// 1000-record replay costs exactly one render.
+func (b *BaseModel) renderAfterProxyRequests() {
 	// In the detail view an arrival updates only the list data: the viewport is
 	// showing the open detail, so re-rendering/scrolling it would yank the
 	// reader (today's GotoBottom wart). No follow change either. C4 layers the
@@ -272,6 +308,69 @@ func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
 	} else if b.followMode {
 		b.viewport.GotoBottom()
 	}
+}
+
+// handleRequestsSync applies one completed stream synchronization (C6): the
+// REST snapshot oldest-first, then the events buffered during the fetch in
+// arrival order, all through the monotonic merge — so any interleaving of
+// {snapshot copy, live copy, completion} converges on the final record with no
+// duplicate rows and no regressions.
+//
+// Everything renders ONCE at the end: a full 1000-record ring replay must not
+// re-render a thousand times. Cursor and follow semantics are unchanged because
+// they live in that single updateViewport — the cursor is ID-anchored, so a
+// user parked on a row keeps it, and follow mode re-pins to the newest row.
+func (b *BaseModel) handleRequestsSync(msg RequestsSyncMsg) {
+	seen := make(map[string]struct{}, len(msg.Snapshot)+len(msg.Buffered))
+	for _, req := range msg.Snapshot {
+		seen[req.ID] = struct{}{}
+		b.mergeProxyRequest(req)
+	}
+	for _, req := range msg.Buffered {
+		seen[req.ID] = struct{}{}
+		b.mergeProxyRequest(req)
+	}
+
+	b.sweepPriorEpochInFlight(seen)
+	b.renderAfterProxyRequests()
+}
+
+// sweepPriorEpochInFlight marks every still-in-flight row the sync did not
+// account for as stale. Such a row belongs to a dead epoch: the server we just
+// synchronized against has no record of it, so no completion event for it can
+// ever arrive and it would otherwise sit spinning "...ms" forever. seen holds
+// the IDs the sync batch carried (snapshot plus buffered live events), so a
+// request that legitimately started during the fetch is never swept.
+//
+// The mark is TUI-local: staleness on a proxy.RequestRecord is derived from its
+// age (StaleAt), and back-dating a record's Timestamp to force that would
+// corrupt the time column. The map is rebuilt from the live list on every sweep,
+// so it cannot grow past the list.
+func (b *BaseModel) sweepPriorEpochInFlight(seen map[string]struct{}) {
+	stale := make(map[string]bool)
+	for _, req := range b.proxyRequests {
+		if !req.InFlight || req.ID == "" {
+			continue
+		}
+		if _, ok := seen[req.ID]; ok {
+			continue
+		}
+		stale[req.ID] = true
+	}
+	b.staleRequests = stale
+}
+
+// requestIsStale reports whether a row renders as stale (D8, #53): either it
+// has been in-flight past constants.InFlightStaleAfter, or a sync batch swept
+// it as prior-epoch. Final records are never stale under either rule, which is
+// also why a swept row that later completes needs no explicit unmarking: the
+// in-flight gate below short-circuits before the map is consulted, and the next
+// sweep rebuilds the map from scratch anyway.
+func (b *BaseModel) requestIsStale(req proxy.RequestRecord) bool {
+	if !req.InFlight {
+		return false
+	}
+	return req.StaleAt(time.Now()) || b.staleRequests[req.ID]
 }
 
 // handleFilterKey handles keys in filter mode
@@ -1446,7 +1545,7 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	durationMs := req.Duration.Milliseconds()
 	var duration string
 	switch {
-	case req.StaleAt(time.Now()):
+	case b.requestIsStale(req):
 		duration = "stale?"
 	case req.InFlight:
 		duration = "  ...ms"

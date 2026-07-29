@@ -140,6 +140,12 @@ type TUIClient interface {
 	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error
 	ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
+
+	// GetProxyRequests fetches the ring snapshot the requests stream
+	// synchronizes against on every connect. It is the one ctx-taking
+	// non-stream method: the fetch is owned by a stream attempt and must be
+	// abandoned the moment that attempt ends.
+	GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error)
 }
 
 // RunClient starts the TUI application in client mode (connected via API)
@@ -170,10 +176,11 @@ func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg))
 				sendStreamedLogEntry(send, entry)
 			})
 		}),
-		streamLoop(StreamRequests, send, classifyRequestsStreamError, func(ctx context.Context, onConnect func()) error {
-			return client.ConsumeProxyRequests(ctx, domain.ProxyRequestParams{}, onConnect, func(req api.ProxyRequestResponse) {
-				sendStreamedProxyRequest(send, req)
-			})
+		// The requests stream is NOT a pure stream consumer: every connect
+		// synchronizes against a REST snapshot before reporting OK, so its
+		// markSynced lands inside the sync protocol rather than on connect.
+		streamLoop(StreamRequests, send, classifyRequestsStreamError, func(ctx context.Context, markSynced func()) error {
+			return consumeRequestsWithSync(ctx, client, send, markSynced)
 		}),
 	}
 
@@ -234,7 +241,15 @@ func sendStreamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) {
 
 // sendStreamedProxyRequest converts one streamed proxy request and delivers it.
 func sendStreamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) {
-	send(ProxyRequestMsg(proxy.RequestRecord{
+	send(ProxyRequestMsg(streamedProxyRequest(send, req)))
+}
+
+// streamedProxyRequest converts one wire proxy request to a record without
+// delivering it, so the sync protocol can buffer live events and convert
+// snapshot records (same wire type) through exactly the same mapping. send is
+// still needed: a malformed timestamp warns through the log pane.
+func streamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) proxy.RequestRecord {
+	return proxy.RequestRecord{
 		ID:         req.ID,
 		Timestamp:  parseStreamTimestamp(send, "proxy request", req.Timestamp),
 		Method:     req.Method,
@@ -244,5 +259,5 @@ func sendStreamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) 
 		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
 		RemoteAddr: req.RemoteAddr,
 		InFlight:   req.InFlight,
-	}))
+	}
 }

@@ -811,7 +811,7 @@ func TestClient_GetProxyRequests(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	resp, err := client.GetProxyRequests(domain.ProxyRequestParams{
+	resp, err := client.GetProxyRequests(context.Background(), domain.ProxyRequestParams{
 		Subdomain: "api",
 		Method:    "GET",
 		MinStatus: 400,

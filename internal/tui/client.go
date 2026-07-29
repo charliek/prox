@@ -112,6 +112,27 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchRequestDetail(record.ID, m.detailFetchSeq))
 		}
 
+	case RequestsSyncMsg:
+		// One batch, one render (C6). Attach mode only: local mode reads the
+		// request ring directly and has nothing to synchronize against.
+		m.handleRequestsSync(msg)
+		// D16 also applies to a completion that arrives via the sync batch
+		// instead of a live event: an open detail still showing an in-flight
+		// snapshot must refetch once its row went final. Guarded on the
+		// detail's own in-flight state (unlike the live path, which fires at
+		// most once per ID by upsert monotonicity) so routine reconnect syncs
+		// don't refetch an already-final detail on every re-sync.
+		if m.viewMode == ViewModeRequestDetail && m.selectedRequestID != "" &&
+			(m.requestDetail == nil || m.requestDetail.InFlight) {
+			for _, r := range m.proxyRequests {
+				if r.ID == m.selectedRequestID && !r.InFlight {
+					m.detailFetchSeq++
+					cmds = append(cmds, m.fetchRequestDetail(r.ID, m.detailFetchSeq))
+					break
+				}
+			}
+		}
+
 	case StreamStatusMsg:
 		m.handleStreamStatus(msg)
 

@@ -216,12 +216,16 @@ func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
 	return &resp, nil
 }
 
-// GetProxyRequests gets recent proxy requests with optional filtering
-func (c *Client) GetProxyRequests(params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+// GetProxyRequests gets recent proxy requests with optional filtering.
+//
+// It takes a context because the TUI's requests-stream sync calls it once per
+// connect and must abandon an in-flight snapshot fetch the moment its stream
+// attempt ends (tui.TUIClient).
+func (c *Client) GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
 	path := pathWithQuery("/api/v1/proxy/requests", buildProxyRequestQueryParams(params))
 
 	var resp api.ProxyRequestsResponse
-	if err := c.get(path, &resp); err != nil {
+	if err := c.getCtx(ctx, path, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -294,11 +298,11 @@ func httpStatusError(statusCode int, errResp *api.ErrorResponse) *APIError {
 }
 
 func (c *Client) doRequest(method, path string, v interface{}) error {
-	return c.doRequestWith(c.httpClient, method, path, v)
+	return c.doRequestWith(context.Background(), c.httpClient, method, path, v)
 }
 
-func (c *Client) doRequestWith(client *http.Client, method, path string, v interface{}) error {
-	req, err := http.NewRequest(method, c.baseURL+path, nil)
+func (c *Client) doRequestWith(ctx context.Context, client *http.Client, method, path string, v interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
@@ -331,6 +335,12 @@ func (c *Client) get(path string, v interface{}) error {
 	return c.doRequest("GET", path, v)
 }
 
+// getCtx is get with a caller-supplied context, so a cancellable caller aborts
+// its request rather than waiting out the client's 30s timeout.
+func (c *Client) getCtx(ctx context.Context, path string, v interface{}) error {
+	return c.doRequestWith(ctx, c.httpClient, "GET", path, v)
+}
+
 func (c *Client) post(path string, v interface{}) error {
 	return c.doRequest("POST", path, v)
 }
@@ -339,7 +349,7 @@ func (c *Client) post(path string, v interface{}) error {
 // tolerates a stop/restart that the daemon holds open up to a configured stop
 // budget (#35, D2).
 func (c *Client) postLifecycle(path string, v interface{}) error {
-	return c.doRequestWith(c.lifecycleClient, "POST", path, v)
+	return c.doRequestWith(context.Background(), c.lifecycleClient, "POST", path, v)
 }
 
 // addAuthHeader adds the Authorization header if a token is available
