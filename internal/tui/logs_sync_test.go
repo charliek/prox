@@ -429,7 +429,7 @@ func TestConsumeLogsWithSync_DeadDialNeverSyncs(t *testing.T) {
 // and every applied line gets a DisplaySeq so the search cursor can anchor to
 // it.
 func TestLogsSync_BatchAppendsNoticeThenEntries(t *testing.T) {
-	m := NewClientModel(&stubTUIClient{})
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	m, _ = clientUpdateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{Process: "web", Line: "before"}))
 
@@ -455,7 +455,7 @@ func TestLogsSync_BatchAppendsNoticeThenEntries(t *testing.T) {
 // TestLogsSync_EmptyBatchIsNoOp pins that a caught-up reconnect — the common
 // case on a quiet stream — changes nothing at all.
 func TestLogsSync_EmptyBatchIsNoOp(t *testing.T) {
-	m := NewClientModel(&stubTUIClient{})
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	m, _ = clientUpdateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{Process: "web", Line: "only"}))
 	seqBefore := m.logSeq
@@ -472,7 +472,7 @@ func TestLogsSync_EmptyBatchIsNoOp(t *testing.T) {
 // process list (ProcessesMsg). A batch must not smuggle in filter state a live
 // entry would not have created.
 func TestLogsSync_BatchDoesNotRegisterProcesses(t *testing.T) {
-	m := NewClientModel(&stubTUIClient{})
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	m, _ = clientUpdateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
 
 	m = clientUpdate(m, LogsSyncMsg{Entries: []domain.LogEntry{{Process: "batch-only", Line: "x"}}})

@@ -35,7 +35,7 @@ func (e *fakeAPIError) ErrorCode() string { return e.code }
 // readyClientModel builds a ClientModel wide enough that the status bar renders
 // without wrapping the health segments.
 func readyClientModel() ClientModel {
-	m := NewClientModel(&stubTUIClient{})
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 20})
 	return nm.(ClientModel)
 }

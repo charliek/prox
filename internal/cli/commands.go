@@ -661,7 +661,17 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run TUI in client mode
-	if err := tui.RunClient(client); err != nil {
+	// Attach supervises nothing, so it has no out-of-band shutdown to honor:
+	// ShutdownCh stays nil and quitting is the user's keypress alone.
+	opts := tui.ClientOptions{
+		Help: tui.HelpConfig{
+			TitleSuffix: "(Client Mode)",
+			QuitMessage: "Quit (daemon continues running)",
+		},
+		ConnectedStatus: "Connected via API",
+		ShutdownCh:      nil,
+	}
+	if err := tui.RunClient(client, opts); err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}
 	return nil

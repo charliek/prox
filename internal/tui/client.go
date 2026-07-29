@@ -11,12 +11,55 @@ import (
 	"github.com/charliek/prox/internal/stream"
 )
 
+// ClientOptions carries everything that differs between the two client-mode
+// callers — `prox attach`, talking to another process's daemon over HTTP, and
+// `prox up --tui`, talking to its own in-process API. The model, the streams and
+// every key binding are shared; only the wording and the shutdown wiring below
+// are per-caller, so this stays deliberately small rather than growing into a
+// general settings bag.
+type ClientOptions struct {
+	// Help supplies the help overlay's title suffix and quit wording. The two
+	// callers must word quit differently: leaving attach abandons a daemon that
+	// keeps running, leaving `up --tui` takes the processes down with it.
+	Help HelpConfig
+
+	// ConnectedStatus is the status-line text rendered whenever nothing is
+	// wrong. Every degraded wording — connection outage, old daemon, restart
+	// result — outranks it; see View.
+	ConnectedStatus string
+
+	// ShutdownCh, when non-nil, quits the program on close. This is how an
+	// out-of-band shutdown request (POST /shutdown, via the coordinator's
+	// trigger channel) reaches a --tui daemon, which otherwise blocks in
+	// tea.Program.Run forever. Attach mode passes nil: it supervises nothing,
+	// so nothing can ask it to shut down out of band.
+	//
+	// The wait is PROGRAM-OWNED — a tea.Cmd returned from Init (see
+	// waitForExternalShutdown), not a goroutine holding the *tea.Program and
+	// calling Quit on it. That keeps quitting on one path (a message through
+	// Update) so it cannot race the program's own teardown, at the cost of one
+	// command goroutine parked on the channel for the rest of a hand-quit
+	// session — harmless, since both callers exit the process once RunClient
+	// returns.
+	ShutdownCh <-chan struct{}
+}
+
+// ExternalShutdownMsg reports that ClientOptions.ShutdownCh closed, i.e. that
+// something outside the TUI asked the program to stop. Update answers it with
+// tea.Quit, so an out-of-band shutdown and a user pressing q leave through
+// exactly the same path.
+type ExternalShutdownMsg struct{}
+
 // ClientModel is the bubbletea model for TUI client mode (connected via API)
 type ClientModel struct {
 	BaseModel
 
 	// Dependencies
 	client TUIClient
+
+	// opts is the run's per-caller configuration. Help is copied into
+	// BaseModel by newBaseModel; the rest is read from here.
+	opts ClientOptions
 
 	// connectionError is the attach session's global connection state, DERIVED
 	// (C12) from the processes stream's health rather than reported by any
@@ -37,23 +80,39 @@ type ClientModel struct {
 }
 
 // NewClientModel creates a new TUI model for client mode
-func NewClientModel(client TUIClient) ClientModel {
+func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 	return ClientModel{
-		BaseModel: newBaseModel(HelpConfig{
-			TitleSuffix: "(Client Mode)",
-			QuitMessage: "Quit (daemon continues running)",
-		}),
-		client: client,
+		BaseModel: newBaseModel(opts.Help),
+		client:    client,
+		opts:      opts,
 	}
 }
 
-// Init has nothing to do. Attach mode has no periodic work left: every feed —
-// logs, requests and, since C12, processes — is pushed by a stream loop that
-// RunClient starts alongside the program, and the processes stream's
-// snapshot-on-connect delivers the initial process list without anyone asking
-// for it. The method stays because tea.Model requires it.
+// Init starts the external-shutdown wait, and nothing else. Client mode has no
+// periodic work: every feed — logs, requests and, since 017 C12, processes — is
+// pushed by a stream loop that RunClient starts alongside the program, and the
+// processes stream's snapshot-on-connect delivers the initial process list
+// without anyone asking for it.
+//
+// With no ShutdownCh (attach) there is nothing to wait for and Init returns nil,
+// which is also what the no-poll proof in client_model_test.go pins.
 func (m ClientModel) Init() tea.Cmd {
-	return nil
+	if m.opts.ShutdownCh == nil {
+		return nil
+	}
+	return waitForExternalShutdown(m.opts.ShutdownCh)
+}
+
+// waitForExternalShutdown blocks in a command goroutine until ch closes (or
+// receives), then reports ExternalShutdownMsg. bubbletea runs each command on
+// its own goroutine, so blocking here costs nothing but that goroutine; see
+// ClientOptions.ShutdownCh for why the wait lives in a command rather than
+// beside the program.
+func waitForExternalShutdown(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		<-ch
+		return ExternalShutdownMsg{}
+	}
 }
 
 // errProcessesStreamLost is the connection error shown when the processes
@@ -106,6 +165,11 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case ExternalShutdownMsg:
+		// Same exit as q/Ctrl-C: RunClient returns and the caller runs its
+		// normal shutdown sequence, so both routes are identical.
+		return m, tea.Quit
 
 	case tea.WindowSizeMsg:
 		m.handleWindowSize(msg)
@@ -362,7 +426,7 @@ func (m ClientModel) View() string {
 	case ModeHelp:
 		return m.helpView()
 	default:
-		statusInfo := "Connected via API"
+		statusInfo := m.opts.ConnectedStatus
 		if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
 			// The old-daemon park is not an outage and never self-heals by
 			// waiting, so "retrying..." would be a lie — render the actionable
