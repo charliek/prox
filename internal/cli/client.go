@@ -275,8 +275,13 @@ type APIError struct {
 // status-specific fallback. The text is user-facing: CLI commands surface it
 // verbatim through clientError.
 func (e *APIError) Error() string {
-	if e.Message != "" {
+	// Code is optional on the wire: a handler that writes {"error":"..."}
+	// without a code must not render a bare ": msg" (CodeRabbit PR #87).
+	if e.Message != "" && e.Code != "" {
 		return fmt.Sprintf("%s: %s", e.Code, e.Message)
+	}
+	if e.Message != "" {
+		return e.Message
 	}
 
 	switch e.Status {

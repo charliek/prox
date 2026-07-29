@@ -979,6 +979,14 @@ func TestClient_APIError(t *testing.T) {
 			wantText: "access denied: insufficient permissions",
 		},
 		{
+			name:        "message without code renders bare message",
+			status:      http.StatusServiceUnavailable,
+			contentType: "application/json",
+			body:        `{"error":"proxy is not enabled"}`,
+			wantMessage: "proxy is not enabled",
+			wantText:    "proxy is not enabled",
+		},
+		{
 			name:        "not found with error body",
 			status:      http.StatusNotFound,
 			contentType: "application/json",
