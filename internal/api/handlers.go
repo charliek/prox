@@ -48,13 +48,29 @@ type Handlers struct {
 	proxyStatus    ProxyStatusProvider
 
 	// sseHeartbeatInterval overrides constants.SSEHeartbeatInterval for the SSE
-	// handlers (StreamLogs, StreamProxyRequests). Zero means "use the default";
-	// tests in this package set it directly to a short interval instead of
-	// mutating a package-level var, which would race across parallel tests
-	// (mirrors the forwarderConfig injectable-value idiom in
+	// handlers (StreamLogs, StreamProxyRequests, StreamProcesses). Zero means
+	// "use the default"; tests in this package set it directly to a short
+	// interval instead of mutating a package-level var, which would race across
+	// parallel tests (mirrors the forwarderConfig injectable-value idiom in
 	// internal/proxyd/forwarder.go).
 	sseHeartbeatInterval time.Duration
+
+	// processStreamDebounceInterval is the trailing-edge debounce window
+	// StreamProcesses waits (while absorbing further wakes) after a
+	// process-change before it snapshots and sends (plan 017 C11). Unlike
+	// sseHeartbeatInterval, this field is seeded with the production default at
+	// construction (see NewHandlers), so ZERO is unambiguous test territory: a
+	// test that wants every wake to snapshot immediately (no coalescing) sets
+	// this to 0 directly, and a test exercising the debounce itself sets it to
+	// a short interval instead of the production ~100ms.
+	processStreamDebounceInterval time.Duration
 }
+
+// processStreamDebounceDefault is the production trailing-edge debounce window
+// for StreamProcesses (plan 017 C11): a burst of rapid process transitions
+// (several processes starting together, a flapping health check, ...)
+// coalesces into one snapshot instead of one event per change.
+const processStreamDebounceDefault = 100 * time.Millisecond
 
 // heartbeatInterval returns the SSE heartbeat interval to use: the injected
 // test override if set, otherwise the production default.
@@ -65,14 +81,23 @@ func (h *Handlers) heartbeatInterval() time.Duration {
 	return constants.SSEHeartbeatInterval
 }
 
+// processStreamDebounce returns the trailing-edge debounce window
+// StreamProcesses applies after a wake, before it snapshots and sends. See the
+// processStreamDebounceInterval field comment for why 0 here is a real,
+// deliberate "no debounce" value rather than an unset sentinel.
+func (h *Handlers) processStreamDebounce() time.Duration {
+	return h.processStreamDebounceInterval
+}
+
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
 // exercise POST /shutdown; the handler guards against it.
 func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile string, shutdown ShutdownController) *Handlers {
 	return &Handlers{
-		supervisor: sup,
-		logManager: logMgr,
-		configFile: configFile,
-		shutdown:   shutdown,
+		supervisor:                    sup,
+		logManager:                    logMgr,
+		configFile:                    configFile,
+		shutdown:                      shutdown,
+		processStreamDebounceInterval: processStreamDebounceDefault,
 	}
 }
 
@@ -158,17 +183,25 @@ func summarizeCheck(kind, target string) string {
 
 // GetProcesses handles GET /api/v1/processes
 func (h *Handlers) GetProcesses(w http.ResponseWriter, r *http.Request) {
-	processes := h.supervisor.Processes()
+	writeJSON(w, http.StatusOK, processListResponse(h.supervisor))
+}
+
+// processListResponse converts the supervisor's current process set to a
+// ProcessListResponse. Factored out (plan 017 C11) so GetProcesses (REST) and
+// StreamProcesses (SSE, sse.go) share ONE conversion -- they cannot drift
+// apart, and every event on the stream is exactly what a poll of GetProcesses
+// would return at that instant.
+func processListResponse(sup *supervisor.Supervisor) ProcessListResponse {
+	processes := sup.Processes()
 
 	resp := ProcessListResponse{
 		Processes: make([]ProcessResponse, len(processes)),
 	}
-
 	for i, p := range processes {
 		resp.Processes[i] = ToProcessResponse(p)
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
 
 // GetProcess handles GET /api/v1/processes/{name}

@@ -179,11 +179,12 @@ func authMiddleware(authEnabled bool, token string) func(http.Handler) http.Hand
 //     (11m). The supervisor bounds start/stop/restart internally per-process by
 //     the configured stop budget; /shutdown?wait=true blocks for the whole drain.
 //     This router ceiling is hang protection only.
-//   - SSE group (/logs/stream, /proxy/requests/stream): NO timeout middleware.
-//     The streams are long-lived by design (WriteTimeout is 0 for the same
-//     reason); they end when the client disconnects (r.Context() is cancelled
-//     on connection close) or when the daemon shuts down (the log manager
-//     closes subscriber channels at shutdown). (#42)
+//   - SSE group (/logs/stream, /proxy/requests/stream, /processes/stream): NO
+//     timeout middleware. The streams are long-lived by design (WriteTimeout
+//     is 0 for the same reason); they end when the client disconnects
+//     (r.Context() is cancelled on connection close) or when the daemon
+//     shuts down (the log manager / supervisor change bus close subscriber
+//     channels at shutdown). (#42)
 //   - Default group (everything else): defaultRequestTimeout (30s).
 func (s *Server) registerRoutes() {
 	// Health check at root (no auth required). Kept under the default 30s
@@ -224,6 +225,9 @@ func (s *Server) registerRoutes() {
 			// /proxy/requests/{id} lives in the default group below; chi routes
 			// the literal "stream" segment ahead of the {id} parameter.
 			r.Get("/proxy/requests/stream", s.handlers.StreamProxyRequests)
+			// Same precedence note applies: /processes/stream (here) vs.
+			// /processes/{name} (default group below).
+			r.Get("/processes/stream", s.handlers.StreamProcesses)
 		})
 
 		// Everything else keeps the default 30s ceiling.
