@@ -163,6 +163,37 @@ const (
 	SSEReadTimeout = 60 * time.Second
 )
 
+// Stream reconnection
+//
+// These bound the generic SSE reconnect runner in internal/stream, which every
+// prox stream consumer (TUI attach streams, CLI --follow commands) drives. They
+// are deliberately NOT shared with the proxyd forwarder's own reconnect loop:
+// the forwarder predates this package and keeps its local constants so the two
+// can be retuned independently.
+const (
+	// StreamReconnectBaseBackoff is the wait before the first reconnect
+	// attempt after a stream ends, and the value the backoff resets to once an
+	// attempt has survived StreamReconnectFlapThreshold.
+	StreamReconnectBaseBackoff = 500 * time.Millisecond
+
+	// StreamReconnectMaxBackoff caps the exponential reconnect backoff. The
+	// wait doubles per failed cycle (500ms, 1s, 2s, 4s) and is then clamped
+	// here, so a server that is down for a long time is re-probed at a steady
+	// 5s rather than drifting toward minutes.
+	StreamReconnectMaxBackoff = 5 * time.Second
+
+	// StreamReconnectFlapThreshold is the minimum lifetime an attempt must
+	// reach before its end counts as a recovery (i.e. resets the backoff to
+	// StreamReconnectBaseBackoff). A connect that dies instantly is a flap, not
+	// a recovery: without the guard, a crash-looping server that accepts and
+	// immediately EOFs would reset the backoff on every cycle and be hammered
+	// at the base rate forever. This mirrors the proxyd forwarder's
+	// streamFlapThreshold precedent (see internal/proxyd/forwarder.go), but is
+	// a SEPARATE knob by plan decision — the forwarder keeps its own constant
+	// and does not read this one.
+	StreamReconnectFlapThreshold = 1 * time.Second
+)
+
 // TUI timing
 const (
 	// TUILocalTickInterval drives the local-mode TUI's periodic process-list
