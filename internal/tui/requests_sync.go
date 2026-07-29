@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,7 +44,8 @@ var errRequestsSyncOverflow = errors.New("requests sync: live event buffer overf
 const requestsSnapshotFetchAttempts = 3
 
 // consumeRequestsWithSync is the requests stream's single connect-and-consume
-// attempt (the logs stream stays a pure stream consumer; C9 owns log sync).
+// attempt. The logs stream runs the same protocol over its own payload
+// (consumeLogsWithSync); the two are meant to read as one.
 //
 // The protocol, mirroring the forwarder's proven backfillSnapshot shape:
 //
@@ -53,80 +53,30 @@ const requestsSnapshotFetchAttempts = 3
 //     does NOT complete — the sync: markSynced is deliberately not called yet,
 //     so the loop stays in Syncing and the status bar keeps saying so.
 //  2. Live events arriving from here on are BUFFERED, not delivered.
-//  3. Concurrently (a goroutine — the reader goroutine is busy reading, and
-//     buffering would deadlock if the fetch ran on it), fetch the full ring
+//  3. Concurrently, on the fetch goroutine (see syncFetch), fetch the full ring
 //     over REST.
 //  4. On success, deliver one RequestsSyncMsg carrying the snapshot and the
 //     buffer, mark the loop synchronized (StateOK), and flip live events back
 //     to direct delivery. All three happen under one mutex, so the reader
 //     goroutine cannot interleave an event between the batch and the flip.
-//
-// The fetch goroutine is tied to a per-attempt context and waited for before
-// returning, so it never outlives its attempt — which is what makes calling
-// markSynced from it safe despite stream.Config.Attempt's "call it from the
-// attempt itself" rule: the rule exists to stop a STRAGGLING goroutine from
-// flipping a later attempt's state, and this one cannot straggle (the loop's
-// epoch guard is the second line of defense).
 func consumeRequestsWithSync(ctx context.Context, client TUIClient, send func(tea.Msg), markSynced func()) error {
-	attemptCtx, cancel := context.WithCancel(ctx)
+	attemptCtx, fetch := newSyncFetch(ctx)
+	defer fetch.join()
 
-	st := &requestsSyncState{buffering: true, abort: cancel}
-	fetchDone := make(chan struct{})
-	var fetchStarted atomic.Bool
-	var fetchErr error
-
-	// join ends the fetch goroutine and waits for it, so it can never outlive
-	// its attempt. Idempotent (cancel is; a closed channel stays receivable),
-	// so it is safe both as the deferred backstop and as the explicit join
-	// below that makes fetchErr readable.
-	join := func() {
-		cancel()
-		if fetchStarted.Load() {
-			<-fetchDone
-		}
-	}
-	defer join()
+	st := &requestsSyncState{buffering: true, abort: fetch.abort, send: send}
 
 	err := client.ConsumeProxyRequests(attemptCtx, domain.ProxyRequestParams{},
 		func() {
-			// One sync per attempt: a client that called onConnect twice would
-			// otherwise start a second fetch goroutine and double-close
-			// fetchDone.
-			if !fetchStarted.CompareAndSwap(false, true) {
-				return
-			}
-			go func() {
-				defer close(fetchDone)
-				fetchErr = syncRequestsSnapshot(attemptCtx, client, send, st, markSynced)
-				if fetchErr != nil {
-					// Give up on this attempt: the loop reconnects and the
-					// next attempt re-syncs from scratch.
-					cancel()
-				}
-			}()
+			fetch.start(func() error {
+				return syncRequestsSnapshot(attemptCtx, client, st, markSynced)
+			})
 		},
-		func(req api.ProxyRequestResponse) {
-			st.observe(send, req)
-		})
+		st.observe)
 
-	// Join before reading fetchErr: the deferred backstop runs only after the
-	// return value has been computed.
-	join()
-
-	// Prefer the sync-protocol cause. Aborting a sync cancels the attempt
-	// context, which makes ConsumeProxyRequests report a generic cancellation
-	// that would otherwise hide why the attempt is recycling. A cancellation
-	// of the PARENT context (the TUI quitting) is not ours to reinterpret —
-	// the loop ends on it regardless.
-	if ctx.Err() == nil {
-		if st.overflowed() {
-			return errRequestsSyncOverflow
-		}
-		if fetchErr != nil {
-			return fetchErr
-		}
-	}
-	return err
+	// Join before reading the fetch's error: the deferred backstop runs only
+	// after the return value has been computed.
+	fetch.join()
+	return fetch.attemptError(ctx, st.abortErr(), err)
 }
 
 // syncRequestsSnapshot fetches the ring snapshot and completes the sync. It
@@ -143,7 +93,7 @@ func consumeRequestsWithSync(ctx context.Context, client TUIClient, send func(te
 // A ctx cancellation returns nil: the attempt is already ending for a reason
 // the caller knows better than we do, and reporting a bare cancellation here
 // would mask the stream's real error.
-func syncRequestsSnapshot(ctx context.Context, client TUIClient, send func(tea.Msg), st *requestsSyncState, markSynced func()) error {
+func syncRequestsSnapshot(ctx context.Context, client TUIClient, st *requestsSyncState, markSynced func()) error {
 	var lastErr error
 	for i := 0; i < requestsSnapshotFetchAttempts; i++ {
 		if i > 0 {
@@ -163,7 +113,7 @@ func syncRequestsSnapshot(ctx context.Context, client TUIClient, send func(tea.M
 			continue
 		}
 
-		st.complete(send, snapshotRecords(send, resp.Requests), markSynced)
+		st.complete(snapshotRecords(st.send, resp.Requests), markSynced)
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -194,20 +144,21 @@ type requestsSyncState struct {
 	buf       []proxy.RequestRecord
 	overflow  bool
 
-	// abort cancels the attempt context. Called (once, outside mu) when the
-	// buffer overflows, since a buffering onEvent has no other way to end the
-	// attempt.
+	// abort cancels the attempt context (syncFetch.abort). Called once, outside
+	// mu, when the buffer overflows.
 	abort func()
+
+	send func(tea.Msg)
 }
 
 // observe handles one live event: buffered while the snapshot is outstanding,
 // delivered directly once the sync has completed.
-func (st *requestsSyncState) observe(send func(tea.Msg), req api.ProxyRequestResponse) {
+func (st *requestsSyncState) observe(req api.ProxyRequestResponse) {
 	st.mu.Lock()
 
 	if !st.buffering {
 		st.mu.Unlock()
-		sendStreamedProxyRequest(send, req)
+		sendStreamedProxyRequest(st.send, req)
 		return
 	}
 	if st.overflow {
@@ -223,14 +174,14 @@ func (st *requestsSyncState) observe(send func(tea.Msg), req api.ProxyRequestRes
 		return
 	}
 
-	st.buf = append(st.buf, streamedProxyRequest(send, req))
+	st.buf = append(st.buf, streamedProxyRequest(st.send, req))
 	st.mu.Unlock()
 }
 
 // complete delivers the sync batch and switches to passthrough. A no-op once
 // the attempt has overflowed (the batch is moot) or the sync already completed
 // (a client that called onConnect twice).
-func (st *requestsSyncState) complete(send func(tea.Msg), snapshot []proxy.RequestRecord, markSynced func()) {
+func (st *requestsSyncState) complete(snapshot []proxy.RequestRecord, markSynced func()) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -242,14 +193,19 @@ func (st *requestsSyncState) complete(send func(tea.Msg), snapshot []proxy.Reque
 	st.buf = nil
 	st.buffering = false
 
-	send(RequestsSyncMsg{Snapshot: snapshot, Buffered: buffered})
+	st.send(RequestsSyncMsg{Snapshot: snapshot, Buffered: buffered})
 	// Only NOW is the stream synchronized: the models hold the full ring plus
 	// everything that arrived during the fetch.
 	markSynced()
 }
 
-func (st *requestsSyncState) overflowed() bool {
+// abortErr reports the sync-protocol reason this attempt must be recycled, or
+// nil if it ended for a reason of the stream's own.
+func (st *requestsSyncState) abortErr() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.overflow
+	if st.overflow {
+		return errRequestsSyncOverflow
+	}
+	return nil
 }

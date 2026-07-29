@@ -447,7 +447,7 @@ func TestClient_GetLogs(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	logs, err := client.GetLogs(domain.LogParams{
+	logs, err := client.GetLogs(context.Background(), domain.LogParams{
 		Process: "web",
 		Lines:   50,
 		Pattern: "error",
@@ -1180,6 +1180,7 @@ func TestClient_ConsumeLogs_ReturnsTerminalError(t *testing.T) {
 	connected := false
 	err := client.ConsumeLogs(context.Background(), domain.LogParams{},
 		func() { connected = true },
+		nil, // no handshake hook: this server sends none
 		func(entry api.LogEntryResponse) { got = append(got, entry) })
 
 	if err == nil {
@@ -1285,5 +1286,174 @@ func TestClient_StreamLogsChannel_ContextCancel(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("server handler still holding the cancelled connection")
+	}
+}
+
+// sseHandshakeServer writes the exact frame sequence the logs endpoint sends
+// (plan 017 C8): the ": connected" comment, a named handshake frame, log
+// entries, and — to pin the event-name tracking — a SECOND handshake mid-stream
+// followed by one more entry. It then returns, ending the stream.
+func sseHandshakeServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": connected\n\n"))
+		w.Write([]byte("event: handshake\ndata: {\"stream_id\":\"epoch-1\"}\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"one\",\"seq\":1}\n\n"))
+		w.Write([]byte(": ping\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"two\",\"seq\":2}\n\n"))
+		w.Write([]byte("event: handshake\ndata: {\"stream_id\":\"epoch-1\"}\n\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"three\",\"seq\":3}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+}
+
+// TestClient_ConsumeLogs_HandshakeReachesHookNotEntryParser pins the C9 reader
+// contract: a handshake frame is delivered to the handshake hook and never to
+// the entry parser, the entries around it still parse (with their seq), and a
+// repeated handshake mid-stream is delivered again — harmless, and the frame
+// name must not leak into the entry that follows it.
+func TestClient_ConsumeLogs_HandshakeReachesHookNotEntryParser(t *testing.T) {
+	server := sseHandshakeServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var handshakes []api.HandshakeResponse
+	var got []api.LogEntryResponse
+	err := client.ConsumeLogs(context.Background(), domain.LogParams{},
+		nil,
+		func(hs api.HandshakeResponse) { handshakes = append(handshakes, hs) },
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if err == nil {
+		t.Fatal("expected terminal error when the server ends the stream, got nil")
+	}
+	if len(handshakes) != 2 {
+		t.Fatalf("expected 2 handshakes delivered, got %d (%v)", len(handshakes), handshakes)
+	}
+	for i, hs := range handshakes {
+		if hs.StreamID != "epoch-1" {
+			t.Errorf("handshake %d: expected stream_id %q, got %q", i, "epoch-1", hs.StreamID)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 log entries, got %d (%v)", len(got), got)
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		if got[i].Line != want {
+			t.Errorf("entry %d: expected line %q, got %q", i, want, got[i].Line)
+		}
+		if got[i].Seq != uint64(i+1) {
+			t.Errorf("entry %d: expected seq %d, got %d", i, i+1, got[i].Seq)
+		}
+	}
+}
+
+// TestClient_ConsumeLogs_NilHandshakeHookDropsFrame pins the nilable hook: a
+// consumer that does not care about the epoch (the --follow commands, the
+// channel form) sees the handshake frame dropped, never a phantom log entry.
+func TestClient_ConsumeLogs_NilHandshakeHookDropsFrame(t *testing.T) {
+	server := sseHandshakeServer(t)
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var got []api.LogEntryResponse
+	_ = client.ConsumeLogs(context.Background(), domain.LogParams{}, nil, nil,
+		func(entry api.LogEntryResponse) { got = append(got, entry) })
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 log entries with a nil handshake hook, got %d (%v)", len(got), got)
+	}
+}
+
+// TestClient_GetLogs_SinceSeqAndCursorMetadata covers the resume half of the
+// cursor API on the client: since_seq rides the query when set, and the
+// response's cursor metadata is decoded for the sync protocol to compare
+// against.
+func TestClient_GetLogs_SinceSeqAndCursorMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("since_seq"); got != "7" {
+			t.Errorf("expected since_seq=7, got %q", got)
+		}
+		if got := r.URL.Query().Get("lines"); got != "1000" {
+			t.Errorf("expected lines=1000, got %q", got)
+		}
+		resp := api.LogsResponse{
+			Logs:      []api.LogEntryResponse{{Line: "eight", Seq: 8}},
+			StreamID:  "epoch-1",
+			OldestSeq: 3,
+			LatestSeq: 8,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	logs, err := client.GetLogs(context.Background(), domain.LogParams{Lines: 1000, SinceSeq: 7})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if logs.StreamID != "epoch-1" {
+		t.Errorf("expected stream_id %q, got %q", "epoch-1", logs.StreamID)
+	}
+	if logs.OldestSeq != 3 || logs.LatestSeq != 8 {
+		t.Errorf("expected bounds 3..8, got %d..%d", logs.OldestSeq, logs.LatestSeq)
+	}
+	if len(logs.Logs) != 1 || logs.Logs[0].Seq != 8 {
+		t.Errorf("expected one entry with seq 8, got %v", logs.Logs)
+	}
+}
+
+// TestBuildLogQueryParams_OmitsZeroSinceSeq pins the one wire subtlety of the
+// cursor: a zero SinceSeq must not be sent, because `since_seq=0` selects the
+// server's resume path (oldest-first from the start of the ring) rather than
+// the last-`lines` path a cursorless caller wants.
+func TestBuildLogQueryParams_OmitsZeroSinceSeq(t *testing.T) {
+	query := buildLogQueryParams(domain.LogParams{Lines: 1000})
+	if _, present := query["since_seq"]; present {
+		t.Errorf("expected no since_seq for a zero cursor, got %q", query.Get("since_seq"))
+	}
+
+	query = buildLogQueryParams(domain.LogParams{Lines: 1000, SinceSeq: 1})
+	if got := query.Get("since_seq"); got != "1" {
+		t.Errorf("expected since_seq=1, got %q", got)
+	}
+}
+
+// TestClient_ConsumeLogs_DataLineConsumesEventName pins the SSE dispatch rule
+// (codex C9 review): one event: field names ONE dispatch. A data line following
+// the handshake's data line without its own event: prefix — and before any
+// blank-line frame delimiter — is a plain log entry, not a second handshake.
+func TestClient_ConsumeLogs_DataLineConsumesEventName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Deliberately NO blank line between the handshake's data and the entry.
+		w.Write([]byte("event: handshake\n"))
+		w.Write([]byte("data: {\"stream_id\":\"epoch-x\"}\n"))
+		w.Write([]byte("data: {\"timestamp\":\"2024-01-01T00:00:00Z\",\"process\":\"web\",\"stream\":\"stdout\",\"line\":\"after-handshake\",\"seq\":7}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	var handshakes []api.HandshakeResponse
+	var entries []api.LogEntryResponse
+	_ = client.ConsumeLogs(context.Background(), domain.LogParams{},
+		nil,
+		func(hs api.HandshakeResponse) { handshakes = append(handshakes, hs) },
+		func(e api.LogEntryResponse) { entries = append(entries, e) })
+
+	if len(handshakes) != 1 || handshakes[0].StreamID != "epoch-x" {
+		t.Fatalf("expected exactly one handshake for epoch-x, got %+v", handshakes)
+	}
+	if len(entries) != 1 || entries[0].Line != "after-handshake" {
+		t.Fatalf("expected the follow-on data line to parse as a log entry, got %+v", entries)
 	}
 }

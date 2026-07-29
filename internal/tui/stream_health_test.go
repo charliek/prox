@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -238,6 +239,47 @@ func (c *msgCollector) await(t *testing.T, match func(tea.Msg) bool) tea.Msg {
 	}
 }
 
+// syncHarness runs one attach stream's connect-and-consume sync attempts: it
+// collects the messages an attempt delivers, counts markSynced calls, and
+// publishes syncedCh so a scripted stream can wait for the sync barrier before
+// streaming more events. attempt is the protocol under test, so the same
+// harness drives both consumeRequestsWithSync and consumeLogsWithSync.
+type syncHarness struct {
+	collector *msgCollector
+	syncedCh  chan struct{}
+	syncedN   atomic.Int32
+	once      sync.Once
+	attempt   func(ctx context.Context, client TUIClient, send func(tea.Msg), markSynced func()) error
+}
+
+func newSyncHarness(attempt func(context.Context, TUIClient, func(tea.Msg), func()) error) *syncHarness {
+	return &syncHarness{collector: newMsgCollector(), syncedCh: make(chan struct{}), attempt: attempt}
+}
+
+func (h *syncHarness) markSynced() {
+	h.syncedN.Add(1)
+	h.once.Do(func() { close(h.syncedCh) })
+}
+
+func (h *syncHarness) run(ctx context.Context, client TUIClient) error {
+	return h.attempt(ctx, client, h.collector.send, h.markSynced)
+}
+
+// runInBackground starts one attempt and returns a channel carrying its error.
+func (h *syncHarness) runInBackground(ctx context.Context, client TUIClient) <-chan error {
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.run(ctx, client) }()
+	return errCh
+}
+
+// awaitSync blocks until the attempt delivers its sync batch, of whichever
+// message type the stream under test carries.
+func awaitSync[T tea.Msg](t *testing.T, h *syncHarness) T {
+	t.Helper()
+	msg := h.collector.await(t, func(m tea.Msg) bool { _, ok := m.(T); return ok })
+	return msg.(T)
+}
+
 // TestForwardLogs_ChannelCloseReportsClosed pins the W7 hardening: a local
 // subscription that dies on its own marks the stream closed and says so once.
 func TestForwardLogs_ChannelCloseReportsClosed(t *testing.T) {
@@ -340,18 +382,25 @@ func startClientStreams(t *testing.T, client TUIClient, send func(tea.Msg)) {
 }
 
 // TestRunClientStreams_ForwardsEventsAndStatus pins the wiring end to end: a
-// streamed entry reaches the model as a LogEntryMsg and the loop's own
-// transitions arrive as StreamStatusMsg for the right stream.
+// streamed entry reaches the model and the loop's own transitions arrive as
+// StreamStatusMsg for the right stream.
+//
+// Which message carries the entry is timing-dependent since C9: an entry that
+// races the backfill fetch is buffered into the LogsSyncMsg, and one that
+// arrives after the sync barrier passes through as a LogEntryMsg. Both are
+// correct deliveries, so the assertion accepts either.
 func TestRunClientStreams_ForwardsEventsAndStatus(t *testing.T) {
 	collector := newMsgCollector()
 	client := &stubTUIClient{
-		consumeLogs: func(ctx context.Context, onConnect func(), onEvent func(api.LogEntryResponse)) error {
+		consumeLogs: func(ctx context.Context, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error {
 			onConnect()
+			onHandshake(api.HandshakeResponse{StreamID: stubLogEpoch})
 			onEvent(api.LogEntryResponse{
 				Timestamp: time.Now().Format(time.RFC3339Nano),
 				Process:   "web",
 				Stream:    "stdout",
 				Line:      "streamed",
+				Seq:       1,
 			})
 			<-ctx.Done()
 			return ctx.Err()
@@ -360,17 +409,29 @@ func TestRunClientStreams_ForwardsEventsAndStatus(t *testing.T) {
 
 	startClientStreams(t, client, collector.send)
 
-	msg := collector.await(t, func(m tea.Msg) bool { _, ok := m.(LogEntryMsg); return ok })
-	assert.Equal(t, "streamed", domain.LogEntry(msg.(LogEntryMsg)).Line)
+	collector.await(t, func(m tea.Msg) bool { return logMsgCarriesLine(m, "streamed") })
 
-	// markSynced rides onConnect: OK is reported once the connection stands.
-	var sawLogsOK bool
-	for _, m := range collector.all() {
-		if s, ok := m.(StreamStatusMsg); ok && s.Stream == StreamLogs && s.Status.State == stream.StateOK {
-			sawLogsOK = true
+	// markSynced now rides the sync barrier: OK follows the backfill.
+	collector.await(t, func(m tea.Msg) bool {
+		s, ok := m.(StreamStatusMsg)
+		return ok && s.Stream == StreamLogs && s.Status.State == stream.StateOK
+	})
+}
+
+// logMsgCarriesLine reports whether msg delivers a log line with the given
+// text, through either attach-mode path (live entry or sync batch).
+func logMsgCarriesLine(msg tea.Msg, line string) bool {
+	switch v := msg.(type) {
+	case LogEntryMsg:
+		return domain.LogEntry(v).Line == line
+	case LogsSyncMsg:
+		for _, e := range v.Entries {
+			if e.Line == line {
+				return true
+			}
 		}
 	}
-	assert.True(t, sawLogsOK, "logs loop reports OK once the connection is established")
+	return false
 }
 
 // TestRunClientStreams_AttemptErrorReportsReconnecting pins that an attempt
@@ -379,7 +440,7 @@ func TestRunClientStreams_AttemptErrorReportsReconnecting(t *testing.T) {
 	collector := newMsgCollector()
 	client := &stubTUIClient{
 		// onConnect deliberately not called: a dead-on-arrival dial.
-		consumeLogs: func(context.Context, func(), func(api.LogEntryResponse)) error {
+		consumeLogs: func(context.Context, func(), func(api.HandshakeResponse), func(api.LogEntryResponse)) error {
 			return errors.New("connection refused")
 		},
 	}

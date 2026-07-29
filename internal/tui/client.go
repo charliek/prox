@@ -99,6 +99,11 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case LogEntryMsg:
 		m.handleLogEntry(domain.LogEntry(msg))
 
+	case LogsSyncMsg:
+		// One batch, one render (C9). Attach mode only: local mode reads the
+		// log manager's ring directly and has nothing to synchronize against.
+		m.handleLogsSync(msg)
+
 	case ProxyRequestMsg:
 		record := proxy.RequestRecord(msg)
 		m.handleProxyRequest(record)

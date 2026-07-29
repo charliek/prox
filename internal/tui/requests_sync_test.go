@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -261,41 +259,10 @@ func TestRequestsSync_SweptRowUnmarkedByLateCompletion(t *testing.T) {
 
 // --- attempt-level sync protocol ---
 
-// syncHarness runs consumeRequestsWithSync attempts: it collects the messages
-// the attempt delivers, counts markSynced calls, and publishes syncedCh so a
-// scripted stream can wait for the sync barrier before streaming more events.
-type syncHarness struct {
-	collector *msgCollector
-	syncedCh  chan struct{}
-	syncedN   atomic.Int32
-	once      sync.Once
-}
-
-func newSyncHarness() *syncHarness {
-	return &syncHarness{collector: newMsgCollector(), syncedCh: make(chan struct{})}
-}
-
-func (h *syncHarness) markSynced() {
-	h.syncedN.Add(1)
-	h.once.Do(func() { close(h.syncedCh) })
-}
-
-func (h *syncHarness) run(ctx context.Context, client TUIClient) error {
-	return consumeRequestsWithSync(ctx, client, h.collector.send, h.markSynced)
-}
-
-// runInBackground starts one attempt and returns a channel carrying its error.
-func (h *syncHarness) runInBackground(ctx context.Context, client TUIClient) <-chan error {
-	errCh := make(chan error, 1)
-	go func() { errCh <- h.run(ctx, client) }()
-	return errCh
-}
-
-// awaitSync blocks until the attempt delivers its RequestsSyncMsg.
-func (h *syncHarness) awaitSync(t *testing.T) RequestsSyncMsg {
-	t.Helper()
-	msg := h.collector.await(t, func(m tea.Msg) bool { _, ok := m.(RequestsSyncMsg); return ok })
-	return msg.(RequestsSyncMsg)
+// newRequestsSyncHarness drives consumeRequestsWithSync attempts. See
+// syncHarness (stream_health_test.go) for the machinery.
+func newRequestsSyncHarness() *syncHarness {
+	return newSyncHarness(consumeRequestsWithSync)
 }
 
 // TestConsumeRequestsWithSync_DeliversBatchThenMarksSynced pins the barrier:
@@ -303,7 +270,7 @@ func (h *syncHarness) awaitSync(t *testing.T) RequestsSyncMsg {
 // RequestsSyncMsg (never delivered loose), markSynced fires only after that
 // message, and later events pass straight through.
 func TestConsumeRequestsWithSync_DeliversBatchThenMarksSynced(t *testing.T) {
-	h := newSyncHarness()
+	h := newRequestsSyncHarness()
 	buffered := make(chan struct{})
 	client := &stubTUIClient{
 		snapshot: []api.ProxyRequestResponse{wireRequest("snap-1", 200, false)},
@@ -329,7 +296,7 @@ func TestConsumeRequestsWithSync_DeliversBatchThenMarksSynced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := h.runInBackground(ctx, client)
 
-	syncMsg := h.awaitSync(t)
+	syncMsg := awaitSync[RequestsSyncMsg](t, h)
 	assert.Equal(t, []string{"snap-1"}, wireIDs(syncMsg.Snapshot))
 	assert.Equal(t, []string{"live-1"}, wireIDs(syncMsg.Buffered))
 
@@ -362,7 +329,7 @@ func TestConsumeRequestsWithSync_DeliversBatchThenMarksSynced(t *testing.T) {
 // ends the attempt with a distinct, retryable error rather than dropping
 // events, and the next attempt re-syncs cleanly.
 func TestConsumeRequestsWithSync_BufferOverflowAbortsAttempt(t *testing.T) {
-	h := newSyncHarness()
+	h := newRequestsSyncHarness()
 	overflowed := make(chan struct{})
 	client := &stubTUIClient{}
 	client.consumeRequests = func(ctx context.Context, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
@@ -389,11 +356,11 @@ func TestConsumeRequestsWithSync_BufferOverflowAbortsAttempt(t *testing.T) {
 	}
 
 	// A re-attempt against a healthy stream syncs normally.
-	retryH := newSyncHarness()
+	retryH := newRequestsSyncHarness()
 	retry := &stubTUIClient{snapshot: []api.ProxyRequestResponse{wireRequest("snap-1", 200, false)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := retryH.runInBackground(ctx, retry)
-	assert.Equal(t, []string{"snap-1"}, wireIDs(retryH.awaitSync(t).Snapshot))
+	assert.Equal(t, []string{"snap-1"}, wireIDs(awaitSync[RequestsSyncMsg](t, retryH).Snapshot))
 	cancel()
 	<-errCh
 	assert.Equal(t, int32(1), retryH.syncedN.Load())
@@ -413,7 +380,7 @@ func TestConsumeRequestsWithSync_SnapshotFetchRetriesThenRecycles(t *testing.T) 
 		},
 	}
 
-	h := newSyncHarness()
+	h := newRequestsSyncHarness()
 	err := h.run(context.Background(), client)
 
 	assert.Equal(t, requestsSnapshotFetchAttempts, client.snapshotCalls(), "retries in place")
@@ -435,7 +402,7 @@ func TestConsumeRequestsWithSync_StreamErrorSurvivesTheSync(t *testing.T) {
 		},
 	}
 
-	h := newSyncHarness()
+	h := newRequestsSyncHarness()
 	assert.EqualError(t, h.run(context.Background(), client), "connection reset")
 }
 
@@ -448,7 +415,7 @@ func TestConsumeRequestsWithSync_DeadDialNeverSyncs(t *testing.T) {
 		},
 	}
 
-	h := newSyncHarness()
+	h := newRequestsSyncHarness()
 	assert.EqualError(t, h.run(context.Background(), client), "connection refused")
 	assert.Equal(t, 0, client.snapshotCalls(), "no snapshot fetch without a connection")
 	assert.Zero(t, h.syncedN.Load())

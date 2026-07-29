@@ -191,11 +191,21 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	}
 }
 
-// handleLogEntry handles a new log entry message
+// handleLogEntry handles a new log entry message: one append followed by one
+// render.
 func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	// Check if we're at/near bottom BEFORE adding new content
 	wasNearBottom := b.isNearBottom()
+	b.appendLogEntry(entry)
+	b.renderAfterLogEntries(wasNearBottom)
+}
 
+// appendLogEntry stamps one entry and appends it to the ring WITHOUT
+// rendering. Split out of handleLogEntry so a sync batch (C9) can apply a
+// thousand entries and render once; every arrival path — live entry, batch
+// entry, synthetic notice — goes through here, so the DisplaySeq stamping and
+// the eviction trim are identical for all of them.
+func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
 	// Stamp a session-local monotonic DisplaySeq so the logs search cursor can
 	// anchor to this line's identity across the front-eviction ring below. This
 	// overwrites nothing on the wire: the server's LogEntry.Seq is a separate
@@ -209,6 +219,14 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 		copy(newEntries, b.logEntries[len(b.logEntries)-maxLogEntries:])
 		b.logEntries = newEntries
 	}
+}
+
+// renderAfterLogEntries is the shared render tail for log arrivals — one live
+// entry or a whole sync batch. wasNearBottom is the viewport's position
+// sampled BEFORE the entries were appended (its meaning is lost afterwards).
+// Batches deliberately share it so a 1000-entry replay costs exactly one
+// render, mirroring renderAfterProxyRequests.
+func (b *BaseModel) renderAfterLogEntries(wasNearBottom bool) {
 	b.updateViewport()
 
 	// If user was at bottom, re-enable follow mode and stay at bottom — UNLESS an
@@ -225,6 +243,34 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 	} else if b.followMode {
 		b.viewport.GotoBottom()
 	}
+}
+
+// handleLogsSync applies one completed logs-stream synchronization (C9): the
+// optional notice line first, then the batch entries oldest-first, then ONE
+// render.
+//
+// The handler is deliberately dumb — append, don't merge. All the hard parts
+// (which entries to fetch, epoch changes, dropping entries this model has
+// already been shown) live in the sync layer, which excludes overlap by
+// cursor BEFORE delivery (logs_sync.go). Log lines have no identity to merge
+// on the way proxy requests do (the same line can legitimately repeat), so a
+// model-side dedupe is not available even in principle.
+//
+// Entries that predate an epoch change stay in the list as history: they are
+// what the previous daemon run printed, and the notice line marks the seam.
+func (b *BaseModel) handleLogsSync(msg LogsSyncMsg) {
+	if msg.Notice == "" && len(msg.Entries) == 0 {
+		return // nothing changed: a caught-up reconnect must not force a render
+	}
+
+	wasNearBottom := b.isNearBottom()
+	if msg.Notice != "" {
+		b.appendLogEntry(systemLogEntry(msg.Notice))
+	}
+	for _, entry := range msg.Entries {
+		b.appendLogEntry(entry)
+	}
+	b.renderAfterLogEntries(wasNearBottom)
 }
 
 // handleProxyRequest handles a new proxy request message: one monotonic merge

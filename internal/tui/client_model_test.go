@@ -31,10 +31,12 @@ type stubTUIClient struct {
 	detailErr    error
 
 	// Optional per-stream attempt behavior; nil means "connect successfully,
-	// then block until cancelled" (onConnect fires, no events). A scripted
-	// hook owns the onConnect call: invoke it to model an established
-	// connection, skip it to model a dead-on-arrival dial.
-	consumeLogs     func(ctx context.Context, onConnect func(), onEvent func(api.LogEntryResponse)) error
+	// announce the default log epoch, then block until cancelled" (onConnect
+	// and — for logs — onHandshake fire, no events). A scripted hook owns both
+	// calls: invoke onConnect to model an established connection, skip it to
+	// model a dead-on-arrival dial; invoke onHandshake to model a C8+ daemon,
+	// skip it to model an old one that sends no handshake.
+	consumeLogs     func(ctx context.Context, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error
 	consumeRequests func(ctx context.Context, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
 
 	// snapshot is the requests-sync REST payload (newest-first, as the real
@@ -44,7 +46,18 @@ type stubTUIClient struct {
 	snapshotErr  error
 	snapshotCall func(n int) // optional per-call hook; n is the 1-based call count
 	snapshotN    int         // number of GetProxyRequests calls made
+
+	// logsResponder backs the C9 logs-sync backfill (GetLogs): it owns the
+	// response for each call, so a test can serve a different payload per
+	// attempt (n is the 1-based call count). nil means an empty response.
+	// logsParams records every call's params, in order.
+	logsResponder func(n int, params domain.LogParams) (*api.LogsResponse, error)
+	logsParams    []domain.LogParams
 }
+
+// stubLogEpoch is the stream_id the default ConsumeLogs stub announces. Tests
+// that script their own handshake pick their own.
+const stubLogEpoch = "epoch-stub"
 
 func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
 	return &api.ProcessListResponse{}, nil
@@ -52,13 +65,39 @@ func (s *stubTUIClient) GetProcesses() (*api.ProcessListResponse, error) {
 
 func (s *stubTUIClient) RestartProcess(string) error { return nil }
 
-func (s *stubTUIClient) ConsumeLogs(ctx context.Context, _ domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error {
+func (s *stubTUIClient) ConsumeLogs(ctx context.Context, _ domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error {
 	if s.consumeLogs != nil {
-		return s.consumeLogs(ctx, onConnect, onEvent)
+		return s.consumeLogs(ctx, onConnect, onHandshake, onEvent)
 	}
 	onConnect()
+	onHandshake(api.HandshakeResponse{StreamID: stubLogEpoch})
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// GetLogs serves the logs-sync backfill. Params are recorded so tests can pin
+// the full-fetch vs since_seq-resume decision.
+func (s *stubTUIClient) GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error) {
+	s.mu.Lock()
+	s.logsParams = append(s.logsParams, params)
+	n := len(s.logsParams)
+	responder := s.logsResponder
+	s.mu.Unlock()
+
+	if responder != nil {
+		return responder(n, params)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return &api.LogsResponse{}, nil
+}
+
+// logsCalls returns the params of every GetLogs call, in order.
+func (s *stubTUIClient) logsCalls() []domain.LogParams {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.LogParams(nil), s.logsParams...)
 }
 
 func (s *stubTUIClient) ConsumeProxyRequests(ctx context.Context, _ domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {

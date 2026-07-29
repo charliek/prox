@@ -166,6 +166,18 @@ func buildLogQueryParams(params domain.LogParams) url.Values {
 	if params.Regex {
 		query.Set("regex", "true")
 	}
+	// since_seq is sent only when it names a real cursor. A zero SinceSeq means
+	// the caller has consumed nothing, and sending `since_seq=0` would flip the
+	// server onto its resume path (every entry in the buffer, oldest-first,
+	// capped at `lines` from the OLDEST end) when what a cursorless caller wants
+	// is the last-`lines` path. The two agree only when the buffer holds fewer
+	// than `lines` entries, so the distinction is load-bearing (plan 017 C9).
+	//
+	// This builder is shared with logsStreamPath: the SSE endpoint ignores
+	// since_seq today, and no stream subscription sets it.
+	if params.SinceSeq > 0 {
+		query.Set("since_seq", fmt.Sprintf("%d", params.SinceSeq))
+	}
 	return query
 }
 
@@ -205,12 +217,16 @@ func pathWithQuery(path string, query url.Values) string {
 	return path + "?" + query.Encode()
 }
 
-// GetLogs gets logs with optional filtering
-func (c *Client) GetLogs(params domain.LogParams) (*api.LogsResponse, error) {
+// GetLogs gets logs with optional filtering.
+//
+// It takes a context for the same reason GetProxyRequests does: the TUI's
+// logs-stream sync calls it once per connect and must abandon an in-flight
+// backfill the moment that stream attempt ends (tui.TUIClient, plan 017 C9).
+func (c *Client) GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error) {
 	path := pathWithQuery("/api/v1/logs", buildLogQueryParams(params))
 
 	var resp api.LogsResponse
-	if err := c.get(path, &resp); err != nil {
+	if err := c.getCtx(ctx, path, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -362,18 +378,16 @@ func (c *Client) addAuthHeader(req *http.Request) {
 // parseSSELogEntry parses a single SSE data line into a log entry.
 // Returns the parsed entry and true if successful, or an empty entry and false if parsing failed.
 //
-// readSSE (below) does not look at "event:" lines at all -- it only inspects
-// blank lines, comments, and "data:" lines -- so the "event: handshake" frame
-// StreamLogs sends right after ": connected" (plan 017 C8, see
-// api.HandshakeResponse) is invisible to it, but the "data: {"stream_id":...}"
-// line that follows still reaches this parser. json.Unmarshal ignores unknown
-// fields, so that payload decodes into an api.LogEntryResponse without error,
-// leaving every field at its zero value. Reject that shape explicitly: a real
-// log entry always has either a non-empty Process, a non-empty Line, or a
-// manager-assigned Seq >= 1, so Process=="" && Line=="" && Seq==0 can only be
-// a non-log payload riding the same "data:" convention (today, the
-// handshake). Without this guard it would surface as a phantom empty log row
-// in the attach TUI.
+// readSSE (below) now tracks "event:" lines and routes an "event: handshake"
+// frame's payload to the handshake hook instead of this parser (plan 017 C9),
+// so the handshake no longer reaches it in practice. The guard below stays
+// regardless, as defense against any other non-entry payload riding the
+// "data:" convention: json.Unmarshal ignores unknown fields, so such a payload
+// decodes into an api.LogEntryResponse without error, leaving every field at
+// its zero value. A real log entry always has either a non-empty Process, a
+// non-empty Line, or a manager-assigned Seq >= 1, so Process=="" && Line=="" &&
+// Seq==0 can only be a non-log payload — without this it would surface as a
+// phantom empty log row in the attach TUI.
 func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
 	var entry api.LogEntryResponse
 	if err := json.Unmarshal([]byte(data), &entry); err != nil {
@@ -384,6 +398,23 @@ func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
 		return api.LogEntryResponse{}, false
 	}
 	return entry, true
+}
+
+// sseHandshakeEvent is the SSE event name carrying api.HandshakeResponse. The
+// logs stream sends exactly one, immediately after ": connected" and before any
+// entry (internal/api/sse.go).
+const sseHandshakeEvent = "handshake"
+
+// parseSSEHandshake parses the payload of an "event: handshake" frame. A
+// malformed payload warns and is dropped: the consumer then behaves exactly as
+// it does against a server that sends no handshake at all.
+func parseSSEHandshake(data string) (api.HandshakeResponse, bool) {
+	var hs api.HandshakeResponse
+	if err := json.Unmarshal([]byte(data), &hs); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE handshake: %v\n", err)
+		return hs, false
+	}
+	return hs, true
 }
 
 // parseSSEProxyRequest parses a single SSE data line into a proxy request.
@@ -496,7 +527,20 @@ func dialSSE(ctx context.Context, c *Client, path string) (*sseStream, error) {
 // event to onEvent. It returns the terminal read error, or nil when ctx was
 // cancelled. Reads carry constants.SSEReadTimeout as a deadline so a server
 // that dies without closing the connection cannot hang the reader forever.
-func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bool), onEvent func(T)) error {
+//
+// Frames are read as name+payload: an "event: <name>" line names the frame that
+// the next "data:" line carries, and the blank line terminating a frame clears
+// the name (comments never do — they are not frames). Only one named event
+// exists today: "handshake" (plan 017 C8), whose payload goes to onHandshake
+// (nilable; nil means "ignore the frame") and NEVER to the entry parser, which
+// would otherwise see a payload that is not an event of type T. An unnamed
+// frame is a plain data event, exactly as before this hook existed, so a server
+// that sends no handshake simply never fires it.
+//
+// A server MAY send more than one handshake on a stream; each one is delivered.
+// Consumers treat a repeat as harmless (the TUI's logs sync latches the first —
+// see logsSyncState.noteHandshake).
+func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bool), onHandshake func(api.HandshakeResponse), onEvent func(T)) error {
 	defer s.close()
 
 	bodyReader := &deadlineReader{
@@ -505,6 +549,10 @@ func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bo
 		timeout: constants.SSEReadTimeout,
 	}
 	reader := bufio.NewReader(bodyReader)
+
+	// event names the frame currently being read; "" is an unnamed (plain data)
+	// frame.
+	event := ""
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -516,12 +564,32 @@ func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bo
 		}
 
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, ":") {
+		if line == "" {
+			event = "" // end of frame: the name does not carry into the next one
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue // comment (": connected", ": ping") — not a frame
+		}
+
+		if name, ok := strings.CutPrefix(line, "event: "); ok {
+			event = name
 			continue
 		}
 
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			// A data line consumes the pending event name (codex C9 finding):
+			// per the SSE model one event field names one dispatch, so a
+			// following data line without its own event: prefix is a plain
+			// entry, even before any blank-line frame delimiter arrives.
+			frameEvent := event
+			event = ""
+			if frameEvent == sseHandshakeEvent {
+				if hs, ok := parseSSEHandshake(data); ok && onHandshake != nil {
+					onHandshake(hs)
+				}
+				continue
+			}
 			if item, ok := parse(data); ok {
 				onEvent(item)
 			}
@@ -534,8 +602,9 @@ func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bo
 // be nil) fires exactly once, after the dial fully succeeded (headers +
 // content type validated) and before the first read — it exists so a
 // reconnect loop can mark the attempt healthy only once a connection
-// actually stands, never for a dead-on-arrival dial.
-func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool), onConnect func(), onEvent func(T)) error {
+// actually stands, never for a dead-on-arrival dial. onHandshake (may be nil)
+// receives the stream's handshake frame, if it sends one; see readSSE.
+func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(string) (T, bool), onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(T)) error {
 	s, err := dialSSE(ctx, c, path)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -546,7 +615,7 @@ func consumeSSE[T any](ctx context.Context, c *Client, path string, parse func(s
 	if onConnect != nil {
 		onConnect()
 	}
-	return readSSE(ctx, s, parse, onEvent)
+	return readSSE(ctx, s, parse, onHandshake, onEvent)
 }
 
 // streamSSE is the channel form of an SSE attempt: connect-time failures come
@@ -567,7 +636,10 @@ func streamSSE[T any](ctx context.Context, c *Client, path string, parse func(st
 	ch := make(chan T, 100)
 	go func() {
 		defer close(ch)
-		_ = readSSE(ctx, s, parse, func(item T) {
+		// nil handshake hook: the channel form carries one element type and has
+		// no way to surface a handshake, so the frame is ignored (as it was
+		// before C9 taught the reader to recognize it).
+		_ = readSSE(ctx, s, parse, nil, func(item T) {
 			// Never block past cancellation: a consumer that stopped reading
 			// would otherwise pin this goroutine.
 			select {
@@ -594,15 +666,20 @@ func proxyRequestsStreamPath(params domain.ProxyRequestParams) string {
 // ConsumeLogs delivers streamed log entries to onEvent until the stream ends,
 // returning the error that ended it (nil on ctx cancellation). onConnect
 // (nilable) fires once after the connection is established, before the first
-// read. It is the attempt form the TUI's reconnect loop drives; the channel
-// form below serves the one-shot --follow commands.
-func (c *Client) ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error {
-	return consumeSSE(ctx, c, logsStreamPath(params), parseSSELogEntry, onConnect, onEvent)
+// read. onHandshake (nilable) receives the stream's handshake frame, which
+// carries the server's current log epoch — the attach TUI's log sync needs it
+// to decide how to backfill (plan 017 C9); a pre-C8 daemon sends none and the
+// hook simply never fires. It is the attempt form the TUI's reconnect loop
+// drives; the channel form below serves the one-shot --follow commands.
+func (c *Client) ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error {
+	return consumeSSE(ctx, c, logsStreamPath(params), parseSSELogEntry, onConnect, onHandshake, onEvent)
 }
 
-// ConsumeProxyRequests is the proxy-request counterpart of ConsumeLogs.
+// ConsumeProxyRequests is the proxy-request counterpart of ConsumeLogs. The
+// requests stream sends no handshake (it has no epoch/cursor protocol), so it
+// passes a nil hook.
 func (c *Client) ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
-	return consumeSSE(ctx, c, proxyRequestsStreamPath(params), parseSSEProxyRequest, onConnect, onEvent)
+	return consumeSSE(ctx, c, proxyRequestsStreamPath(params), parseSSEProxyRequest, onConnect, nil, onEvent)
 }
 
 // StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.

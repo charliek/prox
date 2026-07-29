@@ -137,15 +137,20 @@ func reportLocalStreamClosed(ctx context.Context, send func(tea.Msg), id StreamI
 type TUIClient interface {
 	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
-	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onEvent func(api.LogEntryResponse)) error
+	// ConsumeLogs takes an onHandshake hook alongside onConnect: the logs sync
+	// (C9) must learn the server's log epoch before it can decide how to
+	// backfill, and that epoch rides a named handshake frame on the stream
+	// itself. A daemon that sends none never fires it.
+	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error
 	ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
 
-	// GetProxyRequests fetches the ring snapshot the requests stream
-	// synchronizes against on every connect. It is the one ctx-taking
-	// non-stream method: the fetch is owned by a stream attempt and must be
-	// abandoned the moment that attempt ends.
+	// GetProxyRequests and GetLogs fetch what the requests and logs streams
+	// synchronize against on every connect. They are the ctx-taking non-stream
+	// methods: each fetch is owned by a stream attempt and must be abandoned
+	// the moment that attempt ends.
 	GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error)
+	GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error)
 }
 
 // RunClient starts the TUI application in client mode (connected via API)
@@ -170,15 +175,17 @@ func RunClient(client TUIClient) error {
 // loop's error is classified terminal. send is the program's message sink,
 // injected so the wiring is testable without a live *tea.Program.
 func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg)) {
+	// One log-sync session for the whole attach run: it carries the cursor and
+	// epoch ACROSS reconnects, which is what lets attempt N+1 resume where
+	// attempt N stopped instead of re-fetching the world (C9).
+	logsSess := newLogsSyncSession()
+
 	loops := []*stream.Loop{
-		streamLoop(StreamLogs, send, classifyStreamError, func(ctx context.Context, onConnect func()) error {
-			return client.ConsumeLogs(ctx, domain.LogParams{}, onConnect, func(entry api.LogEntryResponse) {
-				sendStreamedLogEntry(send, entry)
-			})
+		// Neither data stream is a pure stream consumer: each connect
+		// synchronizes against a REST fetch before reporting OK (C6, C9).
+		streamLoop(StreamLogs, send, classifyStreamError, func(ctx context.Context, markSynced func()) error {
+			return consumeLogsWithSync(ctx, client, logsSess, send, markSynced)
 		}),
-		// The requests stream is NOT a pure stream consumer: every connect
-		// synchronizes against a REST snapshot before reporting OK, so its
-		// markSynced lands inside the sync protocol rather than on connect.
 		streamLoop(StreamRequests, send, classifyRequestsStreamError, func(ctx context.Context, markSynced func()) error {
 			return consumeRequestsWithSync(ctx, client, send, markSynced)
 		}),
@@ -199,17 +206,14 @@ func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg))
 // connect-and-consume attempt, classify is the stream's reconnect policy, and
 // every transition reaches the models as a StreamStatusMsg for id.
 //
-// markSynced rides the client's onConnect hook, so it fires only once a
-// connection actually stands (headers + content type validated) — a
-// dead-on-arrival dial stays in Syncing and can never flash OK or clear the
-// outage warning (codex C5 finding). For these pure stream consumers connect
-// IS sync; the requests sync protocol later moves markSynced after its
-// snapshot barrier.
-func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, consume func(ctx context.Context, onConnect func()) error) *stream.Loop {
+// markSynced is handed to the attempt rather than called for it. Both of
+// today's attach streams call it from inside their sync protocol, after the
+// batch barrier, so an attempt that connects but cannot synchronize stays in
+// Syncing and can never flash OK or clear the outage warning (codex C5
+// finding).
+func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, consume func(ctx context.Context, markSynced func()) error) *stream.Loop {
 	return stream.NewLoop(stream.Config{
-		Attempt: func(ctx context.Context, markSynced func()) error {
-			return consume(ctx, markSynced)
-		},
+		Attempt:  consume,
 		Classify: classify,
 		OnStatus: func(s stream.Status) {
 			send(StreamStatusMsg{Stream: id, Status: s})
@@ -231,12 +235,25 @@ func parseStreamTimestamp(send func(tea.Msg), what, raw string) time.Time {
 
 // sendStreamedLogEntry converts one streamed log entry and delivers it.
 func sendStreamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) {
-	send(LogEntryMsg(domain.LogEntry{
+	send(LogEntryMsg(streamedLogEntry(send, entry)))
+}
+
+// streamedLogEntry converts one wire log entry without delivering it, so the
+// sync protocol can buffer live entries and convert backfill entries (same wire
+// type) through exactly the same mapping. send is still needed: a malformed
+// timestamp warns through the log pane.
+//
+// Seq is carried through: it is the server ingest sequence the sync protocol's
+// cursor arithmetic runs on, and is unrelated to the TUI-local DisplaySeq that
+// BaseModel stamps on arrival (D7).
+func streamedLogEntry(send func(tea.Msg), entry api.LogEntryResponse) domain.LogEntry {
+	return domain.LogEntry{
 		Timestamp: parseStreamTimestamp(send, "log", entry.Timestamp),
 		Process:   entry.Process,
 		Stream:    domain.Stream(entry.Stream),
 		Line:      entry.Line,
-	}))
+		Seq:       entry.Seq,
+	}
 }
 
 // sendStreamedProxyRequest converts one streamed proxy request and delivers it.

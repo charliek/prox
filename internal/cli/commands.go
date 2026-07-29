@@ -396,7 +396,7 @@ func runLogs(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// Get logs
-		logs, err := client.GetLogs(params)
+		logs, err := client.GetLogs(commandContext(cmd), params)
 		if err != nil {
 			return clientError(err, "Is prox running? Try 'prox up' first.")
 		}
