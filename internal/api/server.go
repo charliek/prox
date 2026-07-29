@@ -48,10 +48,15 @@ type Server struct {
 func NewServer(config ServerConfig, handlers *Handlers) *Server {
 	r := chi.NewRouter()
 
-	// Middleware
+	// Middleware. No request logger: chi's middleware.Logger printed every
+	// control-plane request straight to stdout (drowning `prox up` process
+	// logs), and its wrapped ResponseWriter implements an errorless Flush,
+	// which http.ResponseController prefers over Unwrap — masking the SSE
+	// flush errors sseWrite relies on to detect dead clients. Any future
+	// writer-wrapping middleware on the SSE routes must implement FlushError
+	// or Unwrap-without-Flush to preserve that detection.
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	// NOTE: the request timeout is applied per route group in registerRoutes,
 	// not globally here. Most routes get defaultRequestTimeout (30s); the

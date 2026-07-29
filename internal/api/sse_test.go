@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 )
@@ -297,4 +299,138 @@ func TestStreamLogs_NoFlusher_ReturnsJSONError(t *testing.T) {
 	if errResp.Code != domain.ErrCodeStreamingNotSupported {
 		t.Errorf("expected code %q, got %q", domain.ErrCodeStreamingNotSupported, errResp.Code)
 	}
+}
+
+// readSSEConnected reads the ": connected" comment every SSE handler writes
+// on subscribe and returns a buffered reader positioned right after it, ready
+// for the caller to keep reading SSE lines from. Shared by the StreamLogs and
+// StreamProxyRequests heartbeat/disconnect tests below.
+func readSSEConnected(t *testing.T, resp *http.Response) *bufio.Reader {
+	t.Helper()
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, line, ": connected")
+	return reader
+}
+
+// requireSSEHeartbeats reads SSE lines from reader until it has seen minPings
+// ": ping" heartbeats and one "data: " line containing dataMarker, failing if
+// that takes longer than window. window is the cadence assertion, not just a
+// hang guard: callers pick a small multiple of the injected heartbeat
+// interval, so an implementation whose real cadence grossly exceeds the
+// configured interval cannot pass on scheduling luck, while the margin stays
+// wide enough not to flake under CI load. Shared by the StreamLogs and
+// StreamProxyRequests heartbeat tests to also assert heartbeats and data
+// events interleave rather than one starving the other.
+func requireSSEHeartbeats(t *testing.T, reader *bufio.Reader, dataMarker string, minPings int, window time.Duration) {
+	t.Helper()
+	start := time.Now()
+	pings, sawData := 0, false
+	for pings < minPings || !sawData {
+		if elapsed := time.Since(start); elapsed > window {
+			t.Fatalf("saw %d/%d pings, data=%v after %v (window %v)",
+				pings, minPings, sawData, elapsed, window)
+		}
+		l, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		switch {
+		case strings.TrimSpace(l) == ": ping":
+			pings++
+		case strings.HasPrefix(l, "data: ") && strings.Contains(l, dataMarker):
+			sawData = true
+		}
+	}
+}
+
+// requireSSEHandlerReturns waits for done to close (an SSE handler returning
+// after its deferred cleanup), failing the test if it doesn't within 2s.
+// Shared by the StreamLogs and StreamProxyRequests client-disconnect tests.
+func requireSSEHandlerReturns(t *testing.T, done <-chan struct{}, handlerName string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s did not return after the client closed the connection", handlerName)
+	}
+}
+
+// TestStreamLogs_Heartbeat drives StreamLogs behind a real httptest.Server (an
+// httptest.ResponseRecorder never streams to a reader in real time, so a
+// heartbeat cadence can't be observed against one) with a short injected
+// heartbeat interval. It asserts an idle stream still emits ": ping" comments
+// on that cadence, and that a data event published mid-stream is delivered
+// interleaved with the heartbeats rather than starving one or the other.
+func TestStreamLogs_Heartbeat(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{
+		BufferSize:         100,
+		SubscriptionBuffer: 10,
+	})
+	defer logMgr.Close()
+
+	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers.sseHeartbeatInterval = 20 * time.Millisecond
+
+	srv := httptest.NewServer(http.HandlerFunc(handlers.StreamLogs))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	reader := readSSEConnected(t, resp)
+
+	// Publish a data event partway through the read loop so it must interleave
+	// with the heartbeat ticks rather than block on them.
+	go func() {
+		time.Sleep(4 * handlers.sseHeartbeatInterval)
+		logMgr.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   "hb",
+			Stream:    domain.StreamStdout,
+			Line:      "interleaved",
+		})
+	}()
+
+	// 3 pings within 1s at a 20ms interval: generous 16× margin against CI
+	// scheduling, yet a cadence regression to even 500ms/ping cannot pass.
+	requireSSEHeartbeats(t, reader, "interleaved", 3, time.Second)
+}
+
+// TestStreamLogs_ClientDisconnect_ReturnsHandler covers the teardown path with
+// a real connection close (as opposed to the context-cancellation simulation
+// used by TestStreamLogs_Headers et al.): once the client closes its side of
+// the connection, the handler's next write must fail and it must return,
+// freeing the log subscription via its deferred Unsubscribe.
+func TestStreamLogs_ClientDisconnect_ReturnsHandler(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{
+		BufferSize:         100,
+		SubscriptionBuffer: 10,
+	})
+	defer logMgr.Close()
+
+	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers.sseHeartbeatInterval = 10 * time.Millisecond
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.StreamLogs(w, r)
+		close(done)
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	readSSEConnected(t, resp)
+
+	require.NoError(t, resp.Body.Close())
+
+	requireSSEHandlerReturns(t, done, "StreamLogs")
 }

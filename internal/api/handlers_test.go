@@ -995,6 +995,96 @@ func TestStreamProxyRequests(t *testing.T) {
 	})
 }
 
+// TestStreamProxyRequests_Heartbeat mirrors TestStreamLogs_Heartbeat: a real
+// httptest.Server with a short injected heartbeat interval, asserting an idle
+// stream still emits ": ping" on cadence and that a record published
+// mid-stream arrives interleaved with the heartbeats.
+func TestStreamProxyRequests_Heartbeat(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers.sseHeartbeatInterval = 20 * time.Millisecond
+
+	rm := proxy.NewRequestManager(100)
+	handlers.SetRequestManager(rm)
+
+	srv := httptest.NewServer(http.HandlerFunc(handlers.StreamProxyRequests))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	reader := readSSEConnected(t, resp)
+
+	go func() {
+		time.Sleep(4 * handlers.sseHeartbeatInterval)
+		rm.Record(proxy.RequestRecord{
+			Timestamp:  time.Now(),
+			Method:     "GET",
+			URL:        "/heartbeat-interleave",
+			Subdomain:  "test",
+			StatusCode: 200,
+			Duration:   time.Millisecond,
+			RemoteAddr: "127.0.0.1",
+		})
+	}()
+
+	// 3 pings within 1s at a 20ms interval: generous 16× margin against CI
+	// scheduling, yet a cadence regression to even 500ms/ping cannot pass.
+	requireSSEHeartbeats(t, reader, "/heartbeat-interleave", 3, time.Second)
+}
+
+// TestStreamProxyRequests_ClientDisconnect_ReturnsHandler covers the teardown
+// path with a real connection close, complementing the "SSE headers set
+// correctly" context-cancellation subtest in TestStreamProxyRequests: once the
+// client closes its side of the connection, the handler's next write must
+// fail and it must return, freeing the subscription via its deferred
+// Unsubscribe.
+func TestStreamProxyRequests_ClientDisconnect_ReturnsHandler(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers.sseHeartbeatInterval = 10 * time.Millisecond
+
+	rm := proxy.NewRequestManager(100)
+	handlers.SetRequestManager(rm)
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.StreamProxyRequests(w, r)
+		close(done)
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	readSSEConnected(t, resp)
+
+	require.NoError(t, resp.Body.Close())
+
+	requireSSEHandlerReturns(t, done, "StreamProxyRequests")
+}
+
 func TestStreamProxyRequests_ProxyNotEnabled(t *testing.T) {
 	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
 	defer logMgr.Close()

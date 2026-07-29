@@ -18,11 +18,6 @@ import (
 	"github.com/charliek/prox/internal/domain"
 )
 
-// sseReadTimeout is the timeout for SSE reads. If no data is received within
-// this duration, the connection is considered dead. SSE servers send heartbeats,
-// so this should be longer than the heartbeat interval.
-const sseReadTimeout = 60 * time.Second
-
 // deadlineReader wraps an io.Reader and sets a read deadline on each read.
 // This prevents indefinite hangs when the server dies without closing the connection.
 type deadlineReader struct {
@@ -387,7 +382,7 @@ func streamSSE[T any](req *http.Request, parse func(string) (T, bool)) (<-chan T
 		bodyReader := &deadlineReader{
 			r:       resp.Body,
 			conn:    conn,
-			timeout: sseReadTimeout,
+			timeout: constants.SSEReadTimeout,
 		}
 		reader := bufio.NewReader(bodyReader)
 

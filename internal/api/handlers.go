@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -46,6 +45,23 @@ type Handlers struct {
 	configFile     string
 	shutdown       ShutdownController
 	proxyStatus    ProxyStatusProvider
+
+	// sseHeartbeatInterval overrides constants.SSEHeartbeatInterval for the SSE
+	// handlers (StreamLogs, StreamProxyRequests). Zero means "use the default";
+	// tests in this package set it directly to a short interval instead of
+	// mutating a package-level var, which would race across parallel tests
+	// (mirrors the forwarderConfig injectable-value idiom in
+	// internal/proxyd/forwarder.go).
+	sseHeartbeatInterval time.Duration
+}
+
+// heartbeatInterval returns the SSE heartbeat interval to use: the injected
+// test override if set, otherwise the production default.
+func (h *Handlers) heartbeatInterval() time.Duration {
+	if h.sseHeartbeatInterval > 0 {
+		return h.sseHeartbeatInterval
+	}
+	return constants.SSEHeartbeatInterval
 }
 
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
@@ -611,8 +627,7 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error: "streaming not supported",
 			Code:  domain.ErrCodeStreamingNotSupported,
@@ -630,14 +645,25 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 	sub := h.requestManager.Subscribe(filter)
 	defer h.requestManager.Unsubscribe(sub.ID)
 
+	// rc lets each SSE write set a per-write deadline (see sseWrite in sse.go).
+	rc := http.NewResponseController(w)
+
 	// Send initial comment to establish connection
-	fmt.Fprintf(w, ": connected\n\n")
-	flusher.Flush()
+	if err := sseWrite(rc, w, []byte(": connected\n\n")); err != nil {
+		return
+	}
+
+	ticker := time.NewTicker(h.heartbeatInterval())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ticker.C:
+			if err := sseWrite(rc, w, []byte(": ping\n\n")); err != nil {
+				return
+			}
 		case req, ok := <-sub.Ch:
 			if !ok {
 				return
@@ -650,10 +676,9 @@ func (h *Handlers) StreamProxyRequests(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if _, err := w.Write([]byte("data: " + string(data) + "\n\n")); err != nil {
+			if err := sseWrite(rc, w, []byte("data: "), data, []byte("\n\n")); err != nil {
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }
