@@ -18,7 +18,7 @@ func TestHealthChecker_Healthy(t *testing.T) {
 		StartPeriod: 50 * time.Millisecond,
 	}
 
-	checker := NewHealthChecker("test", config)
+	checker := NewHealthChecker("test", config, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -45,7 +45,7 @@ func TestHealthChecker_Unhealthy(t *testing.T) {
 		StartPeriod: 10 * time.Millisecond,
 	}
 
-	checker := NewHealthChecker("test", config)
+	checker := NewHealthChecker("test", config, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -77,7 +77,7 @@ func TestHealthChecker_RecoveryAfterFailure(t *testing.T) {
 		StartPeriod: 10 * time.Millisecond,
 	}
 
-	checker := NewHealthChecker("test", config)
+	checker := NewHealthChecker("test", config, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -101,7 +101,7 @@ func TestHealthChecker_StartPeriod(t *testing.T) {
 		StartPeriod: 200 * time.Millisecond,
 	}
 
-	checker := NewHealthChecker("test", config)
+	checker := NewHealthChecker("test", config, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

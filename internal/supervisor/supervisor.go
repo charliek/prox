@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -96,8 +97,35 @@ type Supervisor struct {
 
 	// eventMu protects eventSubs from concurrent access
 	eventMu sync.RWMutex
-	// eventSubs holds channels for subscribers to supervisor events
+	// eventSubs holds channels for subscribers to supervisor events. This is the
+	// legacy, in-package typed-event fan-out (subscribeEvents/emit): drop-on-full,
+	// never closed, and consumed only by the supervisor's own tests. External
+	// consumers use the dirty-latch change bus below.
 	eventSubs []chan SupervisorEvent
+
+	// --- process-change bus (plan 017 C10) ---
+	//
+	// changeMu guards changeSubs and changeClosed. It is a LEAF lock: the only work
+	// done under it is map bookkeeping, non-blocking channel sends, and channel
+	// closes -- never a call back into supervisor/process/health code and never
+	// another lock acquisition. Because every send AND every close happens under
+	// this one mutex, a notify can never race a close into a closed channel (the
+	// logs/requests managers need the send outside their write lock because their
+	// sends carry payloads under an RWMutex; here the whole fan-out is O(subs)
+	// non-blocking sends, so a plain mutex is both simpler and safe).
+	changeMu sync.Mutex
+	// changeSubs holds the coalescing dirty-latch subscribers by id. Each channel
+	// has capacity 1 and is written with a non-blocking send, so it is a LEVEL
+	// latch ("something changed since you last looked"), not an edge queue: a burst
+	// of transitions can never lose its last event, because a subscriber that wakes
+	// re-snapshots the whole world via Processes(). Events therefore carry no
+	// payload at all.
+	changeSubs map[string]chan struct{}
+	// changeClosed latches at CloseEvents (which Stop always runs): every
+	// subscriber channel is closed once, and a later Subscribe returns an
+	// already-closed channel so a stream request racing shutdown ends immediately
+	// instead of blocking on a latch nothing will ever set.
+	changeClosed bool
 
 	// childrenMu serializes writes to the orphan-reaping ownership ledger
 	// (<supConfig.StateDir>/prox.children). Holding it across BOTH the s.mu
@@ -218,6 +246,7 @@ func New(cfg *config.Config, logManager *logs.Manager, runner ProcessRunner, sup
 		runner:     runner,
 		logManager: logManager,
 		state:      "stopped",
+		changeSubs: make(map[string]chan struct{}),
 	}
 	s.bootMarker = s.readBootMarker()
 	// Default resolver factory: build the real dependency resolver from config
@@ -347,6 +376,14 @@ func (s *Supervisor) startWithFilter(ctx context.Context, filter map[string]bool
 		s.mu.Unlock()
 	}
 
+	// Registration itself is a visible change: dormant task entries (and any
+	// filtered-out processes' absence) are part of Processes() output. The
+	// supervisor_start emit above fires BEFORE registration, so a subscriber
+	// woken by it can snapshot an incomplete process set and — if the filter
+	// then schedules nothing — never be woken again (codex C10 finding). One
+	// explicit notify after registration closes that window; no lock held.
+	s.notifyChange()
+
 	// Start all processes concurrently (tasks are skipped here; they are
 	// demand-driven or bare-up-driven -- see scheduleTaskDemands).
 	s.startProcessesConcurrently(&result)
@@ -417,6 +454,9 @@ func (s *Supervisor) createManagedProcess(name string, procConfig config.Process
 	// every managed process) means all launch paths persist and a future one
 	// cannot forget.
 	mp.onLaunched = s.persistChildren
+	// Wake the change bus on every process-level state commit (plan 017 C10).
+	// ManagedProcess invokes it only with p.mu released (see notifyChange there).
+	mp.onChange = s.notifyChange
 
 	return mp, nil
 }
@@ -557,6 +597,7 @@ func (s *Supervisor) createManagedTask(name string, taskConfig config.TaskConfig
 		return nil
 	}
 	mp.onLaunched = s.persistChildren
+	mp.onChange = s.notifyChange
 	return mp, nil
 }
 
@@ -893,6 +934,14 @@ func (s *Supervisor) RefuseLaunches() {
 // never a typed-nil *ProcessStopError -- when the stop is clean, and likewise nil
 // from the not-running early return (nothing to do) (#36, D3).
 func (s *Supervisor) Stop(ctx context.Context) error {
+	// Latch the change bus closed once this stop returns, on EVERY path including
+	// the not-running early return below (a shutdown must always release SSE
+	// subscribers, whether or not there was anything left to stop). Registered as
+	// the FIRST defer so it runs LAST: after the per-process stop goroutines, after
+	// the supervisor_stop emit, and with no lock held (the emit's own notify has
+	// already fired, so subscribers observe the final state and then end-of-stream).
+	defer s.CloseEvents()
+
 	s.mu.Lock()
 	if s.state != "running" {
 		s.mu.Unlock()
@@ -1322,8 +1371,15 @@ func (st SupervisorStatus) UptimeSeconds() int64 {
 	return int64(time.Since(st.StartedAt).Seconds())
 }
 
-// Subscribe creates a channel for receiving supervisor events
-func (s *Supervisor) Subscribe() <-chan SupervisorEvent {
+// subscribeEvents creates a channel for receiving typed supervisor events.
+//
+// This is the LEGACY in-package fan-out: unbounded subscriber list, drop-on-full
+// delivery, no unsubscribe and no close. It is consumed only by the supervisor's
+// own tests (which assert event TYPES per process); every external consumer uses
+// the payload-free change bus (Subscribe/Unsubscribe/CloseEvents) instead, which
+// every emit also feeds. It is deliberately left unexported and unchanged rather
+// than being grown into a second real bus.
+func (s *Supervisor) subscribeEvents() <-chan SupervisorEvent {
 	ch := make(chan SupervisorEvent, 100)
 
 	s.eventMu.Lock()
@@ -1333,16 +1389,117 @@ func (s *Supervisor) Subscribe() <-chan SupervisorEvent {
 	return ch
 }
 
-// emit sends an event to all subscribers
+// emit sends an event to all typed-event subscribers and wakes the change bus.
+//
+// Every emit is by construction a ProcessInfo-visible change, so routing all of
+// them through notifyChange keeps the two in lockstep without duplicating call
+// sites. Changes with no typed event (natural exit, health flips, waiting/blocked
+// transitions) call notifyChange directly.
 func (s *Supervisor) emit(event SupervisorEvent) {
 	s.eventMu.RLock()
-	defer s.eventMu.RUnlock()
-
 	for _, ch := range s.eventSubs {
 		select {
 		case ch <- event:
 		default:
 			// Channel full, skip
+		}
+	}
+	s.eventMu.RUnlock()
+
+	// Outside eventMu: notifyChange takes changeMu, and keeping the two critical
+	// sections disjoint means the bus never inherits the event list's lock.
+	s.notifyChange()
+}
+
+// changeSubIDCounter names change-bus subscriptions (mirrors the logs
+// subscription-id counter).
+var changeSubIDCounter atomic.Uint64
+
+// Subscribe registers a coalescing dirty-latch subscriber on the process-change
+// bus and returns its id (for Unsubscribe) and its wake channel.
+//
+// The channel carries NO payload: a wake means "some ProcessInfo-visible thing
+// changed; re-read Processes()". It has capacity 1 and is written with a
+// non-blocking send, so a burst of transitions collapses into a single pending
+// wake and the emitter is never blocked or slowed by a subscriber. Because the
+// latch is level rather than edge, the LAST change of a burst can never be lost:
+// either the latch is already set (the subscriber has not looked yet and will
+// see the final state when it does) or the send sets it.
+//
+// After CloseEvents the returned channel is already closed, so a stream handler
+// that races shutdown observes end-of-stream immediately instead of blocking on
+// a latch nothing will ever set (mirrors logs.SubscriptionManager.Subscribe).
+func (s *Supervisor) Subscribe() (string, <-chan struct{}) {
+	id := "sup-" + strconv.FormatUint(changeSubIDCounter.Add(1), 10)
+	ch := make(chan struct{}, 1)
+
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	if s.changeClosed {
+		close(ch)
+		return id, ch
+	}
+	s.changeSubs[id] = ch
+	return id, ch
+}
+
+// Unsubscribe removes a change-bus subscriber and closes its channel. Idempotent:
+// an unknown id (already unsubscribed, or dropped by CloseEvents) is a no-op.
+func (s *Supervisor) Unsubscribe(id string) {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	ch, ok := s.changeSubs[id]
+	if !ok {
+		return
+	}
+	delete(s.changeSubs, id)
+	close(ch)
+}
+
+// SubscriberCount returns the number of live change-bus subscribers.
+func (s *Supervisor) SubscriberCount() int {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	return len(s.changeSubs)
+}
+
+// CloseEvents latches the change bus closed: every current subscriber channel is
+// closed (so a handler blocked on a wake returns), and every later Subscribe gets
+// an already-closed channel. Idempotent.
+//
+// Supervisor.Stop always runs this (see its deferred call), and up.go's shutdown
+// sequence runs Stop before the API server shutdown -- the same ordering the log
+// and request managers need, because the no-timeout SSE routes only end when
+// their data source closes (internal/api/server.go's route contract).
+func (s *Supervisor) CloseEvents() {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	if s.changeClosed {
+		return
+	}
+	s.changeClosed = true
+	for id, ch := range s.changeSubs {
+		delete(s.changeSubs, id)
+		close(ch)
+	}
+}
+
+// notifyChange sets every subscriber's dirty latch.
+//
+// LOCK DISCIPLINE: callers MUST hold no supervisor, process or health-checker
+// lock. notifyChange itself takes only changeMu (a leaf) and performs
+// non-blocking sends, so it never blocks and never re-enters supervisor code --
+// but keeping the callers lock-free is what makes the bus impossible to deadlock
+// against Processes(), which a woken subscriber calls straight back into.
+func (s *Supervisor) notifyChange() {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	for _, ch := range s.changeSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// Latch already set: the subscriber has not re-snapshotted yet, so it
+			// will observe this change (and everything after it) when it does.
 		}
 	}
 }

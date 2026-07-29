@@ -738,6 +738,14 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 			}
 		}
 		deps.sup.SystemLog("shutdown complete")
+		// Release any /processes/stream subscribers, for the same reason the log and
+		// request managers are closed below: the no-timeout SSE routes only end when
+		// their data source closes. Stage 2's sup.Stop already latched the change bus
+		// closed (Supervisor.Stop defers CloseEvents on every path), so this is
+		// idempotent -- it is kept explicit here so the ordering requirement (every
+		// stream source closes BEFORE the stage-5 API shutdown) is visible in the
+		// shutdown sequence itself.
+		deps.sup.CloseEvents()
 	}
 	// Give the terminal log printer a moment to drain the final lines before Close.
 	time.Sleep(logFlushDelay)

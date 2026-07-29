@@ -226,6 +226,15 @@ type ManagedProcess struct {
 	// lock-free (like launchGate).
 	onLaunched func()
 
+	// onChange, when set, wakes the supervisor's process-change bus (plan 017 C10).
+	// It carries no payload -- a subscriber re-reads Processes() -- and is invoked
+	// ONLY with p.mu released (see notifyChange), because a woken subscriber calls
+	// straight back into Processes(), whose s.mu -> p.mu order would AB-BA against a
+	// notify fired under p.mu. supervisor.createManagedProcess/createManagedTask
+	// inject it; nil (direct construction in tests) means "no bus". Set once before
+	// publication, so it is read lock-free (like launchGate/onLaunched).
+	onChange func()
+
 	// stopBarrier is a test-only seam (nil in production). Stop invokes it,
 	// unlocked, at interleaving-sensitive points identified by phase:
 	//
@@ -304,6 +313,17 @@ func NewManagedProcess(config domain.ProcessConfig, env map[string]string, runne
 		state:          domain.ProcessStateStopped,
 		taskTimeout:    config.TaskTimeout,
 		taskHasTimeout: config.TaskHasTimeout,
+	}
+}
+
+// notifyChange wakes the supervisor's change bus for this process (plan 017 C10).
+//
+// LOCK DISCIPLINE: the caller MUST hold neither p.mu nor any supervisor lock --
+// every call site below documents which lock it has just released. A nil hook
+// (directly constructed test process) is a no-op.
+func (p *ManagedProcess) notifyChange() {
+	if p.onChange != nil {
+		p.onChange()
 	}
 }
 
@@ -604,6 +624,11 @@ func (p *ManagedProcess) bumpRestart() {
 	p.mu.Lock()
 	p.restartCount++
 	p.mu.Unlock()
+	// RestartCount is ProcessInfo-visible. Lock discipline: p.mu released above;
+	// the caller (executeTask) holds no process/supervisor lock either. The other
+	// bump (Restart) is bracketed by the stop half's and start half's own notifies,
+	// so it needs no site of its own.
+	p.notifyChange()
 }
 
 // startWithConfigGen is the shared launch wrapper: it runs the locked launch
@@ -615,6 +640,13 @@ func (p *ManagedProcess) startWithConfigGen(ctx context.Context, pending *pendin
 	if err == nil && p.onLaunched != nil {
 		p.onLaunched()
 	}
+	// Wake the change bus for every launch attempt. Lock discipline: p.mu is fully
+	// released by startWithConfigLocked before this runs (the same reason onLaunched
+	// is invoked here). Fired on the error path too, because a failed launch can
+	// still have committed a visible state (Crashed on an env-reload or runner
+	// failure); a refusal that changed nothing merely costs one spurious wake, which
+	// the level latch coalesces away.
+	p.notifyChange()
 	return err
 }
 
@@ -759,7 +791,10 @@ func (p *ManagedProcess) startWithConfigLocked(ctx context.Context, pending *pen
 
 	// Start health checker if configured
 	if p.config.Healthcheck != nil && p.config.Healthcheck.Cmd != "" {
-		p.healthChecker = NewHealthChecker(p.config.Name, *p.config.Healthcheck)
+		// The transition callback is stored here (under p.mu) but only ever FIRED
+		// from the checker's own goroutine with h.mu released, so wiring it inside
+		// this critical section is safe.
+		p.healthChecker = NewHealthChecker(p.config.Name, *p.config.Healthcheck, p.notifyChange)
 		p.healthChecker.Start(processCtx)
 	}
 
@@ -845,6 +880,13 @@ func (p *ManagedProcess) stopTask(ctx context.Context) error {
 // crashed for a task run-timeout). A surviving group always commits crashed
 // regardless; the error paths are unchanged.
 func (p *ManagedProcess) stop(ctx context.Context, cleanState domain.ProcessState) (retErr error) {
+	// Wake the change bus once this stop has settled, whichever of the many exits
+	// it takes (waiting->stopped, blocked->stopped, the early no-ops, and the final
+	// verdict commit). Registered as the FIRST defer so it runs LAST -- after the
+	// deferred episode backstop below, hence with p.mu released. Not every path
+	// changes state; a spurious wake just costs the subscriber one re-snapshot.
+	defer p.notifyChange()
+
 	p.mu.Lock()
 
 	switch p.state {
@@ -967,6 +1009,12 @@ func (p *ManagedProcess) stop(ctx context.Context, cleanState domain.ProcessStat
 	p.healthChecker = nil
 	barrier := p.stopBarrier
 	p.mu.Unlock()
+
+	// The Stopping transition is itself ProcessInfo-visible and can precede the
+	// terminal verdict by the whole stop budget, so surface it now rather than
+	// letting the stream jump straight from running to stopped. Lock discipline:
+	// p.mu released immediately above.
+	p.notifyChange()
 
 	defer func() { p.backstopStopEpisode(ep, inst, retErr) }()
 
@@ -1205,6 +1253,9 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 	exitCode := exitCodeFromWaitErr(err)
 
 	p.mu.Lock()
+	// prevState is sampled under the lock so the natural-exit commit below can be
+	// detected exactly (see the notify after the unlock).
+	prevState := p.state
 	// Generation guard: a stale monitor -- one whose instance has already been
 	// replaced by a newer Start -- must touch nothing shared and emit no
 	// (misleading) logs (drain-timeout notice or exit code) attributed to a run
@@ -1250,7 +1301,18 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 	}
 	// Deliberately do NOT null p.current: retaining it keeps the pgid reapable
 	// for a retry Stop.
+	stateChanged := p.state != prevState
 	p.mu.Unlock()
+
+	// Natural exit / task completion: this is the only path that commits
+	// completed or crashed without any supervisor-level emit, so it must wake the
+	// bus itself. Lock discipline: p.mu released immediately above; monitor holds
+	// nothing else. Gated on an actual transition so the far more common
+	// stop-driven exits (where Stop owns the verdict and its own notify) do not
+	// double-wake.
+	if stateChanged {
+		p.notifyChange()
+	}
 
 	inst.closeDone()
 }
