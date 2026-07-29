@@ -91,6 +91,11 @@ const (
 	ErrCodeProcessAlreadyWaiting = "PROCESS_ALREADY_WAITING"
 	ErrCodeProcessNotRunning     = "PROCESS_NOT_RUNNING"
 	ErrCodeInvalidPattern        = "INVALID_PATTERN"
+	// ErrCodeInvalidSinceSeq marks a GET /api/v1/logs?since_seq=... value that
+	// failed to parse as a uint64 (plan 017 C8). Distinct from
+	// ErrCodeInvalidPattern (a bad regex) so callers can tell which parameter
+	// was rejected.
+	ErrCodeInvalidSinceSeq       = "INVALID_SINCE_SEQ"
 	ErrCodeShutdownInProgress    = "SHUTDOWN_IN_PROGRESS"
 	ErrCodeEnvReloadFailed       = "ENV_RELOAD_FAILED"
 	ErrCodeProcessGroupNotReaped = "PROCESS_GROUP_NOT_REAPED"

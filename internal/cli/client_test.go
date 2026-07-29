@@ -572,16 +572,51 @@ func TestParseSSELogEntry_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestParseSSELogEntry_EmptyObject documents the plan 017 C8 guard: an empty
+// object unmarshals into a zero-valued LogEntryResponse without a JSON error
+// (unknown/missing fields are simply left at their zero value), but a real
+// log entry can never have empty Process AND empty Line AND Seq==0 all at
+// once, so this shape is rejected rather than surfaced as a phantom log row.
 func TestParseSSELogEntry_EmptyObject(t *testing.T) {
 	data := `{}`
+
+	_, ok := parseSSELogEntry(data)
+
+	if ok {
+		t.Fatal("expected parsing to reject an empty object")
+	}
+}
+
+// TestParseSSELogEntry_HandshakePayload asserts the guard specifically
+// against the stream handshake event's body (api.HandshakeResponse): its
+// only field, stream_id, is not a LogEntryResponse field, so it unmarshals
+// the same as an empty object and must be rejected the same way (plan 017
+// C8) -- this is what keeps the "event: handshake" frame StreamLogs sends
+// from materializing as a phantom empty log row in the attach TUI.
+func TestParseSSELogEntry_HandshakePayload(t *testing.T) {
+	data := `{"stream_id":"deadbeefcafef00d"}`
+
+	_, ok := parseSSELogEntry(data)
+
+	if ok {
+		t.Fatal("expected parsing to reject a handshake-shaped payload")
+	}
+}
+
+// TestParseSSELogEntry_SeqOnlyRealEntry guards the other side of the fix: a
+// real entry with an empty Line (a blank log line is legitimate output) must
+// still be accepted as long as Process or Seq is non-zero, so the guard
+// cannot be loosened to reject on Line alone.
+func TestParseSSELogEntry_SeqOnlyRealEntry(t *testing.T) {
+	data := `{"process":"web","stream":"stdout","line":"","seq":7}`
 
 	entry, ok := parseSSELogEntry(data)
 
 	if !ok {
-		t.Fatal("expected parsing to succeed for empty object")
+		t.Fatal("expected parsing to succeed for a real entry with an empty line")
 	}
-	if entry.Process != "" || entry.Line != "" {
-		t.Errorf("expected empty fields, got process=%q, line=%q", entry.Process, entry.Line)
+	if entry.Seq != 7 {
+		t.Errorf("expected seq 7, got %d", entry.Seq)
 	}
 }
 

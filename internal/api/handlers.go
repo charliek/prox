@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -231,18 +232,58 @@ func (h *Handlers) RestartProcess(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SuccessResponse{Success: true})
 }
 
-// GetLogs handles GET /api/v1/logs
+// GetLogs handles GET /api/v1/logs.
+//
+// Response ordering: without since_seq, Logs holds the newest `lines`
+// matching entries in the ring buffer's own chronological (oldest-first)
+// order -- unchanged from before this cursor API existed. With since_seq,
+// Logs holds every matching entry with Seq > since_seq, oldest-first BY
+// CONSTRUCTION (logs.Manager.QueryFromSeq deliberately keeps the OLDEST
+// entries when `lines` caps the result, so a resuming client advances its
+// cursor contiguously instead of being handed a slice with a gap in it). Both
+// paths therefore render oldest-first, but for different reasons -- do not
+// assume the last-N path's order is incidental.
+//
+// StreamID/OldestSeq/LatestSeq are populated on EVERY response (plan 017 C8),
+// not just since_seq requests, so a client can detect a daemon restart
+// (StreamID changed) or a buffer rollover past its held cursor (OldestSeq >
+// since_seq+1) from a plain poll. Both paths source Logs and the bounds from
+// ONE logs.Manager buffer snapshot (via QueryFromSeq) so they can never
+// describe different moments.
 func (h *Handlers) GetLogs(w http.ResponseWriter, r *http.Request) {
-	filter, limit, err := parseLogParams(r)
+	filter, limit, sinceSeq, hasSinceSeq, err := parseLogParams(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: err.Error(),
-			Code:  domain.ErrCodeInvalidPattern,
+			Code:  domain.ErrCodeInvalidSinceSeq,
 		})
 		return
 	}
 
-	entries, total, err := h.logManager.QueryLast(filter, limit)
+	var (
+		entries              []domain.LogEntry
+		total                int
+		oldestSeq, latestSeq uint64
+	)
+	if hasSinceSeq {
+		entries, oldestSeq, latestSeq, err = h.logManager.QueryFromSeq(filter, sinceSeq, limit)
+		total = len(entries)
+	} else {
+		// QueryFromSeq(sinceSeq=0) is uncapped (limit=0) here so it returns
+		// every matching entry oldest-first from ONE buffer snapshot; trimming
+		// to the newest `limit` below reproduces the historical QueryLast
+		// behavior while still sourcing entries and bounds from that same
+		// snapshot (see doc comment above).
+		var all []domain.LogEntry
+		all, oldestSeq, latestSeq, err = h.logManager.QueryFromSeq(filter, 0, 0)
+		if err == nil {
+			total = len(all)
+			entries = all
+			if limit > 0 && len(entries) > limit {
+				entries = entries[len(entries)-limit:]
+			}
+		}
+	}
 	if err != nil {
 		writeError(w, err)
 		return
@@ -252,6 +293,9 @@ func (h *Handlers) GetLogs(w http.ResponseWriter, r *http.Request) {
 		Logs:          make([]LogEntryResponse, len(entries)),
 		FilteredCount: len(entries),
 		TotalCount:    total,
+		StreamID:      h.logManager.StreamID(),
+		OldestSeq:     oldestSeq,
+		LatestSeq:     latestSeq,
 	}
 
 	for i, e := range entries {
@@ -329,10 +373,16 @@ func shutdownFailures(outcome *domain.ProcessStopError) []ShutdownFailureRespons
 	return failures
 }
 
-// parseLogParams extracts log filter parameters from request
-func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
-	filter := domain.LogFilter{}
-
+// parseLogParams extracts log filter parameters from the request: the
+// process/pattern/regex filter, the "lines" limit (default
+// constants.DefaultLogLimit, capped at constants.MaxLogLines; a malformed or
+// non-positive value silently falls back to the default -- preserved
+// unchanged for backward compatibility), and the optional "since_seq" resume
+// cursor (plan 017 C8, hasSinceSeq reports whether it was present at all).
+// Unlike "lines", a present-but-unparseable since_seq is a hard error: it
+// names a specific cursor the caller believes is valid, so silently
+// substituting a default would silently change what "resume from here" means.
+func parseLogParams(r *http.Request) (filter domain.LogFilter, limit int, sinceSeq uint64, hasSinceSeq bool, err error) {
 	// Process filter
 	if processes := r.URL.Query().Get("process"); processes != "" {
 		filter.Processes = strings.Split(processes, ",")
@@ -347,9 +397,9 @@ func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
 	}
 
 	// Lines limit (default 100, max 10000 to prevent DoS)
-	limit := constants.DefaultLogLimit
+	limit = constants.DefaultLogLimit
 	if linesStr := r.URL.Query().Get("lines"); linesStr != "" {
-		if l, err := strconv.Atoi(linesStr); err == nil && l > 0 {
+		if l, perr := strconv.Atoi(linesStr); perr == nil && l > 0 {
 			if l > constants.MaxLogLines {
 				limit = constants.MaxLogLines
 			} else {
@@ -358,7 +408,24 @@ func parseLogParams(r *http.Request) (domain.LogFilter, int, error) {
 		}
 	}
 
-	return filter, limit, nil
+	// since_seq resume cursor. Presence is checked via the query map, not a
+	// non-empty Get: an explicitly empty `?since_seq=` is a malformed resume
+	// request and must 400 rather than silently degrade to the last-N path,
+	// which could hand a resuming client a page with a hidden gap.
+	if sinceVals, present := r.URL.Query()["since_seq"]; present {
+		sinceStr := ""
+		if len(sinceVals) > 0 {
+			sinceStr = sinceVals[0]
+		}
+		v, perr := strconv.ParseUint(sinceStr, 10, 64)
+		if perr != nil {
+			return domain.LogFilter{}, 0, 0, false, fmt.Errorf("invalid since_seq %q: %w", sinceStr, perr)
+		}
+		sinceSeq = v
+		hasSinceSeq = true
+	}
+
+	return filter, limit, sinceSeq, hasSinceSeq, nil
 }
 
 // writeJSON writes a JSON response

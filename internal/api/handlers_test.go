@@ -222,6 +222,15 @@ func TestGetLogs(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Len(t, resp.Logs, 10)
+
+		// Cursor metadata (plan 017 C8) is populated on every response, even
+		// the plain last-N path that never touched since_seq.
+		assert.Equal(t, logMgr.StreamID(), resp.StreamID)
+		assert.Equal(t, uint64(1), resp.OldestSeq)
+		assert.Equal(t, uint64(10), resp.LatestSeq)
+		for i, e := range resp.Logs {
+			assert.Equal(t, uint64(i+1), e.Seq, "entry %d should carry its manager-assigned seq", i)
+		}
 	})
 
 	t.Run("get logs with limit", func(t *testing.T) {
@@ -356,6 +365,129 @@ func TestGetLogs_InvalidRegexPattern(t *testing.T) {
 	err := json.NewDecoder(w.Body).Decode(&resp)
 	require.NoError(t, err)
 	assert.Equal(t, domain.ErrCodeInvalidPattern, resp.Code)
+}
+
+// TestGetLogs_SinceSeq covers the new since_seq resume path (plan 017 C8):
+// exactly the entries newer than the cursor come back, oldest-first, with
+// bounds describing the whole buffer.
+func TestGetLogs_SinceSeq(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	for i := 0; i < 10; i++ {
+		logMgr.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   "web",
+			Stream:    domain.StreamStdout,
+			Line:      fmt.Sprintf("line %d", i),
+		})
+	}
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=5", nil)
+	w := httptest.NewRecorder()
+
+	handlers.GetLogs(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp LogsResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+
+	require.Len(t, resp.Logs, 5, "expected only entries with seq > 5")
+	assert.Equal(t, logMgr.StreamID(), resp.StreamID)
+	assert.Equal(t, uint64(1), resp.OldestSeq)
+	assert.Equal(t, uint64(10), resp.LatestSeq)
+
+	// Oldest-first by construction, exactly seq 6..10.
+	for i, e := range resp.Logs {
+		assert.Equal(t, uint64(6+i), e.Seq)
+	}
+}
+
+// TestGetLogs_SinceSeq_RolledBuffer covers the gap-detection case: the buffer
+// has evicted entries older than since_seq, so the client can tell it missed
+// some (OldestSeq > since_seq+1) rather than mistake a short result for
+// "caught up" (plan 017 C8).
+func TestGetLogs_SinceSeq_RolledBuffer(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 5})
+	defer logMgr.Close()
+
+	for i := 0; i < 10; i++ {
+		logMgr.Write(domain.LogEntry{
+			Timestamp: time.Now(),
+			Process:   "web",
+			Stream:    domain.StreamStdout,
+			Line:      fmt.Sprintf("line %d", i),
+		})
+	}
+	// Capacity 5, 10 writes: only seq 6..10 remain in the ring.
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=1", nil)
+	w := httptest.NewRecorder()
+
+	handlers.GetLogs(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp LogsResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+
+	assert.Equal(t, uint64(6), resp.OldestSeq)
+	assert.Equal(t, uint64(10), resp.LatestSeq)
+	assert.Greater(t, resp.OldestSeq, uint64(1)+1, "oldestSeq should be detectably past since_seq+1")
+	assert.Len(t, resp.Logs, 5)
+}
+
+// TestGetLogs_SinceSeq_ParseError asserts an unparseable since_seq is a hard
+// 400, distinct from the invalid-regex 400 (plan 017 C8).
+func TestGetLogs_SinceSeq_ParseError(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=not-a-number", nil)
+	w := httptest.NewRecorder()
+
+	handlers.GetLogs(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, domain.ErrCodeInvalidSinceSeq, resp.Code)
+
+	// An explicitly EMPTY since_seq is present-but-malformed: it must 400 too,
+	// not silently degrade to the last-N path (which could hand a resuming
+	// client a page with a hidden gap) — codex C8 finding.
+	req = httptest.NewRequest("GET", "/api/v1/logs?since_seq=", nil)
+	w = httptest.NewRecorder()
+
+	handlers.GetLogs(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var emptyResp ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&emptyResp))
+	assert.Equal(t, domain.ErrCodeInvalidSinceSeq, emptyResp.Code)
 }
 
 func TestProcessControl_NotFound(t *testing.T) {

@@ -361,11 +361,27 @@ func (c *Client) addAuthHeader(req *http.Request) {
 
 // parseSSELogEntry parses a single SSE data line into a log entry.
 // Returns the parsed entry and true if successful, or an empty entry and false if parsing failed.
+//
+// readSSE (below) does not look at "event:" lines at all -- it only inspects
+// blank lines, comments, and "data:" lines -- so the "event: handshake" frame
+// StreamLogs sends right after ": connected" (plan 017 C8, see
+// api.HandshakeResponse) is invisible to it, but the "data: {"stream_id":...}"
+// line that follows still reaches this parser. json.Unmarshal ignores unknown
+// fields, so that payload decodes into an api.LogEntryResponse without error,
+// leaving every field at its zero value. Reject that shape explicitly: a real
+// log entry always has either a non-empty Process, a non-empty Line, or a
+// manager-assigned Seq >= 1, so Process=="" && Line=="" && Seq==0 can only be
+// a non-log payload riding the same "data:" convention (today, the
+// handshake). Without this guard it would surface as a phantom empty log row
+// in the attach TUI.
 func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
 	var entry api.LogEntryResponse
 	if err := json.Unmarshal([]byte(data), &entry); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE log entry: %v\n", err)
 		return entry, false
+	}
+	if entry.Process == "" && entry.Line == "" && entry.Seq == 0 {
+		return api.LogEntryResponse{}, false
 	}
 	return entry, true
 }

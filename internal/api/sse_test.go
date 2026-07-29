@@ -176,17 +176,36 @@ func TestStreamLogs_DataFormat(t *testing.T) {
 		t.Fatal("handler did not finish")
 	}
 
-	// Parse SSE events
+	// Parse SSE events. The stream now also carries the handshake event (plan
+	// 017 C8) as its own "data: " line immediately preceded by "event:
+	// handshake" -- track the previous line so that payload isn't mistaken
+	// for a log entry.
 	body := rec.Body.String()
 	scanner := bufio.NewScanner(strings.NewReader(body))
 
-	foundData := false
+	var (
+		foundData      bool
+		foundHandshake bool
+		prevLine       string
+	)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data: ") {
-			foundData = true
 			data := strings.TrimPrefix(line, "data: ")
 
+			if strings.TrimSpace(prevLine) == "event: handshake" {
+				var hs HandshakeResponse
+				if err := json.Unmarshal([]byte(data), &hs); err != nil {
+					t.Errorf("failed to parse handshake data line: %v", err)
+				} else if hs.StreamID != logMgr.StreamID() {
+					t.Errorf("expected handshake stream_id %q, got %q", logMgr.StreamID(), hs.StreamID)
+				}
+				foundHandshake = true
+				prevLine = line
+				continue
+			}
+
+			foundData = true
 			var entry LogEntryResponse
 			if err := json.Unmarshal([]byte(data), &entry); err != nil {
 				t.Errorf("failed to parse data line: %v", err)
@@ -200,13 +219,73 @@ func TestStreamLogs_DataFormat(t *testing.T) {
 				if entry.Line != "test message" {
 					t.Errorf("expected Line 'test message', got %q", entry.Line)
 				}
+				if entry.Seq == 0 {
+					t.Error("expected the streamed entry to carry a non-zero Seq")
+				}
 			}
 		}
+		prevLine = line
 	}
 
+	if !foundHandshake {
+		t.Error("expected to find the handshake data line in SSE response")
+	}
 	if !foundData {
 		t.Error("expected to find data line in SSE response")
 	}
+}
+
+// TestStreamLogs_Handshake asserts the "event: handshake" frame is written
+// immediately after the ": connected" comment and carries the manager's
+// current stream ID (plan 017 C8): a reconnecting client must learn the
+// epoch before it can decide how to backfill.
+func TestStreamLogs_Handshake(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{
+		BufferSize:         100,
+		SubscriptionBuffer: 10,
+	})
+	defer logMgr.Close()
+
+	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", "/api/v1/logs/stream", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handlers.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	body := rec.Body.String()
+
+	// Drop blank lines (SSE frame separators) so the adjacency check is
+	// robust to the ": connected\n\n" / "event:...\ndata:...\n\n" framing.
+	var nonEmpty []string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.TrimSpace(l) != "" {
+			nonEmpty = append(nonEmpty, l)
+		}
+	}
+
+	require.GreaterOrEqual(t, len(nonEmpty), 3, "expected the connected comment, the handshake event line and its data line")
+	require.Contains(t, nonEmpty[0], ": connected")
+	require.Equal(t, "event: handshake", nonEmpty[1])
+	require.True(t, strings.HasPrefix(nonEmpty[2], "data: "))
+
+	var hs HandshakeResponse
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(nonEmpty[2], "data: ")), &hs))
+	require.Equal(t, logMgr.StreamID(), hs.StreamID)
 }
 
 func TestStreamLogs_InvalidPattern(t *testing.T) {

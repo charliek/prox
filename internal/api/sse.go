@@ -59,6 +59,24 @@ func (h *Handlers) StreamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send the handshake event immediately after: a reconnecting client must
+	// learn the current stream epoch BEFORE deciding how to backfill (see
+	// HandshakeResponse). It rides a named "event: handshake" frame, not a
+	// bare "data:" line, precisely so it cannot be mistaken for a log entry by
+	// an old client -- see HandshakeResponse's doc comment for the full
+	// reasoning and the parseSSELogEntry guard that backs it up.
+	handshake, err := json.Marshal(HandshakeResponse{StreamID: h.logManager.StreamID()})
+	if err != nil {
+		// StreamID is a plain string; Marshal cannot fail for this shape in
+		// practice. Guard anyway rather than risk writing a broken frame.
+		log.Printf("failed to marshal handshake: %v", err)
+		return
+	}
+	if err := sseWrite(rc, w, []byte("event: handshake\n"), []byte("data: "), handshake, []byte("\n\n")); err != nil {
+		log.Printf("SSE write error (client likely disconnected): %v", err)
+		return
+	}
+
 	ticker := time.NewTicker(h.heartbeatInterval())
 	defer ticker.Stop()
 
