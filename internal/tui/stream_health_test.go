@@ -483,6 +483,158 @@ func TestRunClientStreams_ProxyNotEnabledParks(t *testing.T) {
 	})
 }
 
+// --- C12: the processes stream ---
+
+// TestRunClientStreams_ProcessesSnapshotsReachTheModel pins the third loop end
+// to end: a full snapshot pushed on the processes stream arrives as the same
+// ProcessesMsg the deleted poll produced, converted field for field.
+func TestRunClientStreams_ProcessesSnapshotsReachTheModel(t *testing.T) {
+	collector := newMsgCollector()
+	client := &stubTUIClient{
+		consumeProcesses: func(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error {
+			onConnect()
+			onEvent(api.ProcessListResponse{Processes: []api.ProcessResponse{{
+				Name:      "web",
+				Status:    "running",
+				PID:       4242,
+				Restarts:  2,
+				Health:    "healthy",
+				Kind:      "process",
+				WaitingOn: []string{"db"},
+			}}})
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	startClientStreams(t, client, collector.send)
+
+	msg := collector.await(t, func(m tea.Msg) bool { _, ok := m.(ProcessesMsg); return ok })
+	processes := []domain.ProcessInfo(msg.(ProcessesMsg))
+	require.Len(t, processes, 1)
+	assert.Equal(t, "web", processes[0].Name)
+	assert.Equal(t, domain.ProcessState("running"), processes[0].State)
+	assert.Equal(t, 4242, processes[0].PID)
+	assert.Equal(t, 2, processes[0].RestartCount)
+	assert.Equal(t, domain.HealthStatus("healthy"), processes[0].Health)
+	assert.Equal(t, domain.ProcessKind("process"), processes[0].Kind)
+	assert.Equal(t, []string{"db"}, processes[0].WaitingOn)
+
+	// Connect IS sync for this stream: OK follows onConnect with no barrier, so
+	// it has already been delivered by the time the snapshot lands. Scanned
+	// from the full log rather than awaited, since the await above may have
+	// consumed it (the loop emits each status exactly once).
+	require.Eventually(t, func() bool {
+		for _, m := range collector.all() {
+			if s, ok := m.(StreamStatusMsg); ok && s.Stream == StreamProcesses && s.Status.State == stream.StateOK {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond, "connect is sync for the processes stream")
+}
+
+// TestRunClientStreams_ProcessesReconnectReprobesParkedLoops pins W2's
+// re-probe: the requests loop parks (proxy disabled) with no timer of its own,
+// so only an external nudge can ever retry it. The processes stream
+// reconnecting is that nudge — it is the evidence attach mode has that the
+// daemon it lost came back, possibly with the proxy now enabled.
+//
+// The observable is a SECOND ConsumeProxyRequests attempt: the parked loop
+// would otherwise never make one.
+func TestRunClientStreams_ProcessesReconnectReprobesParkedLoops(t *testing.T) {
+	collector := newMsgCollector()
+
+	// The processes stream connects, then drops once; the loop's backoff
+	// reconnects it, and THAT second OK is the re-probe trigger.
+	var attempts atomic.Int32
+	client := &stubTUIClient{
+		consumeRequests: func(context.Context, func(), func(api.ProxyRequestResponse)) error {
+			return &fakeAPIError{status: http.StatusServiceUnavailable, code: domain.ErrCodeProxyNotEnabled}
+		},
+		consumeProcesses: func(ctx context.Context, onConnect func(), _ func(api.ProcessListResponse)) error {
+			onConnect()
+			if attempts.Add(1) == 1 {
+				return errors.New("daemon went away")
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	startClientStreams(t, client, collector.send)
+
+	// The requests loop parks first...
+	collector.await(t, func(m tea.Msg) bool {
+		s, ok := m.(StreamStatusMsg)
+		return ok && s.Stream == StreamRequests && s.Status.State == stream.StateUnavailable
+	})
+	require.Equal(t, 1, client.requestsCalls(), "a parked loop makes no further attempts on its own")
+
+	// ...and is woken by the processes stream's reconnect.
+	require.Eventually(t, func() bool { return client.requestsCalls() >= 2 },
+		5*time.Second, 10*time.Millisecond,
+		"the processes stream's reconnect must re-probe the parked requests loop")
+	assert.GreaterOrEqual(t, int(attempts.Load()), 2)
+}
+
+// TestRunClientStreams_ProcessesNotFoundParks pins the version-skew classifier
+// reaching the processes loop: an old daemon with no such endpoint answers 404,
+// and the loop parks rather than reconnecting against a route that will never
+// exist.
+func TestRunClientStreams_ProcessesNotFoundParks(t *testing.T) {
+	collector := newMsgCollector()
+	client := &stubTUIClient{
+		consumeProcesses: func(context.Context, func(), func(api.ProcessListResponse)) error {
+			return &fakeAPIError{status: http.StatusNotFound}
+		},
+	}
+
+	startClientStreams(t, client, collector.send)
+
+	collector.await(t, func(m tea.Msg) bool {
+		s, ok := m.(StreamStatusMsg)
+		return ok && s.Stream == StreamProcesses && s.Status.State == stream.StateUnavailable
+	})
+}
+
+// TestClassifyProcessesStreamError pins the processes-only addition: a 404 is
+// version skew (park), auth is still terminal, everything else still retries.
+func TestClassifyProcessesStreamError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want stream.Classification
+	}{
+		{"not found (old daemon)", &fakeAPIError{status: http.StatusNotFound}, stream.ClassUnavailable},
+		{"wrapped not found", fmt.Errorf("stream: %w", &fakeAPIError{status: http.StatusNotFound}), stream.ClassUnavailable},
+		{"unauthorized", &fakeAPIError{status: http.StatusUnauthorized}, stream.ClassTerminal},
+		{"forbidden", &fakeAPIError{status: http.StatusForbidden}, stream.ClassTerminal},
+		{"server error", &fakeAPIError{status: http.StatusInternalServerError}, stream.ClassTransient},
+		{"network error", errors.New("dial tcp: connection refused"), stream.ClassTransient},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyProcessesStreamError(tt.err))
+		})
+	}
+}
+
+// TestStreamHealthSegments_ProcessesNeverRenders pins the matrix completion:
+// however degraded the processes stream gets, it contributes no segment — the
+// global connection notice reports it instead, and reporting it twice in two
+// wordings would be worse than either alone.
+func TestStreamHealthSegments_ProcessesNeverRenders(t *testing.T) {
+	for _, state := range []stream.State{
+		stream.StateReconnecting, stream.StateSyncing, stream.StateUnavailable, stream.StateClosed,
+	} {
+		m := clientUpdate(readyClientModel(), statusMsg(StreamProcesses, stream.StateReconnecting))
+		m = clientUpdate(m, statusMsg(StreamProcesses, state))
+		assert.Empty(t, m.streamHealthSegments(), "state %s", state)
+		assert.NotContains(t, m.View(), "processes:", "state %s", state)
+	}
+}
+
 // TestSendStreamedLogEntry_BadTimestampWarns pins the conversion factored out of
 // the old forwarder: a malformed timestamp still delivers the entry, preceded by
 // a system warning.
@@ -525,4 +677,62 @@ func TestSendStreamedProxyRequest_Converts(t *testing.T) {
 	assert.True(t, ts.Equal(record.Timestamp))
 	assert.Equal(t, 25*time.Millisecond, record.Duration)
 	assert.True(t, record.InFlight)
+}
+
+// TestRunClientStreams_LogsReconnectRescuesParkedProcessesLoop pins the
+// SYMMETRY of the re-probe (codex C12 finding): the processes loop itself can
+// park (old daemon, 404), and the only production nudge that can ever rescue
+// it is a SIBLING stream's reconnect — the logs stream dropping and coming
+// back is exactly what a daemon upgrade under a live attach looks like.
+func TestRunClientStreams_LogsReconnectRescuesParkedProcessesLoop(t *testing.T) {
+	collector := newMsgCollector()
+
+	// The re-probe fires on a stream's SECOND OK, and the logs stream only
+	// reaches OK once its sync completes (handshake + fetch), so attempt 1
+	// must fully sync before it fails: the hook hands over the handshake,
+	// waits until the loop has reported OK, then returns an error.
+	logsOK := func() int {
+		n := 0
+		for _, m := range collector.all() {
+			if s, ok := m.(StreamStatusMsg); ok && s.Stream == StreamLogs && s.Status.State == stream.StateOK {
+				n++
+			}
+		}
+		return n
+	}
+	var logAttempts atomic.Int32
+	client := &stubTUIClient{
+		consumeProcesses: func(context.Context, func(), func(api.ProcessListResponse)) error {
+			return &fakeAPIError{status: http.StatusNotFound}
+		},
+		consumeLogs: func(ctx context.Context, onConnect func(), onHandshake func(api.HandshakeResponse), _ func(api.LogEntryResponse)) error {
+			onConnect()
+			onHandshake(api.HandshakeResponse{StreamID: "epoch-1"})
+			if logAttempts.Add(1) == 1 {
+				// Fail only after the sync landed OK #1, so the reconnect's
+				// OK #2 is unambiguously a reconnect.
+				deadline := time.Now().Add(5 * time.Second)
+				for logsOK() < 1 && time.Now().Before(deadline) {
+					time.Sleep(2 * time.Millisecond)
+				}
+				return errors.New("daemon went away")
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	startClientStreams(t, client, collector.send)
+
+	// The processes loop parks on the 404...
+	collector.await(t, func(m tea.Msg) bool {
+		s, ok := m.(StreamStatusMsg)
+		return ok && s.Stream == StreamProcesses && s.Status.State == stream.StateUnavailable
+	})
+	require.Equal(t, 1, client.processesCalls(), "a parked loop makes no further attempts on its own")
+
+	// ...and is woken by the logs stream's reconnect (its second OK).
+	require.Eventually(t, func() bool { return client.processesCalls() >= 2 },
+		5*time.Second, 10*time.Millisecond,
+		"a sibling stream's reconnect must re-probe the parked processes loop")
 }

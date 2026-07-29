@@ -17,8 +17,9 @@ type StreamID int
 const (
 	StreamLogs StreamID = iota
 	StreamRequests
-	// StreamProcesses is defined now and unused until the processes stream
-	// replaces attach mode's polling tick.
+	// StreamProcesses is attach mode's process-state feed, which replaced the
+	// polling tick in C12. Its health is reported like the others' but rendered
+	// differently — see streamHealthSegments.
 	StreamProcesses
 )
 
@@ -87,6 +88,21 @@ func classifyRequestsStreamError(err error) stream.Classification {
 	return classifyStreamError(err)
 }
 
+// classifyProcessesStreamError extends the shared policy with the one condition
+// unique to the processes stream: version skew. A daemon predating plan 017 has
+// no /api/v1/processes/stream at all and answers 404, which no amount of
+// retrying fixes — only replacing the daemon does. The loop parks
+// (ClassUnavailable) rather than hammering a route that does not exist, and the
+// attach model renders the parked state as a standing connection error naming
+// the old daemon (see ClientModel.noteProcessesStreamHealth).
+func classifyProcessesStreamError(err error) stream.Classification {
+	var apiErr APIStatusError
+	if errors.As(err, &apiErr) && apiErr.StatusCode() == http.StatusNotFound {
+		return stream.ClassUnavailable
+	}
+	return classifyStreamError(err)
+}
+
 // handleStreamStatus records a stream's new health. Both maps are allocated by
 // newBaseModel.
 //
@@ -115,9 +131,20 @@ func (b *BaseModel) handleStreamStatus(msg StreamStatusMsg) {
 //
 // StateUnavailable is deliberately passive ("requests: n/a", no warning sign) —
 // it means the feed does not exist here, not that something broke.
+//
+// StreamProcesses contributes NO segment, ever (C12). It is attach mode's
+// global-liveness signal rather than one feed among three: losing it means the
+// daemon is gone, which the status line already reports as "Connection error
+// (retrying...)" via ClientModel.connectionError, derived from exactly this
+// stream's health. A segment here would report the same outage twice, in two
+// wordings. Local mode never degrades it at all (newBaseModel starts every
+// stream OK and nothing moves the processes entry off it).
 func (b *BaseModel) streamHealthSegments() []string {
 	var segs []string
 	for _, id := range allStreams {
+		if id == StreamProcesses {
+			continue
+		}
 		st, ok := b.streamHealth[id]
 		if !ok {
 			continue

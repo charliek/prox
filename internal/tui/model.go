@@ -196,10 +196,11 @@ func refreshProcesses() tea.Cmd {
 }
 
 // tickCmd returns a command that ticks after d, driving the periodic
-// process-list refresh. The interval is a parameter because the two modes
-// pay different costs per tick: local mode reads the in-process supervisor,
-// attach mode does an HTTP round trip (until the processes stream replaces
-// it entirely).
+// process-list refresh. LOCAL MODE ONLY since C12: attach mode's tick was
+// deleted when the processes stream took over, so the only remaining caller
+// reads the in-process supervisor, which costs nothing. The interval stays a
+// parameter rather than being inlined so the cadence remains one named
+// constant away from the call.
 func tickCmd(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return TickMsg(t)

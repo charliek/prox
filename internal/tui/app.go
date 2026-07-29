@@ -134,8 +134,10 @@ func reportLocalStreamClosed(ctx context.Context, send func(tea.Msg), id StreamI
 // one connect-and-consume attempt owned by an internal/stream.Loop, which needs
 // the terminal error to classify it. The channel forms remain on *cli.Client for
 // the --follow commands.
+// GetProcesses is deliberately absent: attach mode learns process state from
+// the processes stream alone (C12), so nothing here polls REST /processes. The
+// method stays on *cli.Client for the one-shot CLI commands.
 type TUIClient interface {
-	GetProcesses() (*api.ProcessListResponse, error)
 	RestartProcess(name string) error
 	// ConsumeLogs takes an onHandshake hook alongside onConnect: the logs sync
 	// (C9) must learn the server's log epoch before it can decide how to
@@ -143,6 +145,10 @@ type TUIClient interface {
 	// itself. A daemon that sends none never fires it.
 	ConsumeLogs(ctx context.Context, params domain.LogParams, onConnect func(), onHandshake func(api.HandshakeResponse), onEvent func(api.LogEntryResponse)) error
 	ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error
+	// ConsumeProcesses carries a full process-list snapshot per event, so it
+	// needs neither params nor a handshake: there is nothing to filter and
+	// nothing to resume from.
+	ConsumeProcesses(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error
 	GetProxyRequest(id string, includeBody bool) (*api.ProxyRequestDetailResponse, error)
 
 	// GetProxyRequests and GetLogs fetch what the requests and logs streams
@@ -180,16 +186,38 @@ func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg))
 	// attempt N stopped instead of re-fetching the world (C9).
 	logsSess := newLogsSyncSession()
 
-	loops := []*stream.Loop{
-		// Neither data stream is a pure stream consumer: each connect
-		// synchronizes against a REST fetch before reporting OK (C6, C9).
-		streamLoop(StreamLogs, send, classifyStreamError, func(ctx context.Context, markSynced func()) error {
-			return consumeLogsWithSync(ctx, client, logsSess, send, markSynced)
-		}),
-		streamLoop(StreamRequests, send, classifyRequestsStreamError, func(ctx context.Context, markSynced func()) error {
-			return consumeRequestsWithSync(ctx, client, send, markSynced)
-		}),
+	// Re-probing is SYMMETRIC (codex C12 finding): each loop's observer wakes
+	// every OTHER loop on a reconnect. The loops slice is filled before any
+	// Run starts, and OnStatus only fires from a Run goroutine, so the
+	// closures' reads are ordered after the write by goroutine creation.
+	var loops []*stream.Loop
+	probeOthers := func(self int) func(stream.Status) {
+		return reprobeOnReconnect(func() {
+			for i, l := range loops {
+				if i != self {
+					l.Probe()
+				}
+			}
+		})
 	}
+
+	// Neither data stream is a pure stream consumer: each connect
+	// synchronizes against a REST fetch before reporting OK (C6, C9).
+	logsLoop := streamLoop(StreamLogs, send, classifyStreamError, probeOthers(0), func(ctx context.Context, markSynced func()) error {
+		return consumeLogsWithSync(ctx, client, logsSess, send, markSynced)
+	})
+	requestsLoop := streamLoop(StreamRequests, send, classifyRequestsStreamError, probeOthers(1), func(ctx context.Context, markSynced func()) error {
+		return consumeRequestsWithSync(ctx, client, send, markSynced)
+	})
+	// The processes stream IS a pure consumer (snapshot-per-event); it also
+	// doubles as the run's daemon-liveness signal (see ClientModel).
+	processesLoop := streamLoop(StreamProcesses, send, classifyProcessesStreamError,
+		probeOthers(2),
+		func(ctx context.Context, markSynced func()) error {
+			return consumeProcesses(ctx, client, send, markSynced)
+		})
+
+	loops = []*stream.Loop{logsLoop, requestsLoop, processesLoop}
 
 	var wg sync.WaitGroup
 	wg.Add(len(loops))
@@ -206,19 +234,99 @@ func runClientStreams(ctx context.Context, client TUIClient, send func(tea.Msg))
 // connect-and-consume attempt, classify is the stream's reconnect policy, and
 // every transition reaches the models as a StreamStatusMsg for id.
 //
-// markSynced is handed to the attempt rather than called for it. Both of
-// today's attach streams call it from inside their sync protocol, after the
-// batch barrier, so an attempt that connects but cannot synchronize stays in
-// Syncing and can never flash OK or clear the outage warning (codex C5
-// finding).
-func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, consume func(ctx context.Context, markSynced func()) error) *stream.Loop {
+// markSynced is handed to the attempt rather than called for it. The two
+// synchronizing attach streams call it from inside their sync protocol, after
+// the batch barrier, so an attempt that connects but cannot synchronize stays
+// in Syncing and can never flash OK or clear the outage warning (codex C5
+// finding). The processes stream has no such barrier — see consumeProcesses.
+//
+// observe (nilable) is an extra hook run on every transition, before the
+// message is sent. It exists for the one cross-loop behavior in attach mode:
+// the processes stream's reconnect re-probing the parked loops.
+func streamLoop(id StreamID, send func(tea.Msg), classify func(error) stream.Classification, observe func(stream.Status), consume func(ctx context.Context, markSynced func()) error) *stream.Loop {
 	return stream.NewLoop(stream.Config{
 		Attempt:  consume,
 		Classify: classify,
 		OnStatus: func(s stream.Status) {
+			if observe != nil {
+				observe(s)
+			}
 			send(StreamStatusMsg{Stream: id, Status: s})
 		},
 	})
+}
+
+// reprobeOnReconnect builds a stream's status observer: every OK transition
+// AFTER the first one is a RECONNECT, which is the best evidence attach mode
+// has that the daemon it lost was replaced — so it fires probe, which wakes
+// the OTHER loops. Any of them may be parked in StateUnavailable with no timer
+// of its own: a proxy-disabled requests stream, or the processes stream parked
+// on an old daemon's 404 — which is exactly why probing must be symmetric
+// rather than processes-only (codex C12 finding): the parked processes loop
+// can only be rescued by a sibling's reconnect.
+//
+// The other loops are probed unconditionally rather than only when parked:
+// Loop.Probe coalesces and never blocks, and a probe delivered to a loop that
+// is not parked at worst short-circuits one backoff wait — which, mid-daemon-
+// restart, is the desired behavior anyway.
+//
+// The bool needs no synchronization: Config.OnStatus is serialized by the
+// loop's own mutex and is never called concurrently.
+func reprobeOnReconnect(probe func()) func(stream.Status) {
+	sawOK := false
+	return func(s stream.Status) {
+		if s.State != stream.StateOK {
+			return
+		}
+		if !sawOK {
+			sawOK = true // the initial connect is not a reconnect
+			return
+		}
+		probe()
+	}
+}
+
+// consumeProcesses is the processes stream's single connect-and-consume
+// attempt. It is the one attach stream with no sync protocol: the endpoint
+// writes a full snapshot immediately after ": connected" and a full snapshot on
+// every later change (internal/api/sse.go), so there is no REST fetch to
+// reconcile against and no cursor to resume from — connect IS sync, and
+// markSynced rides onConnect.
+//
+// The consequence, accepted deliberately: OK can lead the first snapshot's
+// arrival by the microseconds it takes the server's initial write to land, a
+// window in which the status bar says healthy while the process list is still
+// the previous one (empty at startup). The alternative — deferring markSynced
+// to the first event — would leave the stream stuck in Syncing forever against
+// a daemon supervising nothing.
+func consumeProcesses(ctx context.Context, client TUIClient, send func(tea.Msg), markSynced func()) error {
+	return client.ConsumeProcesses(ctx, markSynced, func(resp api.ProcessListResponse) {
+		send(ProcessesMsg(streamedProcesses(resp)))
+	})
+}
+
+// streamedProcesses converts one full process-list snapshot to the domain
+// slice the models hold. It is the pure form of what attach mode's polling
+// fetchProcesses command used to do inline (C12 deleted the poll).
+//
+// ProcessState and the rest are cast directly from their status strings; an
+// unknown value from a newer daemon renders with default styling rather than
+// being rejected.
+func streamedProcesses(resp api.ProcessListResponse) []domain.ProcessInfo {
+	processes := make([]domain.ProcessInfo, len(resp.Processes))
+	for i, p := range resp.Processes {
+		processes[i] = domain.ProcessInfo{
+			Name:         p.Name,
+			State:        domain.ProcessState(p.Status),
+			PID:          p.PID,
+			RestartCount: p.Restarts,
+			Health:       domain.HealthStatus(p.Health),
+			Kind:         domain.ProcessKind(p.Kind),
+			WaitingOn:    p.WaitingOn,
+			BlockedOn:    p.BlockedOn,
+		}
+	}
+	return processes
 }
 
 // parseStreamTimestamp parses a server-supplied event timestamp. A malformed one

@@ -197,9 +197,11 @@ const (
 // TUI timing
 const (
 	// TUILocalTickInterval drives the local-mode TUI's periodic process-list
-	// refresh. Local mode reads the in-process supervisor directly, so a
-	// fast tick costs nothing; attach mode reuses this interval only until
-	// its poll is replaced by the processes SSE stream (plan 017 C12).
+	// refresh, and only local mode's: it reads the in-process supervisor
+	// directly, so a fast tick costs nothing. Attach mode used to share the
+	// interval for an HTTP poll; C12 deleted that poll in favor of the
+	// processes SSE stream, so nothing in attach mode ticks any more
+	// (plan 017 C12).
 	TUILocalTickInterval = 500 * time.Millisecond
 )
 

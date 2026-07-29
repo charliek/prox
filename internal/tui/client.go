@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"errors"
+
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/charliek/prox/internal/api"
-	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/stream"
 )
 
 // ClientModel is the bubbletea model for TUI client mode (connected via API)
@@ -16,8 +18,12 @@ type ClientModel struct {
 	// Dependencies
 	client TUIClient
 
-	// Connection state
-	connectionError error // Last API connection error, nil if connected
+	// connectionError is the attach session's global connection state, DERIVED
+	// (C12) from the processes stream's health rather than reported by any
+	// failing call: nothing polls any more, so there is no request left to fail
+	// and produce it. noteProcessesStreamHealth owns every write; nil means
+	// connected.
+	connectionError error
 
 	// detailFetchSeq counts every fetchRequestDetail call (Enter and D16's
 	// background live-refresh alike); each call's closure captures its own
@@ -41,46 +47,55 @@ func NewClientModel(client TUIClient) ClientModel {
 	}
 }
 
-// Init initializes the model
+// Init has nothing to do. Attach mode has no periodic work left: every feed —
+// logs, requests and, since C12, processes — is pushed by a stream loop that
+// RunClient starts alongside the program, and the processes stream's
+// snapshot-on-connect delivers the initial process list without anyone asking
+// for it. The method stays because tea.Model requires it.
 func (m ClientModel) Init() tea.Cmd {
-	return tea.Batch(
-		m.fetchProcesses(),
-		tickCmd(constants.TUILocalTickInterval),
-	)
+	return nil
 }
 
-// fetchProcesses returns a command to fetch processes from the API
-func (m ClientModel) fetchProcesses() tea.Cmd {
-	return func() tea.Msg {
-		resp, err := m.client.GetProcesses()
-		if err != nil {
-			return ClientErrorMsg{Err: err}
-		}
+// errProcessesStreamLost is the connection error shown when the processes
+// stream dropped without an error of its own (the daemon closed the stream
+// cleanly, e.g. a shutdown mid-attach).
+var errProcessesStreamLost = errors.New("connection to the prox daemon was lost")
 
-		// Convert API response to domain ProcessInfo
-		// Note: ProcessState is cast directly from the status string.
-		// Known valid states: starting, running, stopping, stopped, failed.
-		// Unknown states will result in default styling in the TUI.
-		processes := make([]domain.ProcessInfo, len(resp.Processes))
-		for i, p := range resp.Processes {
-			processes[i] = domain.ProcessInfo{
-				Name:         p.Name,
-				State:        domain.ProcessState(p.Status),
-				PID:          p.PID,
-				RestartCount: p.Restarts,
-				Health:       domain.HealthStatus(p.Health),
-				Kind:         domain.ProcessKind(p.Kind),
-				WaitingOn:    p.WaitingOn,
-				BlockedOn:    p.BlockedOn,
-			}
-		}
-		return ProcessesMsg(processes)
+// errProcessesStreamUnsupported is the version-skew case: the loop parks on a
+// 404 (classifyProcessesStreamError), which means the daemon predates the
+// processes stream and no reconnect can help until it is replaced.
+var errProcessesStreamUnsupported = errors.New("the prox daemon is too old to push process state; restart it on this prox version")
+
+// noteProcessesStreamHealth derives connectionError from the processes stream's
+// health. That stream is attach mode's liveness signal — it is the one feed
+// whose absence means the whole view is stale, and the only one that exists on
+// every daemon regardless of configuration (the requests feed is off whenever
+// the proxy is) — so its state, and only its state, drives the status line's
+// "Connection error (retrying...)".
+//
+// Reconnecting and Closed are outages; Unavailable is the old-daemon park.
+// Only OK clears the error: the loop emits Syncing before every retry DIALS,
+// so clearing on Syncing/Connecting would flip the banner back to "Connected"
+// for the whole life of a dial that may hang for its full 30s header timeout
+// against a blackholed daemon (codex C12 finding). During startup neither
+// state sets nor clears anything — connectionError is nil until the first
+// degradation.
+func (m *ClientModel) noteProcessesStreamHealth(msg StreamStatusMsg) {
+	if msg.Stream != StreamProcesses {
+		return
 	}
-}
-
-// ClientErrorMsg is sent when an API error occurs
-type ClientErrorMsg struct {
-	Err error
+	switch msg.Status.State {
+	case stream.StateReconnecting, stream.StateClosed:
+		if msg.Status.Err != nil {
+			m.connectionError = msg.Status.Err
+		} else {
+			m.connectionError = errProcessesStreamLost
+		}
+	case stream.StateUnavailable:
+		m.connectionError = errProcessesStreamUnsupported
+	case stream.StateOK:
+		m.connectionError = nil
+	}
 }
 
 // Update handles messages
@@ -140,22 +155,20 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamStatusMsg:
 		m.handleStreamStatus(msg)
+		m.noteProcessesStreamHealth(msg)
 
 	case ProcessesMsg:
+		// One full snapshot off the processes stream (C12). connectionError is
+		// deliberately NOT touched here: it is derived from stream health
+		// alone, and the OK transition that precedes the first snapshot has
+		// already cleared it.
 		m.processes = []domain.ProcessInfo(msg)
-		m.connectionError = nil // Clear error on successful fetch
 		// Update filter map with any new processes
 		for _, p := range m.processes {
 			if _, ok := m.filterProcesses[p.Name]; !ok {
 				m.filterProcesses[p.Name] = true
 			}
 		}
-
-	case ClientErrorMsg:
-		// Note: No automatic reconnection is attempted. If daemon stops,
-		// user must quit (q) and re-run 'prox attach'. This is intentional
-		// to avoid masking daemon failures.
-		m.connectionError = msg.Err
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process
@@ -203,11 +216,6 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.updateViewport()
 		}
-
-	case TickMsg:
-		// Refresh processes periodically
-		cmds = append(cmds, m.fetchProcesses())
-		cmds = append(cmds, tickCmd(constants.TUILocalTickInterval))
 	}
 
 	// Handle viewport updates
@@ -355,7 +363,19 @@ func (m ClientModel) View() string {
 		return m.helpView()
 	default:
 		statusInfo := "Connected via API"
-		if m.connectionError != nil {
+		if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
+			// The old-daemon park is not an outage and never self-heals by
+			// waiting, so "retrying..." would be a lie — render the actionable
+			// hint instead.
+			statusInfo = truncateError(m.connectionError, maxErrorDisplayLen)
+		} else if m.connectionError != nil && m.streamHealth[StreamProcesses].State == stream.StateClosed {
+			// Terminal: the loop is gone (auth failure classified terminal, or
+			// quit teardown) and no retry will ever happen — promising one
+			// would be a lie too (codex C12 finding).
+			statusInfo = "Connection lost: " + truncateError(m.connectionError, maxErrorDisplayLen)
+		} else if m.connectionError != nil {
+			// One wording for every transient degraded processes-stream state:
+			// the per-stream detail lives in the status bar's health segments.
 			statusInfo = "Connection error (retrying...)"
 		} else if m.lastRestartProcess != "" {
 			if m.lastRestartError != nil {

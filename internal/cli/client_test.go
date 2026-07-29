@@ -1155,6 +1155,109 @@ func TestDialSSE_AcceptsContentTypeParameters(t *testing.T) {
 }
 
 // sseHangupServer writes one log event and then returns, ending the stream.
+// TestParseSSEProcessList_ValidSnapshot pins the processes-stream parser: a
+// full snapshot decodes field for field.
+func TestParseSSEProcessList_ValidSnapshot(t *testing.T) {
+	resp, ok := parseSSEProcessList(`{"processes":[{"name":"web","status":"running","pid":42,"restarts":1,"health":"healthy","kind":"process"}]}`)
+	if !ok {
+		t.Fatal("expected a valid snapshot to parse")
+	}
+	if len(resp.Processes) != 1 {
+		t.Fatalf("expected 1 process, got %d", len(resp.Processes))
+	}
+	if resp.Processes[0].Name != "web" || resp.Processes[0].PID != 42 {
+		t.Errorf("unexpected process %+v", resp.Processes[0])
+	}
+}
+
+// TestParseSSEProcessList_EmptyIsValid pins that an empty list is a real
+// snapshot ("nothing running"), not a frame to drop — unlike the logs parser,
+// whose all-zero guard filters non-entry payloads.
+func TestParseSSEProcessList_EmptyIsValid(t *testing.T) {
+	resp, ok := parseSSEProcessList(`{"processes":[]}`)
+	if !ok {
+		t.Fatal("an empty process list is a legitimate snapshot")
+	}
+	if len(resp.Processes) != 0 {
+		t.Errorf("expected no processes, got %d", len(resp.Processes))
+	}
+}
+
+// TestParseSSEProcessList_InvalidJSON drops the frame rather than failing the
+// stream.
+func TestParseSSEProcessList_InvalidJSON(t *testing.T) {
+	if _, ok := parseSSEProcessList("{not json"); ok {
+		t.Error("expected malformed JSON to be rejected")
+	}
+}
+
+// TestClient_ConsumeProcesses_DeliversSnapshots is the attempt-level contract
+// the attach TUI's processes loop depends on: onConnect fires once, every data
+// frame is delivered as a full snapshot, and the read error that ends the
+// stream is returned rather than swallowed.
+func TestClient_ConsumeProcesses_DeliversSnapshots(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/processes/stream" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("the processes stream takes no params, got %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(": connected\n\n"))
+		w.Write([]byte("data: {\"processes\":[{\"name\":\"web\",\"status\":\"starting\"}]}\n\n"))
+		w.Write([]byte("data: {\"processes\":[{\"name\":\"web\",\"status\":\"running\"}]}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	connected := 0
+	var got []api.ProcessListResponse
+	err := client.ConsumeProcesses(context.Background(),
+		func() { connected++ },
+		func(resp api.ProcessListResponse) { got = append(got, resp) })
+
+	if err == nil {
+		t.Fatal("expected the terminal read error when the server ends the stream")
+	}
+	if connected != 1 {
+		t.Errorf("expected onConnect exactly once, got %d", connected)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(got))
+	}
+	if got[0].Processes[0].Status != "starting" || got[1].Processes[0].Status != "running" {
+		t.Errorf("snapshots delivered out of order or mangled: %+v", got)
+	}
+}
+
+// TestClient_ConsumeProcesses_NotFoundSurfacesStatus pins the version-skew
+// signal the TUI classifier keys on: a daemon without the endpoint answers 404,
+// and that status must reach the caller discriminably.
+func TestClient_ConsumeProcesses_NotFoundSurfacesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	err := client.ConsumeProcesses(context.Background(),
+		func() { t.Error("onConnect must not fire for a failed dial") },
+		func(api.ProcessListResponse) { t.Error("no event should be delivered") })
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T (%v)", err, err)
+	}
+	if apiErr.StatusCode() != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", apiErr.StatusCode())
+	}
+}
+
 func sseHangupServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

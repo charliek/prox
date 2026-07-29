@@ -428,6 +428,21 @@ func parseSSEProxyRequest(data string) (api.ProxyRequestResponse, bool) {
 	return req, true
 }
 
+// parseSSEProcessList parses a single SSE data line of the processes stream
+// into a full process snapshot. Every event on that stream is a complete
+// api.ProcessListResponse (internal/api/sse.go) — there are no deltas — so an
+// empty Processes slice is a legitimate payload ("nothing is configured or
+// running") rather than a frame to filter out, and no zero-value guard like
+// parseSSELogEntry's applies here.
+func parseSSEProcessList(data string) (api.ProcessListResponse, bool) {
+	var resp api.ProcessListResponse
+	if err := json.Unmarshal([]byte(data), &resp); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE process snapshot: %v\n", err)
+		return resp, false
+	}
+	return resp, true
+}
+
 // sseErrorBodyLimit bounds how much of a non-200 SSE connect body is read
 // before parsing it as an api.ErrorResponse.
 const sseErrorBodyLimit = 8 << 10
@@ -680,6 +695,24 @@ func (c *Client) ConsumeLogs(ctx context.Context, params domain.LogParams, onCon
 // passes a nil hook.
 func (c *Client) ConsumeProxyRequests(ctx context.Context, params domain.ProxyRequestParams, onConnect func(), onEvent func(api.ProxyRequestResponse)) error {
 	return consumeSSE(ctx, c, proxyRequestsStreamPath(params), parseSSEProxyRequest, onConnect, nil, onEvent)
+}
+
+// processesStreamPath is the process-state SSE endpoint. Unlike the logs and
+// requests streams it takes no query parameters: every event is the full
+// process list, unfiltered.
+const processesStreamPath = "/api/v1/processes/stream"
+
+// ConsumeProcesses delivers full process-list snapshots to onEvent until the
+// stream ends, returning the error that ended it (nil on ctx cancellation).
+// onConnect (nilable) fires once after the connection is established, before
+// the first read.
+//
+// The stream sends no handshake (it has no epoch/cursor protocol — each event
+// is self-describing current state), so it passes a nil hook. It is the
+// attempt form the attach TUI's reconnect loop drives; there is no channel
+// form because no --follow command consumes process state.
+func (c *Client) ConsumeProcesses(ctx context.Context, onConnect func(), onEvent func(api.ProcessListResponse)) error {
+	return consumeSSE(ctx, c, processesStreamPath, parseSSEProcessList, onConnect, nil, onEvent)
 }
 
 // StreamProxyRequestsChannel returns a channel that streams proxy requests via SSE.
