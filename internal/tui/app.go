@@ -9,66 +9,9 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/domain"
-	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
-	"github.com/charliek/prox/internal/supervisor"
 )
-
-// Run starts the TUI application.
-//
-// shutdownCh, when it closes, quits the program: this is how an out-of-band
-// shutdown request (POST /shutdown, via the coordinator's trigger channel)
-// reaches a --tui daemon, which otherwise blocks here forever. On quit -- whether
-// triggered this way or by the user pressing q/Ctrl-C -- Run returns and the
-// caller runs the normal shutdown sequence, so both routes are identical.
-func Run(sup *supervisor.Supervisor, logMgr *logs.Manager, reqMgr *proxy.RequestManager, shutdownCh <-chan struct{}) error {
-	model := NewModel(sup, logMgr)
-	p := tea.NewProgram(model, tea.WithAltScreen())
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Quit the program when an external shutdown is requested. The goroutine also
-	// exits when ctx is cancelled (after p.Run returns), so a hand-quit TUI never
-	// leaks it.
-	go func() {
-		select {
-		case <-shutdownCh:
-			p.Quit()
-		case <-ctx.Done():
-		}
-	}()
-
-	// Subscribe to logs before starting the forwarder
-	subID, ch, err := logMgr.Subscribe(domain.LogFilter{})
-	if err != nil {
-		// Don't cancel the context here - proxy request forwarding should still work.
-		p.Send(LogEntryMsg(systemLogEntry("Error subscribing to logs: " + err.Error())))
-	} else {
-		go forwardLogs(ctx, p.Send, ch)
-	}
-
-	// Subscribe to proxy requests if available
-	var reqSubID string
-	if reqMgr != nil {
-		sub := reqMgr.Subscribe(proxy.RequestFilter{})
-		reqSubID = sub.ID
-		go forwardProxyRequests(ctx, p.Send, sub.Ch)
-	}
-
-	_, runErr := p.Run()
-
-	// Cleanup: cancel context and unsubscribe
-	cancel()
-	if subID != "" {
-		logMgr.Unsubscribe(subID)
-	}
-	if reqSubID != "" && reqMgr != nil {
-		reqMgr.Unsubscribe(reqSubID)
-	}
-
-	return runErr
-}
 
 // systemLogEntry builds the synthetic "system" log line the TUI uses to show
 // itself a message in the log pane.
@@ -79,52 +22,6 @@ func systemLogEntry(line string) domain.LogEntry {
 		Stream:    domain.StreamStderr,
 		Line:      line,
 	}
-}
-
-// forwardSubscription pumps a local-mode subscription channel into the TUI. It
-// exits when the context is cancelled or the channel is closed. toMsg wraps one
-// element as the message the models expect; closedLine is the system log line
-// recorded if the channel ends on its own.
-func forwardSubscription[T any](ctx context.Context, send func(tea.Msg), ch <-chan T, id StreamID, closedLine string, toMsg func(T) tea.Msg) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case v, ok := <-ch:
-			if !ok {
-				reportLocalStreamClosed(ctx, send, id, closedLine)
-				return
-			}
-			send(toMsg(v))
-		}
-	}
-}
-
-// forwardLogs forwards log entries from the subscription channel to the TUI.
-func forwardLogs(ctx context.Context, send func(tea.Msg), ch <-chan domain.LogEntry) {
-	forwardSubscription(ctx, send, ch, StreamLogs, "Log stream closed",
-		func(entry domain.LogEntry) tea.Msg { return LogEntryMsg(entry) })
-}
-
-// forwardProxyRequests forwards proxy requests from the subscription channel to
-// the TUI.
-func forwardProxyRequests(ctx context.Context, send func(tea.Msg), ch <-chan proxy.RequestRecord) {
-	forwardSubscription(ctx, send, ch, StreamRequests, "Proxy request stream closed",
-		func(req proxy.RequestRecord) tea.Msg { return ProxyRequestMsg(req) })
-}
-
-// reportLocalStreamClosed surfaces a local-mode subscription channel that ended
-// on its own. Local mode has no reconnect loop, so the feed is gone for the rest
-// of the session and the user has to be told: the status bar marks the stream
-// closed and one system log line records it. A close observed during shutdown
-// (ctx already cancelled, which the select can lose the race to) is expected and
-// stays silent.
-func reportLocalStreamClosed(ctx context.Context, send func(tea.Msg), id StreamID, line string) {
-	if ctx.Err() != nil {
-		return
-	}
-	send(StreamStatusMsg{Stream: id, Status: stream.Status{State: stream.StateClosed}})
-	send(LogEntryMsg(systemLogEntry(line)))
 }
 
 // TUIClient is the interface for TUI client mode API interactions.

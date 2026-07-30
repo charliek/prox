@@ -17,10 +17,8 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/domain"
-	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
-	"github.com/charliek/prox/internal/supervisor"
 )
 
 // fakeAPIError implements APIStatusError, standing in for *cli.APIError, which
@@ -118,39 +116,6 @@ func TestStreamStatus_SegmentOrderIsFixed(t *testing.T) {
 	assert.Less(t, strings.Index(view, "logs:"), strings.Index(view, "requests:"))
 }
 
-// newLocalTestModel builds a Model (local mode) with default test
-// dependencies. base_behavior_test.go's newTestModel builds a ClientModel
-// instead (018 C3 ported its tests off Model onto ClientModel); this one
-// exists solely so the two TestLocalModel_* tests below keep exercising real
-// local-mode construction until C4 deletes Model, and them, together.
-func newLocalTestModel() Model {
-	logMgr := logs.NewManager(logs.DefaultManagerConfig())
-	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	return NewModel(sup, logMgr)
-}
-
-// TestLocalModel_StreamsStartHealthy pins the local-mode initialization: every
-// stream is OK up front, so the bar is clean until a subscription dies.
-func TestLocalModel_StreamsStartHealthy(t *testing.T) {
-	m := newLocalTestModel()
-	for _, id := range allStreams {
-		assert.Equal(t, stream.StateOK, m.streamHealth[id].State, "stream %s", id)
-	}
-	assert.Empty(t, m.streamHealthSegments())
-}
-
-// TestLocalModel_HandlesStreamStatusMsg pins that the local Update loop routes
-// the message too — both models share the rendering path.
-func TestLocalModel_HandlesStreamStatusMsg(t *testing.T) {
-	nm, _ := newLocalTestModel().Update(tea.WindowSizeMsg{Width: 200, Height: 20})
-	m := nm.(Model)
-	nm, _ = m.Update(statusMsg(StreamLogs, stream.StateClosed))
-	m = nm.(Model)
-
-	assert.Equal(t, stream.StateClosed, m.streamHealth[StreamLogs].State)
-	assert.Contains(t, m.View(), "⚠ logs: disconnected")
-}
-
 // --- classifier ---
 
 // TestClassifyStreamError covers the shared policy: auth failures are terminal,
@@ -208,7 +173,7 @@ func TestClassifyRequestsStreamError(t *testing.T) {
 	}
 }
 
-// --- local-mode forwarders ---
+// --- attach-mode message plumbing ---
 
 // msgCollector is a thread-safe stand-in for (*tea.Program).Send.
 type msgCollector struct {
@@ -293,89 +258,6 @@ func awaitSync[T tea.Msg](t *testing.T, h *syncHarness) T {
 	t.Helper()
 	msg := h.collector.await(t, func(m tea.Msg) bool { _, ok := m.(T); return ok })
 	return msg.(T)
-}
-
-// TestForwardLogs_ChannelCloseReportsClosed pins the W7 hardening: a local
-// subscription that dies on its own marks the stream closed and says so once.
-func TestForwardLogs_ChannelCloseReportsClosed(t *testing.T) {
-	collector := newMsgCollector()
-	ch := make(chan domain.LogEntry)
-	close(ch)
-
-	forwardLogs(context.Background(), collector.send, ch)
-
-	msgs := collector.all()
-	require.Len(t, msgs, 2)
-	assert.Equal(t, StreamStatusMsg{Stream: StreamLogs, Status: stream.Status{State: stream.StateClosed}}, msgs[0])
-	entry, ok := msgs[1].(LogEntryMsg)
-	require.True(t, ok)
-	assert.Equal(t, "system", entry.Process)
-	assert.Contains(t, entry.Line, "Log stream closed")
-}
-
-// TestForwardLogs_CancelledCloseIsSilent pins the other half: a close during
-// shutdown is expected and must not spam the log pane or the status bar.
-func TestForwardLogs_CancelledCloseIsSilent(t *testing.T) {
-	collector := newMsgCollector()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	ch := make(chan domain.LogEntry)
-	close(ch)
-
-	forwardLogs(ctx, collector.send, ch)
-
-	assert.Empty(t, collector.all())
-}
-
-// TestForwardProxyRequests_ChannelCloseReportsClosed mirrors the logs case for
-// the requests subscription.
-func TestForwardProxyRequests_ChannelCloseReportsClosed(t *testing.T) {
-	collector := newMsgCollector()
-	ch := make(chan proxy.RequestRecord)
-	close(ch)
-
-	forwardProxyRequests(context.Background(), collector.send, ch)
-
-	msgs := collector.all()
-	require.Len(t, msgs, 2)
-	assert.Equal(t, StreamStatusMsg{Stream: StreamRequests, Status: stream.Status{State: stream.StateClosed}}, msgs[0])
-	entry, ok := msgs[1].(LogEntryMsg)
-	require.True(t, ok)
-	assert.Contains(t, entry.Line, "Proxy request stream closed")
-}
-
-// TestForwardProxyRequests_CancelledCloseIsSilent pins the shutdown path.
-func TestForwardProxyRequests_CancelledCloseIsSilent(t *testing.T) {
-	collector := newMsgCollector()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	ch := make(chan proxy.RequestRecord)
-	close(ch)
-
-	forwardProxyRequests(ctx, collector.send, ch)
-
-	assert.Empty(t, collector.all())
-}
-
-// TestForwardLogs_DeliversEntries keeps the happy path covered after the send
-// injection.
-func TestForwardLogs_DeliversEntries(t *testing.T) {
-	collector := newMsgCollector()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ch := make(chan domain.LogEntry, 1)
-	ch <- domain.LogEntry{Process: "web", Line: "hello"}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		forwardLogs(ctx, collector.send, ch)
-	}()
-
-	msg := collector.await(t, func(m tea.Msg) bool { _, ok := m.(LogEntryMsg); return ok })
-	assert.Equal(t, "hello", domain.LogEntry(msg.(LogEntryMsg)).Line)
-	cancel()
-	<-done
 }
 
 // --- attach-mode loop wiring ---

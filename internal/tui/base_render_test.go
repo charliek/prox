@@ -121,10 +121,10 @@ func TestRenderBodyLines_RawBytesThatLookLikeBase64(t *testing.T) {
 	assert.NotContains(t, out, "|Man|")
 }
 
-// TestRenderBodyLines_BinaryRawData pins the local-mode path
-// (convertCapturedBodyToBodyData): binary bytes are stored directly, not
-// base64-encoded, so a failed base64 decode must fall back to previewing the
-// raw string bytes rather than dropping the body or erroring.
+// TestRenderBodyLines_BinaryRawData pins the DataBase64=false path: binary
+// bytes stored directly, not base64-encoded, so a failed base64 decode must
+// fall back to previewing the raw string bytes rather than dropping the body
+// or erroring.
 func TestRenderBodyLines_BinaryRawData(t *testing.T) {
 	raw := []byte{0x00, 0x01, 0x02, 0xff, 0xfe}
 	b := &BodyData{

@@ -253,9 +253,15 @@ func clientUpdate(m ClientModel, msg tea.Msg) ClientModel {
 
 // --- C12: the poll is gone; process state arrives on a stream ---
 
+// unhandledTickMsg stands in for the periodic tick the deleted local-mode
+// poll used to ride (TickMsg no longer exists — 018 C4 deleted local mode
+// entirely). Any message type Update doesn't switch on must be just as inert,
+// so this unexported, locally-defined type keeps that invariant covered.
+type unhandledTickMsg struct{}
+
 // TestClientModel_NeverPollsProcesses is the panel-mandated no-poll proof.
 // Init must return no command at all, and no message the model can receive —
-// including the TickMsg the deleted poll used to ride — may produce a REST
+// including an unhandled periodic-tick-shaped message — may produce a REST
 // process fetch. The compile-level half of the proof is that
 // ClientModel.fetchProcesses and TUIClient.GetProcesses no longer exist;
 // this is the runtime half.
@@ -265,8 +271,9 @@ func TestClientModel_NeverPollsProcesses(t *testing.T) {
 
 	require.Nil(t, m.Init(), "attach mode has no periodic work left")
 
-	// A synthetic tick must be inert (the case was deleted, not repurposed).
-	_, cmd := m.Update(TickMsg(time.Now()))
+	// A synthetic, unhandled message must be inert (the tick case was
+	// deleted, not repurposed).
+	_, cmd := m.Update(unhandledTickMsg{})
 	if cmd != nil {
 		// tea.Batch of nothing can still be non-nil; running it must at least
 		// never produce a fetch.

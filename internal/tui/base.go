@@ -5,21 +5,37 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
+)
+
+// Mode represents the current TUI mode
+type Mode int
+
+const (
+	ModeNormal Mode = iota
+	ModeFilter
+	ModeSearch
+	ModeStringFilter
+	ModeHelp
+)
+
+// ViewMode represents which content is being displayed
+type ViewMode int
+
+const (
+	ViewModeLogs ViewMode = iota
+	ViewModeRequests
+	ViewModeRequestDetail
 )
 
 // maxLogEntries is the maximum number of log entries to keep in memory
@@ -1030,6 +1046,10 @@ func (b *BaseModel) logSearchMatchInfo(entries []domain.LogEntry) (position, tot
 	return position, total
 }
 
+// nearBottomThreshold is the scroll percentage (0.0-1.0) at which we consider
+// the viewport to be "near" the bottom for auto-follow purposes.
+const nearBottomThreshold = 0.98
+
 // isNearBottom checks if the viewport is at or near the bottom
 func (b *BaseModel) isNearBottom() bool {
 	if b.viewport.AtBottom() {
@@ -1388,16 +1408,13 @@ const hexPreviewMaxBytes = 256
 const hexPreviewBytesPerLine = 16
 
 // renderBinaryPreview turns a binary body's Data into hexdump-style preview
-// lines, dimming the trailing "more bytes" line. Data reaches the TUI two
-// ways: the API always base64-encodes binary bytes for the wire
-// (attach mode, client.go fetchRequestDetail -> clientBodyToBodyData), while
-// local mode (convertCapturedBodyToBodyData) stores the raw decoded bytes
-// directly in the string. A base64 decode is tried first; a decode failure
-// (the common case for raw local-mode bytes, which are essentially never
-// valid base64) falls back to treating Data as the raw bytes themselves, so
-// both paths are previewed correctly. Empty raw bytes (nothing to preview,
-// e.g. a body flagged binary but not actually loaded) fall back to the
-// original placeholder rather than an empty hexdump.
+// lines, dimming the trailing "more bytes" line. The API always base64-encodes
+// binary bytes for the wire (client.go fetchRequestDetail -> clientBodyToBodyData),
+// so DataBase64 is normally true here; dataBase64 false (raw, not base64-encoded
+// bytes) is also supported — a decode failure falls back to treating Data as
+// the raw bytes themselves, so both are previewed correctly. Empty raw bytes
+// (nothing to preview, e.g. a body flagged binary but not actually loaded)
+// fall back to the original placeholder rather than an empty hexdump.
 func renderBinaryPreview(data string, dataBase64 bool) []string {
 	raw := []byte(data)
 	if dataBase64 {
@@ -1614,6 +1631,17 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	)
 }
 
+// getProcessStyle returns the style for a process name
+func getProcessStyle(name string, processes []domain.ProcessInfo) lipgloss.Style {
+	// Find process index for color
+	for i, p := range processes {
+		if p.Name == name {
+			return processColors[i%len(processColors)]
+		}
+	}
+	return defaultProcessStyle
+}
+
 // formatLogEntry formats a single log entry for display
 func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 	// Get process color
@@ -1676,6 +1704,47 @@ func isASCIINoESC(s string) bool {
 		}
 	}
 	return true
+}
+
+// processStyle returns style based on process state
+func processStyle(state domain.ProcessState) lipgloss.Style {
+	switch state {
+	case domain.ProcessStateRunning:
+		return runningStyle
+	case domain.ProcessStateStopped:
+		return stoppedStyle
+	case domain.ProcessStateCrashed:
+		return crashedStyle
+	case domain.ProcessStateStarting:
+		return startingStyle
+	case domain.ProcessStateStopping:
+		return stoppingStyle
+	case domain.ProcessStateWaiting:
+		return waitingStyle
+	case domain.ProcessStateBlocked:
+		return blockedStyle
+	case domain.ProcessStateCompleted:
+		return completedStyle
+	default:
+		return defaultProcessStyle
+	}
+}
+
+// gatedDetail returns the inline gated-launch annotation for a process (plan 013
+// D5): " (waiting on: X, Y)" while waiting, " (blocked on: X)" while blocked, and
+// "" in every other state. Targets are shown in declaration order.
+func gatedDetail(p domain.ProcessInfo) string {
+	switch p.State {
+	case domain.ProcessStateWaiting:
+		if len(p.WaitingOn) > 0 {
+			return " (waiting on: " + strings.Join(p.WaitingOn, ", ") + ")"
+		}
+	case domain.ProcessStateBlocked:
+		if len(p.BlockedOn) > 0 {
+			return " (blocked on: " + strings.Join(p.BlockedOn, ", ") + ")"
+		}
+	}
+	return ""
 }
 
 // processPanel renders the process status header
@@ -1978,93 +2047,4 @@ func truncateError(err error, maxLen int) string {
 		return msg[:maxLen-3] + "..."
 	}
 	return msg
-}
-
-// convertRequestRecordToDetail converts a proxy.RequestRecord to RequestDetailData.
-// This is shared between Model (local mode) and ClientModel (API mode).
-// Bodies are loaded and content-decoded via the proxy loader so FilePath-backed
-// (disk-spilled) bodies are read rather than dropped.
-func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
-	return convertRequestRecordToDetailWithDirs(req, captureAllowedDirs())
-}
-
-// convertRequestRecordToDetailWithDirs is convertRequestRecordToDetail with an
-// explicit FilePath allowlist, separated so tests can supply a temp directory.
-func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs []string) *RequestDetailData {
-	detail := &RequestDetailData{
-		ID:         req.ID,
-		Timestamp:  req.Timestamp.Format("2006-01-02 15:04:05.000"),
-		Method:     req.Method,
-		URL:        req.URL,
-		Subdomain:  req.Subdomain,
-		StatusCode: req.StatusCode,
-		DurationMs: req.Duration.Milliseconds(),
-		RemoteAddr: req.RemoteAddr,
-		InFlight:   req.InFlight,
-		Stale:      req.StaleAt(time.Now()),
-	}
-
-	if req.Details != nil {
-		detail.RequestHeaders = req.Details.RequestHeaders
-		detail.ResponseHeaders = req.Details.ResponseHeaders
-
-		if req.Details.RequestBody != nil {
-			detail.RequestBody = convertCapturedBodyToBodyData(req.Details.RequestBody, allowedDirs)
-		}
-		if req.Details.ResponseBody != nil {
-			detail.ResponseBody = convertCapturedBodyToBodyData(req.Details.ResponseBody, allowedDirs)
-		}
-	}
-
-	return detail
-}
-
-// convertCapturedBodyToBodyData loads/decodes a captured body for TUI display.
-// An unavailable (evicted) body is marked so the renderer can note it rather
-// than showing garbage; binary and decoded-text semantics follow the loader.
-func convertCapturedBodyToBodyData(body *proxy.CapturedBody, allowedDirs []string) *BodyData {
-	bd := &BodyData{
-		Size:            body.Size,
-		Truncated:       body.Truncated,
-		ContentType:     body.ContentType,
-		ContentEncoding: body.ContentEncoding,
-		IsBinary:        body.IsBinary,
-	}
-
-	decoded, err := proxy.LoadDecodedBody(body, allowedDirs)
-	if err != nil || !decoded.Available {
-		bd.Unavailable = true
-		if decoded.UnavailableReason != "" {
-			bd.UnavailableReason = decoded.UnavailableReason
-		} else {
-			bd.UnavailableReason = "evicted"
-		}
-		return bd
-	}
-
-	bd.IsBinary = decoded.IsBinary
-	// Defense in depth (mirrors the API serve path): never treat bytes that are
-	// not valid UTF-8 as text, even if the loaded record claims they are — a
-	// socket-supplied flag or a mutated disk file must not reach the terminal
-	// as raw control bytes. Either way the raw bytes are kept in bd.Data
-	// (unlike the attach path, local mode never base64-encodes them) so a
-	// binary body still has bytes for the hexdump preview (D11, #50.2).
-	if !decoded.IsBinary && utf8.Valid(decoded.Data) {
-		bd.Data = string(decoded.Data)
-	} else {
-		bd.IsBinary = true
-		bd.Data = string(decoded.Data)
-	}
-	return bd
-}
-
-// captureAllowedDirs returns the directories a captured body's FilePath may
-// resolve within for the in-TUI loader: the local project capture dir
-// (cwd/.prox/capture) and the shared daemon capture dir under the user's home.
-func captureAllowedDirs() []string {
-	var primary string
-	if cwd, err := os.Getwd(); err == nil {
-		primary = filepath.Join(cwd, constants.CaptureDirectory)
-	}
-	return proxy.CaptureAllowedDirs(primary)
 }
