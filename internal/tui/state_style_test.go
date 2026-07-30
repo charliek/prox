@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/charliek/prox/internal/domain"
 )
@@ -71,4 +73,47 @@ func TestGatedDetail(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHealthDotStyles_ReuseProcessColors pins that the health-dot styles
+// (plan 018 D13) reuse the existing running/crashed colors rather than
+// introducing a new palette entry.
+func TestHealthDotStyles_ReuseProcessColors(t *testing.T) {
+	assert.Equal(t, string(runningColor), colorStr(healthyDotStyle.GetForeground()))
+	assert.Equal(t, string(crashedColor), colorStr(unhealthyDotStyle.GetForeground()))
+}
+
+// TestHealthDot pins the process panel's health indicator (plan 018 D13):
+// healthy and unhealthy each render a styled " ●", while unknown and unset
+// (the zero value) render nothing.
+func TestHealthDot(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(prev)
+
+	tests := []struct {
+		name   string
+		status domain.HealthStatus
+		want   string
+	}{
+		{"healthy", domain.HealthStatusHealthy, healthyDotStyle.Render(" ●")},
+		{"unhealthy", domain.HealthStatusUnhealthy, unhealthyDotStyle.Render(" ●")},
+		{"unknown", domain.HealthStatusUnknown, ""},
+		{"unset", domain.HealthStatus(""), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := healthDot(tc.status); got != tc.want {
+				t.Errorf("healthDot(%q) = %q, want %q", tc.status, got, tc.want)
+			}
+		})
+	}
+
+	// The healthy and unhealthy dots must actually carry distinct ANSI color
+	// codes, not just distinct text, to prove they're separately styled.
+	healthy := healthDot(domain.HealthStatusHealthy)
+	unhealthy := healthDot(domain.HealthStatusUnhealthy)
+	assert.Contains(t, healthy, "\x1b[")
+	assert.Contains(t, unhealthy, "\x1b[")
+	assert.NotEqual(t, healthy, unhealthy)
 }

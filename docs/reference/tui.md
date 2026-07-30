@@ -74,6 +74,8 @@ The processes panel color-codes each process name by its state, including the st
 
 A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on, appended directly to its name in the panel: `web (waiting on: postgres, redis)` or `web (blocked on: postgres)`, in declaration order. There's no separate detail area for this in the compact processes panel — it's shown inline because that's all the space there is.
 
+A process with a [healthcheck](configuration.md#health-check-fields) configured shows a health dot right after its name: green `●` while healthy, red `●` while unhealthy. It's styled separately from the name's state color, so it stays visible regardless of process state. A process still reporting `unknown` health, or with no healthcheck configured at all, shows no dot.
+
 A request whose response is still streaming shows its real header-time status but `...` in place of the duration until it completes; the row then updates in place (same position, no duplicate) rather than adding a new line.
 
 ## Keybindings

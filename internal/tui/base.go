@@ -1815,6 +1815,22 @@ func gatedDetail(p domain.ProcessInfo) string {
 	return ""
 }
 
+// healthDot returns the process panel's health indicator (plan 018 D13): a
+// green " ●" for domain.HealthStatusHealthy, a red " ●" for
+// domain.HealthStatusUnhealthy, and "" for domain.HealthStatusUnknown or any
+// other/empty value — so a process with no healthcheck configured renders
+// nothing extra.
+func healthDot(status domain.HealthStatus) string {
+	switch status {
+	case domain.HealthStatusHealthy:
+		return healthyDotStyle.Render(" ●")
+	case domain.HealthStatusUnhealthy:
+		return unhealthyDotStyle.Render(" ●")
+	default:
+		return ""
+	}
+}
+
 // processPanel renders the process status header
 func (b *BaseModel) processPanel() string {
 	var items []string
@@ -1835,12 +1851,18 @@ func (b *BaseModel) processPanel() string {
 		// detail area.
 		name += gatedDetail(proc)
 
+		// Health dot (plan 018 D13): appended as a separately styled segment
+		// after the name so the name's state style cannot swallow or recolor
+		// it. Empty for unknown/unset health, so processes without a
+		// healthcheck render byte-identical to before this feature.
+		dot := healthDot(proc.Health)
+
 		// Show number key (only in logs view where 1-9 keys work)
 		if b.viewMode == ViewModeLogs {
 			key := fmt.Sprintf("%d:", i+1)
-			items = append(items, style.Render(key+name))
+			items = append(items, style.Render(key+name)+dot)
 		} else {
-			items = append(items, style.Render(name))
+			items = append(items, style.Render(name)+dot)
 		}
 	}
 

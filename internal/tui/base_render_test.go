@@ -5,7 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/charliek/prox/internal/domain"
 )
 
 // joinBody renders a body section and joins the lines into one string so
@@ -405,4 +409,82 @@ func TestFormatRequestDetail_Completed_NoInFlightNote(t *testing.T) {
 	out := strings.Join(b.formatRequestDetail(), "\n")
 	assert.NotContains(t, out, "in flight")
 	assert.Contains(t, out, "Duration: 42ms")
+}
+
+// TestProcessPanel_HealthDot pins the plan 018 D13 process-panel health
+// indicator: a healthy process gets a green " ●" appended after its
+// rendered name as a separately styled segment, unhealthy gets a red one,
+// and unknown/unset render no dot at all — so a process with no healthcheck
+// configured is unaffected.
+func TestProcessPanel_HealthDot(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(prev)
+
+	t.Run("healthy renders a green dot as a separate segment", func(t *testing.T) {
+		b := &BaseModel{
+			viewMode: ViewModeRequests,
+			processes: []domain.ProcessInfo{
+				{Name: "web", State: domain.ProcessStateRunning, Health: domain.HealthStatusHealthy},
+			},
+		}
+		out := b.processPanel()
+		wantName := processStyle(domain.ProcessStateRunning).Render("web")
+		wantDot := healthyDotStyle.Render(" ●")
+		assert.Contains(t, out, wantName+wantDot, "the dot follows the name as its own styled segment")
+		assert.NotContains(t, out, wantName+" ●", "the dot must be styled, not plain text")
+	})
+
+	t.Run("unhealthy renders a red dot as a separate segment", func(t *testing.T) {
+		b := &BaseModel{
+			viewMode: ViewModeRequests,
+			processes: []domain.ProcessInfo{
+				{Name: "api", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnhealthy},
+			},
+		}
+		out := b.processPanel()
+		wantName := processStyle(domain.ProcessStateRunning).Render("api")
+		wantDot := unhealthyDotStyle.Render(" ●")
+		assert.Contains(t, out, wantName+wantDot)
+	})
+
+	t.Run("unknown renders no dot", func(t *testing.T) {
+		b := &BaseModel{
+			viewMode: ViewModeRequests,
+			processes: []domain.ProcessInfo{
+				{Name: "worker", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnknown},
+			},
+		}
+		out := b.processPanel()
+		assert.NotContains(t, out, "●")
+	})
+
+	t.Run("empty/unset health renders no dot", func(t *testing.T) {
+		b := &BaseModel{
+			viewMode: ViewModeRequests,
+			processes: []domain.ProcessInfo{
+				{Name: "cron", State: domain.ProcessStateRunning},
+			},
+		}
+		out := b.processPanel()
+		assert.NotContains(t, out, "●")
+	})
+
+	t.Run("no-healthcheck process renders byte-identical to the pre-dot output", func(t *testing.T) {
+		b := &BaseModel{
+			viewMode: ViewModeLogs,
+			processes: []domain.ProcessInfo{
+				{Name: "web", State: domain.ProcessStateRunning},
+				{Name: "worker", State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres"}},
+			},
+		}
+		// Constructed the same way processPanel built its output before the
+		// health dot existed: styled "key:name[+gated detail]" segments,
+		// joined by two spaces, wrapped in headerStyle — no dot anywhere.
+		want := headerStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
+			processStyle(domain.ProcessStateRunning).Render("1:web"),
+			processStyle(domain.ProcessStateWaiting).Render("2:worker (waiting on: postgres)"),
+		}, "  ")))
+		assert.Equal(t, want, b.processPanel())
+	})
 }

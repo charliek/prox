@@ -28,6 +28,11 @@ every feature, key binding, and fix lands in both at once.
   restarted or replaced daemon), then lets you re-page. This also fixes a
   wrong "stale?" marker: an in-flight request sitting deeper in the ring than
   the sync fetch reaches is no longer mistaken for one the server has lost.
+- **The processes panel now shows a health dot** (plan 018). A process with a
+  healthcheck configured gets a small `●` after its name — green while
+  healthy, red while unhealthy — styled independently of the process's own
+  state color so it can't be swallowed or recolored. A process with no
+  healthcheck (or one still reporting `unknown`) renders exactly as before.
 
 ### Changed
 
