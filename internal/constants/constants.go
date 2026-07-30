@@ -226,8 +226,10 @@ const (
 	// back. It is deliberately SMALLER than the ring (MaxProxyRequests): a TUI
 	// needs a screenful plus comfortable scroll depth, not the whole ring, and
 	// paging the remainder on demand through the BeforeID cursor keeps startup
-	// cost independent of how deep retention goes. It must not exceed the TUI's
-	// own display ring (tui.maxProxyRequests, which is defined from it), or the
+	// cost independent of how deep retention goes. It doubles as that scroll-back
+	// PAGE size. It must not exceed the TUI's own display ring
+	// (tui.maxRequestHistory, which is defined from MaxProxyRequests — the TUI
+	// may hold the whole server ring once the user has paged through it), or the
 	// snapshot it just paid to fetch would be trimmed on arrival.
 	//
 	// Equal to ProxyRequestDetailWindow today by coincidence, not by contract:

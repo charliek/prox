@@ -129,6 +129,16 @@ pauses follow; moving it back onto the newest row (`j`/`PgDn`), or pressing
 `G`/`End`/`F`, resumes it. While follow is paused, arriving requests never move
 the cursor off the row you selected.
 
+**Scroll-back.** The TUI loads the newest 1000 requests when it connects.
+Moving the cursor onto the oldest row loads the next older page automatically
+(1000 at a time, up to the 5000 the server retains). The status bar reports
+`loading older…` while a page is in flight, `start of history` once the oldest
+retained request is loaded, and `⚠ older: …` if a page could not be fetched —
+move up again to retry. Filters and searches never reach the fetch: they apply
+to what is displayed, not to what is loaded. Reconnecting re-syncs against the
+server's current window and discards pages older than it, so a scrolled-back
+list can never show a gap; page back down again after a reconnect.
+
 **Search vs. filter.** `/` in the requests view *navigates* — it jumps the
 cursor to matching rows and leaves every row visible — so it composes with an
 active `s` filter (matches are computed over the filtered list) instead of

@@ -290,8 +290,10 @@ func TestProxyRequestBufferLimit(t *testing.T) {
 	model := newTestModel()
 	model.ready = true
 
-	// Add more than maxProxyRequests (1000) entries
-	for i := 0; i < 1005; i++ {
+	// Overfill the history cap. The bound is the constant, not a literal, so the
+	// test scales with a retuned cap (D12b raised it from the sync limit to the
+	// server's retention).
+	for i := 0; i < maxRequestHistory+5; i++ {
 		req := proxy.RequestRecord{
 			Timestamp: time.Now(),
 			Subdomain: "api",
@@ -302,8 +304,7 @@ func TestProxyRequestBufferLimit(t *testing.T) {
 		model = newModel.(ClientModel)
 	}
 
-	// Should be capped at 1000
-	assert.Len(t, model.proxyRequests, 1000)
+	assert.Len(t, model.proxyRequests, maxRequestHistory)
 }
 
 func TestTUI_ProxyRequestMsg(t *testing.T) {
@@ -886,7 +887,7 @@ func TestRequestsCursor_FollowArrivalPinsNewest(t *testing.T) {
 }
 
 func TestRequestsCursor_AppendTrimMidList(t *testing.T) {
-	m := newRequestsModel(maxProxyRequests, 5) // exactly full
+	m := newRequestsModel(maxRequestHistory, 5) // exactly full
 	m.followMode = false
 	m.setRequestCursor(m.filteredProxyRequests(), 500)
 	m.updateViewport()
@@ -895,13 +896,13 @@ func TestRequestsCursor_AppendTrimMidList(t *testing.T) {
 	// A new arrival appends and trims the oldest row; the ID-anchored cursor
 	// rides down one index onto its still-present row.
 	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
-	assert.Len(t, m.proxyRequests, maxProxyRequests)
+	assert.Len(t, m.proxyRequests, maxRequestHistory)
 	assert.Equal(t, "req-500", m.cursorID)
 	assert.Equal(t, 499, m.cursorIdx)
 }
 
 func TestRequestsCursor_TrimmedRowClamps(t *testing.T) {
-	m := newRequestsModel(maxProxyRequests, 5)
+	m := newRequestsModel(maxRequestHistory, 5)
 	m.followMode = false
 	m.setRequestCursor(m.filteredProxyRequests(), 0) // cursor on the oldest row
 	m.updateViewport()
@@ -909,7 +910,7 @@ func TestRequestsCursor_TrimmedRowClamps(t *testing.T) {
 
 	// The arrival trims req-000 away; the cursor clamps to the row now at idx 0.
 	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
-	assert.Len(t, m.proxyRequests, maxProxyRequests)
+	assert.Len(t, m.proxyRequests, maxRequestHistory)
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, "req-001", m.cursorID, "cursor re-anchors to the row now at its index")
 }

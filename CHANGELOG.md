@@ -8,6 +8,27 @@ TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
 TUI. The owner's TUI is the same API-client TUI attach has always run, so
 every feature, key binding, and fix lands in both at once.
 
+### Added
+
+- **Requests scroll-back in the TUI** (plan 018). Scrolling to the top of the
+  requests list now loads the next older page of requests from the ring
+  automatically (1000 at a time, up to the full 5000 the server retains), so
+  you can walk back through traffic that the initial sync did not carry. The
+  status bar reports the state: `loading older…` while a page is in flight,
+  `start of history` once the oldest retained request is on screen, and
+  `⚠ older: …` if a page fetch fails — pressing up again retries. One page is
+  ever in flight at a time, and paging is unaffected by an active filter or
+  search: the filters apply to what you see, not to what is fetched.
+- **A reconnect now rebases the requests list on the server's current
+  window** (plan 018). Requests carry no sequence numbers, so a client cannot
+  prove that history it scrolled back to still joins up with a snapshot taken
+  after a connection gap. Rather than showing a list with an invisible hole in
+  it, a completed re-sync drops everything older than the snapshot it just
+  fetched (and clears the list entirely when the server's ring is empty — a
+  restarted or replaced daemon), then lets you re-page. This also fixes a
+  wrong "stale?" marker: an in-flight request sitting deeper in the ring than
+  the sync fetch reaches is no longer mistaken for one the server has lost.
+
 ### Changed
 
 - **`prox up --tui` runs the same API-client TUI as `prox attach`** (plan
@@ -45,8 +66,9 @@ every feature, key binding, and fix lands in both at once.
   headers, but its body is not stored.
 - **The TUI now syncs the newest 1000 requests rather than the whole ring**
   (plan 018), so startup and reconnect cost stay flat as retention grows.
-  Older records are fetched on demand as you scroll back (scroll-back lands
-  later in this release).
+  Older records are fetched on demand as you scroll back (see scroll-back
+  above); the TUI itself will hold up to the full 5000 once you have paged
+  through them.
 - **`--tui` on a non-interactive terminal is now an error** (plan 018).
   `prox up --tui` with stdin or stdout redirected (a pipe, a CI runner, an
   agent harness) exits non-zero with `--tui requires an interactive

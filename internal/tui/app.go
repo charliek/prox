@@ -50,8 +50,10 @@ type TUIClient interface {
 
 	// GetProxyRequests and GetLogs fetch what the requests and logs streams
 	// synchronize against on every connect. They are the ctx-taking non-stream
-	// methods: each fetch is owned by a stream attempt and must be abandoned
-	// the moment that attempt ends.
+	// methods: a sync fetch is owned by a stream attempt and must be abandoned
+	// the moment that attempt ends. GetProxyRequests has one other caller,
+	// requests scroll-back (fetchOlderRequests), which belongs to no stream
+	// attempt and so supplies its own timeout bound instead.
 	GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error)
 	GetLogs(ctx context.Context, params domain.LogParams) (*api.LogsResponse, error)
 }

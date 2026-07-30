@@ -74,11 +74,16 @@ func syncModel() ClientModel {
 
 // --- merge / interleaving permutations (Update-driven) ---
 
-// TestRequestsSync_SnapshotInFlightCannotRegressLiveFinal covers the ordering
-// that snapshot replay makes unavoidable: the completion arrived live before
-// the sync, and the snapshot (taken earlier, server-side) still shows the
-// request in flight. Final is terminal, so the row must not regress.
-func TestRequestsSync_SnapshotInFlightCannotRegressLiveFinal(t *testing.T) {
+// TestRequestsSync_RebuildTakesPayloadState pins that the rebuild trusts the
+// sync payload over anything the model held before it — including a pre-sync
+// FINAL row whose payload copy is in-flight. Within one server epoch that
+// interleaving is impossible (the server ring is monotonic per ID, and the
+// snapshot is fetched after connect, so it can only be as-new-or-newer than
+// any pre-sync event); observing it means the pre-sync row belongs to a dead
+// epoch, and the payload is the only truth. The genuinely reachable race —
+// the completion arriving DURING the fetch — is payload-internal and covered
+// by TestRequestsSync_BufferedFinalWinsOverSnapshotInFlight below.
+func TestRequestsSync_RebuildTakesPayloadState(t *testing.T) {
 	m := syncModel()
 	m = clientUpdate(m, ProxyRequestMsg(syncRecord("req-1", 200, false)))
 
@@ -88,8 +93,7 @@ func TestRequestsSync_SnapshotInFlightCannotRegressLiveFinal(t *testing.T) {
 
 	assert.Equal(t, []string{"req-1"}, requestIDs(m), "no duplicate row")
 	row := findRequest(t, m, "req-1")
-	assert.False(t, row.InFlight, "a snapshot's stale in-flight copy must not regress a final row")
-	assert.Equal(t, 200, row.StatusCode)
+	assert.True(t, row.InFlight, "the rebuilt list is the payload's state, not the dead epoch's")
 }
 
 // TestRequestsSync_BufferedFinalWinsOverSnapshotInFlight covers the same race
@@ -198,12 +202,21 @@ func TestRequestsSync_CursorSurvivesBatch(t *testing.T) {
 	require.False(t, m.followMode)
 
 	m = clientUpdate(m, RequestsSyncMsg{
-		Snapshot: []proxy.RequestRecord{syncRecord("snap-1", 200, false)},
+		// The payload carries the seeded rows (the rebuild keeps ONLY payload
+		// rows), plus one new snapshot row and one buffered live row.
+		Snapshot: []proxy.RequestRecord{
+			syncRecord("req-000", 200, false),
+			syncRecord("req-001", 200, false),
+			syncRecord("req-002", 200, false),
+			syncRecord("req-003", 200, false),
+			syncRecord("req-004", 200, false),
+			syncRecord("snap-1", 200, false),
+		},
 		Buffered: []proxy.RequestRecord{syncRecord("live-1", 200, false)},
 	})
 
 	assert.Equal(t, "req-001", m.cursorID, "the ID-anchored cursor survives the batch")
-	assert.Equal(t, 1, m.cursorIdx, "and keeps its index: the batch only appended")
+	assert.Equal(t, 1, m.cursorIdx, "and keeps its index: the payload lists it at the same position")
 	assert.False(t, m.followMode, "a sync batch never re-engages follow")
 }
 
@@ -222,39 +235,125 @@ func TestRequestsSync_FollowPinsToNewestAfterBatch(t *testing.T) {
 	assert.Equal(t, len(m.proxyRequests)-1, m.cursorIdx)
 }
 
-// --- prior-epoch sweep ---
+// --- D12: drop-on-resync ---
 
-// TestRequestsSync_PriorEpochInFlightSweptStale pins that an in-flight row the
-// synchronized server has never heard of is marked stale immediately: its
-// daemon is gone, so no completion can ever arrive and the row would otherwise
-// spin "...ms" forever.
-func TestRequestsSync_PriorEpochInFlightSweptStale(t *testing.T) {
-	m := syncModel()
-	m = clientUpdate(m, ProxyRequestMsg(syncRecord("orphan", 0, true)))
-	m = clientUpdate(m, ProxyRequestMsg(syncRecord("done", 200, false)))
-	require.False(t, m.requestIsStale(findRequest(t, m, "orphan")), "not stale before the sync")
+// TestRequestsSync_DropsRowsOlderThanSnapshotWindow is drop-on-resync's core
+// property: rows positioned before the snapshot's oldest record — here a block of
+// scrolled-back history plus the pre-sync rows it was paged onto — are discarded,
+// leaving the list a single time-ordered window with no unrepresentable hole in
+// it. The pagination state is re-installed from the sync, so the user re-pages
+// from the new window's edge.
+func TestRequestsSync_DropsRowsOlderThanSnapshotWindow(t *testing.T) {
+	stub := &stubTUIClient{snapshot: olderPage(2), nextBeforeID: "cur-2"}
+	m := primedPagingModel(stub, 3, "cur-1") // req-000..req-002
+
+	// Page in some history first, so the list holds paged-in rows AND live ones.
+	m, cmd := gotoOldest(m)
+	m = clientUpdate(m, pageMsgFrom(t, cmd))
+	require.Equal(t, []string{"older-0", "older-1", "req-000", "req-001", "req-002"}, requestIDs(m))
+	genBefore := m.pagingGen
+
+	// A reconnect's snapshot starts at req-002: everything older is gone from
+	// this model's view.
+	m = clientUpdate(m, RequestsSyncMsg{
+		Snapshot:     []proxy.RequestRecord{syncRecord("req-002", 200, false), syncRecord("req-003", 200, false)},
+		Buffered:     []proxy.RequestRecord{syncRecord("req-004", 200, false)},
+		NextBeforeID: "cur-9",
+	})
+
+	assert.Equal(t, []string{"req-002", "req-003", "req-004"}, requestIDs(m),
+		"paged-in history and pre-window rows are dropped; ordering stays arrival order")
+	assert.Equal(t, "cur-9", m.pagingCursor, "the cursor is re-installed from the sync")
+	assert.Equal(t, pagingReady, m.pagingPhase)
+	assert.Equal(t, genBefore+1, m.pagingGen, "every sync bumps the generation")
+}
+
+// TestRequestsSync_DropOnResyncCursorFallsBackByIndex pins the cursor's behavior
+// when its row is one of the dropped ones: the ID anchor is gone, so
+// resolveRequestCursor falls back to the last-known index, clamped.
+func TestRequestsSync_DropOnResyncCursorFallsBackByIndex(t *testing.T) {
+	m := newClientRequestsModel(&stubTUIClient{}, 5, 10)
+	m = clientUpdate(m, keyRune('g')) // cursor on req-000, follow off
+	require.Equal(t, "req-000", m.cursorID)
 
 	m = clientUpdate(m, RequestsSyncMsg{
-		Snapshot: []proxy.RequestRecord{syncRecord("known", 0, true)},
+		Snapshot: []proxy.RequestRecord{syncRecord("req-003", 200, false), syncRecord("req-004", 200, false)},
+	})
+
+	require.Equal(t, []string{"req-003", "req-004"}, requestIDs(m))
+	assert.Equal(t, 0, m.cursorIdx, "the stale index is clamped into the shortened list")
+	assert.Equal(t, "req-003", m.cursorID, "and re-anchors to the row now there")
+}
+
+// TestRequestsSync_EmptySnapshotClearsList pins the empty-ring case: the server
+// we just synchronized against holds nothing, which means a fresh or replaced
+// daemon — a cleared view is the truth, not a reason to keep showing the last
+// daemon's requests. The phase follows the sync's own cursor.
+func TestRequestsSync_EmptySnapshotClearsList(t *testing.T) {
+	t.Run("no cursor: exhausted", func(t *testing.T) {
+		m := newClientRequestsModel(&stubTUIClient{}, 4, 10)
+
+		m = clientUpdate(m, RequestsSyncMsg{})
+
+		assert.Empty(t, m.proxyRequests, "an empty snapshot clears the list")
+		assert.Equal(t, pagingExhausted, m.pagingPhase)
+		assert.Equal(t, -1, m.cursorIdx, "an empty list resets to the no-cursor sentinel")
+		// "start of history" is suppressed on an empty list: there is no history
+		// to be at the start of.
+		assert.NotContains(t, m.View(), "start of history")
+	})
+
+	t.Run("cursor present: ready", func(t *testing.T) {
+		m := newClientRequestsModel(&stubTUIClient{}, 4, 10)
+
+		m = clientUpdate(m, RequestsSyncMsg{NextBeforeID: "cur-1"})
+
+		assert.Empty(t, m.proxyRequests)
+		assert.Equal(t, pagingReady, m.pagingPhase)
+		assert.Equal(t, "cur-1", m.pagingCursor)
+	})
+}
+
+// TestRequestsSync_RowsAbsentFromPayloadAreDropped is the soundness proof D12
+// exists for (Codex's blocker, resolved by rebuild): a pre-sync row absent from
+// the sync payload is dropped — whether it sat deeper in the ring than the
+// snapshot's fetch window (absent for a benign reason; marking it stale would
+// have been a lie) or inside the window on a server that lost it (a dead
+// epoch; keeping it spinning "...ms" forever would be a lie too). The rebuild
+// removes the distinction: the post-sync list is exactly the payload, so no
+// false stale mark is even possible.
+func TestRequestsSync_RowsAbsentFromPayloadAreDropped(t *testing.T) {
+	m := syncModel()
+	m = clientUpdate(m, ProxyRequestMsg(syncRecord("deep-inflight", 0, true))) // below the window
+	m = clientUpdate(m, ProxyRequestMsg(syncRecord("window-oldest", 200, false)))
+	m = clientUpdate(m, ProxyRequestMsg(syncRecord("inside-inflight", 0, true))) // inside it, server lost it
+	m = clientUpdate(m, ProxyRequestMsg(syncRecord("done", 200, false)))
+
+	m = clientUpdate(m, RequestsSyncMsg{
+		Snapshot: []proxy.RequestRecord{syncRecord("window-oldest", 200, false), syncRecord("known", 0, true)},
 		Buffered: []proxy.RequestRecord{syncRecord("fresh", 0, true)},
 	})
 
-	assert.True(t, m.requestIsStale(findRequest(t, m, "orphan")), "swept: absent from the snapshot")
+	assert.Equal(t, []string{"window-oldest", "known", "fresh"}, requestIDs(m),
+		"the post-sync list is exactly the payload, in payload order")
 	assert.False(t, m.requestIsStale(findRequest(t, m, "known")), "in the snapshot")
 	assert.False(t, m.requestIsStale(findRequest(t, m, "fresh")), "started during the fetch")
-	assert.False(t, m.requestIsStale(findRequest(t, m, "done")), "final rows are never stale")
-	assert.Contains(t, m.View(), "stale?", "the sweep is visible in the requests list")
 }
 
-// TestRequestsSync_SweptRowUnmarkedByLateCompletion pins the mark is not
-// permanent: a completion that does arrive clears it.
-func TestRequestsSync_SweptRowUnmarkedByLateCompletion(t *testing.T) {
+// TestRequestsSync_DroppedRowReturnsOnLateCompletion pins that the rebuild's
+// drop is not a tombstone: a completion event that does arrive after its row
+// was dropped re-adds the row as a novel final record through the ordinary
+// live-event path.
+func TestRequestsSync_DroppedRowReturnsOnLateCompletion(t *testing.T) {
 	m := syncModel()
 	m = clientUpdate(m, ProxyRequestMsg(syncRecord("orphan", 0, true)))
-	m = clientUpdate(m, RequestsSyncMsg{})
-	require.True(t, m.requestIsStale(findRequest(t, m, "orphan")))
+	m = clientUpdate(m, RequestsSyncMsg{
+		Snapshot: []proxy.RequestRecord{syncRecord("anchor", 200, false)},
+	})
+	require.Equal(t, []string{"anchor"}, requestIDs(m), "orphan dropped by the rebuild")
 
 	m = clientUpdate(m, ProxyRequestMsg(syncRecord("orphan", 200, false)))
+	assert.Equal(t, []string{"anchor", "orphan"}, requestIDs(m))
 	assert.False(t, m.requestIsStale(findRequest(t, m, "orphan")))
 }
 

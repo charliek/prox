@@ -307,6 +307,11 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case RequestsPageMsg:
+		// One scroll-back page, one render (D11). Supersession, error
+		// classification and the phase transition all live in the helper.
+		m.prependOlderRequests(msg)
+
 	case StreamStatusMsg:
 		m.handleStreamStatus(msg)
 		m.noteProcessesStreamHealth(msg)
@@ -438,9 +443,12 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle common navigation keys
+	// Handle common navigation keys. A handled key may have moved the requests
+	// cursor onto the oldest visible row, which is scroll-back's trigger (D11):
+	// the check has to run HERE rather than inside handleNavigationKey, which
+	// returns a bool and cannot dispatch a command.
 	if m.handleNavigationKey(msg) {
-		return m, nil
+		return m, m.maybeFetchOlderRequests()
 	}
 
 	return m, nil
