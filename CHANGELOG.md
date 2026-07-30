@@ -23,6 +23,30 @@ every feature, key binding, and fix lands in both at once.
   shutdown sequence and exit contract. The status line carries no
   "Connected via API" text under `--tui`: it is the owner's own TUI, not a
   remote attach.
+- **Proxy request retention raised to 5000 records** (was 1000; plan 018).
+  Every request ring — the standalone proxy, the shared daemon's per-project
+  rings, and each project's local forwarded ring — now keeps the newest 5000
+  requests, so you can scroll much further back through traffic before
+  records age out. The `?limit=` ceiling on `GET
+  /api/v1/proxy/requests` (and the daemon's equivalent) moves to 5000 with
+  it: the ring size and the per-call limit are the same number by
+  definition, because the shared-daemon forwarder has to be able to backfill
+  a full ring in one fetch after a reconnect.
+- **Captured bodies are now retained for the newest 1000 requests, not all
+  5000** (plan 018). Deeper retention would otherwise multiply memory by
+  five, since a captured body can be up to 64KB inline. When a request falls
+  outside the newest-1000 window its request/response bodies are dropped —
+  inline bytes released, spilled body files unlinked — while the record
+  itself and its captured **headers** are kept, along with body metadata
+  (size, content type, truncation). Opening such a request shows its full
+  metadata and headers with the body reported as `evicted`, the same signal
+  an over-budget spilled body already used. A slow in-flight request that
+  ages out of the window before it completes keeps its completion status and
+  headers, but its body is not stored.
+- **The TUI now syncs the newest 1000 requests rather than the whole ring**
+  (plan 018), so startup and reconnect cost stay flat as retention grows.
+  Older records are fetched on demand as you scroll back (scroll-back lands
+  later in this release).
 - **`--tui` on a non-interactive terminal is now an error** (plan 018).
   `prox up --tui` with stdin or stdout redirected (a pipe, a CI runner, an
   agent harness) exits non-zero with `--tui requires an interactive

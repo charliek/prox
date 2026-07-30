@@ -337,10 +337,16 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 // (duplicates and stale in-flight events are no-ops), so records are never
 // delivered twice.
 //
-// The limit is pinned to constants.MaxProxyRequests (the daemon ring size) so a
-// full ring backfills completely; an omitted limit would silently cap at the
-// daemon's default of 100. Client.Requests decodes all-or-nothing, so a
-// truncated body applies zero records.
+// The limit is pinned to constants.MaxProxyRequests so a full ring backfills
+// completely in one fetch; an omitted limit would silently cap at the daemon's
+// default of 100. That works because the daemon ring size
+// (constants.DefaultProxyRequestBufferSize) is DEFINED as MaxProxyRequests — do
+// not compare either against a literal, and do not raise the ring size without
+// raising the clamp. Client.Requests decodes all-or-nothing, so a truncated body
+// applies zero records.
+//
+// Records outside the daemon's captured-body detail window arrive with their
+// bodies already marked evicted (D9b); they replay into localRM as-is.
 //
 // On any failure — non-200, decode error, timeout, or ctx cancellation — it
 // logs one warning and returns, leaving the stream to run in degraded,

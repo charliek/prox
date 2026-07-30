@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -255,7 +256,10 @@ func TestBackfill_AllRecordsDeliveredPinsLimit(t *testing.T) {
 
 	select {
 	case gotLimit := <-limitCh:
-		assert.Equal(t, "1000", gotLimit, "backfill must request the explicit MaxProxyRequests limit")
+		assert.Equal(t, strconv.Itoa(constants.MaxProxyRequests), gotLimit,
+			"backfill must request the explicit MaxProxyRequests limit")
+		assert.Equal(t, constants.MaxProxyRequests, constants.DefaultProxyRequestBufferSize,
+			"the backfill fetch size must equal the daemon ring size, or a full ring cannot backfill in one fetch")
 	case <-time.After(time.Second):
 		t.Fatal("snapshot endpoint was never hit")
 	}

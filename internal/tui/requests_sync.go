@@ -104,7 +104,9 @@ func syncRequestsSnapshot(ctx context.Context, client TUIClient, st *requestsSyn
 			}
 		}
 
-		resp, err := client.GetProxyRequests(ctx, domain.ProxyRequestParams{Limit: constants.MaxProxyRequests})
+		// Scroll-back pages the older records on demand through the BeforeID
+		// cursor, so this fetch is a screenful's worth, not the whole ring.
+		resp, err := client.GetProxyRequests(ctx, domain.ProxyRequestParams{Limit: constants.TUIRequestsSyncLimit})
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -167,6 +169,10 @@ func (st *requestsSyncState) observe(req api.ProxyRequestResponse) {
 		st.mu.Unlock()
 		return
 	}
+	// The live-buffer cap stays at the RING size (MaxProxyRequests), not the
+	// smaller sync fetch limit: this bounds how many events may pile up while
+	// the snapshot is outstanding, and once that many have arrived the snapshot
+	// is worthless anyway (the whole ring turned over).
 	if len(st.buf) >= constants.MaxProxyRequests {
 		st.overflow = true
 		st.mu.Unlock()

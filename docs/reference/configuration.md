@@ -569,7 +569,11 @@ Sizes use binary suffixes — `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`, each 1024× the
 
 #### How eviction works
 
-Only bodies larger than the 64KB inline threshold spill to a file on disk; smaller bodies live inline with the record and are never subject to the disk budget. Every spilled body file counts against **one** budget:
+There are two independent eviction rules. The **retention window** below applies to every captured body, inline or spilled; the **disk budget** after it applies only to spilled files.
+
+**Retention window.** A request ring keeps the newest **5000** records, but captured bodies are retained only for the newest **1000**. When a record falls outside that window prox drops its request and response body data — inline bytes released, spilled files unlinked — while keeping the record, its metadata (method, URL, status, timing), its captured **headers**, and the body metadata (size, content type, truncation). Fetching such a body reports it as no longer available. This is what keeps 5000-record retention cheap: 5000 records of metadata and headers is small, 5000 records of bodies is not. Neither number is configurable.
+
+**Disk budget.** Only bodies larger than the 64KB inline threshold spill to a file on disk; smaller bodies live inline with the record and are never subject to the disk budget. Every spilled body file counts against **one** budget:
 
 - **Standalone mode:** the project's own `disk_budget` (or the `1GB` default).
 - **Shared daemon:** there is only one physical capture directory (`~/.prox/capture`) for every registered project, so the daemon computes a single effective budget — the **minimum**, across every capture-enabled project, of that project's `disk_budget` (or the `1GB` default for a project that left it unset). An explicit value can only **lower** the shared bound; raising it above the default requires **every** capture-enabled project on the daemon to opt into a larger value.

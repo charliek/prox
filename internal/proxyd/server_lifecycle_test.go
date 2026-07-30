@@ -263,11 +263,11 @@ func TestHandleGetRequests_LimitClamp(t *testing.T) {
 	})
 
 	t.Run("over-max limit defaults to 100", func(t *testing.T) {
-		assert.Equal(t, 100, getCount(t, "&limit=1001"))
+		assert.Equal(t, 100, getCount(t, "&limit="+strconv.Itoa(constants.MaxProxyRequests+1)))
 	})
 
 	t.Run("max limit applies", func(t *testing.T) {
-		assert.Equal(t, 150, getCount(t, "&limit=1000"))
+		assert.Equal(t, 150, getCount(t, "&limit="+strconv.Itoa(constants.MaxProxyRequests)))
 	})
 }
 

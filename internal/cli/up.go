@@ -1124,7 +1124,10 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	// the shared mode, the active client, the original register request (C6
 	// re-registers with it), and the local manager (source of the dropped-events
 	// count), and receives forwarder connection state as the status sink (D5).
-	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
+	// A replica manager: capture (and the detail-window memory bound) lives on
+	// the daemon side; see NewReplicaRequestManager for why the window must not
+	// run here.
+	localRM := proxy.NewReplicaRequestManager(constants.DefaultProxyRequestBufferSize)
 	handlers.SetRequestManager(localRM)
 	rt.SetMode(proxyModeShared)
 	rt.SetClient(client)

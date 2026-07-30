@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
@@ -41,8 +42,10 @@ const (
 // maxLogEntries is the maximum number of log entries to keep in memory
 const maxLogEntries = 1000
 
-// maxProxyRequests is the maximum number of proxy requests to keep in memory
-const maxProxyRequests = 1000
+// maxProxyRequests is the maximum number of proxy requests to keep in memory.
+// DEFINED as the initial sync size so the snapshot the TUI fetches always fits:
+// a smaller display ring would trim records it just paid to transfer.
+const maxProxyRequests = constants.TUIRequestsSyncLimit
 
 // maxErrorDisplayLen is the maximum length of error messages in the status bar
 const maxErrorDisplayLen = 60

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,10 @@ type DecodedBody struct {
 // disk when the body was spilled to a FilePath.
 //
 //   - A nil body yields (nil, nil).
+//   - A body marked Evicted (its data was dropped when the record left the
+//     ring's detail window, D9b) yields an os.ErrNotExist-wrapped error, so it
+//     travels the same "evicted" path as a body whose spilled file is gone
+//     rather than masquerading as an empty body.
 //   - An inline body returns a copy of Data (callers must not mutate the record).
 //   - A FilePath body MUST resolve within one of allowedDirs; a path that
 //     escapes every allowed directory is rejected with an error rather than
@@ -52,6 +57,10 @@ type DecodedBody struct {
 func LoadCapturedBody(body *CapturedBody, allowedDirs []string) ([]byte, error) {
 	if body == nil {
 		return nil, nil
+	}
+
+	if body.Evicted {
+		return nil, fmt.Errorf("captured body evicted by request retention: %w", os.ErrNotExist)
 	}
 
 	if body.Data != nil {
@@ -287,12 +296,15 @@ func brotliLimited(raw []byte, limit int64) ([]byte, bool) {
 
 // LoadDecodedBody composes LoadCapturedBody + DecodeCapturedBody.
 //
-// A nil body yields an unavailable result. A missing capture file (the record
-// is still valid, but its FilePath body was evicted/removed) is treated as a
-// benign condition (D7): the result is marked unavailable with reason "evicted"
-// and a nil error, so the caller returns HTTP 200 with no data rather than
-// failing the request. Any other load failure (e.g. an out-of-allowlist path or
-// an I/O error) is marked unavailable with reason "unavailable" and returned
+// A nil body yields an unavailable result. A body whose data is simply gone —
+// a missing capture file (the record is still valid, but its FilePath body was
+// evicted/removed) or a body the ring marked Evicted on leaving the detail
+// window (D9b) — is treated as a benign condition (D7): the result is marked
+// unavailable with reason "evicted" and a nil error, so the caller returns HTTP
+// 200 with no data rather than failing the request. Both cases are detected as
+// errors.Is(err, fs.ErrNotExist) — not os.IsNotExist, which does not unwrap
+// %w-wrapped sentinels. Any other load failure (e.g. an out-of-allowlist path
+// or an I/O error) is marked unavailable with reason "unavailable" and returned
 // together with the underlying error so callers can log it.
 func LoadDecodedBody(body *CapturedBody, allowedDirs []string) (DecodedBody, error) {
 	if body == nil {
@@ -301,7 +313,7 @@ func LoadDecodedBody(body *CapturedBody, allowedDirs []string) (DecodedBody, err
 
 	raw, err := LoadCapturedBody(body, allowedDirs)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return DecodedBody{Available: false, UnavailableReason: "evicted"}, nil
 		}
 		return DecodedBody{Available: false, UnavailableReason: "unavailable"}, err
