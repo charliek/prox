@@ -17,8 +17,10 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
+	"github.com/charliek/prox/internal/supervisor"
 )
 
 // fakeAPIError implements APIStatusError, standing in for *cli.APIError, which
@@ -116,10 +118,21 @@ func TestStreamStatus_SegmentOrderIsFixed(t *testing.T) {
 	assert.Less(t, strings.Index(view, "logs:"), strings.Index(view, "requests:"))
 }
 
+// newLocalTestModel builds a Model (local mode) with default test
+// dependencies. base_behavior_test.go's newTestModel builds a ClientModel
+// instead (018 C3 ported its tests off Model onto ClientModel); this one
+// exists solely so the two TestLocalModel_* tests below keep exercising real
+// local-mode construction until C4 deletes Model, and them, together.
+func newLocalTestModel() Model {
+	logMgr := logs.NewManager(logs.DefaultManagerConfig())
+	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	return NewModel(sup, logMgr)
+}
+
 // TestLocalModel_StreamsStartHealthy pins the local-mode initialization: every
 // stream is OK up front, so the bar is clean until a subscription dies.
 func TestLocalModel_StreamsStartHealthy(t *testing.T) {
-	m := newTestModel()
+	m := newLocalTestModel()
 	for _, id := range allStreams {
 		assert.Equal(t, stream.StateOK, m.streamHealth[id].State, "stream %s", id)
 	}
@@ -129,8 +142,10 @@ func TestLocalModel_StreamsStartHealthy(t *testing.T) {
 // TestLocalModel_HandlesStreamStatusMsg pins that the local Update loop routes
 // the message too — both models share the rendering path.
 func TestLocalModel_HandlesStreamStatusMsg(t *testing.T) {
-	m := updateModel(newTestModel(), tea.WindowSizeMsg{Width: 200, Height: 20})
-	m = updateModel(m, statusMsg(StreamLogs, stream.StateClosed))
+	nm, _ := newLocalTestModel().Update(tea.WindowSizeMsg{Width: 200, Height: 20})
+	m := nm.(Model)
+	nm, _ = m.Update(statusMsg(StreamLogs, stream.StateClosed))
+	m = nm.(Model)
 
 	assert.Equal(t, stream.StateClosed, m.streamHealth[StreamLogs].State)
 	assert.Contains(t, m.View(), "⚠ logs: disconnected")
