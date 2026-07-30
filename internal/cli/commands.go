@@ -10,6 +10,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
@@ -974,11 +976,30 @@ func printHeaders(headers map[string][]string) {
 
 // isTerminal returns true if stdout is connected to a terminal.
 func isTerminal() bool {
-	fi, err := os.Stdout.Stat()
-	if err != nil {
+	return isTTY(os.Stdout)
+}
+
+// isInteractiveStdio reports whether BOTH stdin and stdout are terminals, i.e.
+// whether a full-screen TUI can actually be driven here. isTerminal above only
+// asks about output, which is the right question for "may I colorize / draw a
+// table"; a TUI additionally needs keyboard input, so `prox up --tui` under
+// `prox up --tui | tee log`, a CI runner, or an agent harness has to be refused
+// rather than left drawing an alt-screen nobody can quit.
+func isInteractiveStdio() bool {
+	return isTTY(os.Stdin) && isTTY(os.Stdout)
+}
+
+// isTTY reports whether f is a real terminal. The probe is isatty, not
+// the ModeCharDevice bit: /dev/null is a character device too, so the mode-bit
+// check would wave through `--tui </dev/null` and leave a TUI nobody can drive
+// (cursor review, C2). go-isatty is already in the module graph via bubbletea —
+// this is the same answer the TUI itself would get. A nil file counts as "not a
+// terminal" — the conservative answer for every caller.
+func isTTY(f *os.File) bool {
+	if f == nil {
 		return false
 	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
+	return isatty.IsTerminal(f.Fd())
 }
 
 // parseSinceFlag parses the --since flag value, accepting either an RFC3339

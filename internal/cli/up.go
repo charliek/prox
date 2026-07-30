@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -104,6 +106,16 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	captureOverrideEnabled, captureOverrideSet, err := resolveCaptureFlag(enableCapture, noCapture)
 	if err != nil {
 		return err
+	}
+	// A TUI needs a keyboard and a screen. Refuse here — before the supervisor,
+	// proxy, or API server exist — so a piped or non-interactive invocation
+	// (`prox up --tui | tee log`, CI, an agent harness) fails fast instead of
+	// starting everything and then handing bubbletea a screen nobody can read and a
+	// keyboard nobody can press — a run that can then only be ended by signal.
+	// Ordered AFTER the flag-conflict checks above so a genuine misuse of flags
+	// reports the conflict rather than the terminal.
+	if useTUI && !isInteractiveStdio() {
+		return fmt.Errorf("--tui requires an interactive terminal")
 	}
 
 	// Get working directory for state files
@@ -493,13 +505,30 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 
 	// Handle TUI vs terminal output
 	if useTUI {
-		// Run TUI - it blocks until quit. Passing the coordinator's trigger channel
-		// lets POST /shutdown quit the program (a goroutine inside tui.Run calls
-		// p.Quit() on trigger), so a TUI daemon honors the API shutdown and runs the
-		// same shutdown sequence + exit contract below. Quitting the TUI by hand
-		// still returns from tui.Run into that same sequence, unchanged.
-		reqMgr := localRequestManager(proxyService, handlers)
-		if err := tui.Run(sup, logMgr, reqMgr, coordinator.TriggerCh()); err != nil {
+		// `up --tui` runs the SAME API-client TUI as `prox attach` (plan 018), just
+		// pointed at the API server this process started a few lines above instead of
+		// another project's daemon. One model, one set of streams, one set of key
+		// bindings to maintain — the owner's TUI is no longer a second implementation
+		// reading the supervisor and log manager in-process.
+		//
+		// Two ownership notes:
+		//
+		//   - ShutdownCh is the coordinator's trigger channel, so POST /shutdown and an
+		//     external SIGINT/SIGTERM quit the program exactly as they did before.
+		//   - "q stops the supervisor" is owned by the FALLTHROUGH, not by the TUI:
+		//     RunClient returning for ANY reason continues into the shutdown sequence
+		//     below, which is what takes the processes down. Attach mode gets the
+		//     opposite behavior purely by being a different process.
+		//
+		// ConnectedStatus is deliberately empty: this is the owner's own TUI, not a
+		// remote attach, so there is no connection to advertise in the status line.
+		// The token goes in through memory (see NewClientWithToken) rather than being
+		// re-read from ~/.prox/token.
+		client := NewClientWithToken(dialableAPIURL(cfg.API.Host, boundAPIPort(apiListener, cfg.API.Port)), token)
+		if err := tui.RunClient(client, tui.ClientOptions{
+			Help:       tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
+			ShutdownCh: coordinator.TriggerCh(),
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
@@ -551,6 +580,59 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		return fmt.Errorf("shutdown incomplete: %w", outcome)
 	}
 	return nil
+}
+
+// dialableAPIURL builds the base URL a process uses to reach its OWN in-process
+// API server (`prox up --tui`). It exists because neither half of the obvious
+// answer is usable as-is:
+//
+//   - api.Server.Addr() reports the CONFIGURED host, which may be a wildcard.
+//     0.0.0.0 and :: are bind addresses, not destinations — some stacks route
+//     them to localhost, others refuse — so they are normalized to the matching
+//     loopback address. Any concrete host (localhost, 127.0.0.1, a LAN IP) is
+//     passed through untouched: the server is listening there, so that is exactly
+//     where to dial.
+//   - the port must come from the BOUND listener, not the config: with dynamic
+//     allocation the two can disagree, and only the listener knows the truth.
+//
+// net.JoinHostPort does the joining so an IPv6 host gets its brackets ("::1"
+// becomes "[::1]:9000"); naive host+":"+port produces a URL that never parses.
+func dialableAPIURL(host string, port int) string {
+	return "http://" + net.JoinHostPort(dialableHost(host), strconv.Itoa(port))
+}
+
+// dialableHost maps a configured bind host to a host that can be dialed. Empty
+// means "all interfaces" to net.Listen exactly as 0.0.0.0 does, so both — and the
+// IPv6 wildcard — collapse to their loopback equivalents.
+//
+// Brackets are stripped first: the config's Listen call formats "host:port" with
+// sprintf, so an IPv6 host only ever BINDS in bracketed form ("[::1]"). Passing
+// that bracketed form through JoinHostPort would double-bracket it into a URL
+// that never parses (cursor review, C2) — so this normalizes to the bare
+// address and lets JoinHostPort re-bracket.
+func dialableHost(host string) string {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	switch host {
+	case "", "0.0.0.0":
+		return "127.0.0.1"
+	case "::":
+		return "::1"
+	default:
+		return host
+	}
+}
+
+// boundAPIPort reports the port the API listener actually holds, falling back to
+// the configured port. The fallback is unreachable in practice (the listener is
+// always TCP) and exists only so a non-TCP listener degrades instead of panicking
+// on the type assertion.
+func boundAPIPort(ln net.Listener, configured int) int {
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcpAddr.Port
+	}
+	return configured
 }
 
 // forwardShutdownSignal blocks until an external SIGINT/SIGTERM arrives on sigCh

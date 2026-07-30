@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -436,5 +438,92 @@ func TestResolveCaptureFlag_Matrix(t *testing.T) {
 		_, ok, err := resolveCaptureFlag(false, false)
 		require.NoError(t, err)
 		assert.False(t, ok, "caller must leave the config's own Enabled value untouched")
+	})
+}
+
+// TestDialableAPIURL pins the URL `up --tui` dials to reach its own in-process
+// API server. The two failure modes this helper exists for are both covered: a
+// wildcard bind host is not a destination (it must become the matching loopback
+// address), and an IPv6 host must be bracketed so the result is a parseable URL.
+func TestDialableAPIURL(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		port int
+		want string
+	}{
+		{"IPv4 wildcard becomes loopback", "0.0.0.0", 9000, "http://127.0.0.1:9000"},
+		{"empty host is the IPv4 wildcard too", "", 9000, "http://127.0.0.1:9000"},
+		{"IPv6 wildcard becomes bracketed loopback", "::", 9000, "http://[::1]:9000"},
+		{"localhost passes through", "localhost", 4000, "http://localhost:4000"},
+		{"explicit 127.0.0.1 passes through", "127.0.0.1", 4000, "http://127.0.0.1:4000"},
+		{"explicit IPv6 host is bracketed", "::1", 4000, "http://[::1]:4000"},
+		// Bracketed forms are how IPv6 hosts actually BIND today (Listen formats
+		// host:port with sprintf, so only "[::1]" survives it) — they must not be
+		// double-bracketed into an unparseable URL (cursor review, C2).
+		{"bracketed IPv6 host is not double-bracketed", "[::1]", 4000, "http://[::1]:4000"},
+		{"bracketed IPv6 wildcard becomes bracketed loopback", "[::]", 9000, "http://[::1]:9000"},
+		{"a LAN bind host is dialed as configured", "192.168.1.10", 8080, "http://192.168.1.10:8080"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dialableAPIURL(tc.host, tc.port)
+			assert.Equal(t, tc.want, got)
+			// Whatever we build must survive url.Parse — the bracketing bug this
+			// helper prevents shows up as a parse failure, not a wrong string.
+			u, err := url.Parse(got)
+			require.NoError(t, err)
+			assert.Equal(t, strconv.Itoa(tc.port), u.Port())
+		})
+	}
+}
+
+// TestBoundAPIPort_UsesListenerNotConfig pins that the client is built against
+// the port the listener actually holds: with dynamic allocation (:0) the config
+// value is 0 and only the listener knows the truth.
+func TestBoundAPIPort_UsesListenerNotConfig(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	actual := ln.Addr().(*net.TCPAddr).Port
+	require.NotZero(t, actual)
+
+	assert.Equal(t, actual, boundAPIPort(ln, 0), "the dynamic port must propagate")
+	assert.Equal(t, "http://127.0.0.1:"+strconv.Itoa(actual), dialableAPIURL("0.0.0.0", boundAPIPort(ln, 0)))
+}
+
+// TestIsTTY pins the terminal probe isInteractiveStdio is built on. The
+// interactive case cannot be tested without a PTY (plan 018 C9 covers
+// `up --tui` end to end under one); what is testable here is the negative
+// answer the --tui guard depends on: a pipe, a regular file, and — the reason
+// the probe is isatty rather than the ModeCharDevice bit — /dev/null are not
+// terminals.
+func TestIsTTY(t *testing.T) {
+	t.Run("a pipe is not a terminal", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		require.NoError(t, err)
+		defer r.Close()
+		defer w.Close()
+		assert.False(t, isTTY(r))
+		assert.False(t, isTTY(w))
+	})
+
+	t.Run("a regular file is not a terminal", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "notty")
+		require.NoError(t, err)
+		defer f.Close()
+		assert.False(t, isTTY(f))
+	})
+
+	t.Run("a nil file is not a terminal", func(t *testing.T) {
+		assert.False(t, isTTY(nil))
+	})
+
+	t.Run("/dev/null is not a terminal", func(t *testing.T) {
+		f, err := os.Open(os.DevNull)
+		require.NoError(t, err)
+		defer f.Close()
+		assert.False(t, isTTY(f), "a char device that is not a tty must be refused (cursor review, C2)")
 	})
 }

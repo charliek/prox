@@ -49,11 +49,23 @@ type Client struct {
 	lifecycleClient *http.Client
 }
 
-// NewClient creates a new API client
+// NewClient creates a new API client, reading the auth token from disk
+// (~/.prox/token). This is the form every out-of-process CLI command wants: it
+// has no other way to learn the daemon's token.
 func NewClient(baseURL string) *Client {
 	// Try to load token from file
 	token, _ := loadToken() // Ignore error - token may not exist
+	return NewClientWithToken(baseURL, token)
+}
 
+// NewClientWithToken creates a new API client against an explicitly supplied
+// token, skipping the token file entirely. `prox up --tui` needs this: it talks
+// to the API server it just started in this very process, and it already holds
+// the token it minted (empty when auth is disabled). Re-reading ~/.prox/token
+// there would be both pointless and wrong — the file is a single global slot, so
+// another project's `prox up` starting concurrently would have overwritten it
+// with a token this server does not accept.
+func NewClientWithToken(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		token:   token,

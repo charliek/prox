@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
+TUI. The owner's TUI is the same API-client TUI attach has always run, so
+every feature, key binding, and fix lands in both at once.
+
+### Changed
+
+- **`prox up --tui` runs the same API-client TUI as `prox attach`** (plan
+  018). It is now a client of the API server `prox up` starts in its own
+  process rather than a second, local-only implementation reading the
+  supervisor and log manager directly. Everything attach mode gained — the
+  reconnecting log/request/process streams, the stream-health status line,
+  request detail and its live refresh, the cursor and filter behavior — is
+  now what `--tui` shows, and the two can no longer drift. Quit semantics
+  are unchanged: `q` still stops the supervisor and takes the processes
+  down with it (attach mode still leaves the daemon running), and `POST
+  /shutdown` plus `SIGINT`/`SIGTERM` still quit the TUI and run the normal
+  shutdown sequence and exit contract. The status line carries no
+  "Connected via API" text under `--tui`: it is the owner's own TUI, not a
+  remote attach.
+- **`--tui` on a non-interactive terminal is now an error** (plan 018).
+  `prox up --tui` with stdin or stdout redirected (a pipe, a CI runner, an
+  agent harness) exits non-zero with `--tui requires an interactive
+  terminal` before starting the supervisor, proxy, or API server, instead
+  of starting everything and then drawing a full-screen TUI nobody can see
+  or quit. Non-interactive callers want plain `prox up` (streams logs to
+  stdout) or `prox up -d`.
+
 ## v0.2.4
 
 Hardening release. Capture is now visible-by-default (redaction removed —
