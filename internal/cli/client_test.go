@@ -736,6 +736,7 @@ func TestBuildProxyRequestQueryParams(t *testing.T) {
 				Since:       sinceFixture,
 				URLContains: "/orders",
 				Limit:       50,
+				BeforeID:    "req-42",
 			},
 			expected: map[string]string{
 				"subdomain":    "api",
@@ -745,7 +746,26 @@ func TestBuildProxyRequestQueryParams(t *testing.T) {
 				"since":        sinceFixture.Format(time.RFC3339Nano),
 				"url_contains": "/orders",
 				"limit":        "50",
+				"before_id":    "req-42",
 			},
+		},
+		{
+			// D12/#50 pagination cursor (plan 018 C6): sent only when the
+			// caller actually holds one.
+			name: "before_id only",
+			params: domain.ProxyRequestParams{
+				BeforeID: "req-99",
+			},
+			expected: map[string]string{
+				"before_id": "req-99",
+			},
+		},
+		{
+			name: "empty before_id omitted",
+			params: domain.ProxyRequestParams{
+				BeforeID: "",
+			},
+			expected: map[string]string{},
 		},
 		{
 			name: "zero values not included",
@@ -867,6 +887,58 @@ func TestClient_GetProxyRequests(t *testing.T) {
 	}
 	if resp.TotalCount != 100 {
 		t.Errorf("expected TotalCount 100, got %d", resp.TotalCount)
+	}
+}
+
+// TestClient_GetProxyRequests_BeforeIDAndNextBeforeID pins the D12/#50
+// pagination cursor's round trip through the client (plan 018 C6): a caller
+// that sets BeforeID sends before_id on the wire, and the server's
+// next_before_id comes back on the decoded response untouched. C7 builds
+// scroll-back paging on top of this plumbing.
+func TestClient_GetProxyRequests_BeforeIDAndNextBeforeID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("before_id"); got != "req-anchor" {
+			t.Errorf("expected before_id=req-anchor, got %q", got)
+		}
+		resp := api.ProxyRequestsResponse{
+			Requests:     []api.ProxyRequestResponse{{ID: "req-older"}},
+			NextBeforeID: "req-older",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	resp, err := client.GetProxyRequests(context.Background(), domain.ProxyRequestParams{
+		BeforeID: "req-anchor",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.NextBeforeID != "req-older" {
+		t.Errorf("expected NextBeforeID %q, got %q", "req-older", resp.NextBeforeID)
+	}
+}
+
+// TestClient_GetProxyRequests_OmitsBeforeIDWhenUnset pins the other half of
+// the wire contract: a caller with no cursor (the common case — every
+// snapshot fetch before C7 exists) must not send before_id at all, since an
+// empty string on the wire is indistinguishable from "the page before the
+// very first request" rather than "no cursor".
+func TestClient_GetProxyRequests_OmitsBeforeIDWhenUnset(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, present := r.URL.Query()["before_id"]; present {
+			t.Errorf("expected no before_id param, got %q", r.URL.Query().Get("before_id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(api.ProxyRequestsResponse{})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	if _, err := client.GetProxyRequests(context.Background(), domain.ProxyRequestParams{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

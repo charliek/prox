@@ -53,11 +53,24 @@ type stubTUIClient struct {
 
 	// snapshot is the requests-sync REST payload (newest-first, as the real
 	// endpoint returns). nil means an empty snapshot. snapshotErr, when set,
-	// fails every fetch; snapshotCalls counts them.
-	snapshot     []api.ProxyRequestResponse
-	snapshotErr  error
-	snapshotCall func(n int) // optional per-call hook; n is the 1-based call count
-	snapshotN    int         // number of GetProxyRequests calls made
+	// fails every fetch; snapshotCalls counts them. nextBeforeID is the
+	// response's pagination cursor (plan 018 D12/C6) — "" (the default) means
+	// "reached the ring's oldest record", matching the server's own omitempty
+	// wire behavior.
+	//
+	// snapshotCall is an optional per-call hook — n is the 1-based call count,
+	// params is what the caller passed to GetProxyRequests (so a test can see
+	// the BeforeID it sent). It runs BEFORE snapshot/snapshotErr/nextBeforeID
+	// are read, so a hook may mutate them (e.g. keyed on params.BeforeID) to
+	// script a different page per call — C7 uses this to serve
+	// before_id-anchored scroll-back pages. snapshotParams records every
+	// call's params, in order, mirroring logsParams below.
+	snapshot       []api.ProxyRequestResponse
+	snapshotErr    error
+	nextBeforeID   string
+	snapshotCall   func(n int, params domain.ProxyRequestParams)
+	snapshotN      int // number of GetProxyRequests calls made
+	snapshotParams []domain.ProxyRequestParams
 
 	// logsResponder backs the C9 logs-sync backfill (GetLogs): it owns the
 	// response for each call, so a test can serve a different payload per
@@ -187,23 +200,33 @@ func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDet
 	}, nil
 }
 
-func (s *stubTUIClient) GetProxyRequests(ctx context.Context, _ domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+func (s *stubTUIClient) GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
 	s.mu.Lock()
 	s.snapshotN++
 	n := s.snapshotN
-	hook, err, records := s.snapshotCall, s.snapshotErr, s.snapshot
+	s.snapshotParams = append(s.snapshotParams, params)
+	hook := s.snapshotCall
 	s.mu.Unlock()
 
 	if hook != nil {
-		hook(n)
+		// Runs outside the lock (a hook may block, e.g. waiting on a channel)
+		// but BEFORE the response fields are read below, so a scripted hook
+		// can mutate snapshot/snapshotErr/nextBeforeID — keyed on n or
+		// params.BeforeID — to shape this call's own response.
+		hook(n, params)
 	}
+
+	s.mu.Lock()
+	err, records, next := s.snapshotErr, s.snapshot, s.nextBeforeID
+	s.mu.Unlock()
+
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &api.ProxyRequestsResponse{Requests: records}, nil
+	return &api.ProxyRequestsResponse{Requests: records, NextBeforeID: next}, nil
 }
 
 // snapshotCalls returns how many times GetProxyRequests has been called.
@@ -211,6 +234,15 @@ func (s *stubTUIClient) snapshotCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.snapshotN
+}
+
+// snapshotCallParams returns the params of every GetProxyRequests call, in
+// order — the observable that proves a scroll-back fetch (C7) sent the
+// BeforeID it meant to.
+func (s *stubTUIClient) snapshotCallParams() []domain.ProxyRequestParams {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.ProxyRequestParams(nil), s.snapshotParams...)
 }
 
 // lastRequestedID returns the most recent GetProxyRequest id, or "".

@@ -36,6 +36,12 @@ type LogParams struct {
 //   - URLContains: Filter to requests whose URL (path+query) contains this substring,
 //     case-insensitive. Empty string means no filtering.
 //   - Limit: Maximum number of requests to return. 0 means use server default.
+//   - BeforeID: List-fetch pagination cursor only (ring-position cursor
+//     pagination, D12/#50) — anchors the page strictly older than this
+//     request ID. Empty string means "start from the newest record". The
+//     STREAM path (Client.ConsumeProxyRequests) must never set this: the
+//     stream endpoint parses and ignores before_id, since a live SSE
+//     subscription has no notion of paging backward.
 type ProxyRequestParams struct {
 	Subdomain   string
 	Method      string
@@ -44,4 +50,5 @@ type ProxyRequestParams struct {
 	Since       time.Time
 	URLContains string
 	Limit       int
+	BeforeID    string
 }

@@ -217,6 +217,13 @@ func buildProxyRequestQueryParams(params domain.ProxyRequestParams) url.Values {
 	if params.Limit > 0 {
 		query.Set("limit", fmt.Sprintf("%d", params.Limit))
 	}
+	// before_id is sent only when the caller actually holds a pagination
+	// cursor (domain.ProxyRequestParams.BeforeID). This builder is shared with
+	// proxyRequestsStreamPath: the stream endpoint parses and ignores
+	// before_id, and no stream subscription sets it (list-fetch use only).
+	if params.BeforeID != "" {
+		query.Set("before_id", params.BeforeID)
+	}
 	return query
 }
 

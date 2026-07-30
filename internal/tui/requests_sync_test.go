@@ -13,6 +13,7 @@ import (
 
 	"github.com/charliek/prox/internal/api"
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/stream"
 )
@@ -291,7 +292,7 @@ func TestConsumeRequestsWithSync_DeliversBatchThenMarksSynced(t *testing.T) {
 		return ctx.Err()
 	}
 	// The fetch may only return once the first live event has been buffered.
-	client.snapshotCall = func(int) { <-buffered }
+	client.snapshotCall = func(int, domain.ProxyRequestParams) { <-buffered }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := h.runInBackground(ctx, client)
@@ -342,7 +343,7 @@ func TestConsumeRequestsWithSync_BufferOverflowAbortsAttempt(t *testing.T) {
 		return ctx.Err()
 	}
 	// Hold the snapshot until the buffer has overflowed.
-	client.snapshotCall = func(int) { <-overflowed }
+	client.snapshotCall = func(int, domain.ProxyRequestParams) { <-overflowed }
 
 	err := h.run(context.Background(), client)
 
@@ -437,7 +438,7 @@ func TestRunClientStreams_RequestsOKOnlyAfterSync(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	client.snapshotCall = func(int) { <-release }
+	client.snapshotCall = func(int, domain.ProxyRequestParams) { <-release }
 
 	startClientStreams(t, client, collector.send)
 
