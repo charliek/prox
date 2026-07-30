@@ -1816,16 +1816,18 @@ func gatedDetail(p domain.ProcessInfo) string {
 }
 
 // healthDot returns the process panel's health indicator (plan 018 D13): a
-// green " ●" for domain.HealthStatusHealthy, a red " ●" for
+// green " ●" for domain.HealthStatusHealthy, a red " ✗" for
 // domain.HealthStatusUnhealthy, and "" for domain.HealthStatusUnknown or any
 // other/empty value — so a process with no healthcheck configured renders
-// nothing extra.
+// nothing extra. The two states use distinct GLYPHS, not just colors: on a
+// NO_COLOR/monochrome terminal, or to a red-green color-blind reader, two
+// same-shaped dots are indistinguishable (CodeRabbit, PR #88).
 func healthDot(status domain.HealthStatus) string {
 	switch status {
 	case domain.HealthStatusHealthy:
 		return healthyDotStyle.Render(" ●")
 	case domain.HealthStatusUnhealthy:
-		return unhealthyDotStyle.Render(" ●")
+		return unhealthyDotStyle.Render(" ✗")
 	default:
 		return ""
 	}

@@ -999,7 +999,9 @@ func isTTY(f *os.File) bool {
 	if f == nil {
 		return false
 	}
-	return isatty.IsTerminal(f.Fd())
+	// IsCygwinTerminal covers mintty/MSYS2 on Windows, where the terminal is a
+	// pipe that IsTerminal alone rejects (CodeRabbit, PR #88).
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 }
 
 // parseSinceFlag parses the --since flag value, accepting either an RFC3339

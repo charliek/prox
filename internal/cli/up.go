@@ -503,7 +503,9 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 	}()
 
-	// Handle TUI vs terminal output
+	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
+	// session must reach the exit contract below.
+	var tuiErr error
 	if useTUI {
 		// `up --tui` runs the SAME API-client TUI as `prox attach` (plan 018), just
 		// pointed at the API server this process started a few lines above instead of
@@ -529,6 +531,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			Help:       tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
 			ShutdownCh: coordinator.TriggerCh(),
 		}); err != nil {
+			// Printed now for the interactive user, and retained: a session
+			// whose TUI failed must not exit 0 just because shutdown went
+			// cleanly — scripted callers need to tell the two apart
+			// (CodeRabbit, PR #88). Folded into the exit contract below.
+			tuiErr = fmt.Errorf("TUI error: %w", err)
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
@@ -577,9 +584,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Breaking change: foreground `prox up` previously always exited 0 (CHANGELOG
 	// in C5).
 	if outcome != nil {
-		return fmt.Errorf("shutdown incomplete: %w", outcome)
+		// errors.Join keeps a TUI failure visible alongside the shutdown
+		// verdict; either alone still makes `up` exit non-zero.
+		return errors.Join(tuiErr, fmt.Errorf("shutdown incomplete: %w", outcome))
 	}
-	return nil
+	return tuiErr
 }
 
 // dialableAPIURL builds the base URL a process uses to reach its OWN in-process

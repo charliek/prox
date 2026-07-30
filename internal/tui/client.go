@@ -448,7 +448,14 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// the check has to run HERE rather than inside handleNavigationKey, which
 	// returns a bool and cannot dispatch a command.
 	if m.handleNavigationKey(msg) {
-		return m, m.maybeFetchOlderRequests()
+		// The command is evaluated BEFORE m is copied into the return values:
+		// maybeFetchOlderRequests mutates m (pagingPhase=loading), and Go does
+		// not specify the order of a plain operand relative to a call in the
+		// same return statement — `return m, m.maybeFetchOlderRequests()` could
+		// legally return a model copy without the mutation, silently breaking
+		// single-flight (CodeRabbit, PR #88).
+		cmd := m.maybeFetchOlderRequests()
+		return m, cmd
 	}
 
 	return m, nil

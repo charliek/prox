@@ -84,7 +84,7 @@ func TestHealthDotStyles_ReuseProcessColors(t *testing.T) {
 }
 
 // TestHealthDot pins the process panel's health indicator (plan 018 D13):
-// healthy and unhealthy each render a styled " ●", while unknown and unset
+// healthy renders a styled " ●", unhealthy a styled " ✗" (distinct glyphs for monochrome/color-blind readability), while unknown and unset
 // (the zero value) render nothing.
 func TestHealthDot(t *testing.T) {
 	prev := lipgloss.ColorProfile()
@@ -97,7 +97,9 @@ func TestHealthDot(t *testing.T) {
 		want   string
 	}{
 		{"healthy", domain.HealthStatusHealthy, healthyDotStyle.Render(" ●")},
-		{"unhealthy", domain.HealthStatusUnhealthy, unhealthyDotStyle.Render(" ●")},
+		// Distinct glyph, not just a distinct color: monochrome/NO_COLOR and
+		// red-green color-blind readers must still tell the states apart.
+		{"unhealthy", domain.HealthStatusUnhealthy, unhealthyDotStyle.Render(" ✗")},
 		{"unknown", domain.HealthStatusUnknown, ""},
 		{"unset", domain.HealthStatus(""), ""},
 	}

@@ -412,8 +412,7 @@ func TestFormatRequestDetail_Completed_NoInFlightNote(t *testing.T) {
 }
 
 // TestProcessPanel_HealthDot pins the plan 018 D13 process-panel health
-// indicator: a healthy process gets a green " ●" appended after its
-// rendered name as a separately styled segment, unhealthy gets a red one,
+// indicator: // rendered name as a separately styled segment, unhealthy gets a red one,
 // and unknown/unset render no dot at all — so a process with no healthcheck
 // configured is unaffected.
 func TestProcessPanel_HealthDot(t *testing.T) {
@@ -444,7 +443,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("api")
-		wantDot := unhealthyDotStyle.Render(" ●")
+		wantDot := unhealthyDotStyle.Render(" ✗")
 		assert.Contains(t, out, wantName+wantDot)
 	})
 
@@ -457,6 +456,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		assert.NotContains(t, out, "●")
+		assert.NotContains(t, out, "✗")
 	})
 
 	t.Run("empty/unset health renders no dot", func(t *testing.T) {
@@ -468,6 +468,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		assert.NotContains(t, out, "●")
+		assert.NotContains(t, out, "✗")
 	})
 
 	t.Run("no-healthcheck process renders byte-identical to the pre-dot output", func(t *testing.T) {
