@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/creack/pty v1.1.24
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.19.1
