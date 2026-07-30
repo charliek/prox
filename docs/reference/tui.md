@@ -173,12 +173,11 @@ Request Body (35 bytes, application/json)
   since headers/bodies haven't been captured yet, `(request in flight —
   details arrive on completion)` instead of the usual body sections.
 - Detail views live-update: when the open request completes, the view
-  refreshes in place with its final duration, headers, and bodies, and your
-  scroll position is preserved. In local mode (`prox up`) this happens
-  instantly from the streamed record; in client mode (`prox attach`) it
-  re-fetches the request in the background, with no loading flicker. If that
-  background re-fetch fails, the last snapshot stays on screen and the note
-  changes to `(live refresh failed — press esc and re-enter to reload)`.
+  re-fetches the request in the background and refreshes in place with its
+  final duration, headers, and bodies — no loading flicker, and your scroll
+  position is preserved. If that background re-fetch fails, the last snapshot
+  stays on screen and the note changes to `(live refresh failed — press esc
+  and re-enter to reload)`.
 
 ## Process Filter Mode
 

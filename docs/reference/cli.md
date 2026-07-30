@@ -31,7 +31,7 @@ prox up [processes...]
 | Flag | Description |
 |------|-------------|
 | `--detach, -d` | Run in background (daemon mode) |
-| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`) |
+| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`; requires an interactive terminal on stdin and stdout) |
 | `--api-port, -p` | Override API server port (otherwise dynamic) |
 | `--http-port` | Override proxy HTTP port |
 | `--https-port` | Override proxy HTTPS port |
