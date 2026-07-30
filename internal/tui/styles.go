@@ -76,6 +76,13 @@ var (
 
 	defaultProcessStyle = lipgloss.NewStyle()
 
+	// Health-dot styles for the process panel (plan 018 D13): reuse the
+	// running/crashed colors so a healthy/unhealthy dot stays visually
+	// consistent with process state coloring rather than introducing a new
+	// palette entry.
+	healthyDotStyle   = lipgloss.NewStyle().Foreground(runningColor)
+	unhealthyDotStyle = lipgloss.NewStyle().Foreground(crashedColor)
+
 	// Header style
 	headerStyle = lipgloss.NewStyle().
 			Background(headerBg).

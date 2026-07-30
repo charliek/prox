@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -11,12 +12,146 @@ import (
 	"github.com/charliek/prox/internal/stream"
 )
 
+// LogEntryMsg is sent when a new log entry arrives
+type LogEntryMsg domain.LogEntry
+
+// ProxyRequestMsg is sent when a new proxy request is recorded
+type ProxyRequestMsg proxy.RequestRecord
+
+// ProcessesMsg is sent when processes should be refreshed
+type ProcessesMsg []domain.ProcessInfo
+
+// RestartResultMsg is sent when a restart operation completes
+type RestartResultMsg struct {
+	Process string
+	Err     error
+}
+
+// RestartResultClearMsg is sent to clear the restart result after a delay
+type RestartResultClearMsg struct{}
+
+// RequestDetailMsg is sent when request details are loaded. Seq is the
+// fetchRequestDetail call's sequence number (ClientModel.detailFetchSeq at
+// dispatch time) — the handler drops any msg whose Seq doesn't match the
+// current value, so a stale or superseded fetch can never clobber a newer
+// one (D16).
+type RequestDetailMsg struct {
+	ID      string
+	Seq     int
+	Details *RequestDetailData
+}
+
+// RequestDetailErrorMsg is sent when loading request details fails. Seq is
+// the fetchRequestDetail call's sequence number (see RequestDetailMsg).
+type RequestDetailErrorMsg struct {
+	ID  string
+	Seq int
+	Err error
+}
+
+// RequestDetailData holds the detailed information about a request for TUI display
+type RequestDetailData struct {
+	ID         string
+	Timestamp  string
+	Method     string
+	URL        string
+	Subdomain  string
+	StatusCode int
+	DurationMs int64
+	RemoteAddr string
+	// InFlight marks a request whose response is still streaming: Duration
+	// renders as "(in flight)" and a nil Details gets an explanatory note
+	// instead of being treated as "capture not enabled".
+	InFlight bool
+	// Stale marks an in-flight request that has been in-flight longer than
+	// constants.InFlightStaleAfter (D8, #53): the completion event may have
+	// been lost and the true outcome is unknown. Always false when InFlight
+	// is false.
+	Stale           bool
+	RequestHeaders  map[string][]string
+	ResponseHeaders map[string][]string
+	RequestBody     *BodyData
+	ResponseBody    *BodyData
+}
+
+// BodyData holds captured body information
+type BodyData struct {
+	Size            int64
+	Truncated       bool
+	ContentType     string
+	ContentEncoding string
+	IsBinary        bool
+	Data            string
+	// DataBase64 marks Data as base64-encoded (the wire format: the API
+	// base64-encodes binary bodies). A producer that already holds raw bytes
+	// leaves this false, so the hex preview never has to guess — raw bytes
+	// that merely LOOK like base64 must not be decoded.
+	DataBase64 bool
+	// Unavailable is true when the body existed but could no longer be loaded
+	// (e.g. its disk file was evicted); UnavailableReason explains why.
+	Unavailable       bool
+	UnavailableReason string
+}
+
+// restartResultClearDelay is how long to show restart result before clearing
+const restartResultClearDelay = 3 * time.Second
+
+// restartResultClearCmd returns a command that clears the restart result after a delay
+func restartResultClearCmd() tea.Cmd {
+	return tea.Tick(restartResultClearDelay, func(t time.Time) tea.Msg {
+		return RestartResultClearMsg{}
+	})
+}
+
+// ClientOptions carries everything that differs between the two client-mode
+// callers — `prox attach`, talking to another process's daemon over HTTP, and
+// `prox up --tui`, talking to its own in-process API. The model, the streams and
+// every key binding are shared; only the wording and the shutdown wiring below
+// are per-caller, so this stays deliberately small rather than growing into a
+// general settings bag.
+type ClientOptions struct {
+	// Help supplies the help overlay's title suffix and quit wording. The two
+	// callers must word quit differently: leaving attach abandons a daemon that
+	// keeps running, leaving `up --tui` takes the processes down with it.
+	Help HelpConfig
+
+	// ConnectedStatus is the status-line text rendered whenever nothing is
+	// wrong. Every degraded wording — connection outage, old daemon, restart
+	// result — outranks it; see View.
+	ConnectedStatus string
+
+	// ShutdownCh, when non-nil, quits the program on close. This is how an
+	// out-of-band shutdown request (POST /shutdown, via the coordinator's
+	// trigger channel) reaches a --tui daemon, which otherwise blocks in
+	// tea.Program.Run forever. Attach mode passes nil: it supervises nothing,
+	// so nothing can ask it to shut down out of band.
+	//
+	// The wait is PROGRAM-OWNED — a tea.Cmd returned from Init (see
+	// waitForExternalShutdown), not a goroutine holding the *tea.Program and
+	// calling Quit on it. That keeps quitting on one path (a message through
+	// Update) so it cannot race the program's own teardown, at the cost of one
+	// command goroutine parked on the channel for the rest of a hand-quit
+	// session — harmless, since both callers exit the process once RunClient
+	// returns.
+	ShutdownCh <-chan struct{}
+}
+
+// ExternalShutdownMsg reports that ClientOptions.ShutdownCh closed, i.e. that
+// something outside the TUI asked the program to stop. Update answers it with
+// tea.Quit, so an out-of-band shutdown and a user pressing q leave through
+// exactly the same path.
+type ExternalShutdownMsg struct{}
+
 // ClientModel is the bubbletea model for TUI client mode (connected via API)
 type ClientModel struct {
 	BaseModel
 
 	// Dependencies
 	client TUIClient
+
+	// opts is the run's per-caller configuration. Help is copied into
+	// BaseModel by newBaseModel; the rest is read from here.
+	opts ClientOptions
 
 	// connectionError is the attach session's global connection state, DERIVED
 	// (C12) from the processes stream's health rather than reported by any
@@ -37,23 +172,39 @@ type ClientModel struct {
 }
 
 // NewClientModel creates a new TUI model for client mode
-func NewClientModel(client TUIClient) ClientModel {
+func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 	return ClientModel{
-		BaseModel: newBaseModel(HelpConfig{
-			TitleSuffix: "(Client Mode)",
-			QuitMessage: "Quit (daemon continues running)",
-		}),
-		client: client,
+		BaseModel: newBaseModel(opts.Help),
+		client:    client,
+		opts:      opts,
 	}
 }
 
-// Init has nothing to do. Attach mode has no periodic work left: every feed —
-// logs, requests and, since C12, processes — is pushed by a stream loop that
-// RunClient starts alongside the program, and the processes stream's
-// snapshot-on-connect delivers the initial process list without anyone asking
-// for it. The method stays because tea.Model requires it.
+// Init starts the external-shutdown wait, and nothing else. Client mode has no
+// periodic work: every feed — logs, requests and, since 017 C12, processes — is
+// pushed by a stream loop that RunClient starts alongside the program, and the
+// processes stream's snapshot-on-connect delivers the initial process list
+// without anyone asking for it.
+//
+// With no ShutdownCh (attach) there is nothing to wait for and Init returns nil,
+// which is also what the no-poll proof in client_model_test.go pins.
 func (m ClientModel) Init() tea.Cmd {
-	return nil
+	if m.opts.ShutdownCh == nil {
+		return nil
+	}
+	return waitForExternalShutdown(m.opts.ShutdownCh)
+}
+
+// waitForExternalShutdown blocks in a command goroutine until ch closes (or
+// receives), then reports ExternalShutdownMsg. bubbletea runs each command on
+// its own goroutine, so blocking here costs nothing but that goroutine; see
+// ClientOptions.ShutdownCh for why the wait lives in a command rather than
+// beside the program.
+func waitForExternalShutdown(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		<-ch
+		return ExternalShutdownMsg{}
+	}
 }
 
 // errProcessesStreamLost is the connection error shown when the processes
@@ -107,6 +258,11 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case ExternalShutdownMsg:
+		// Same exit as q/Ctrl-C: RunClient returns and the caller runs its
+		// normal shutdown sequence, so both routes are identical.
+		return m, tea.Quit
+
 	case tea.WindowSizeMsg:
 		m.handleWindowSize(msg)
 		m.updateViewport()
@@ -115,8 +271,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleLogEntry(domain.LogEntry(msg))
 
 	case LogsSyncMsg:
-		// One batch, one render (C9). Attach mode only: local mode reads the
-		// log manager's ring directly and has nothing to synchronize against.
+		// One batch, one render (C9).
 		m.handleLogsSync(msg)
 
 	case ProxyRequestMsg:
@@ -133,8 +288,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case RequestsSyncMsg:
-		// One batch, one render (C6). Attach mode only: local mode reads the
-		// request ring directly and has nothing to synchronize against.
+		// One batch, one render (C6).
 		m.handleRequestsSync(msg)
 		// D16 also applies to a completion that arrives via the sync batch
 		// instead of a live event: an open detail still showing an in-flight
@@ -152,6 +306,11 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+
+	case RequestsPageMsg:
+		// One scroll-back page, one render (D11). Supersession, error
+		// classification and the phase transition all live in the helper.
+		m.prependOlderRequests(msg)
 
 	case StreamStatusMsg:
 		m.handleStreamStatus(msg)
@@ -284,9 +443,19 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle common navigation keys
+	// Handle common navigation keys. A handled key may have moved the requests
+	// cursor onto the oldest visible row, which is scroll-back's trigger (D11):
+	// the check has to run HERE rather than inside handleNavigationKey, which
+	// returns a bool and cannot dispatch a command.
 	if m.handleNavigationKey(msg) {
-		return m, nil
+		// The command is evaluated BEFORE m is copied into the return values:
+		// maybeFetchOlderRequests mutates m (pagingPhase=loading), and Go does
+		// not specify the order of a plain operand relative to a call in the
+		// same return statement — `return m, m.maybeFetchOlderRequests()` could
+		// legally return a model copy without the mutation, silently breaking
+		// single-flight (CodeRabbit, PR #88).
+		cmd := m.maybeFetchOlderRequests()
+		return m, cmd
 	}
 
 	return m, nil
@@ -362,7 +531,7 @@ func (m ClientModel) View() string {
 	case ModeHelp:
 		return m.helpView()
 	default:
-		statusInfo := "Connected via API"
+		statusInfo := m.opts.ConnectedStatus
 		if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
 			// The old-daemon park is not an outage and never self-heals by
 			// waiting, so "retrying..." would be a lie — render the actionable

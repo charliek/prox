@@ -53,11 +53,24 @@ type stubTUIClient struct {
 
 	// snapshot is the requests-sync REST payload (newest-first, as the real
 	// endpoint returns). nil means an empty snapshot. snapshotErr, when set,
-	// fails every fetch; snapshotCalls counts them.
-	snapshot     []api.ProxyRequestResponse
-	snapshotErr  error
-	snapshotCall func(n int) // optional per-call hook; n is the 1-based call count
-	snapshotN    int         // number of GetProxyRequests calls made
+	// fails every fetch; snapshotCalls counts them. nextBeforeID is the
+	// response's pagination cursor (plan 018 D12/C6) — "" (the default) means
+	// "reached the ring's oldest record", matching the server's own omitempty
+	// wire behavior.
+	//
+	// snapshotCall is an optional per-call hook — n is the 1-based call count,
+	// params is what the caller passed to GetProxyRequests (so a test can see
+	// the BeforeID it sent). It runs BEFORE snapshot/snapshotErr/nextBeforeID
+	// are read, so a hook may mutate them (e.g. keyed on params.BeforeID) to
+	// script a different page per call — C7 uses this to serve
+	// before_id-anchored scroll-back pages. snapshotParams records every
+	// call's params, in order, mirroring logsParams below.
+	snapshot       []api.ProxyRequestResponse
+	snapshotErr    error
+	nextBeforeID   string
+	snapshotCall   func(n int, params domain.ProxyRequestParams)
+	snapshotN      int // number of GetProxyRequests calls made
+	snapshotParams []domain.ProxyRequestParams
 
 	// logsResponder backs the C9 logs-sync backfill (GetLogs): it owns the
 	// response for each call, so a test can serve a different payload per
@@ -187,23 +200,33 @@ func (s *stubTUIClient) GetProxyRequest(id string, _ bool) (*api.ProxyRequestDet
 	}, nil
 }
 
-func (s *stubTUIClient) GetProxyRequests(ctx context.Context, _ domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
+func (s *stubTUIClient) GetProxyRequests(ctx context.Context, params domain.ProxyRequestParams) (*api.ProxyRequestsResponse, error) {
 	s.mu.Lock()
 	s.snapshotN++
 	n := s.snapshotN
-	hook, err, records := s.snapshotCall, s.snapshotErr, s.snapshot
+	s.snapshotParams = append(s.snapshotParams, params)
+	hook := s.snapshotCall
 	s.mu.Unlock()
 
 	if hook != nil {
-		hook(n)
+		// Runs outside the lock (a hook may block, e.g. waiting on a channel)
+		// but BEFORE the response fields are read below, so a scripted hook
+		// can mutate snapshot/snapshotErr/nextBeforeID — keyed on n or
+		// params.BeforeID — to shape this call's own response.
+		hook(n, params)
 	}
+
+	s.mu.Lock()
+	err, records, next := s.snapshotErr, s.snapshot, s.nextBeforeID
+	s.mu.Unlock()
+
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &api.ProxyRequestsResponse{Requests: records}, nil
+	return &api.ProxyRequestsResponse{Requests: records, NextBeforeID: next}, nil
 }
 
 // snapshotCalls returns how many times GetProxyRequests has been called.
@@ -211,6 +234,15 @@ func (s *stubTUIClient) snapshotCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.snapshotN
+}
+
+// snapshotCallParams returns the params of every GetProxyRequests call, in
+// order — the observable that proves a scroll-back fetch (C7) sent the
+// BeforeID it meant to.
+func (s *stubTUIClient) snapshotCallParams() []domain.ProxyRequestParams {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.ProxyRequestParams(nil), s.snapshotParams...)
 }
 
 // lastRequestedID returns the most recent GetProxyRequest id, or "".
@@ -223,10 +255,23 @@ func (s *stubTUIClient) lastRequestedID() string {
 	return s.requestedIDs[len(s.requestedIDs)-1]
 }
 
+// attachClientOptions mirrors what runAttach passes RunClient, so model tests
+// render the same help and status text the shipped attach TUI does. ShutdownCh
+// stays nil, as in attach mode.
+func attachClientOptions() ClientOptions {
+	return ClientOptions{
+		Help: HelpConfig{
+			TitleSuffix: "(Client Mode)",
+			QuitMessage: "Quit (daemon continues running)",
+		},
+		ConnectedStatus: "Connected via API",
+	}
+}
+
 // newClientRequestsModel builds a ClientModel in the requests view holding n
 // requests, viewport content sized to viewportHeight (see newRequestsModel).
 func newClientRequestsModel(stub *stubTUIClient, n, viewportHeight int) ClientModel {
-	m := NewClientModel(stub)
+	m := NewClientModel(stub, attachClientOptions())
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = makeTestRequests(n)
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
@@ -240,20 +285,27 @@ func clientUpdate(m ClientModel, msg tea.Msg) ClientModel {
 
 // --- C12: the poll is gone; process state arrives on a stream ---
 
+// unhandledTickMsg stands in for the periodic tick the deleted local-mode
+// poll used to ride (TickMsg no longer exists — 018 C4 deleted local mode
+// entirely). Any message type Update doesn't switch on must be just as inert,
+// so this unexported, locally-defined type keeps that invariant covered.
+type unhandledTickMsg struct{}
+
 // TestClientModel_NeverPollsProcesses is the panel-mandated no-poll proof.
 // Init must return no command at all, and no message the model can receive —
-// including the TickMsg the deleted poll used to ride — may produce a REST
+// including an unhandled periodic-tick-shaped message — may produce a REST
 // process fetch. The compile-level half of the proof is that
 // ClientModel.fetchProcesses and TUIClient.GetProcesses no longer exist;
 // this is the runtime half.
 func TestClientModel_NeverPollsProcesses(t *testing.T) {
 	stub := &stubTUIClient{}
-	m := NewClientModel(stub)
+	m := NewClientModel(stub, attachClientOptions())
 
 	require.Nil(t, m.Init(), "attach mode has no periodic work left")
 
-	// A synthetic tick must be inert (the case was deleted, not repurposed).
-	_, cmd := m.Update(TickMsg(time.Now()))
+	// A synthetic, unhandled message must be inert (the tick case was
+	// deleted, not repurposed).
+	_, cmd := m.Update(unhandledTickMsg{})
 	if cmd != nil {
 		// tea.Batch of nothing can still be non-nil; running it must at least
 		// never produce a fetch.
@@ -269,7 +321,7 @@ func TestClientModel_NeverPollsProcesses(t *testing.T) {
 // visible) in the filter map, while an existing name's filter choice is left
 // alone.
 func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
-	m := NewClientModel(&stubTUIClient{})
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	m.filterProcesses["web"] = false // the user hid this one earlier
 
 	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{
@@ -437,7 +489,7 @@ func TestClientModel_EnterGotoTop(t *testing.T) {
 // (D16's guard tests drive detail state directly rather than through a live
 // requests list).
 func newClientDetailModel(stub *stubTUIClient) ClientModel {
-	m := NewClientModel(stub)
+	m := NewClientModel(stub, attachClientOptions())
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 11})
 	return nm.(ClientModel)
 }
@@ -471,7 +523,7 @@ func TestClientModel_FetchRequestDetail_MapsStale(t *testing.T) {
 	stub := &stubTUIClient{detailResp: &api.ProxyRequestDetailResponse{
 		ProxyRequestResponse: api.ProxyRequestResponse{ID: "req-000", InFlight: true, Stale: true},
 	}}
-	m := NewClientModel(stub)
+	m := NewClientModel(stub, attachClientOptions())
 
 	msg := m.fetchRequestDetail("req-000", 1)()
 	detailMsg, ok := msg.(RequestDetailMsg)
@@ -668,4 +720,115 @@ func TestClientModel_DetailLiveRefresh_EscClearsRefreshFailed(t *testing.T) {
 
 	assert.Equal(t, ViewModeRequests, m.viewMode)
 	assert.False(t, m.detailRefreshFailed)
+}
+
+// --- 018 C1: ClientOptions (help text, status wording, external shutdown) ---
+
+// runCmdWithin runs cmd and returns its message, failing the test if none
+// arrives promptly. Every ShutdownCh assertion below goes through it: a
+// regression that blocks forever (a waiter watching the wrong channel, or one
+// that is never released) must fail the suite fast instead of hanging it.
+func runCmdWithin(t *testing.T, cmd tea.Cmd) tea.Msg {
+	t.Helper()
+	require.NotNil(t, cmd, "expected a command to run")
+
+	msgs := make(chan tea.Msg, 1)
+	go func() { msgs <- cmd() }()
+
+	select {
+	case msg := <-msgs:
+		return msg
+	case <-time.After(2 * time.Second):
+		t.Fatal("command produced no message")
+		return nil
+	}
+}
+
+// TestClientModel_InitWithoutShutdownChReturnsNil pins the attach shape: no
+// external shutdown channel means Init has nothing at all to do, exactly as
+// before ClientOptions existed (and see TestClientModel_NeverPollsProcesses for
+// the no-poll half of the same guarantee).
+func TestClientModel_InitWithoutShutdownChReturnsNil(t *testing.T) {
+	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
+	assert.Nil(t, m.Init(), "a nil ShutdownCh leaves Init with no work")
+}
+
+// TestClientModel_ExternalShutdownQuits pins the program-owned shutdown path
+// end to end: Init returns the waiter, closing the channel releases it as
+// ExternalShutdownMsg, and Update answers that message with tea.Quit. No
+// goroutine outside the program ever touches the program to quit it.
+func TestClientModel_ExternalShutdownQuits(t *testing.T) {
+	shutdownCh := make(chan struct{})
+	opts := attachClientOptions()
+	opts.ShutdownCh = shutdownCh
+	m := NewClientModel(&stubTUIClient{}, opts)
+
+	cmd := m.Init()
+	require.NotNil(t, cmd, "a supervising caller's ShutdownCh must be waited on")
+
+	close(shutdownCh)
+	assert.Equal(t, ExternalShutdownMsg{}, runCmdWithin(t, cmd))
+
+	_, quitCmd := m.Update(ExternalShutdownMsg{})
+	assert.Equal(t, tea.QuitMsg{}, runCmdWithin(t, quitCmd),
+		"an external shutdown leaves through the same quit as q/Ctrl-C")
+}
+
+// TestClientModel_ExternalShutdownAlreadyClosed covers the race the waiter has
+// to survive: the shutdown request can land before the program starts, so a
+// channel already closed at Init time must release the command immediately
+// rather than park it.
+func TestClientModel_ExternalShutdownAlreadyClosed(t *testing.T) {
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+
+	opts := attachClientOptions()
+	opts.ShutdownCh = shutdownCh
+	m := NewClientModel(&stubTUIClient{}, opts)
+
+	assert.Equal(t, ExternalShutdownMsg{}, runCmdWithin(t, m.Init()))
+}
+
+// TestClientModel_ConnectedStatusFromOptions pins that the healthy status-line
+// wording comes from the options rather than being baked into View: `up --tui`
+// is not "Connected via API" to a user, even though it runs the same model.
+func TestClientModel_ConnectedStatusFromOptions(t *testing.T) {
+	opts := attachClientOptions()
+	opts.ConnectedStatus = "Managing 2 processes"
+	m := NewClientModel(&stubTUIClient{}, opts)
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 20})
+	m = nm.(ClientModel)
+
+	view := m.View()
+	assert.Contains(t, view, "Managing 2 processes")
+	assert.NotContains(t, view, "Connected via API", "no wording is hardcoded any more")
+}
+
+// TestClientModel_EmptyConnectedStatusRendersNothing pins the zero value: a
+// caller that wants no healthy-state wording gets none, not a default.
+func TestClientModel_EmptyConnectedStatusRendersNothing(t *testing.T) {
+	m := NewClientModel(&stubTUIClient{}, ClientOptions{})
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 20})
+	m = nm.(ClientModel)
+
+	assert.NotContains(t, m.View(), "Connected via API")
+}
+
+// TestClientModel_HelpConfigFromOptions pins the help overlay's two per-caller
+// strings threading through ClientOptions into BaseModel.
+func TestClientModel_HelpConfigFromOptions(t *testing.T) {
+	opts := ClientOptions{Help: HelpConfig{
+		TitleSuffix: "(Local Mode)",
+		QuitMessage: "Quit (stops all processes)",
+	}}
+	m := NewClientModel(&stubTUIClient{}, opts)
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	m = nm.(ClientModel)
+	m.mode = ModeHelp
+
+	help := m.View()
+	assert.Contains(t, help, "(Local Mode)")
+	assert.Contains(t, help, "Quit (stops all processes)")
+	assert.NotContains(t, help, "(Client Mode)")
+	assert.NotContains(t, help, "daemon continues running")
 }

@@ -74,6 +74,16 @@ type CapturedBody struct {
 	IsBinary        bool   `json:"is_binary"`                  // True if body appears to be binary data
 	Data            []byte `json:"data"`                       // Inline data for small bodies
 	FilePath        string `json:"file_path"`                  // Disk path for large bodies (Data is nil when set)
+
+	// Evicted marks a body whose DATA is gone but whose metadata (and the
+	// record's headers) is retained: the record fell outside the ring's
+	// captured-body detail window (constants.ProxyRequestDetailWindow, D9b), so
+	// Data was dropped and any spilled file unlinked. LoadCapturedBody turns
+	// this into an os.ErrNotExist-wrapped error so it flows through the SAME
+	// path as a disk-budget-evicted file and reports unavailable_reason
+	// "evicted" — callers need no new case. It crosses the daemon→forwarder
+	// wire so a backfilled record arrives already marked.
+	Evicted bool `json:"evicted,omitempty"`
 }
 
 // requestIDCounter disambiguates requests that share a timestamp/method/URL.
@@ -84,7 +94,8 @@ var requestIDCounter atomic.Uint64
 // GenerateRequestID creates a short hash ID (12 chars, git-style) from request
 // data plus a per-process counter, so IDs are unique within a process even for
 // simultaneous identical requests. (Truncating the hash to 48 bits keeps the
-// birthday-collision residual across the 1000-record ring negligible, unlike
+// birthday-collision residual across a DefaultProxyRequestBufferSize-record ring
+// negligible, unlike
 // the 28 bits of a 7-char ID whose ~0.2%-per-full-ring collision odds could
 // overwrite capture files.) Exported so the shared daemon can generate a
 // request ID before proxying (needed for capture file naming).
@@ -195,18 +206,60 @@ type RequestManager struct {
 
 	// onEvict is called when a request is evicted from the buffer
 	onEvict EvictionCallback
+
+	// detailWindow bounds how many of the NEWEST records keep their captured
+	// BODY data (D9b). Retention (capacity) and body retention are deliberately
+	// separate: metadata + headers are cheap enough to keep for the whole ring,
+	// bodies are not. Once a record falls past this many positions from the
+	// newest, evictDetailWindowLocked replaces that slot's record with a
+	// body-stripped copy (headers KEPT) and its spilled files are unlinked
+	// through onEvict. A value <= 0, or one >= capacity, disables the window —
+	// every record keeps its bodies.
+	detailWindow int
 }
 
-// NewRequestManager creates a new request manager with the specified buffer capacity.
+// NewRequestManager creates a new request manager with the specified buffer
+// capacity and the default captured-body detail window
+// (constants.ProxyRequestDetailWindow).
 func NewRequestManager(capacity int) *RequestManager {
+	return newRequestManagerWithDetailWindow(capacity, constants.ProxyRequestDetailWindow)
+}
+
+// NewReplicaRequestManager creates a request manager for a ring that REPLICATES
+// records captured elsewhere (the forwarder-fed project-local ring in shared
+// mode) rather than owning capture itself. The detail window is disabled: the
+// window's job is bounding capture memory where capture happens, and for a
+// replica that bound is already enforced upstream — records past the daemon's
+// window arrive with their bodies stripped (CapturedBody.Evicted), so the
+// replica can never hold more bodied records than the daemon's window allows.
+//
+// Running the window here would be worse than redundant: the forwarder's
+// backfill deliberately races the live SSE loop, and Upsert's monotonic no-op
+// on an already-final record means a record that arrived live BEFORE its
+// backfill slot sinks toward the replica's oldest end — a position skew that is
+// cosmetic until a local window turns it into evicting the body of a request
+// the daemon still serves (cursor review, C5).
+func NewReplicaRequestManager(capacity int) *RequestManager {
+	return newRequestManagerWithDetailWindow(capacity, 0)
+}
+
+// newRequestManagerWithDetailWindow is NewRequestManager with an explicit
+// captured-body detail window, so tests can exercise the window with a handful
+// of records instead of thousands. Deliberately unexported: the window is not a
+// configurable knob (see docs/reference/configuration.md), so production code
+// must not be able to pick an arbitrary window — the only sanctioned variants
+// are the default and the replica's disabled window above. A non-positive
+// detailWindow keeps bodies for every record in the ring.
+func newRequestManagerWithDetailWindow(capacity, detailWindow int) *RequestManager {
 	if capacity <= 0 {
 		capacity = 1
 	}
 	return &RequestManager{
-		buffer:   make([]RequestRecord, capacity),
-		capacity: capacity,
-		subs:     make(map[string]*RequestSubscription),
-		idIndex:  make(map[string]int, capacity),
+		buffer:       make([]RequestRecord, capacity),
+		capacity:     capacity,
+		subs:         make(map[string]*RequestSubscription),
+		idIndex:      make(map[string]int, capacity),
+		detailWindow: detailWindow,
 	}
 }
 
@@ -239,17 +292,27 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 		m.mu.Unlock()
 		return false
 	}
-	evictedID, onEvict := m.appendRecord(record)
+	evictIDs, onEvict := m.appendRecord(record)
 	m.mu.Unlock()
 
-	// Call eviction callback outside of lock
-	if evictedID != "" && onEvict != nil {
-		onEvict(evictedID)
-	}
+	// Call eviction callbacks outside of lock
+	runEvictions(onEvict, evictIDs)
 
 	// Notify subscribers
 	m.notifySubscribers(record)
 	return true
+}
+
+// runEvictions invokes onEvict for each ID. Every ring path that produces
+// cleanup work funnels through it AFTER releasing m.mu — the callback does disk
+// IO.
+func runEvictions(onEvict EvictionCallback, ids []string) {
+	if onEvict == nil {
+		return
+	}
+	for _, id := range ids {
+		onEvict(id)
+	}
 }
 
 // evictIndex drops the index entry for a slot about to be overwritten. It
@@ -271,17 +334,24 @@ func (m *RequestManager) evictIndex(id string, slot int) {
 // appendRecord writes record into the newest ring slot and advances head,
 // evicting the oldest record when the ring is full. It maintains idIndex on
 // both the overwrite (evictIndex) and the insert (#71), so the map stays in
-// lock-step on both append paths. When the evicted record carried Details it
-// returns that record's ID and the eviction callback so the caller can invoke
-// onEvict after releasing m.mu (disk IO must not run under the lock); both are
-// zero otherwise. This is the shared append arm behind Record and Upsert's
-// insert case. Caller holds m.mu.
-func (m *RequestManager) appendRecord(record RequestRecord) (evictedID string, onEvict EvictionCallback) {
+// lock-step on both append paths.
+//
+// It returns the IDs whose on-disk capture files the caller must clean up after
+// releasing m.mu (disk IO must not run under the lock), together with the
+// eviction callback. Two independent things can land in that list per append:
+// the record pushed out of the ring entirely, and — because the append advanced
+// head by one — the record that just fell outside the captured-body detail
+// window (D9b). Both are amortized O(1): the
+// window boundary moves exactly one slot per append, so at most ONE record
+// crosses it and no scan is needed.
+//
+// This is the shared append arm behind Record and Upsert's insert case. Caller
+// holds m.mu.
+func (m *RequestManager) appendRecord(record RequestRecord) (evictIDs []string, onEvict EvictionCallback) {
 	if m.count == m.capacity {
 		evicted := m.buffer[m.head]
 		if evicted.ID != "" && evicted.Details != nil {
-			evictedID = evicted.ID
-			onEvict = m.onEvict
+			evictIDs = append(evictIDs, evicted.ID)
 		}
 		m.evictIndex(evicted.ID, m.head)
 	}
@@ -291,7 +361,115 @@ func (m *RequestManager) appendRecord(record RequestRecord) (evictedID string, o
 	if m.count < m.capacity {
 		m.count++
 	}
-	return evictedID, onEvict
+	if id := m.evictDetailWindowLocked(); id != "" {
+		evictIDs = append(evictIDs, id)
+	}
+	return evictIDs, m.onEvict
+}
+
+// evictDetailWindowLocked strips the captured body data from the single record
+// that just fell outside the newest-detailWindow window, and returns its ID when
+// that record had SPILLED bodies whose files now need unlinking ("" otherwise —
+// an inline-only body needs no disk work). Called once per append, after head
+// has advanced, so the boundary only ever moves by one slot: O(1), never a scan
+// of the ring.
+//
+// Deliberately publishes NO event, unlike Upsert's out-of-window arm: crossing
+// the boundary is not a change to the request, and one event per append would
+// double this ring's notification traffic forever. Clients learn a body is gone
+// when they next fetch it (unavailable_reason "evicted"); a client still holding
+// the pre-eviction copy may show a body the ring no longer serves, which is the
+// accepted cost. Caller holds m.mu.
+func (m *RequestManager) evictDetailWindowLocked() string {
+	if m.detailWindow <= 0 || m.count <= m.detailWindow {
+		return ""
+	}
+	// The record at newest→oldest offset detailWindow is the one that just
+	// crossed the boundary. detailWindow < count <= capacity here, so the
+	// single +capacity is enough to keep the dividend non-negative.
+	slot := (m.head - 1 - m.detailWindow + m.capacity) % m.capacity
+	rec := m.buffer[slot]
+	if rec.ID == "" || rec.Details == nil {
+		return ""
+	}
+	stripped, spilled := evictBodies(rec)
+	if stripped.Details == rec.Details {
+		// Nothing here held body data — a bodyless GET, or a record that arrived
+		// already Evicted over the daemon→forwarder wire. evictBodies allocated
+		// nothing, so leave the slot untouched rather than rewriting it.
+		return ""
+	}
+	m.buffer[slot] = stripped
+	if !spilled {
+		return ""
+	}
+	return rec.ID
+}
+
+// outsideDetailWindowLocked reports whether the record in slot has already
+// fallen past the captured-body detail window, i.e. whether storing body data
+// there would violate the window invariant. Caller holds m.mu.
+func (m *RequestManager) outsideDetailWindowLocked(slot int) bool {
+	if m.detailWindow <= 0 {
+		return false
+	}
+	pos := (m.head - 1 - slot + m.capacity) % m.capacity
+	return pos >= m.detailWindow
+}
+
+// evictBodies returns a copy of record whose captured body DATA is gone: inline
+// bytes dropped, any spilled FilePath cleared, and each affected body marked
+// Evicted so a later load reports unavailable_reason "evicted" instead of
+// masquerading as an empty body. Captured HEADERS are kept — that is the whole
+// point of the detail window: the record stays inspectable, only its payload
+// goes. A body that never held data (a bodyless GET) is left untouched rather
+// than mislabeled as evicted.
+//
+// Fresh *RequestDetails and *CapturedBody values are allocated rather than
+// mutated in place: subscribers, Recent, and GetByID all hand out record COPIES
+// that share those pointers, so mutating them would race a reader serializing
+// the record outside m.mu. Swapping the pointer under m.mu is safe — every
+// reader takes the copy under the lock.
+//
+// spilled reports whether any evicted body had spilled to disk, i.e. whether the
+// caller must invoke the eviction callback to unlink files.
+//
+// When there was nothing to evict, stripped.Details is the ORIGINAL pointer —
+// callers can use that identity to skip rewriting a ring slot.
+func evictBodies(record RequestRecord) (stripped RequestRecord, spilled bool) {
+	if record.Details == nil {
+		return record, false
+	}
+	reqBody, reqSpilled := evictedBody(record.Details.RequestBody)
+	resBody, resSpilled := evictedBody(record.Details.ResponseBody)
+	if reqBody == record.Details.RequestBody && resBody == record.Details.ResponseBody {
+		return record, false
+	}
+	// Copy-then-override, not a field-by-field rebuild: a field added to
+	// RequestDetails later must survive eviction by construction.
+	details := *record.Details
+	details.RequestBody = reqBody
+	details.ResponseBody = resBody
+	record.Details = &details
+	return record, reqSpilled || resSpilled
+}
+
+// evictedBody returns body with its data removed and Evicted set, allocating a
+// copy so the original (shared with readers) is never mutated. A nil body, an
+// already-evicted one, and one that holds no data at all are returned as-is.
+// spilled reports whether the body had a disk file that now needs unlinking.
+func evictedBody(body *CapturedBody) (evicted *CapturedBody, spilled bool) {
+	if body == nil || body.Evicted {
+		return body, false
+	}
+	if len(body.Data) == 0 && body.FilePath == "" {
+		return body, false
+	}
+	copied := *body
+	copied.Data = nil
+	copied.FilePath = ""
+	copied.Evicted = true
+	return &copied, body.FilePath != ""
 }
 
 // Upsert applies a record as a monotonic two-state transition keyed by ID:
@@ -304,8 +482,12 @@ func (m *RequestManager) appendRecord(record RequestRecord) (evictedID string, o
 // The no-op rows make concurrent interleavings safe: replaying a snapshot
 // while live stream events apply converges to the final record in any order,
 // with no duplicate or regressed notifications. Replace-in-place keeps the
-// ring slot (no head/count change, no eviction) — safe because in-flight
-// records carry no Details, so the transition only ever adds capture state.
+// ring slot (no head/count change, no ring eviction) — safe because in-flight
+// records carry no Details, so the transition only ever adds capture state. The
+// one exception is the captured-body detail window (D9b): a completion landing
+// in a slot that has already aged out of the window has its bodies stripped
+// before it is stored, so a slow request cannot reintroduce body data outside
+// the window (see the case below).
 //
 // Unlike Record, subscribers are notified INSIDE the ring critical section:
 // same-ID notifications can never be observed out of transition order.
@@ -326,7 +508,7 @@ func (m *RequestManager) Upsert(record RequestRecord) bool {
 		record.ID = GenerateRequestID(record.Timestamp, record.Method, record.URL)
 	}
 
-	var evictedID string
+	var evictIDs []string
 	var onEvict EvictionCallback
 
 	m.mu.Lock()
@@ -347,16 +529,29 @@ func (m *RequestManager) Upsert(record RequestRecord) bool {
 	case exists:
 		// In-flight → final: replace in place, ring position (and its index
 		// entry, same ID/slot) preserved.
+		//
+		// A long-running in-flight record can outlive its own slot's stay in the
+		// captured-body detail window: by the time the completion arrives, that
+		// slot may already sit outside the newest-detailWindow window (D9b). The
+		// completion carries the bodies, so storing it verbatim would resurrect
+		// body data in an out-of-window slot and break the invariant. Strip the
+		// bodies BEFORE storing, and notify subscribers with the stripped record
+		// so the wire never advertises data this ring refuses to serve.
+		if m.outsideDetailWindowLocked(idx) {
+			var spilled bool
+			record, spilled = evictBodies(record)
+			if spilled {
+				evictIDs, onEvict = []string{record.ID}, m.onEvict
+			}
+		}
 		m.buffer[idx] = record
 	default:
-		evictedID, onEvict = m.appendRecord(record)
+		evictIDs, onEvict = m.appendRecord(record)
 	}
 	m.notifySubscribers(record)
 	m.mu.Unlock()
 
-	if evictedID != "" && onEvict != nil {
-		onEvict(evictedID)
-	}
+	runEvictions(onEvict, evictIDs)
 	return true
 }
 
@@ -642,6 +837,11 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 // buffer to preserve the contiguous ring invariant. Scoping by project (not
 // hostname) ensures two projects sharing a hostname on different ports don't
 // purge each other's records.
+//
+// The compaction needs no detail-window work (D9b): it preserves arrival order
+// and only removes records, so a surviving record's newest→oldest offset can
+// only shrink. Records can move INTO the window (they stay stripped — evicted
+// bodies are gone for good) but never out of it, so no new violation is created.
 func (m *RequestManager) PurgeByProject(projectDir string) {
 	if projectDir == "" {
 		return
@@ -687,9 +887,5 @@ func (m *RequestManager) PurgeByProject(projectDir string) {
 	m.mu.Unlock()
 
 	// Call eviction callbacks outside of lock
-	if onEvict != nil {
-		for _, id := range evictIDs {
-			onEvict(id)
-		}
-	}
+	runEvictions(onEvict, evictIDs)
 }

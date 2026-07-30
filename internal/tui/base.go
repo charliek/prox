@@ -5,11 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -22,11 +19,38 @@ import (
 	"github.com/charliek/prox/internal/stream"
 )
 
+// Mode represents the current TUI mode
+type Mode int
+
+const (
+	ModeNormal Mode = iota
+	ModeFilter
+	ModeSearch
+	ModeStringFilter
+	ModeHelp
+)
+
+// ViewMode represents which content is being displayed
+type ViewMode int
+
+const (
+	ViewModeLogs ViewMode = iota
+	ViewModeRequests
+	ViewModeRequestDetail
+)
+
 // maxLogEntries is the maximum number of log entries to keep in memory
 const maxLogEntries = 1000
 
-// maxProxyRequests is the maximum number of proxy requests to keep in memory
-const maxProxyRequests = 1000
+// maxRequestHistory is the maximum number of proxy requests the TUI keeps in
+// memory. DEFINED as the server's retention (constants.MaxProxyRequests), not
+// as the sync fetch size: scroll-back (D11) pages the ring in
+// TUIRequestsSyncLimit-sized steps, so a user who keeps paging can legitimately
+// end up holding the WHOLE server ring — a display cap tied to one page's size
+// would throw away history the moment the second page landed. Cap ==
+// retention means paging can never be starved by the display ring, and the
+// trim (keeping newest) only ever discards what the server has itself evicted.
+const maxRequestHistory = constants.MaxProxyRequests
 
 // maxErrorDisplayLen is the maximum length of error messages in the status bar
 const maxErrorDisplayLen = 60
@@ -45,13 +69,6 @@ type BaseModel struct {
 	processes     []domain.ProcessInfo
 	logEntries    []domain.LogEntry
 	proxyRequests []proxy.RequestRecord
-
-	// staleRequests holds the IDs of in-flight rows a requests-stream sync
-	// swept as prior-epoch: the server we synchronized against does not know
-	// them, so their completion can never arrive (see sweepPriorEpochInFlight).
-	// Rebuilt from the live list on every sync, and consulted only through
-	// requestIsStale.
-	staleRequests map[string]bool
 
 	// UI components
 	viewport  viewport.Model
@@ -126,6 +143,21 @@ type BaseModel struct {
 	// on leaving the detail view (esc).
 	detailRefreshFailed bool
 
+	// Requests scroll-back pagination (D11). The state machine lives in
+	// requests_paging.go; the fields live here because handleRequestsSync — a
+	// BaseModel method — installs them on every completed sync.
+	//
+	// pagingCursor is the before_id for the next older page; it is meaningful
+	// only while pagingPhase is pagingReady or pagingLoading. pagingGen is
+	// bumped by every completed sync, which is what makes an in-flight page
+	// result from a superseded generation droppable. pagingErr holds the last
+	// transient page failure for the status segment and is cleared by the next
+	// trigger or sync.
+	pagingCursor string
+	pagingPhase  pagingPhase
+	pagingGen    int
+	pagingErr    error
+
 	// Per-stream health. streamHealth holds the last status reported for each
 	// stream; a stream with no entry has reported nothing and renders nothing.
 	// streamDropped latches a stream that has been seen reconnecting, so the
@@ -154,7 +186,6 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		processes:       make([]domain.ProcessInfo, 0),
 		logEntries:      make([]domain.LogEntry, 0),
 		proxyRequests:   make([]proxy.RequestRecord, 0),
-		staleRequests:   make(map[string]bool),
 		textInput:       ti,
 		mode:            ModeNormal,
 		viewMode:        ViewModeLogs,
@@ -297,31 +328,82 @@ func (b *BaseModel) handleProxyRequest(req proxy.RequestRecord) {
 // never regress a completion that already arrived live, and a duplicate final
 // can never re-render one. In-place replacement keeps every other row's index
 // stable, and the ID-anchored cursor (resolveRequestCursor) rides along on its
-// row regardless. The scan runs newest-first, since that's where a live
-// in-flight row lives.
+// row regardless.
 //
 // Records with no ID (never produced by either proxy path) always append: they
 // have no identity to merge on.
 func (b *BaseModel) mergeProxyRequest(req proxy.RequestRecord) {
-	if req.ID != "" {
-		for i := len(b.proxyRequests) - 1; i >= 0; i-- {
-			if b.proxyRequests[i].ID != req.ID {
-				continue
-			}
-			if b.proxyRequests[i].InFlight {
-				b.proxyRequests[i] = req
-			} // else: final is terminal
-			return
-		}
+	if b.upsertExistingRequest(req) {
+		return
 	}
 
 	b.proxyRequests = append(b.proxyRequests, req)
-	// Keep only last requests - create new slice to release memory from old requests
-	if len(b.proxyRequests) > maxProxyRequests {
-		newRequests := make([]proxy.RequestRecord, maxProxyRequests)
-		copy(newRequests, b.proxyRequests[len(b.proxyRequests)-maxProxyRequests:])
-		b.proxyRequests = newRequests
+	b.trimRequestHistory()
+}
+
+// upsertExistingRequest applies the monotonic rule to an ALREADY-PRESENT row and
+// reports whether it found one. Split out of mergeProxyRequest so the
+// scroll-back page apply (prependOlderRequests) resolves overlaps by exactly the
+// same rule while placing its NOVEL records at the front rather than the end.
+// The scan runs newest-first, since that's where a live in-flight row lives.
+func (b *BaseModel) upsertExistingRequest(req proxy.RequestRecord) bool {
+	if req.ID == "" {
+		return false // no identity to merge on
 	}
+	for i := len(b.proxyRequests) - 1; i >= 0; i-- {
+		if b.proxyRequests[i].ID != req.ID {
+			continue
+		}
+		b.applyMonotonicAt(i, req)
+		return true
+	}
+	return false
+}
+
+// applyMonotonicAt is the two-state transition itself, at a known index.
+func (b *BaseModel) applyMonotonicAt(i int, req proxy.RequestRecord) {
+	b.proxyRequests[i] = monotonicWinner(b.proxyRequests[i], req)
+}
+
+// monotonicWinner is the rule two copies of the same request resolve by: an
+// in-flight incumbent yields to the incoming copy, a final one is terminal. Free
+// function so it also serves records not yet in the list (a scroll-back page's
+// own block — see spliceOlderRequests).
+func monotonicWinner(existing, incoming proxy.RequestRecord) proxy.RequestRecord {
+	if existing.InFlight {
+		return incoming
+	}
+	return existing
+}
+
+// trimRequestHistory enforces the display cap, KEEPING THE NEWEST records — the
+// eviction semantics of every growth path (live arrival, sync batch,
+// scroll-back page).
+func (b *BaseModel) trimRequestHistory() {
+	b.keepNewestRequests(maxRequestHistory)
+}
+
+// keepNewestRequests is the list's single front-eviction primitive: it shrinks
+// proxyRequests to its newest n records. Both callers that drop from the front
+// go through it (the cap trim above and D12's drop-on-resync).
+//
+// The retained records slide down inside the EXISTING array and the vacated
+// tail is cleared, which releases the dropped records (their URL strings and
+// detail pointers) without releasing the array itself. Keeping the array is
+// what makes eviction at the cap cheap: proxyRequests holds up to
+// maxRequestHistory == constants.MaxProxyRequests records, so reallocating the
+// whole list on every arrival past the cap — and again on the append that
+// follows, since a right-sized copy leaves no spare capacity — would turn a
+// steady request stream into megabytes of garbage per request, and a sync batch
+// into a quadratic one.
+func (b *BaseModel) keepNewestRequests(n int) {
+	dropped := len(b.proxyRequests) - n
+	if dropped <= 0 {
+		return
+	}
+	copy(b.proxyRequests, b.proxyRequests[dropped:])
+	clear(b.proxyRequests[n:])
+	b.proxyRequests = b.proxyRequests[:n]
 }
 
 // renderAfterProxyRequests is the shared render tail for request arrivals —
@@ -359,67 +441,65 @@ func (b *BaseModel) renderAfterProxyRequests() {
 	}
 }
 
-// handleRequestsSync applies one completed stream synchronization (C6): the
-// REST snapshot oldest-first, then the events buffered during the fetch in
-// arrival order, all through the monotonic merge — so any interleaving of
-// {snapshot copy, live copy, completion} converges on the final record with no
-// duplicate rows and no regressions.
+// handleRequestsSync applies one completed stream synchronization (C6) by
+// REBUILDING the list from the sync payload: the REST snapshot oldest-first,
+// then the events buffered during the fetch in arrival order, through the
+// monotonic merge — so any interleaving of {snapshot copy, live copy,
+// completion} converges on the final record with no duplicate rows and no
+// regressions. Nothing from before the sync survives it.
+//
+// Rebuild — not merge-into-the-old-list-and-cut — is D12's drop-on-resync.
+// Requests carry no sequence numbers (unlike logs), so a client cannot prove
+// contiguity across a reconnect gap; the only list whose ordering is
+// KNOWN-correct is the sync payload itself, which the server produced in one
+// coherent pass. Cutting the merged list at the snapshot's oldest record was
+// tried first and is unsound three ways (cursor review, C7): an empty
+// snapshot wiped the buffered live events merged just before it; a
+// snapshot-oldest that was NOVEL to the list appended at the back, so the cut
+// deleted every older-but-retained row in front of it; and a cap trim could
+// evict the anchor entirely, turning the cut into a silent no-op that left a
+// hole for the next page to prepend across.
+//
+// The rebuild also subsumes the prior-epoch stale sweep this used to run: a
+// pre-sync row the server no longer has is now DROPPED rather than kept and
+// marked stale — the server we just synchronized against has no record of it,
+// so showing it at all would be showing a dead epoch. requestIsStale keeps
+// only the age-based rule (D8, #53).
+//
+// The cost is deliberate: a reconnect discards paged-in history and the user
+// re-pages it (the server retains constants.MaxProxyRequests; reconnects are
+// rare). An EMPTY snapshot plus no buffered events yields an empty list — a
+// fresh or replaced daemon, and a cleared view is the truth.
 //
 // Everything renders ONCE at the end: a full 1000-record ring replay must not
-// re-render a thousand times. Cursor and follow semantics are unchanged because
-// they live in that single updateViewport — the cursor is ID-anchored, so a
-// user parked on a row keeps it, and follow mode re-pins to the newest row.
+// re-render a thousand times. The cursor is ID-anchored, so a user parked on a
+// row keeps it when the row survives the rebuild and falls back by index when
+// it does not (resolveRequestCursor); follow mode re-pins to the newest row.
+// The pagination install is unconditional and last (D11): the cursor and
+// generation must describe THIS payload's window.
 func (b *BaseModel) handleRequestsSync(msg RequestsSyncMsg) {
-	seen := make(map[string]struct{}, len(msg.Snapshot)+len(msg.Buffered))
+	b.proxyRequests = nil
 	for _, req := range msg.Snapshot {
-		seen[req.ID] = struct{}{}
 		b.mergeProxyRequest(req)
 	}
 	for _, req := range msg.Buffered {
-		seen[req.ID] = struct{}{}
 		b.mergeProxyRequest(req)
 	}
 
-	b.sweepPriorEpochInFlight(seen)
+	b.installRequestsPaging(msg.NextBeforeID)
 	b.renderAfterProxyRequests()
 }
 
-// sweepPriorEpochInFlight marks every still-in-flight row the sync did not
-// account for as stale. Such a row belongs to a dead epoch: the server we just
-// synchronized against has no record of it, so no completion event for it can
-// ever arrive and it would otherwise sit spinning "...ms" forever. seen holds
-// the IDs the sync batch carried (snapshot plus buffered live events), so a
-// request that legitimately started during the fetch is never swept.
-//
-// The mark is TUI-local: staleness on a proxy.RequestRecord is derived from its
-// age (StaleAt), and back-dating a record's Timestamp to force that would
-// corrupt the time column. The map is rebuilt from the live list on every sweep,
-// so it cannot grow past the list.
-func (b *BaseModel) sweepPriorEpochInFlight(seen map[string]struct{}) {
-	stale := make(map[string]bool)
-	for _, req := range b.proxyRequests {
-		if !req.InFlight || req.ID == "" {
-			continue
-		}
-		if _, ok := seen[req.ID]; ok {
-			continue
-		}
-		stale[req.ID] = true
-	}
-	b.staleRequests = stale
-}
-
-// requestIsStale reports whether a row renders as stale (D8, #53): either it
-// has been in-flight past constants.InFlightStaleAfter, or a sync batch swept
-// it as prior-epoch. Final records are never stale under either rule, which is
-// also why a swept row that later completes needs no explicit unmarking: the
-// in-flight gate below short-circuits before the map is consulted, and the next
-// sweep rebuilds the map from scratch anyway.
+// requestIsStale reports whether a row renders as stale (D8, #53): it has been
+// in-flight past constants.InFlightStaleAfter. Final records are never stale.
+// (Prior-epoch in-flight rows — ones the server lost across a reconnect — are
+// dropped by handleRequestsSync's rebuild rather than marked; the age rule is
+// the one staleness signal left.)
 func (b *BaseModel) requestIsStale(req proxy.RequestRecord) bool {
 	if !req.InFlight {
 		return false
 	}
-	return req.StaleAt(time.Now()) || b.staleRequests[req.ID]
+	return req.StaleAt(time.Now())
 }
 
 // handleFilterKey handles keys in filter mode
@@ -1030,6 +1110,10 @@ func (b *BaseModel) logSearchMatchInfo(entries []domain.LogEntry) (position, tot
 	return position, total
 }
 
+// nearBottomThreshold is the scroll percentage (0.0-1.0) at which we consider
+// the viewport to be "near" the bottom for auto-follow purposes.
+const nearBottomThreshold = 0.98
+
 // isNearBottom checks if the viewport is at or near the bottom
 func (b *BaseModel) isNearBottom() bool {
 	if b.viewport.AtBottom() {
@@ -1388,16 +1472,13 @@ const hexPreviewMaxBytes = 256
 const hexPreviewBytesPerLine = 16
 
 // renderBinaryPreview turns a binary body's Data into hexdump-style preview
-// lines, dimming the trailing "more bytes" line. Data reaches the TUI two
-// ways: the API always base64-encodes binary bytes for the wire
-// (attach mode, client.go fetchRequestDetail -> clientBodyToBodyData), while
-// local mode (convertCapturedBodyToBodyData) stores the raw decoded bytes
-// directly in the string. A base64 decode is tried first; a decode failure
-// (the common case for raw local-mode bytes, which are essentially never
-// valid base64) falls back to treating Data as the raw bytes themselves, so
-// both paths are previewed correctly. Empty raw bytes (nothing to preview,
-// e.g. a body flagged binary but not actually loaded) fall back to the
-// original placeholder rather than an empty hexdump.
+// lines, dimming the trailing "more bytes" line. The API always base64-encodes
+// binary bytes for the wire (client.go fetchRequestDetail -> clientBodyToBodyData),
+// so DataBase64 is normally true here; dataBase64 false (raw, not base64-encoded
+// bytes) is also supported — a decode failure falls back to treating Data as
+// the raw bytes themselves, so both are previewed correctly. Empty raw bytes
+// (nothing to preview, e.g. a body flagged binary but not actually loaded)
+// fall back to the original placeholder rather than an empty hexdump.
 func renderBinaryPreview(data string, dataBase64 bool) []string {
 	raw := []byte(data)
 	if dataBase64 {
@@ -1526,9 +1607,13 @@ func (b *BaseModel) filteredEntries() []domain.LogEntry {
 	return result
 }
 
-// filteredProxyRequests returns proxy requests after applying filters
+// filteredProxyRequests returns proxy requests after applying filters. Sized up
+// front for the no-match-dropped case: this runs two or three times per
+// keypress (cursor move, viewport rebuild, status bar) over a list that now
+// reaches constants.MaxProxyRequests, and regrowing from nil each time is the
+// bulk of that cost.
 func (b *BaseModel) filteredProxyRequests() []proxy.RequestRecord {
-	var result []proxy.RequestRecord
+	result := make([]proxy.RequestRecord, 0, len(b.proxyRequests))
 
 	for _, req := range b.proxyRequests {
 		// String filter (on URL, method, and subdomain)
@@ -1614,6 +1699,17 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	)
 }
 
+// getProcessStyle returns the style for a process name
+func getProcessStyle(name string, processes []domain.ProcessInfo) lipgloss.Style {
+	// Find process index for color
+	for i, p := range processes {
+		if p.Name == name {
+			return processColors[i%len(processColors)]
+		}
+	}
+	return defaultProcessStyle
+}
+
 // formatLogEntry formats a single log entry for display
 func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 	// Get process color
@@ -1678,6 +1774,65 @@ func isASCIINoESC(s string) bool {
 	return true
 }
 
+// processStyle returns style based on process state
+func processStyle(state domain.ProcessState) lipgloss.Style {
+	switch state {
+	case domain.ProcessStateRunning:
+		return runningStyle
+	case domain.ProcessStateStopped:
+		return stoppedStyle
+	case domain.ProcessStateCrashed:
+		return crashedStyle
+	case domain.ProcessStateStarting:
+		return startingStyle
+	case domain.ProcessStateStopping:
+		return stoppingStyle
+	case domain.ProcessStateWaiting:
+		return waitingStyle
+	case domain.ProcessStateBlocked:
+		return blockedStyle
+	case domain.ProcessStateCompleted:
+		return completedStyle
+	default:
+		return defaultProcessStyle
+	}
+}
+
+// gatedDetail returns the inline gated-launch annotation for a process (plan 013
+// D5): " (waiting on: X, Y)" while waiting, " (blocked on: X)" while blocked, and
+// "" in every other state. Targets are shown in declaration order.
+func gatedDetail(p domain.ProcessInfo) string {
+	switch p.State {
+	case domain.ProcessStateWaiting:
+		if len(p.WaitingOn) > 0 {
+			return " (waiting on: " + strings.Join(p.WaitingOn, ", ") + ")"
+		}
+	case domain.ProcessStateBlocked:
+		if len(p.BlockedOn) > 0 {
+			return " (blocked on: " + strings.Join(p.BlockedOn, ", ") + ")"
+		}
+	}
+	return ""
+}
+
+// healthDot returns the process panel's health indicator (plan 018 D13): a
+// green " ●" for domain.HealthStatusHealthy, a red " ✗" for
+// domain.HealthStatusUnhealthy, and "" for domain.HealthStatusUnknown or any
+// other/empty value — so a process with no healthcheck configured renders
+// nothing extra. The two states use distinct GLYPHS, not just colors: on a
+// NO_COLOR/monochrome terminal, or to a red-green color-blind reader, two
+// same-shaped dots are indistinguishable (CodeRabbit, PR #88).
+func healthDot(status domain.HealthStatus) string {
+	switch status {
+	case domain.HealthStatusHealthy:
+		return healthyDotStyle.Render(" ●")
+	case domain.HealthStatusUnhealthy:
+		return unhealthyDotStyle.Render(" ✗")
+	default:
+		return ""
+	}
+}
+
 // processPanel renders the process status header
 func (b *BaseModel) processPanel() string {
 	var items []string
@@ -1698,12 +1853,18 @@ func (b *BaseModel) processPanel() string {
 		// detail area.
 		name += gatedDetail(proc)
 
+		// Health dot (plan 018 D13): appended as a separately styled segment
+		// after the name so the name's state style cannot swallow or recolor
+		// it. Empty for unknown/unset health, so processes without a
+		// healthcheck render byte-identical to before this feature.
+		dot := healthDot(proc.Health)
+
 		// Show number key (only in logs view where 1-9 keys work)
 		if b.viewMode == ViewModeLogs {
 			key := fmt.Sprintf("%d:", i+1)
-			items = append(items, style.Render(key+name))
+			items = append(items, style.Render(key+name)+dot)
 		} else {
-			items = append(items, style.Render(name))
+			items = append(items, style.Render(name)+dot)
 		}
 	}
 
@@ -1801,10 +1962,11 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		left = b.statusLeftDefault(extraInfo, requests, entries)
 	}
 
-	// Per-stream health rides on the end of the left side in every mode: a
-	// degraded stream is worth showing even while a filter prompt is open, and
-	// it is orthogonal to the overall-connection text attach mode owns.
-	if segs := b.streamHealthSegments(); len(segs) > 0 {
+	// Per-stream health and scroll-back state ride on the end of the left side in
+	// every mode: a degraded stream (or a page still loading) is worth showing
+	// even while a filter prompt is open, and both are orthogonal to the
+	// overall-connection text attach mode owns.
+	if segs := append(b.streamHealthSegments(), b.requestsPagingSegments()...); len(segs) > 0 {
 		left += " | " + strings.Join(segs, " | ")
 	}
 
@@ -1933,7 +2095,7 @@ func (b *BaseModel) requestsHelpView() string {
 Views:
   Tab        Switch to Logs view
 
-Navigation (moves the cursor row):
+Navigation (moves the cursor row; reaching the oldest row loads older requests):
   j/↓        Move cursor down (onto newest row resumes auto-follow)
   k/↑        Move cursor up (pauses auto-follow)
   g/Home     Move cursor to top (pauses auto-follow)
@@ -1978,93 +2140,4 @@ func truncateError(err error, maxLen int) string {
 		return msg[:maxLen-3] + "..."
 	}
 	return msg
-}
-
-// convertRequestRecordToDetail converts a proxy.RequestRecord to RequestDetailData.
-// This is shared between Model (local mode) and ClientModel (API mode).
-// Bodies are loaded and content-decoded via the proxy loader so FilePath-backed
-// (disk-spilled) bodies are read rather than dropped.
-func convertRequestRecordToDetail(req proxy.RequestRecord) *RequestDetailData {
-	return convertRequestRecordToDetailWithDirs(req, captureAllowedDirs())
-}
-
-// convertRequestRecordToDetailWithDirs is convertRequestRecordToDetail with an
-// explicit FilePath allowlist, separated so tests can supply a temp directory.
-func convertRequestRecordToDetailWithDirs(req proxy.RequestRecord, allowedDirs []string) *RequestDetailData {
-	detail := &RequestDetailData{
-		ID:         req.ID,
-		Timestamp:  req.Timestamp.Format("2006-01-02 15:04:05.000"),
-		Method:     req.Method,
-		URL:        req.URL,
-		Subdomain:  req.Subdomain,
-		StatusCode: req.StatusCode,
-		DurationMs: req.Duration.Milliseconds(),
-		RemoteAddr: req.RemoteAddr,
-		InFlight:   req.InFlight,
-		Stale:      req.StaleAt(time.Now()),
-	}
-
-	if req.Details != nil {
-		detail.RequestHeaders = req.Details.RequestHeaders
-		detail.ResponseHeaders = req.Details.ResponseHeaders
-
-		if req.Details.RequestBody != nil {
-			detail.RequestBody = convertCapturedBodyToBodyData(req.Details.RequestBody, allowedDirs)
-		}
-		if req.Details.ResponseBody != nil {
-			detail.ResponseBody = convertCapturedBodyToBodyData(req.Details.ResponseBody, allowedDirs)
-		}
-	}
-
-	return detail
-}
-
-// convertCapturedBodyToBodyData loads/decodes a captured body for TUI display.
-// An unavailable (evicted) body is marked so the renderer can note it rather
-// than showing garbage; binary and decoded-text semantics follow the loader.
-func convertCapturedBodyToBodyData(body *proxy.CapturedBody, allowedDirs []string) *BodyData {
-	bd := &BodyData{
-		Size:            body.Size,
-		Truncated:       body.Truncated,
-		ContentType:     body.ContentType,
-		ContentEncoding: body.ContentEncoding,
-		IsBinary:        body.IsBinary,
-	}
-
-	decoded, err := proxy.LoadDecodedBody(body, allowedDirs)
-	if err != nil || !decoded.Available {
-		bd.Unavailable = true
-		if decoded.UnavailableReason != "" {
-			bd.UnavailableReason = decoded.UnavailableReason
-		} else {
-			bd.UnavailableReason = "evicted"
-		}
-		return bd
-	}
-
-	bd.IsBinary = decoded.IsBinary
-	// Defense in depth (mirrors the API serve path): never treat bytes that are
-	// not valid UTF-8 as text, even if the loaded record claims they are — a
-	// socket-supplied flag or a mutated disk file must not reach the terminal
-	// as raw control bytes. Either way the raw bytes are kept in bd.Data
-	// (unlike the attach path, local mode never base64-encodes them) so a
-	// binary body still has bytes for the hexdump preview (D11, #50.2).
-	if !decoded.IsBinary && utf8.Valid(decoded.Data) {
-		bd.Data = string(decoded.Data)
-	} else {
-		bd.IsBinary = true
-		bd.Data = string(decoded.Data)
-	}
-	return bd
-}
-
-// captureAllowedDirs returns the directories a captured body's FilePath may
-// resolve within for the in-TUI loader: the local project capture dir
-// (cwd/.prox/capture) and the shared daemon capture dir under the user's home.
-func captureAllowedDirs() []string {
-	var primary string
-	if cwd, err := os.Getwd(); err == nil {
-		primary = filepath.Join(cwd, constants.CaptureDirectory)
-	}
-	return proxy.CaptureAllowedDirs(primary)
 }

@@ -60,9 +60,5 @@ func (lp *LogPrinter) getColor(process string) string {
 
 // isTerminal returns true if stdout is connected to a terminal.
 func (lp *LogPrinter) isTerminal() bool {
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
+	return isTTY(os.Stdout)
 }

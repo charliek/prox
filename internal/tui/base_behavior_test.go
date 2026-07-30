@@ -13,17 +13,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charliek/prox/internal/domain"
-	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
-	"github.com/charliek/prox/internal/supervisor"
 )
 
-// newTestModel creates a Model with default test dependencies.
-// This reduces boilerplate in tests that need a basic model.
-func newTestModel() Model {
-	logMgr := logs.NewManager(logs.DefaultManagerConfig())
-	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	return NewModel(sup, logMgr)
+// newTestModel creates a ClientModel with default test dependencies (a fresh
+// stubTUIClient and attach-mode options). This reduces boilerplate in tests
+// that need a basic model. Ported from local-mode Model onto ClientModel in
+// plan 018 C3 — local mode (Model) is deleted in C4, and Init's no-poll
+// behavior this used to guard is now pinned directly by
+// TestClientModel_NeverPollsProcesses in client_model_test.go.
+func newTestModel() ClientModel {
+	return NewClientModel(&stubTUIClient{}, attachClientOptions())
 }
 
 func TestNewModel(t *testing.T) {
@@ -34,36 +34,7 @@ func TestNewModel(t *testing.T) {
 	assert.Empty(t, model.logEntries)
 }
 
-// TestModel_Init_DoesNotSubscribeToLogs proves the panel finding fixed by
-// plan 017 C13: local mode used to open a SECOND, leaked log subscription
-// from Model.Init (via the now-deleted subscribeToLogs/subIDMsg), on top of
-// the real one app.go's Run makes before starting the forwarder. It executes
-// every command Init returns — exactly as the bubbletea runtime would — and
-// asserts the log manager's subscriber count never moves, using
-// logs.Manager.Stats().Subscribers as the smallest available accessor.
-func TestModel_Init_DoesNotSubscribeToLogs(t *testing.T) {
-	logMgr := logs.NewManager(logs.DefaultManagerConfig())
-	sup := supervisor.New(nil, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	model := NewModel(sup, logMgr)
-
-	before := logMgr.Stats().Subscribers
-
-	cmd := model.Init()
-	require.NotNil(t, cmd)
-	msg := cmd()
-	batch, ok := msg.(tea.BatchMsg)
-	require.True(t, ok, "expected Init to return a tea.Batch, got %T", msg)
-	for _, sub := range batch {
-		if sub != nil {
-			sub() // runs refreshProcesses and tickCmd; neither subscribes
-		}
-	}
-
-	after := logMgr.Stats().Subscribers
-	assert.Equal(t, before, after, "Model.Init must not open its own log subscription — the real one belongs to app.go Run")
-}
-
-func TestModel_HandleKey_Quit(t *testing.T) {
+func TestTUI_HandleKey_Quit(t *testing.T) {
 	model := newTestModel()
 
 	// Test quit with 'q'
@@ -72,46 +43,46 @@ func TestModel_HandleKey_Quit(t *testing.T) {
 	_ = newModel
 }
 
-func TestModel_HandleKey_ModeSwitch(t *testing.T) {
+func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 	model := newTestModel()
 
 	// Test switching to help mode
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 	assert.Equal(t, ModeHelp, m.mode)
 
 	// Test switching to filter mode
 	model = newTestModel()
 	newModel, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 	assert.Equal(t, ModeFilter, m.mode)
 
 	// Test switching to search mode
 	model = newTestModel()
 	newModel, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 	assert.Equal(t, ModeSearch, m.mode)
 
 	// Test switching to string filter mode
 	model = newTestModel()
 	newModel, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 	assert.Equal(t, ModeStringFilter, m.mode)
 }
 
-func TestModel_HandleKey_EscClearsFilters(t *testing.T) {
+func TestTUI_HandleKey_EscClearsFilters(t *testing.T) {
 	model := newTestModel()
 	model.soloProcess = "test"
 	model.searchPattern = "pattern"
 
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyEscape})
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 
 	assert.Empty(t, m.soloProcess)
 	assert.Empty(t, m.searchPattern)
 }
 
-func TestModel_LogEntryMsg(t *testing.T) {
+func TestTUI_LogEntryMsg(t *testing.T) {
 	model := newTestModel()
 	model.ready = true // Set ready to avoid viewport issues
 
@@ -123,14 +94,14 @@ func TestModel_LogEntryMsg(t *testing.T) {
 	}
 
 	newModel, _ := model.Update(LogEntryMsg(entry))
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 
 	assert.Len(t, m.logEntries, 1)
 	assert.Equal(t, "test", m.logEntries[0].Process)
 	assert.Equal(t, "test log line", m.logEntries[0].Line)
 }
 
-func TestModel_LogEntryLimit(t *testing.T) {
+func TestTUI_LogEntryLimit(t *testing.T) {
 	model := newTestModel()
 	model.ready = true
 
@@ -143,7 +114,7 @@ func TestModel_LogEntryLimit(t *testing.T) {
 			Line:      "test log line",
 		}
 		newModel, _ := model.Update(LogEntryMsg(entry))
-		model = newModel.(Model)
+		model = newModel.(ClientModel)
 	}
 
 	// Should be capped at 1000
@@ -229,7 +200,7 @@ func TestFollowModeDisabledOnScrollUp(t *testing.T) {
 			assert.True(t, model.followMode) // starts true
 
 			newModel, _ := model.Update(tt.key)
-			m := newModel.(Model)
+			m := newModel.(ClientModel)
 
 			assert.False(t, m.followMode, "followMode should be false after %s", tt.name)
 		})
@@ -251,7 +222,7 @@ func TestFollowModeEnabledOnGoToBottom(t *testing.T) {
 			model.followMode = false // start with followMode disabled
 
 			newModel, _ := model.Update(tt.key)
-			m := newModel.(Model)
+			m := newModel.(ClientModel)
 
 			assert.True(t, m.followMode, "followMode should be true after %s", tt.name)
 		})
@@ -264,12 +235,12 @@ func TestFollowModeToggle(t *testing.T) {
 
 	// First toggle - should disable
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 	assert.False(t, m.followMode)
 
 	// Second toggle - should enable
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 	assert.True(t, m.followMode)
 }
 
@@ -319,8 +290,10 @@ func TestProxyRequestBufferLimit(t *testing.T) {
 	model := newTestModel()
 	model.ready = true
 
-	// Add more than maxProxyRequests (1000) entries
-	for i := 0; i < 1005; i++ {
+	// Overfill the history cap. The bound is the constant, not a literal, so the
+	// test scales with a retuned cap (D12b raised it from the sync limit to the
+	// server's retention).
+	for i := 0; i < maxRequestHistory+5; i++ {
 		req := proxy.RequestRecord{
 			Timestamp: time.Now(),
 			Subdomain: "api",
@@ -328,14 +301,13 @@ func TestProxyRequestBufferLimit(t *testing.T) {
 			URL:       "/test",
 		}
 		newModel, _ := model.Update(ProxyRequestMsg(req))
-		model = newModel.(Model)
+		model = newModel.(ClientModel)
 	}
 
-	// Should be capped at 1000
-	assert.Len(t, model.proxyRequests, 1000)
+	assert.Len(t, model.proxyRequests, maxRequestHistory)
 }
 
-func TestModel_ProxyRequestMsg(t *testing.T) {
+func TestTUI_ProxyRequestMsg(t *testing.T) {
 	model := newTestModel()
 	model.ready = true
 
@@ -353,7 +325,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	}
 
 	newModel, _ := model.Update(ProxyRequestMsg(req))
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 
 	// Verify request was added
 	assert.Len(t, m.proxyRequests, 1)
@@ -379,7 +351,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	}
 
 	newModel, _ = m.Update(ProxyRequestMsg(req2))
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 
 	assert.Len(t, m.proxyRequests, 2)
 	filtered = m.filteredProxyRequests()
@@ -399,7 +371,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	req1Updated.InFlight = false
 
 	newModel, _ = m.Update(ProxyRequestMsg(req1Updated))
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 
 	assert.Len(t, m.proxyRequests, 2, "same-ID update must not duplicate the row")
 	assert.Equal(t, 204, m.proxyRequests[0].StatusCode)
@@ -411,7 +383,7 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 	regress.StatusCode = 500
 	regress.InFlight = true
 	newModel, _ = m.Update(ProxyRequestMsg(regress))
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 
 	assert.Len(t, m.proxyRequests, 2)
 	assert.Equal(t, 204, m.proxyRequests[0].StatusCode, "a stale in-flight copy must not regress a final row")
@@ -422,15 +394,15 @@ func TestModel_ProxyRequestMsg(t *testing.T) {
 // the ID-anchored cursor survives an in-place upsert of ANOTHER row and of its
 // OWN row without moving, so an arriving completion never changes what Enter
 // opens.
-func TestModel_ProxyRequestMsg_SelectionStable(t *testing.T) {
+func TestTUI_ProxyRequestMsg_SelectionStable(t *testing.T) {
 	m := newRequestsModel(3, 20)
 	// The rows start in-flight: an in-place update is only ever a completion
 	// arriving for a live row (final rows are terminal — C6).
 	for i := range m.proxyRequests {
 		m.proxyRequests[i].InFlight = true
 	}
-	m = updateModel(m, keyRune('g')) // cursor row 0, follow off
-	m = updateModel(m, keyRune('j')) // cursor row 1 (req-001), not the last row
+	m = clientUpdate(m, keyRune('g')) // cursor row 0, follow off
+	m = clientUpdate(m, keyRune('j')) // cursor row 1 (req-001), not the last row
 	assert.Equal(t, "req-001", m.cursorID)
 	assert.Equal(t, 1, m.cursorIdx)
 	assert.False(t, m.followMode)
@@ -438,7 +410,7 @@ func TestModel_ProxyRequestMsg_SelectionStable(t *testing.T) {
 	// In-place upsert of ANOTHER row (row 0 completing) must not move the cursor.
 	other := m.proxyRequests[0]
 	other.StatusCode = 204
-	m = updateModel(m, ProxyRequestMsg(other))
+	m = clientUpdate(m, ProxyRequestMsg(other))
 	assert.Len(t, m.proxyRequests, 3, "in-place update must not change the row count")
 	assert.Equal(t, "req-001", m.cursorID, "cursor stays on its row by ID")
 	assert.Equal(t, 1, m.cursorIdx)
@@ -448,7 +420,7 @@ func TestModel_ProxyRequestMsg_SelectionStable(t *testing.T) {
 	// In-place upsert of the cursor's OWN row must not move it either.
 	own := m.proxyRequests[1]
 	own.StatusCode = 500
-	m = updateModel(m, ProxyRequestMsg(own))
+	m = clientUpdate(m, ProxyRequestMsg(own))
 	assert.Len(t, m.proxyRequests, 3)
 	assert.Equal(t, "req-001", m.cursorID)
 	assert.Equal(t, 1, m.cursorIdx)
@@ -463,12 +435,12 @@ func TestViewModeSwitch(t *testing.T) {
 
 	// Tab key switches to Requests view
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m := newModel.(Model)
+	m := newModel.(ClientModel)
 	assert.Equal(t, ViewModeRequests, m.viewMode)
 
 	// Tab again switches back to Logs view
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m = newModel.(Model)
+	m = newModel.(ClientModel)
 	assert.Equal(t, ViewModeLogs, m.viewMode)
 }
 
@@ -655,24 +627,18 @@ func keyRune(r rune) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
 }
 
-// updateModel applies a message to a Model and returns the concrete result.
-func updateModel(m Model, msg tea.Msg) Model {
-	nm, _ := m.Update(msg)
-	return nm.(Model)
-}
-
-// newRequestsModel builds a Model in the requests view holding n requests
+// newRequestsModel builds a ClientModel in the requests view holding n requests
 // (IDs req-000..req-{n-1}, URLs /path/000..), with the viewport sized so its
 // content Height is viewportHeight (handleWindowSize subtracts the 6-row
 // header+footer margin). followMode starts true, so the cursor begins pinned
 // to the newest row.
-func newRequestsModel(n, viewportHeight int) Model {
+func newRequestsModel(n, viewportHeight int) ClientModel {
 	return newSearchModel(viewportHeight, makeTestRequests(n))
 }
 
 // makeTestRequests builds n proxy request records with the shared fixture
 // convention (IDs req-000.., URLs /path/000.., monotonic timestamps). Shared by
-// both the Model and ClientModel requests-view test constructors.
+// both the ClientModel and ClientModel requests-view test constructors.
 func makeTestRequests(n int) []proxy.RequestRecord {
 	reqs := make([]proxy.RequestRecord, n)
 	base := time.Unix(0, 0)
@@ -690,7 +656,7 @@ func makeTestRequests(n int) []proxy.RequestRecord {
 }
 
 // cursorVisible reports whether the cursor row is within the viewport window.
-func cursorVisible(m Model) bool {
+func cursorVisible(m ClientModel) bool {
 	yo := m.viewport.YOffset
 	return m.cursorIdx >= yo && m.cursorIdx < yo+m.viewport.Height
 }
@@ -703,58 +669,58 @@ func TestRequestsCursor_Movement(t *testing.T) {
 	m := newRequestsModel(10, 5)
 	assert.Equal(t, 9, m.cursorIdx, "follow pins the cursor to the newest row")
 
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	assert.Equal(t, 8, m.cursorIdx)
 	assert.False(t, m.followMode, "k disengages follow")
 
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	assert.Equal(t, 7, m.cursorIdx)
 
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.False(t, m.followMode)
 
 	// Clamp at the top.
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	assert.Equal(t, 0, m.cursorIdx)
 
 	// Half-page paging: step = Height/2 = 5/2 = 2.
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyPgDown})
 	assert.Equal(t, 2, m.cursorIdx)
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyPgUp})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyPgUp})
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.False(t, m.followMode)
 
-	m = updateModel(m, keyRune('G'))
+	m = clientUpdate(m, keyRune('G'))
 	assert.Equal(t, 9, m.cursorIdx)
 	assert.True(t, m.followMode, "G re-engages follow")
 
 	// Clamp at the bottom.
-	m = updateModel(m, keyRune('j'))
+	m = clientUpdate(m, keyRune('j'))
 	assert.Equal(t, 9, m.cursorIdx)
 }
 
 func TestRequestsCursor_VisibilityKeyboardJumps(t *testing.T) {
 	m := newRequestsModel(30, 5)
 
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, 0, m.viewport.YOffset)
 	assert.True(t, cursorVisible(m))
 
 	// Walk the cursor down; it must stay on-screen with minimal scrolling.
 	for i := 1; i <= 20; i++ {
-		m = updateModel(m, keyRune('j'))
+		m = clientUpdate(m, keyRune('j'))
 		assert.Equal(t, i, m.cursorIdx)
 		assert.True(t, cursorVisible(m),
 			"cursor %d must be visible (YOffset %d, height %d)", i, m.viewport.YOffset, m.viewport.Height)
 	}
 
-	m = updateModel(m, keyRune('G'))
+	m = clientUpdate(m, keyRune('G'))
 	assert.Equal(t, 29, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, 0, m.viewport.YOffset)
 }
@@ -764,24 +730,24 @@ func TestRequestsCursor_VisibilityKeyboardJumps(t *testing.T) {
 // requests branch of updateViewport must scroll it so the cursor is visible.
 func TestRequestsCursor_VisibilityTabIn(t *testing.T) {
 	m := newTestModel()
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
 
 	// Fill logs and requests while in the logs view.
 	for i := 0; i < 30; i++ {
-		m = updateModel(m, LogEntryMsg(domain.LogEntry{Timestamp: time.Now(), Process: "p", Line: fmt.Sprintf("log %d", i)}))
+		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{Timestamp: time.Now(), Process: "p", Line: fmt.Sprintf("log %d", i)}))
 	}
 	for i := 0; i < 30; i++ {
-		m = updateModel(m, ProxyRequestMsg(newArrival(fmt.Sprintf("req-%03d", i), fmt.Sprintf("/path/%03d", i))))
+		m = clientUpdate(m, ProxyRequestMsg(newArrival(fmt.Sprintf("req-%03d", i), fmt.Sprintf("/path/%03d", i))))
 	}
 
 	// Scroll the logs viewport up (disengages follow) so YOffset is large.
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	require.Greater(t, m.viewport.YOffset, 5, "logs viewport should be scrolled well down")
 	require.False(t, m.followMode)
 
 	// Tab into the requests view: cursor resolves to row 0 (follow off, no prior
 	// cursor) and the viewport must scroll up to show it.
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyTab})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyTab})
 	assert.Equal(t, ViewModeRequests, m.viewMode)
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, 0, m.viewport.YOffset, "tab-in must reveal the cursor row")
@@ -789,22 +755,22 @@ func TestRequestsCursor_VisibilityTabIn(t *testing.T) {
 
 func TestRequestsCursor_VisibilityResize(t *testing.T) {
 	m := newRequestsModel(40, 10)
-	m = updateModel(m, keyRune('g')) // follow off, cursor 0
+	m = clientUpdate(m, keyRune('g')) // follow off, cursor 0
 	for i := 0; i < 20; i++ {
-		m = updateModel(m, keyRune('j'))
+		m = clientUpdate(m, keyRune('j'))
 	}
 	require.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
 	// Shrink the window: cursor must stay visible.
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 5 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + 6})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
 	// Grow it back: still visible, and the viewport must not be left scrolled
 	// past the true bottom (a grown window shrinks the valid max YOffset —
 	// blank overscroll would report the cursor "visible" while showing gaps).
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 30 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + 6})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
@@ -822,15 +788,15 @@ func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 	m.followMode = false
 	m.updateViewport()
 
-	m = updateModel(m, keyRune('g')) // filtered row 0 = req-030
-	m = updateModel(m, keyRune('j')) // req-031
-	m = updateModel(m, keyRune('j')) // req-032
+	m = clientUpdate(m, keyRune('g')) // filtered row 0 = req-030
+	m = clientUpdate(m, keyRune('j')) // req-031
+	m = clientUpdate(m, keyRune('j')) // req-032
 	require.Equal(t, "req-032", m.cursorID)
 	require.False(t, m.followMode)
 
 	// esc clears the filter; the cursor's row (req-032, full-list index 32) must
 	// remain and be scrolled on-screen.
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
 	assert.Empty(t, m.searchPattern)
 	assert.Equal(t, "req-032", m.cursorID)
 	assert.Equal(t, 32, m.cursorIdx)
@@ -839,17 +805,17 @@ func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 
 func TestRequestsCursor_VisibilityDetailReturn(t *testing.T) {
 	m := newRequestsModel(30, 5)
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	for i := 0; i < 15; i++ {
-		m = updateModel(m, keyRune('j'))
+		m = clientUpdate(m, keyRune('j'))
 	}
 	require.Equal(t, "req-015", m.cursorID)
 
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
 	require.Equal(t, ViewModeRequestDetail, m.viewMode)
 
 	// esc back to the list: the cursor must be restored and visible.
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
 	assert.Equal(t, ViewModeRequests, m.viewMode)
 	assert.Equal(t, "req-015", m.cursorID)
 	assert.True(t, cursorVisible(m))
@@ -861,12 +827,12 @@ func TestRequestsCursor_VisibilityDetailReturn(t *testing.T) {
 // every arrival. Arrivals must leave a user-positioned cursor untouched.
 func TestRequestsCursor_ArrivalDoesNotMoveShortList(t *testing.T) {
 	m := newRequestsModel(3, 20) // fits the viewport
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	require.Equal(t, 1, m.cursorIdx)
 	require.False(t, m.followMode)
 	require.True(t, m.viewport.AtBottom(), "precondition: a short list is always AtBottom")
 
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-new", "/new")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
 	assert.Len(t, m.proxyRequests, 4)
 	assert.Equal(t, "req-001", m.cursorID, "arrival must not move the cursor")
 	assert.Equal(t, 1, m.cursorIdx)
@@ -875,35 +841,35 @@ func TestRequestsCursor_ArrivalDoesNotMoveShortList(t *testing.T) {
 
 func TestRequestsCursor_JOntoLastRowReengagesFollow(t *testing.T) {
 	m := newRequestsModel(5, 20)
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	require.False(t, m.followMode)
 
 	for i := 1; i <= 3; i++ {
-		m = updateModel(m, keyRune('j'))
+		m = clientUpdate(m, keyRune('j'))
 		assert.False(t, m.followMode, "follow stays off until the cursor lands on the last row (idx %d)", m.cursorIdx)
 	}
 	require.Equal(t, 3, m.cursorIdx)
 
-	m = updateModel(m, keyRune('j')) // onto the last row
+	m = clientUpdate(m, keyRune('j')) // onto the last row
 	assert.Equal(t, 4, m.cursorIdx)
 	assert.True(t, m.followMode, "j onto the newest row re-engages follow")
 }
 
 func TestRequestsCursor_GAndFReengageFollow(t *testing.T) {
 	m := newRequestsModel(10, 5)
-	m = updateModel(m, keyRune('k'))
+	m = clientUpdate(m, keyRune('k'))
 	require.False(t, m.followMode)
 
-	m = updateModel(m, keyRune('G'))
+	m = clientUpdate(m, keyRune('G'))
 	assert.True(t, m.followMode)
 	assert.Equal(t, 9, m.cursorIdx)
 
-	m = updateModel(m, keyRune('g')) // follow off, cursor 0
+	m = clientUpdate(m, keyRune('g')) // follow off, cursor 0
 	require.False(t, m.followMode)
-	m = updateModel(m, keyRune('F')) // toggle on -> pins to newest
+	m = clientUpdate(m, keyRune('F')) // toggle on -> pins to newest
 	assert.True(t, m.followMode)
 	assert.Equal(t, 9, m.cursorIdx)
-	m = updateModel(m, keyRune('F')) // toggle off
+	m = clientUpdate(m, keyRune('F')) // toggle off
 	assert.False(t, m.followMode)
 	assert.Equal(t, 9, m.cursorIdx)
 }
@@ -913,7 +879,7 @@ func TestRequestsCursor_FollowArrivalPinsNewest(t *testing.T) {
 	require.True(t, m.followMode)
 	require.Equal(t, 4, m.cursorIdx)
 
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-new", "/new")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
 	assert.Len(t, m.proxyRequests, 6)
 	assert.Equal(t, 5, m.cursorIdx, "follow pins the cursor to the newest row")
 	assert.Equal(t, "req-new", m.cursorID)
@@ -921,7 +887,7 @@ func TestRequestsCursor_FollowArrivalPinsNewest(t *testing.T) {
 }
 
 func TestRequestsCursor_AppendTrimMidList(t *testing.T) {
-	m := newRequestsModel(maxProxyRequests, 5) // exactly full
+	m := newRequestsModel(maxRequestHistory, 5) // exactly full
 	m.followMode = false
 	m.setRequestCursor(m.filteredProxyRequests(), 500)
 	m.updateViewport()
@@ -929,22 +895,22 @@ func TestRequestsCursor_AppendTrimMidList(t *testing.T) {
 
 	// A new arrival appends and trims the oldest row; the ID-anchored cursor
 	// rides down one index onto its still-present row.
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-new", "/new")))
-	assert.Len(t, m.proxyRequests, maxProxyRequests)
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
+	assert.Len(t, m.proxyRequests, maxRequestHistory)
 	assert.Equal(t, "req-500", m.cursorID)
 	assert.Equal(t, 499, m.cursorIdx)
 }
 
 func TestRequestsCursor_TrimmedRowClamps(t *testing.T) {
-	m := newRequestsModel(maxProxyRequests, 5)
+	m := newRequestsModel(maxRequestHistory, 5)
 	m.followMode = false
 	m.setRequestCursor(m.filteredProxyRequests(), 0) // cursor on the oldest row
 	m.updateViewport()
 	require.Equal(t, "req-000", m.cursorID)
 
 	// The arrival trims req-000 away; the cursor clamps to the row now at idx 0.
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-new", "/new")))
-	assert.Len(t, m.proxyRequests, maxProxyRequests)
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
+	assert.Len(t, m.proxyRequests, maxRequestHistory)
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, "req-001", m.cursorID, "cursor re-anchors to the row now at its index")
 }
@@ -952,11 +918,11 @@ func TestRequestsCursor_TrimmedRowClamps(t *testing.T) {
 func TestRequestsCursor_EmptyToNonEmptyFollowOn(t *testing.T) {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11})
 	require.True(t, m.followMode)
 	require.Equal(t, -1, m.cursorIdx, "empty list is the no-cursor sentinel")
 
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-x", "/x")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-x", "/x")))
 	assert.Equal(t, 0, m.cursorIdx)
 	assert.Equal(t, "req-x", m.cursorID, "follow pins the first arrival")
 }
@@ -965,45 +931,20 @@ func TestRequestsCursor_EmptyToNonEmptyFollowOff(t *testing.T) {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
 	m.followMode = false
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11})
 	require.Equal(t, -1, m.cursorIdx)
 
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-x", "/x")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-x", "/x")))
 	assert.Equal(t, 0, m.cursorIdx, "follow off lands the cursor on row 0")
 	assert.Equal(t, "req-x", m.cursorID)
-}
-
-func TestRequestsCursor_EnterOpensCursorRow(t *testing.T) {
-	m := newRequestsModel(10, 5)
-	m = updateModel(m, keyRune('g'))
-	for i := 0; i < 4; i++ {
-		m = updateModel(m, keyRune('j'))
-	}
-	require.Equal(t, "req-004", m.cursorID)
-
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	assert.Equal(t, ViewModeRequestDetail, m.viewMode)
-	assert.Equal(t, "req-004", m.selectedRequestID)
-	if assert.NotNil(t, m.requestDetail) {
-		assert.Equal(t, "req-004", m.requestDetail.ID)
-	}
-}
-
-func TestRequestsCursor_EnterGotoTop(t *testing.T) {
-	m := newRequestsModel(30, 5) // follow on -> cursor deep, viewport scrolled down
-	require.Greater(t, m.viewport.YOffset, 0)
-
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	assert.Equal(t, ViewModeRequestDetail, m.viewMode)
-	assert.Equal(t, 0, m.viewport.YOffset, "entering the detail view starts at the top")
 }
 
 func TestRequestsCursor_EmptyListEnterNoop(t *testing.T) {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11})
 
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
 	assert.Equal(t, ViewModeRequests, m.viewMode, "Enter on an empty list is a no-op")
 	assert.Empty(t, m.selectedRequestID)
 }
@@ -1013,22 +954,29 @@ func TestRequestsCursor_EmptyListEnterNoop(t *testing.T) {
 // and must not scroll the detail viewport out from under the reader.
 func TestRequestsCursor_DetailArrivalNoScroll(t *testing.T) {
 	m := newRequestsModel(10, 2) // tiny viewport so the detail scrolls
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(ClientModel)
 	require.Equal(t, ViewModeRequestDetail, m.viewMode)
+	require.NotNil(t, cmd, "Enter must return a fetch command")
+	// Run the fetch so the detail view has real content to scroll — unlike
+	// local mode's synchronous fill, attach mode starts on "Loading..." (too
+	// short to scroll) until this command's result is applied.
+	m = clientUpdate(m, cmd())
+	require.NotNil(t, m.requestDetail)
 
 	// Reader scrolls down inside the detail.
 	m.viewport.SetYOffset(3)
 	require.Equal(t, 3, m.viewport.YOffset, "precondition: detail content taller than the viewport")
 
-	m = updateModel(m, ProxyRequestMsg(newArrival("req-new", "/new")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-new", "/new")))
 	assert.Equal(t, 3, m.viewport.YOffset, "arrival must not scroll the open detail view")
 	assert.Len(t, m.proxyRequests, 11, "list data is still updated")
 }
 
 func TestRequestsCursor_MarkerOnCursorRow(t *testing.T) {
 	m := newRequestsModel(5, 20) // all rows visible
-	m = updateModel(m, keyRune('g'))
-	m = updateModel(m, keyRune('j')) // cursor on row 1 (req-001, /path/001)
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j')) // cursor on row 1 (req-001, /path/001)
 	require.Equal(t, 1, m.cursorIdx)
 
 	view := m.viewport.View()
@@ -1046,24 +994,24 @@ func TestRequestsCursor_MarkerOnCursorRow(t *testing.T) {
 
 // --- Requests-view search navigation tests (C3 / D12-D13) ---
 
-// newSearchModel builds a Model in the requests view holding the given request
+// newSearchModel builds a ClientModel in the requests view holding the given request
 // records, viewport sized to viewportHeight, follow-mode default (true) so the
 // cursor starts pinned to the newest row.
-func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) Model {
+func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) ClientModel {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = reqs
-	return updateModel(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
 }
 
 // commitSearch drives the `/`-search flow: enter search mode, set the query,
 // and press Enter. handleSearchKey's enter case routes the commit itself
 // (jump in the requests view, filter in the logs view) based on m.viewMode,
 // so one driver helper serves both views.
-func commitSearch(m Model, query string) Model {
-	m = updateModel(m, keyRune('/'))
+func commitSearch(m ClientModel, query string) ClientModel {
+	m = clientUpdate(m, keyRune('/'))
 	m.textInput.SetValue(query)
-	return updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	return clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
 }
 
 // searchFixture builds requests where /alpha matches rows 0 and 2 (with a POST
@@ -1090,7 +1038,7 @@ func searchFixture() []proxy.RequestRecord {
 
 func TestRequestsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
 	m := newSearchModel(20, searchFixture())
-	m = updateModel(m, keyRune('g')) // cursor row 0 (/alpha), follow off
+	m = clientUpdate(m, keyRune('g')) // cursor row 0 (/alpha), follow off
 	require.Equal(t, "r0", m.cursorID)
 
 	// Cursor already sits on a match: at-or-after leaves it in place.
@@ -1099,14 +1047,14 @@ func TestRequestsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
 	assert.Equal(t, "r0", m.cursorID, "at-or-after stays on a cursor that already matches")
 
 	// From row 1 (/beta, no match), the next match at-or-after is row 2.
-	m = updateModel(m, keyRune('g'))
-	m = updateModel(m, keyRune('j')) // row 1
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j')) // row 1
 	require.Equal(t, "r1", m.cursorID)
 	m = commitSearch(m, "alpha")
 	assert.Equal(t, "r2", m.cursorID, "jumps forward to the next match")
 
 	// From row 3 (/gamma, no match), at-or-after wraps to row 0.
-	m = updateModel(m, keyRune('j')) // row 3 (last)
+	m = clientUpdate(m, keyRune('j')) // row 3 (last)
 	require.Equal(t, "r3", m.cursorID)
 	m = commitSearch(m, "alpha")
 	assert.Equal(t, "r0", m.cursorID, "at-or-after wraps around to the first match")
@@ -1114,18 +1062,18 @@ func TestRequestsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
 
 func TestRequestsSearch_NextPrevWrap(t *testing.T) {
 	m := newSearchModel(20, searchFixture())
-	m = updateModel(m, keyRune('g')) // row 0
+	m = clientUpdate(m, keyRune('g')) // row 0
 	m = commitSearch(m, "alpha")
 	require.Equal(t, "r0", m.cursorID)
 
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "r2", m.cursorID, "n advances to the next match")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "r0", m.cursorID, "n wraps to the first match")
 
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, "r2", m.cursorID, "N wraps backward to the last match")
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, "r0", m.cursorID, "N retreats to the previous match")
 }
 
@@ -1134,7 +1082,7 @@ func TestRequestsSearch_OffScreenScrollsMinimally(t *testing.T) {
 	reqs[2].URL = "/target/a"
 	reqs[25].URL = "/target/b"
 	m := newSearchModel(5, reqs) // viewport height 5
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	require.Equal(t, 0, m.viewport.YOffset)
 
 	// Jump to the first match (row 2), already on-screen: no scroll.
@@ -1143,13 +1091,13 @@ func TestRequestsSearch_OffScreenScrollsMinimally(t *testing.T) {
 	assert.True(t, cursorVisible(m))
 
 	// n jumps down to row 25 off-screen: scroll the minimum (YOffset = 25-5+1).
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 25, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	assert.Equal(t, 21, m.viewport.YOffset, "downward jump scrolls minimally")
 
 	// N jumps back up to row 2 off-screen: scroll up to place it at the top.
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, 2, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	assert.Equal(t, 2, m.viewport.YOffset, "upward jump scrolls minimally")
@@ -1172,14 +1120,14 @@ func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
 	m.searchPattern = "api" // active `s` filter: only the 10 api rows remain
 	m.followMode = false
 	m.updateViewport()
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 
 	// Matches are computed over the FILTERED list, so /match/b (web) is skipped.
 	m = commitSearch(m, "match")
 	assert.Equal(t, "req-004", m.cursorID, "search over the filtered list finds the first api match")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "req-012", m.cursorID)
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "req-004", m.cursorID, "wraps over api matches only, skipping the filtered-out web row")
 	assert.Equal(t, "api", m.searchPattern, "the `s` filter is untouched")
 }
@@ -1200,8 +1148,8 @@ func TestRequestsSearch_DoesNotFilter(t *testing.T) {
 func TestRequestsSearch_NoMatch(t *testing.T) {
 	reqs := makeTestRequests(10)
 	m := newSearchModel(20, reqs)
-	m = updateModel(m, keyRune('g'))
-	m = updateModel(m, keyRune('j')) // row 1
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j')) // row 1
 	require.Equal(t, 1, m.cursorIdx)
 
 	m = commitSearch(m, "zzz-nomatch")
@@ -1209,7 +1157,7 @@ func TestRequestsSearch_NoMatch(t *testing.T) {
 	assert.Equal(t, "req-001", m.cursorID)
 
 	// n/N are also no-ops when nothing matches.
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 1, m.cursorIdx)
 
 	bar := m.statusBar("")
@@ -1223,24 +1171,24 @@ func TestRequestsSearch_EscClearsQuery(t *testing.T) {
 	m = commitSearch(m, "needle")
 	require.Equal(t, "needle", m.requestSearchQuery)
 
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
 	assert.Empty(t, m.requestSearchQuery, "esc clears the requests-view search query")
 }
 
 // --- Logs-view search navigation tests (C4 / D6-D10) ---
 
-// newLogsModel builds a Model in the (default) logs view, viewport sized so its
+// newLogsModel builds a ClientModel in the (default) logs view, viewport sized so its
 // content height is viewportHeight (handleWindowSize subtracts the 6-row
 // margin), then streams the given lines through handleLogEntry so each entry is
 // stamped with a unique non-zero Seq — the logs search cursor anchors by Seq, so
 // a zero Seq would break the anchor. followMode starts true (default), pinning
 // the cursor to the newest line until a jump or scroll disengages it.
-func newLogsModel(viewportHeight int, lines []string) Model {
+func newLogsModel(viewportHeight int, lines []string) ClientModel {
 	m := newTestModel()
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
 	base := time.Unix(0, 0)
 	for i, line := range lines {
-		m = updateModel(m, LogEntryMsg(domain.LogEntry{
+		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
 			Timestamp: base.Add(time.Duration(i) * time.Second),
 			Process:   "p",
 			Line:      line,
@@ -1252,7 +1200,7 @@ func newLogsModel(viewportHeight int, lines []string) Model {
 // logCursorLine returns the line the logs search cursor currently sits on
 // (resolved against the filtered list), for assertions that care about which
 // line was landed rather than its shifting index.
-func logCursorLine(t *testing.T, m Model) string {
+func logCursorLine(t *testing.T, m ClientModel) string {
 	t.Helper()
 	fe := m.filteredEntries()
 	require.GreaterOrEqual(t, m.logCursorIdx, 0)
@@ -1279,7 +1227,7 @@ func TestLogsSearch_SlashNavigates(t *testing.T) {
 func TestLogsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
 	// "needle" matches rows 0 and 2; rows 1 and 3 do not.
 	m := newLogsModel(20, []string{"needle a", "x", "needle b", "z"})
-	m = updateModel(m, keyRune('g')) // top of viewport, follow off; origin -> row 0
+	m = clientUpdate(m, keyRune('g')) // top of viewport, follow off; origin -> row 0
 	require.False(t, m.followMode)
 
 	// At-or-after from the top: row 0 already matches, so the cursor stays put.
@@ -1303,18 +1251,18 @@ func TestLogsSearch_JumpAtOrAfterAndWrap(t *testing.T) {
 
 func TestLogsSearch_NextPrevWrap(t *testing.T) {
 	m := newLogsModel(20, []string{"needle a", "x", "needle b", "z"})
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	m = commitSearch(m, "needle")
 	require.Equal(t, 0, m.logCursorIdx)
 
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 2, m.logCursorIdx, "n advances to the next match")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 0, m.logCursorIdx, "n wraps to the first match")
 
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, 2, m.logCursorIdx, "N wraps backward to the last match")
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, 0, m.logCursorIdx, "N retreats to the previous match")
 }
 
@@ -1327,27 +1275,27 @@ func TestLogsSearch_ComposesWithFilter(t *testing.T) {
 	m.searchPattern = "keep" // active `s` filter -> rows 0,2,3 survive
 	m.followMode = false
 	m.updateViewport()
-	m = updateModel(m, keyRune('g')) // origin -> top of the filtered list
+	m = clientUpdate(m, keyRune('g')) // origin -> top of the filtered list
 
 	m = commitSearch(m, "needle")
 	assert.Equal(t, "keep needle a", logCursorLine(t, m), "search starts within the `s`-filtered set")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "keep needle c", logCursorLine(t, m), "n skips the filtered-out drop rows")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "keep needle a", logCursorLine(t, m), "wraps over the filtered matches only")
 	assert.Equal(t, "keep", m.searchPattern, "the `s` filter is untouched")
 }
 
 func TestLogsSearch_NoMatch(t *testing.T) {
 	m := newLogsModel(20, []string{"aaa", "bbb", "ccc"})
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 
 	m = commitSearch(m, "zzz")
 	assert.Equal(t, "zzz", m.logSearchQuery)
 	assert.Equal(t, -1, m.logCursorIdx, "a query with no match leaves no cursor")
 
 	// n/N are also no-ops when nothing matches.
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, -1, m.logCursorIdx)
 
 	bar := m.statusBar("")
@@ -1371,12 +1319,12 @@ func TestLogsSearch_NoMatchAfterPriorMatchClearsCursor(t *testing.T) {
 
 func TestLogsSearch_EscClears(t *testing.T) {
 	m := newLogsModel(20, []string{"aaa", "needle", "bbb"})
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	m = commitSearch(m, "needle")
 	require.Equal(t, "needle", m.logSearchQuery)
 	require.NotEqual(t, -1, m.logCursorIdx)
 
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEscape})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
 	assert.Empty(t, m.logSearchQuery, "esc clears the logs-view search query")
 	assert.Equal(t, int64(0), m.logCursorSeq, "esc resets the logs cursor anchor")
 	assert.Equal(t, -1, m.logCursorIdx, "esc resets the logs cursor index")
@@ -1384,12 +1332,12 @@ func TestLogsSearch_EscClears(t *testing.T) {
 
 func TestLogsSearch_StatusIndicator(t *testing.T) {
 	m := newLogsModel(20, []string{"needle a", "x", "needle b"})
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	m = commitSearch(m, "needle")
 	require.Equal(t, 0, m.logCursorIdx)
 
 	assert.Contains(t, m.statusBar(""), "/needle (1/2)", "shows the cursor's match position of the total")
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Contains(t, m.statusBar(""), "/needle (2/2)", "advancing updates the position")
 }
 
@@ -1423,7 +1371,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 	require.Contains(t, m.statusBar(""), "/hit (1/1)")
 
 	// A new log line arrives while the search is parked off-newest.
-	m = updateModel(m, LogEntryMsg(domain.LogEntry{
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
 		Timestamp: time.Unix(10, 0),
 		Process:   "p",
 		Line:      "e newest",
@@ -1436,7 +1384,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 
 func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 	m := newTestModel()
-	m = updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
 	feed := func(line string) {
 		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
 	}
@@ -1455,7 +1403,7 @@ func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 
 	// Search with follow off so the cursor stays Seq-anchored to NEEDLE as the
 	// ring shifts, rather than being pinned to the newest line.
-	m = updateModel(m, keyRune('g')) // GotoTop, follow off
+	m = clientUpdate(m, keyRune('g')) // GotoTop, follow off
 	m = commitSearch(m, "NEEDLE")
 	require.False(t, m.followMode)
 	require.Contains(t, m.logEntries[m.logCursorIdx].Line, "NEEDLE")
@@ -1496,7 +1444,7 @@ func TestLogsSearch_FirstSearchAfterManualScroll(t *testing.T) {
 	lines[20] = "target below"
 	m := newLogsModel(5, lines) // viewport height 5, follow on, parked at the bottom
 
-	m = updateModel(m, keyRune('k')) // disengage follow
+	m = clientUpdate(m, keyRune('k')) // disengage follow
 	require.False(t, m.followMode)
 	m.viewport.SetYOffset(15) // top visible row is now 15
 	require.Equal(t, 15, m.viewport.YOffset)
@@ -1540,7 +1488,7 @@ func TestLogsSearch_UnicodeAndAnsiRenderSafely(t *testing.T) {
 	// search must not panic or split the escape, and the row marker still lands
 	// on the matched row.
 	m := newLogsModel(20, []string{"before", "cafe \x1b[31mMATCH\x1b[0m after", "café résumé MATCH"})
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	m = commitSearch(m, "MATCH")
 	require.Equal(t, 1, m.logCursorIdx, "the first match at/after the top is the ANSI row")
 
@@ -1564,7 +1512,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	m.searchPattern = "path"
 	m.followMode = false
 	m.updateViewport()
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 
 	m = commitSearch(m, "needle")
 	bar := m.statusBar("")
@@ -1574,7 +1522,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 
 	// Prompt precedence: while typing a search, the input prompt wins over the
 	// committed indicator.
-	m2 := updateModel(m, keyRune('/'))
+	m2 := clientUpdate(m, keyRune('/'))
 	assert.Contains(t, m2.statusBar(""), "Search:", "the mode prompt takes precedence")
 }
 
@@ -1602,7 +1550,7 @@ func TestRequestsSearch_WrapToNewestNoFollow(t *testing.T) {
 	reqs[0].URL = "/hit/a"
 	reqs[5].URL = "/hit/b" // the newest (last) row also matches
 	m := newSearchModel(20, reqs)
-	m = updateModel(m, keyRune('g')) // cursor row 0, follow off
+	m = clientUpdate(m, keyRune('g')) // cursor row 0, follow off
 	require.False(t, m.followMode)
 
 	m = commitSearch(m, "hit")
@@ -1611,7 +1559,7 @@ func TestRequestsSearch_WrapToNewestNoFollow(t *testing.T) {
 
 	// n wraps forward onto the newest row. Unlike `j`, a search jump is
 	// positioning, not scrolling intent: it must NOT re-engage follow.
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 5, m.cursorIdx)
 	assert.Equal(t, "req-005", m.cursorID)
 	assert.False(t, m.followMode, "a search jump onto the newest row must not re-engage follow")
@@ -1649,31 +1597,15 @@ func TestRequestsSearch_SingleMatchNextPrevNoop(t *testing.T) {
 	reqs := makeTestRequests(5)
 	reqs[2].URL = "/only/hit"
 	m := newSearchModel(20, reqs)
-	m = updateModel(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('g'))
 	m = commitSearch(m, "hit")
 	require.Equal(t, 2, m.cursorIdx)
 
-	m = updateModel(m, keyRune('n'))
+	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 2, m.cursorIdx, "n with a sole match is a no-op")
-	m = updateModel(m, keyRune('N'))
+	m = clientUpdate(m, keyRune('N'))
 	assert.Equal(t, 2, m.cursorIdx, "N with a sole match is a no-op")
 	assert.Equal(t, "req-002", m.cursorID)
-}
-
-// newInFlightDetailModel opens the detail view (local mode) for a single
-// in-flight request, viewport sized so its content Height is viewportHeight,
-// and returns the model with the detail already rendered from the top.
-func newInFlightDetailModel(t *testing.T, id string, viewportHeight int) Model {
-	t.Helper()
-	inFlight := proxy.RequestRecord{
-		ID: id, Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
-	}
-	m := newSearchModel(viewportHeight, []proxy.RequestRecord{inFlight})
-	m = updateModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	require.Equal(t, ViewModeRequestDetail, m.viewMode)
-	require.NotNil(t, m.requestDetail)
-	require.True(t, m.requestDetail.InFlight)
-	return m
 }
 
 // finalRecordFor builds the completed (non-in-flight) record that would
@@ -1692,94 +1624,4 @@ func finalRecordFor(id string) proxy.RequestRecord {
 			RequestHeaders: map[string][]string{"X-Test": {"yes"}},
 		},
 	}
-}
-
-// TestModel_DetailLiveRefresh_LocalMatchingFinalRefreshesInPlace pins D15:
-// completing an in-flight request whose detail is open refreshes the view in
-// place — Details render, the "(in flight)" note disappears, and the
-// reader's scroll position is preserved (detail content only grows on
-// completion, and SetContent never resets YOffset on growth).
-func TestModel_DetailLiveRefresh_LocalMatchingFinalRefreshesInPlace(t *testing.T) {
-	m := newInFlightDetailModel(t, "req-1", 5)
-	assert.Contains(t, strings.Join(m.formatRequestDetail(), "\n"), "in flight")
-
-	m.viewport.SetYOffset(2)
-	require.Equal(t, 2, m.viewport.YOffset, "precondition: reader scrolled mid-read")
-
-	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-1")))
-
-	require.NotNil(t, m.requestDetail)
-	assert.False(t, m.requestDetail.InFlight)
-	assert.Equal(t, int64(42), m.requestDetail.DurationMs)
-	assert.Equal(t, 2, m.viewport.YOffset, "reader's scroll position is preserved")
-	rendered := strings.Join(m.formatRequestDetail(), "\n")
-	assert.NotContains(t, rendered, "in flight")
-	assert.Contains(t, rendered, "X-Test", "Details render after the refresh")
-}
-
-// TestModel_DetailLiveRefresh_NonMatchingIDNoRefresh pins that a final record
-// for a DIFFERENT request than the one open in the detail view leaves the
-// displayed snapshot untouched (the list still updates independently).
-func TestModel_DetailLiveRefresh_NonMatchingIDNoRefresh(t *testing.T) {
-	m := newInFlightDetailModel(t, "req-1", 5)
-
-	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-other")))
-
-	assert.True(t, m.requestDetail.InFlight, "the open detail is unaffected by another row's completion")
-	assert.Len(t, m.proxyRequests, 2, "the list still gains the new row")
-}
-
-// TestModel_DetailLiveRefresh_StillInFlightNoRefresh pins that a duplicate
-// in-flight message for the OPEN request (record.InFlight still true) does
-// not trigger a refresh — only a final (!InFlight) record does.
-func TestModel_DetailLiveRefresh_StillInFlightNoRefresh(t *testing.T) {
-	m := newInFlightDetailModel(t, "req-1", 5)
-
-	stillInFlight := proxy.RequestRecord{
-		ID: "req-1", Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
-	}
-	m = updateModel(m, ProxyRequestMsg(stillInFlight))
-
-	assert.True(t, m.requestDetail.InFlight, "a still-in-flight duplicate must not be treated as the refresh")
-}
-
-// TestModel_DetailLiveRefresh_NotInDetailViewNoRefresh pins the list-only
-// path: a final ProxyRequestMsg arriving while the requests view (not the
-// detail view) is showing must not populate requestDetail — refresh only
-// applies to an OPEN detail view.
-func TestModel_DetailLiveRefresh_NotInDetailViewNoRefresh(t *testing.T) {
-	inFlight := proxy.RequestRecord{
-		ID: "req-1", Timestamp: time.Now(), Method: "GET", URL: "/x", InFlight: true,
-	}
-	m := newSearchModel(5, []proxy.RequestRecord{inFlight})
-	require.Equal(t, ViewModeRequests, m.viewMode)
-	require.Nil(t, m.requestDetail)
-
-	m = updateModel(m, ProxyRequestMsg(finalRecordFor("req-1")))
-
-	assert.Equal(t, ViewModeRequests, m.viewMode)
-	assert.Nil(t, m.requestDetail, "no detail view is open, so nothing is populated")
-}
-
-func TestModel_DetailLiveRefresh_ShrinkingContentClamps(t *testing.T) {
-	// A capture-disabled final detail is SHORTER than the in-flight view it
-	// replaces (the two in-flight note lines vanish and no header/body
-	// sections take their place). A bottom-scrolled reader must be pulled
-	// back to the last valid offset, not left on blank overscroll.
-	m := newInFlightDetailModel(t, "req-1", 3)
-	m.viewport.GotoBottom()
-	require.Positive(t, m.viewport.YOffset, "test needs a scrolled-down detail view")
-
-	final := finalRecordFor("req-1")
-	final.Details = nil // capture disabled: no headers/bodies arrive
-	m = updateModel(m, ProxyRequestMsg(final))
-
-	require.NotNil(t, m.requestDetail)
-	assert.False(t, m.requestDetail.InFlight)
-	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	assert.LessOrEqual(t, m.viewport.YOffset, maxOffset,
-		"refresh onto shorter content must clamp the viewport offset")
 }

@@ -194,17 +194,6 @@ const (
 	StreamReconnectFlapThreshold = 1 * time.Second
 )
 
-// TUI timing
-const (
-	// TUILocalTickInterval drives the local-mode TUI's periodic process-list
-	// refresh, and only local mode's: it reads the in-process supervisor
-	// directly, so a fast tick costs nothing. Attach mode used to share the
-	// interval for an HTTP poll; C12 deleted that poll in favor of the
-	// processes SSE stream, so nothing in attach mode ticks any more
-	// (plan 017 C12).
-	TUILocalTickInterval = 500 * time.Millisecond
-)
-
 // Log configuration
 const (
 	// DefaultLogLimit is the default number of log lines to return
@@ -220,9 +209,44 @@ const (
 	// DefaultProxyRequestLimit is the default number of proxy requests to return
 	DefaultProxyRequestLimit = 100
 
-	// MaxProxyRequests is the maximum number of proxy requests that can be requested
-	// to prevent memory exhaustion (DoS protection)
-	MaxProxyRequests = 1000
+	// MaxProxyRequests is the maximum number of proxy requests a single
+	// API/daemon call may ask for — the `?limit=` clamp shared by the project
+	// API's parseProxyRequestParams and the daemon socket's /api/v1/requests
+	// (DoS protection) — AND, by the definition of
+	// DefaultProxyRequestBufferSize below, the proxy request ring size. The two
+	// are deliberately the same number: see that constant for the invariant.
+	//
+	// Raised from 1000 to 5000 (plan 018, D9). Ring memory is bounded not by
+	// this count but by ProxyRequestDetailWindow, which limits how many of
+	// those records keep their captured bodies.
+	MaxProxyRequests = 5000
+
+	// TUIRequestsSyncLimit is how many of the newest proxy requests the TUI
+	// fetches in its initial sync, and the page size it uses to scroll further
+	// back. It is deliberately SMALLER than the ring (MaxProxyRequests): a TUI
+	// needs a screenful plus comfortable scroll depth, not the whole ring, and
+	// paging the remainder on demand through the BeforeID cursor keeps startup
+	// cost independent of how deep retention goes. It doubles as that scroll-back
+	// PAGE size. It must not exceed the TUI's own display ring
+	// (tui.maxRequestHistory, which is defined from MaxProxyRequests — the TUI
+	// may hold the whole server ring once the user has paged through it), or the
+	// snapshot it just paid to fetch would be trimmed on arrival.
+	//
+	// Equal to ProxyRequestDetailWindow today by coincidence, not by contract:
+	// one is a client fetch size, the other a server retention policy. Retune
+	// either without touching the other.
+	TUIRequestsSyncLimit = 1000
+
+	// ProxyRequestDetailWindow is how many of the NEWEST records in a proxy
+	// request ring keep their captured BODY data (plan 018, D9b). When a record
+	// falls outside this window the ring drops its inline body bytes and
+	// unlinks its spilled body files, keeping the record itself plus its
+	// captured HEADERS; a later body fetch for it reports unavailable_reason
+	// "evicted", exactly as a disk-budget-evicted body does. This is what
+	// bounds ring memory: 5000 records of metadata and headers is cheap, 5000
+	// records of bodies (up to the 64KB inline threshold each, twice per
+	// record) is not.
+	ProxyRequestDetailWindow = 1000
 )
 
 // Buffer sizes
@@ -239,8 +263,17 @@ const (
 	// ScannerMaxBufferSize is the maximum buffer size for log line scanning
 	ScannerMaxBufferSize = 1024 * 1024 // 1MB
 
-	// DefaultProxyRequestBufferSize is the default number of proxy requests to keep in memory
-	DefaultProxyRequestBufferSize = 1000
+	// DefaultProxyRequestBufferSize is the default number of proxy requests to
+	// keep in memory. It is DEFINED as MaxProxyRequests rather than merely
+	// happening to equal it, because the shared-daemon forwarder backfills a
+	// full daemon ring in ONE fetch of MaxProxyRequests records
+	// (proxyd.backfillSnapshot): if the ring ever grew past the per-call limit
+	// clamp, a reconnect could no longer restore the whole ring and the two
+	// numbers would have silently drifted apart.
+	//
+	// Only the newest ProxyRequestDetailWindow of these records keep their
+	// captured body data; the rest keep metadata and headers only.
+	DefaultProxyRequestBufferSize = MaxProxyRequests
 )
 
 // Request capture configuration

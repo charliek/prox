@@ -82,7 +82,7 @@ Start with the interactive terminal UI:
 prox up --tui
 ```
 
-Note: The `--tui` flag works in foreground mode only and is mutually exclusive with `--detach`. For background + TUI workflow, use `prox up -d` then `prox attach`.
+Note: The `--tui` flag works in foreground mode only, is mutually exclusive with `--detach`, and requires an interactive terminal (it errors under pipes or redirection). For background + TUI workflow, use `prox up -d` then `prox attach`. Either way it is the same TUI: `prox up --tui` runs it against the process's own API, exactly as `prox attach` does against a daemon — the only difference is that quitting `up --tui` stops your processes, while quitting `attach` leaves the daemon running.
 
 The TUI provides:
 

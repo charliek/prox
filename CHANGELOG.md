@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
+TUI. The owner's TUI is the same API-client TUI attach has always run, so
+every feature, key binding, and fix lands in both at once.
+
+### Added
+
+- **Requests scroll-back in the TUI** (plan 018). Scrolling to the top of the
+  requests list now loads the next older page of requests from the ring
+  automatically (1000 at a time, up to the full 5000 the server retains), so
+  you can walk back through traffic that the initial sync did not carry. The
+  status bar reports the state: `loading older…` while a page is in flight,
+  `start of history` once the oldest retained request is on screen, and
+  `⚠ older: …` if a page fetch fails — pressing up again retries. One page is
+  ever in flight at a time, and paging is unaffected by an active filter or
+  search: the filters apply to what you see, not to what is fetched.
+- **A reconnect now rebases the requests list on the server's current
+  window** (plan 018). Requests carry no sequence numbers, so a client cannot
+  prove that history it scrolled back to still joins up with a snapshot taken
+  after a connection gap. Rather than showing a list with an invisible hole in
+  it, a completed re-sync drops everything older than the snapshot it just
+  fetched (and clears the list entirely when the server's ring is empty — a
+  restarted or replaced daemon), then lets you re-page. This also fixes a
+  wrong "stale?" marker: an in-flight request sitting deeper in the ring than
+  the sync fetch reaches is no longer mistaken for one the server has lost.
+- **The processes panel now shows a health dot** (plan 018). A process with a
+  healthcheck configured gets a small glyph after its name — a green `●` while
+  healthy, a red `✗` while unhealthy — styled independently of the process's own
+  state color so it can't be swallowed or recolored. A process with no
+  healthcheck (or one still reporting `unknown`) renders exactly as before.
+
+### Changed
+
+- **`prox up --tui` runs the same API-client TUI as `prox attach`** (plan
+  018). It is now a client of the API server `prox up` starts in its own
+  process rather than a second, local-only implementation reading the
+  supervisor and log manager directly. Everything attach mode gained — the
+  reconnecting log/request/process streams, the stream-health status line,
+  request detail and its live refresh, the cursor and filter behavior — is
+  now what `--tui` shows, and the two can no longer drift. Quit semantics
+  are unchanged: `q` still stops the supervisor and takes the processes
+  down with it (attach mode still leaves the daemon running), and `POST
+  /shutdown` plus `SIGINT`/`SIGTERM` still quit the TUI and run the normal
+  shutdown sequence and exit contract. The status line carries no
+  "Connected via API" text under `--tui`: it is the owner's own TUI, not a
+  remote attach.
+- **Proxy request retention raised to 5000 records** (was 1000; plan 018).
+  Every request ring — the standalone proxy, the shared daemon's per-project
+  rings, and each project's local forwarded ring — now keeps the newest 5000
+  requests, so you can scroll much further back through traffic before
+  records age out. The `?limit=` ceiling on `GET
+  /api/v1/proxy/requests` (and the daemon's equivalent) moves to 5000 with
+  it: the ring size and the per-call limit are the same number by
+  definition, because the shared-daemon forwarder has to be able to backfill
+  a full ring in one fetch after a reconnect.
+- **Captured bodies are now retained for the newest 1000 requests, not all
+  5000** (plan 018). Deeper retention would otherwise multiply memory by
+  five, since a captured body can be up to 64KB inline. When a request falls
+  outside the newest-1000 window its request/response bodies are dropped —
+  inline bytes released, spilled body files unlinked — while the record
+  itself and its captured **headers** are kept, along with body metadata
+  (size, content type, truncation). Opening such a request shows its full
+  metadata and headers with the body reported as `evicted`, the same signal
+  an over-budget spilled body already used. A slow in-flight request that
+  ages out of the window before it completes keeps its completion status and
+  headers, but its body is not stored.
+- **The TUI now syncs the newest 1000 requests rather than the whole ring**
+  (plan 018), so startup and reconnect cost stay flat as retention grows.
+  Older records are fetched on demand as you scroll back (see scroll-back
+  above); the TUI itself will hold up to the full 5000 once you have paged
+  through them.
+- **`--tui` on a non-interactive terminal is now an error** (plan 018).
+  `prox up --tui` with stdin or stdout redirected (a pipe, a CI runner, an
+  agent harness) exits non-zero with `--tui requires an interactive
+  terminal` before starting the supervisor, proxy, or API server, instead
+  of starting everything and then drawing a full-screen TUI nobody can see
+  or quit. Non-interactive callers want plain `prox up` (streams logs to
+  stdout) or `prox up -d`.
+
 ## v0.2.4
 
 Hardening release. Capture is now visible-by-default (redaction removed —

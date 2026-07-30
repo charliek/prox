@@ -332,7 +332,7 @@ endpoint stays free of duplicates.
 | `since` | string | — | RFC3339 timestamp; only requests recorded at or after this time |
 | `url_contains` | string | — | Case-insensitive substring match against the request URL (path+query only — never scheme/host) |
 | `before_id` | string | — | Cursor: page strictly older than this request ID (see [Cursor pagination](#cursor-pagination) below) |
-| `limit` | int | 100 | Max requests to return (max 1000) |
+| `limit` | int | 100 | Max requests to return (max 5000 — the ring size) |
 
 **Response:**
 
@@ -415,7 +415,7 @@ Retrieve details for one proxied request.
 |-------|------|---------|-------------|
 | `include` | string | — | Set to `body` to include captured request and response body data |
 
-Body data is available by default whenever the project's proxy is enabled — capture is on unless the project set `proxy.capture.enabled: false` or ran with `--no-capture` — but is not guaranteed for every record: a body may be absent when capture is unavailable in the daemon (`capture_available: false` in daemon status) or after disk-budget eviction (`unavailable_reason: "evicted"`, below). Stored `request_headers`/`response_headers` values — including `Authorization`, `Cookie`, and sensitive query params such as inside a `Location`/`Referer` header value — are captured verbatim, with no values altered or hidden. Bodies are likewise captured verbatim, up to `max_body_size`. See [Request Capture](configuration.md#request-capture) for the full cleartext posture and the disk-budget/eviction rules.
+Body data is available by default whenever the project's proxy is enabled — capture is on unless the project set `proxy.capture.enabled: false` or ran with `--no-capture` — but is not guaranteed for every record: a body may be absent when capture is unavailable in the daemon (`capture_available: false` in daemon status), after disk-budget eviction, or once the record falls outside the newest 1000 requests — bodies are retained only for that window even though the ring keeps 5000 records, and the record still carries its metadata and headers. All of those report `unavailable_reason: "evicted"` (below). Stored `request_headers`/`response_headers` values — including `Authorization`, `Cookie`, and sensitive query params such as inside a `Location`/`Referer` header value — are captured verbatim, with no values altered or hidden. Bodies are likewise captured verbatim, up to `max_body_size`. See [Request Capture](configuration.md#request-capture) for the full cleartext posture and the disk-budget/eviction rules.
 
 **Response:**
 
@@ -457,7 +457,7 @@ Body data is available by default whenever the project's proxy is enabled — ca
 | `content_encoding` | Captured `Content-Encoding` header value (e.g. `gzip`); omitted when unencoded |
 | `is_binary` | With `include=body`: whether the **served** (post-decode) bytes are binary. Without it: the stored classification of the **raw wire** bytes (a gzip body reports `true` here even when its decoded form would serve as text) — see decoded-body semantics below |
 | `data` | Body content (only with `include=body`): plain text for text bodies, base64 for binary |
-| `unavailable_reason` | Set (e.g. `evicted`) when `include=body` was requested but the body could no longer be loaded; `data` is absent |
+| `unavailable_reason` | Set (e.g. `evicted`) when `include=body` was requested but the body could no longer be loaded — its spilled file was disk-budget evicted, or the record aged past the newest-1000 captured-body window; `data` is absent, while metadata and headers remain |
 
 **Decoded-body semantics:** captured bodies store the raw wire bytes and are decoded at serve time. Supported `content_encoding` values are `gzip`/`x-gzip`, `deflate` (zlib-wrapped per RFC 9110, with a fallback to raw deflate for servers that send it unwrapped), `zstd`, and `br` (brotli) — decoded automatically, capped at 10MB decoded size (`MaxDecodedBodySize`). When the body was not truncated and decodes cleanly, `is_binary` reflects the decoded content (readable JSON/text decodes to `is_binary: false`). Chained encodings (e.g. `gzip, br`), unrecognized tokens, truncated bodies, corrupt streams, and payloads whose decoded size would exceed the cap are served as the raw bytes, base64-encoded, with `is_binary: true` and `content_encoding` preserved. The stored (raw) binary classification and the served `is_binary` may therefore legitimately differ. The on-disk path of a spilled body is never exposed.
 

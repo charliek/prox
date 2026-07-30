@@ -11,14 +11,14 @@ Run before every commit:
 make lint && make test && make test-race && make build
 ```
 
-~3-4 min total (the integration suite alone is ~70s). Run these bare — do
+~4-5 min total (the integration suite alone is ~95s). Run these bare — do
 NOT pipe through `| tail` or similar; that swallows the exit code and hides
 failures.
 
 ## Plans
 
 Panel-reviewed plans live OUTSIDE this repo, at
-`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 018). One plan → one
+`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 019). One plan → one
 PR of small gated commits. The plan file is never committed here, so the PR
 body must carry the plan's substance — reviewers and future readers only
 have the PR, not the plan file.

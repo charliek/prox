@@ -74,6 +74,8 @@ The processes panel color-codes each process name by its state, including the st
 
 A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on, appended directly to its name in the panel: `web (waiting on: postgres, redis)` or `web (blocked on: postgres)`, in declaration order. There's no separate detail area for this in the compact processes panel — it's shown inline because that's all the space there is.
 
+A process with a [healthcheck](configuration.md#health-check-fields) configured shows a health dot right after its name: green `●` while healthy, red `✗` while unhealthy (distinct glyphs, so the states stay distinguishable without color). It's styled separately from the name's state color, so it stays visible regardless of process state. A process still reporting `unknown` health, or with no healthcheck configured at all, shows no dot.
+
 A request whose response is still streaming shows its real header-time status but `...` in place of the duration until it completes; the row then updates in place (same position, no duplicate) rather than adding a new line.
 
 ## Keybindings
@@ -129,6 +131,16 @@ pauses follow; moving it back onto the newest row (`j`/`PgDn`), or pressing
 `G`/`End`/`F`, resumes it. While follow is paused, arriving requests never move
 the cursor off the row you selected.
 
+**Scroll-back.** The TUI loads the newest 1000 requests when it connects.
+Moving the cursor onto the oldest row loads the next older page automatically
+(1000 at a time, up to the 5000 the server retains). The status bar reports
+`loading older…` while a page is in flight, `start of history` once the oldest
+retained request is loaded, and `⚠ older: …` if a page could not be fetched —
+move up again to retry. Filters and searches never reach the fetch: they apply
+to what is displayed, not to what is loaded. Reconnecting re-syncs against the
+server's current window and discards pages older than it, so a scrolled-back
+list can never show a gap; page back down again after a reconnect.
+
 **Search vs. filter.** `/` in the requests view *navigates* — it jumps the
 cursor to matching rows and leaves every row visible — so it composes with an
 active `s` filter (matches are computed over the filtered list) instead of
@@ -161,12 +173,11 @@ Request Body (35 bytes, application/json)
   since headers/bodies haven't been captured yet, `(request in flight —
   details arrive on completion)` instead of the usual body sections.
 - Detail views live-update: when the open request completes, the view
-  refreshes in place with its final duration, headers, and bodies, and your
-  scroll position is preserved. In local mode (`prox up`) this happens
-  instantly from the streamed record; in client mode (`prox attach`) it
-  re-fetches the request in the background, with no loading flicker. If that
-  background re-fetch fails, the last snapshot stays on screen and the note
-  changes to `(live refresh failed — press esc and re-enter to reload)`.
+  re-fetches the request in the background and refreshes in place with its
+  final duration, headers, and bodies — no loading flicker, and your scroll
+  position is preserved. If that background re-fetch fails, the last snapshot
+  stays on screen and the note changes to `(live refresh failed — press esc
+  and re-enter to reload)`.
 
 ## Process Filter Mode
 

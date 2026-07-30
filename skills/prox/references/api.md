@@ -323,7 +323,7 @@ Retrieve recent proxy requests (requires proxy to be enabled).
 | `since` | string | — | Only requests at or after this time (RFC3339 timestamp, e.g. `2025-01-19T10:00:00Z`) |
 | `url_contains` | string | — | Filter by URL substring (path+query, case-insensitive) |
 | `before_id` | string | — | Cursor: page strictly older than this request ID (see below) |
-| `limit` | int | 100 | Max requests to return (max 1000) |
+| `limit` | int | 100 | Max requests to return (max 5000 — the ring size) |
 
 **Response:**
 
@@ -376,7 +376,7 @@ Retrieve details for one proxied request.
 |-------|------|---------|-------------|
 | `include` | string | — | Set to `body` to include captured request and response body data |
 
-Body data is available by default whenever the project's proxy is enabled — capture is on unless the project set `proxy.capture.enabled: false` or ran with `--no-capture` — but is not guaranteed for every record: a body may be absent when capture is unavailable in the daemon (`capture_available: false` in daemon status) or when the spilled body file was evicted by the disk budget, in which case the body object carries `unavailable_reason: "evicted"`. Stored `request_headers`/`response_headers` values — including sensitive headers (`Authorization`, `Cookie`, etc.) and sensitive query params (in the URL, or inside `Location`/`Referer` header values) — are captured verbatim, with no values altered or hidden. Bodies are likewise captured verbatim, up to `max_body_size` — see `configuration.md` for the full cleartext posture and limits.
+Body data is available by default whenever the project's proxy is enabled — capture is on unless the project set `proxy.capture.enabled: false` or ran with `--no-capture` — but is not guaranteed for every record: a body may be absent when capture is unavailable in the daemon (`capture_available: false` in daemon status), when the spilled body file was evicted by the disk budget, or once the record falls outside the newest 1000 requests (bodies are retained only for that window even though the ring keeps 5000 records; metadata and headers remain). All of those carry `unavailable_reason: "evicted"`. Stored `request_headers`/`response_headers` values — including sensitive headers (`Authorization`, `Cookie`, etc.) and sensitive query params (in the URL, or inside `Location`/`Referer` header values) — are captured verbatim, with no values altered or hidden. Bodies are likewise captured verbatim, up to `max_body_size` — see `configuration.md` for the full cleartext posture and limits.
 
 **Response:**
 
@@ -408,7 +408,7 @@ Body data is available by default whenever the project's proxy is enabled — ca
 }
 ```
 
-`captured_size` is the bytes actually retained after any truncation (vs `size`, the original body size). `content_encoding` records the stored `Content-Encoding` (e.g. `gzip`); gzip/deflate/zstd/brotli bodies are decoded transparently, so `data`/`is_binary` reflect the decoded (served) bytes when `include=body` is used. If a body can no longer be loaded (e.g. its capture file was evicted), the body object carries `"unavailable_reason": "evicted"` instead of `data`.
+`captured_size` is the bytes actually retained after any truncation (vs `size`, the original body size). `content_encoding` records the stored `Content-Encoding` (e.g. `gzip`); gzip/deflate/zstd/brotli bodies are decoded transparently, so `data`/`is_binary` reflect the decoded (served) bytes when `include=body` is used. If a body can no longer be loaded (its capture file was disk-budget evicted, or the record aged past the newest-1000 captured-body window), the body object carries `"unavailable_reason": "evicted"` instead of `data` — metadata and the record's headers are still there.
 
 **Examples:**
 

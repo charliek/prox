@@ -394,3 +394,62 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 		t.Errorf("expected failure diagnostics mentioning 'failed to start', got:\n%s", out)
 	}
 }
+
+// TestUpTUI_NonInteractiveRefusesToStart pins the --tui non-TTY guard (plan 018
+// C2). A piped invocation cannot drive a full-screen TUI, so `prox up --tui` must
+// refuse BEFORE anything starts: non-zero exit, the guard's message, and — the
+// part that matters — no process launched and no .prox state left behind. Run
+// under `go test` the child's stdout/stderr are pipes, which is exactly the
+// non-interactive shape a CI runner or `| tee` produces.
+func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+
+	// Isolated working dir: nothing here touches the repo root's .prox, and the
+	// process the config would have launched leaves a marker file we can look for.
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "launched.marker")
+	cfg := filepath.Join(dir, "prox.yaml")
+	cfgBody := "api:\n  host: 127.0.0.1\n\nprocesses:\n  marker:\n    cmd: touch " + marker + " && sleep 30\n"
+	if err := os.WriteFile(cfg, []byte(cfgBody), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cmd := exec.Command(binary, "up", "--tui", "-c", cfg)
+	cmd.Dir = dir
+
+	done := make(chan struct{})
+	var out []byte
+	var runErr error
+	go func() {
+		out, runErr = cmd.CombinedOutput()
+		close(done)
+	}()
+
+	// The guard runs before any startup work, so this is near-instant; the budget
+	// is generous only to absorb a loaded CI machine.
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		killProx(cmd)
+		t.Fatal("prox up --tui did not exit; the non-TTY guard should refuse immediately")
+	}
+
+	var ee *exec.ExitError
+	if !errors.As(runErr, &ee) {
+		t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", runErr, out)
+	}
+	if !strings.Contains(string(out), "--tui requires an interactive terminal") {
+		t.Errorf("expected the interactive-terminal guard message, got:\n%s", out)
+	}
+
+	// Nothing may have started: no marker from the configured process, and no
+	// state directory (the guard fires before EnsureStateDir).
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("--tui guard must refuse before starting processes, but the marker exists (stat err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
+		t.Errorf("--tui guard must refuse before any state is written, but .prox exists (stat err=%v)", err)
+	}
+}

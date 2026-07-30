@@ -23,9 +23,15 @@ import (
 //
 // Exactly one of these is delivered per successful stream attempt, immediately
 // before the loop is marked synchronized (StateOK).
+//
+// NextBeforeID carries the pagination cursor for scroll-back: the before_id
+// to request for the page strictly older than this snapshot. "" means the
+// snapshot already reached the ring's oldest record — there is nothing older
+// to page to.
 type RequestsSyncMsg struct {
-	Snapshot []proxy.RequestRecord
-	Buffered []proxy.RequestRecord
+	Snapshot     []proxy.RequestRecord
+	Buffered     []proxy.RequestRecord
+	NextBeforeID string
 }
 
 // errRequestsSyncOverflow ends an attempt whose live-event buffer filled before
@@ -104,7 +110,9 @@ func syncRequestsSnapshot(ctx context.Context, client TUIClient, st *requestsSyn
 			}
 		}
 
-		resp, err := client.GetProxyRequests(ctx, domain.ProxyRequestParams{Limit: constants.MaxProxyRequests})
+		// Scroll-back pages the older records on demand through the BeforeID
+		// cursor, so this fetch is a screenful's worth, not the whole ring.
+		resp, err := client.GetProxyRequests(ctx, domain.ProxyRequestParams{Limit: constants.TUIRequestsSyncLimit})
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -113,7 +121,7 @@ func syncRequestsSnapshot(ctx context.Context, client TUIClient, st *requestsSyn
 			continue
 		}
 
-		st.complete(snapshotRecords(st.send, resp.Requests), markSynced)
+		st.complete(snapshotRecords(st.send, resp.Requests), resp.NextBeforeID, markSynced)
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -167,6 +175,10 @@ func (st *requestsSyncState) observe(req api.ProxyRequestResponse) {
 		st.mu.Unlock()
 		return
 	}
+	// The live-buffer cap stays at the RING size (MaxProxyRequests), not the
+	// smaller sync fetch limit: this bounds how many events may pile up while
+	// the snapshot is outstanding, and once that many have arrived the snapshot
+	// is worthless anyway (the whole ring turned over).
 	if len(st.buf) >= constants.MaxProxyRequests {
 		st.overflow = true
 		st.mu.Unlock()
@@ -180,8 +192,11 @@ func (st *requestsSyncState) observe(req api.ProxyRequestResponse) {
 
 // complete delivers the sync batch and switches to passthrough. A no-op once
 // the attempt has overflowed (the batch is moot) or the sync already completed
-// (a client that called onConnect twice).
-func (st *requestsSyncState) complete(snapshot []proxy.RequestRecord, markSynced func()) {
+// (a client that called onConnect twice). nextBeforeID is the fetch response's
+// pagination cursor, passed straight through onto the message (see
+// RequestsSyncMsg.NextBeforeID) — this method does no cursor bookkeeping of
+// its own.
+func (st *requestsSyncState) complete(snapshot []proxy.RequestRecord, nextBeforeID string, markSynced func()) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -193,7 +208,7 @@ func (st *requestsSyncState) complete(snapshot []proxy.RequestRecord, markSynced
 	st.buf = nil
 	st.buffering = false
 
-	st.send(RequestsSyncMsg{Snapshot: snapshot, Buffered: buffered})
+	st.send(RequestsSyncMsg{Snapshot: snapshot, Buffered: buffered, NextBeforeID: nextBeforeID})
 	// Only NOW is the stream synchronized: the models hold the full ring plus
 	// everything that arrived during the fetch.
 	markSynced()
