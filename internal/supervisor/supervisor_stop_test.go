@@ -37,6 +37,39 @@ func (r *nameRunner) Start(_ context.Context, cfg domain.ProcessConfig, _ map[st
 	return fp, nil
 }
 
+// nameFactoryRunner mints a FRESH graceful fakeProcess on every Start, keyed by
+// process name: each name carries a base PID and a per-name launch counter, so
+// launch n of a given name comes back as a distinct live fake with PID base+n.
+// A name's series therefore occupies base..base+launches, so callers must space
+// their base PIDs further apart than any name's launch count.
+//
+// Tests that RESTART a process need this rather than nameRunner. A restart is a
+// new process with a new PID, but a fakeProcess is single-use -- its Wait()
+// channel is closed for good by the first SIGTERM -- so a pre-built fake handed
+// back a second time would already be dead: the relaunched process's monitor
+// would see Wait() return immediately and commit crashed.
+type nameFactoryRunner struct {
+	mu       sync.Mutex
+	basePIDs map[string]int
+	calls    map[string]int
+}
+
+func newNameFactoryRunner(basePIDs map[string]int) *nameFactoryRunner {
+	return &nameFactoryRunner{basePIDs: basePIDs, calls: make(map[string]int, len(basePIDs))}
+}
+
+func (r *nameFactoryRunner) Start(_ context.Context, cfg domain.ProcessConfig, _ map[string]string) (Process, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	base, ok := r.basePIDs[cfg.Name]
+	if !ok {
+		panic("nameFactoryRunner: no base PID configured for process " + cfg.Name)
+	}
+	call := r.calls[cfg.Name]
+	r.calls[cfg.Name]++
+	return newGracefulFake(base + call), nil
+}
+
 // newStopSupervisor builds a supervisor over the given named fakes (each keyed by
 // process name), all sharing stopTimeout. It does not start the supervisor.
 func newStopSupervisor(t *testing.T, fakes map[string]*fakeProcess, stopTimeout string) *Supervisor {
@@ -51,6 +84,25 @@ func newStopSupervisor(t *testing.T, fakes map[string]*fakeProcess, stopTimeout 
 		cfg.Processes[name] = config.ProcessConfig{Cmd: "irrelevant", StopTimeout: stopTimeout}
 	}
 	return New(cfg, logMgr, newNameRunner(fakes), DefaultSupervisorConfig())
+}
+
+// newRestartSupervisor builds a supervisor whose runner mints a fresh graceful
+// fake per launch, one PID series per named process (base PID keyed by name),
+// all sharing stopTimeout. It is the counterpart to newStopSupervisor for tests
+// that stop and start the same process repeatedly. It does not start the
+// supervisor.
+func newRestartSupervisor(t *testing.T, basePIDs map[string]int, stopTimeout string) *Supervisor {
+	t.Helper()
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 200})
+	t.Cleanup(func() { logMgr.Close() })
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 5556, Host: "127.0.0.1"},
+		Processes: make(map[string]config.ProcessConfig, len(basePIDs)),
+	}
+	for name := range basePIDs {
+		cfg.Processes[name] = config.ProcessConfig{Cmd: "irrelevant", StopTimeout: stopTimeout}
+	}
+	return New(cfg, logMgr, newNameFactoryRunner(basePIDs), DefaultSupervisorConfig())
 }
 
 // collectStopEvents drains sub non-blocking and returns the stop/crash events

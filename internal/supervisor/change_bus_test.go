@@ -231,9 +231,7 @@ func TestChangeBus_BurstNeverBlocksEmitterAndCoalesces(t *testing.T) {
 // burst, its wake-driven snapshot converges on the final state -- the property
 // the SSE stream depends on (convergence, not event counts).
 func TestChangeBus_RapidTransitionsConvergeOnFinalState(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"svc": newGracefulFake(9201),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"svc": 9201}, "3s")
 
 	_, ch := sup.Subscribe()
 
@@ -285,9 +283,7 @@ func TestChangeBus_RapidTransitionsConvergeOnFinalState(t *testing.T) {
 // start -> running, stop -> stopped, start again, and a restart-count bump are
 // each observable to a wake-driven subscriber.
 func TestChangeBus_ConvergesOnStartStopAndRestartCount(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"svc": newGracefulFake(9301),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"svc": 9301}, "3s")
 
 	_, ch := sup.Subscribe()
 
@@ -481,10 +477,7 @@ func TestChangeBus_ConvergesOnWaitingThenRunning(t *testing.T) {
 // both the lock discipline (no notify fires under a supervisor/process lock) and
 // the absence of data races on the bus itself.
 func TestChangeBus_SnapshotFromWakeHandlerUnderChurn(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"a": newGracefulFake(9501),
-		"b": newGracefulFake(9502),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"a": 9501, "b": 9601}, "3s")
 
 	const subscribers = 4
 	var wg sync.WaitGroup
@@ -513,16 +506,21 @@ func TestChangeBus_SnapshotFromWakeHandlerUnderChurn(t *testing.T) {
 		churn.Add(1)
 		go func(name string) {
 			defer churn.Done()
+			// assert, not require: FailNow off the test goroutine is
+			// unsupported, and it would abandon this name's remaining
+			// iterations — losing the churn the rest of the test needs.
 			for i := 0; i < 5; i++ {
-				_ = sup.StopProcess(context.Background(), name)
-				_ = sup.StartProcess(context.Background(), name)
+				assert.NoErrorf(t, sup.StopProcess(context.Background(), name), "%s stop #%d", name, i)
+				assert.NoErrorf(t, sup.StartProcess(context.Background(), name), "%s start #%d", name, i)
 			}
 		}(name)
 	}
 	churn.Wait()
 
 	// Stop closes the bus, which is what releases every subscriber goroutine.
-	_ = sup.Stop(context.Background())
+	// With graceful fakes a clean stop is the expected outcome; an error here
+	// would mean a surviving group, which this test should notice.
+	require.NoError(t, sup.Stop(context.Background()))
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
