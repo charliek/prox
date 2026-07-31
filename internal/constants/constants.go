@@ -218,7 +218,8 @@ const (
 	//
 	// Raised from 1000 to 5000 (plan 018, D9). Ring memory is bounded not by
 	// this count but by ProxyRequestDetailWindow, which limits how many of
-	// those records keep their captured bodies.
+	// those records keep their captured bodies — see that constant for how
+	// "which records" is decided (the rule differs by ring type).
 	MaxProxyRequests = 5000
 
 	// TUIRequestsSyncLimit is how many of the newest proxy requests the TUI
@@ -237,15 +238,26 @@ const (
 	// either without touching the other.
 	TUIRequestsSyncLimit = 1000
 
-	// ProxyRequestDetailWindow is how many of the NEWEST records in a proxy
-	// request ring keep their captured BODY data (plan 018, D9b). When a record
-	// falls outside this window the ring drops its inline body bytes and
-	// unlinks its spilled body files, keeping the record itself plus its
-	// captured HEADERS; a later body fetch for it reports unavailable_reason
-	// "evicted", exactly as a disk-budget-evicted body does. This is what
-	// bounds ring memory: 5000 records of metadata and headers is cheap, 5000
-	// records of bodies (up to the 64KB inline threshold each, twice per
-	// record) is not.
+	// ProxyRequestDetailWindow sizes the captured-BODY retention bound on a
+	// proxy request ring (plan 018, D9b) — how many records may hold body
+	// data at once. Two mechanisms share this one constant, sized identically
+	// so their behavior tracks together, but "which records" is decided
+	// differently by ring type:
+	//   - A capture-owning ring (standalone; the shared daemon's per-project
+	//     ring) bounds the NEWEST records by ring POSITION. A record that
+	//     falls outside the window has its inline body bytes dropped AND its
+	//     spilled body files unlinked, keeping the record itself plus its
+	//     captured HEADERS.
+	//   - The forwarder-fed replica in shared mode
+	//     (proxy.NewReplicaRequestManager) bounds records by daemon-supplied
+	//     TIMESTAMP instead, because ring position on a replica is not
+	//     recency, and it strips only inline body Data — it owns no spilled
+	//     files to unlink; the daemon's own disk truth governs those.
+	// Either way, a later body fetch for a stripped record reports
+	// unavailable_reason "evicted", exactly as a disk-budget-evicted body
+	// does. This is what bounds ring memory: 5000 records of metadata and
+	// headers is cheap, 5000 records of bodies (up to the 64KB inline
+	// threshold each, twice per record) is not.
 	ProxyRequestDetailWindow = 1000
 )
 
@@ -271,8 +283,10 @@ const (
 	// clamp, a reconnect could no longer restore the whole ring and the two
 	// numbers would have silently drifted apart.
 	//
-	// Only the newest ProxyRequestDetailWindow of these records keep their
-	// captured body data; the rest keep metadata and headers only.
+	// Only ProxyRequestDetailWindow of these records keep their captured body
+	// data at once; the rest keep metadata and headers only. See that
+	// constant for how "which records" is decided — by ring POSITION on a
+	// capture-owning ring, by TIMESTAMP on the forwarder-fed replica.
 	DefaultProxyRequestBufferSize = MaxProxyRequests
 )
 

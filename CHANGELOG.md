@@ -60,15 +60,22 @@ every feature, key binding, and fix lands in both at once.
   a full ring in one fetch after a reconnect.
 - **Captured bodies are now retained for the newest 1000 requests, not all
   5000** (plan 018). Deeper retention would otherwise multiply memory by
-  five, since a captured body can be up to 64KB inline. When a request falls
-  outside the newest-1000 window its request/response bodies are dropped —
-  inline bytes released, spilled body files unlinked — while the record
-  itself and its captured **headers** are kept, along with body metadata
-  (size, content type, truncation). Opening such a request shows its full
-  metadata and headers with the body reported as `evicted`, the same signal
-  an over-budget spilled body already used. A slow in-flight request that
-  ages out of the window before it completes keeps its completion status and
-  headers, but its body is not stored.
+  five, since a captured body can be up to 64KB inline. On a ring that owns
+  capture (standalone, and the shared daemon's per-project ring), a request
+  falling outside the newest-1000 window has its request/response bodies
+  dropped — inline bytes released, spilled body files unlinked — while the
+  record itself and its captured **headers** are kept, along with body
+  metadata (size, content type, truncation). Opening such a request shows its
+  full metadata and headers with the body reported as `evicted`, the same
+  signal an over-budget spilled body already used. A slow in-flight request
+  that ages out of the window before it completes keeps its completion
+  status and headers, but its body is not stored. Each shared-mode project's
+  local forwarded ring enforces this same 1000-record bound independently,
+  ordered by request timestamp rather than ring position — the daemon's own
+  eviction is silent, so without its own bound this ring would keep every
+  live-forwarded body forever between registrations. It only ever drops
+  inline bytes, since it owns no spilled files to unlink; a spilled body's
+  file eviction is still the daemon's to report.
 - **The TUI now syncs the newest 1000 requests rather than the whole ring**
   (plan 018), so startup and reconnect cost stay flat as retention grows.
   Older records are fetched on demand as you scroll back (see scroll-back

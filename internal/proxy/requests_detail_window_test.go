@@ -15,8 +15,16 @@ import (
 // --- Captured-body detail window (D9b) ---
 //
 // Retention (ring capacity) and BODY retention are separate bounds: the ring
-// keeps constants.DefaultProxyRequestBufferSize records, but only the newest
-// constants.ProxyRequestDetailWindow of them keep their captured bodies.
+// keeps constants.DefaultProxyRequestBufferSize records, but only
+// constants.ProxyRequestDetailWindow of them keep their captured bodies. Two
+// mechanisms share that constant: a capture-owning ring (standalone, the
+// daemon's per-project ring) bounds bodies by ring POSITION — this file's
+// concern below. The forwarder-fed replica has no capture of its own to
+// strip on the daemon's behalf, so it bounds retained INLINE body data by
+// daemon-supplied TIMESTAMP instead; see requests_body_window_test.go for
+// that mechanism's own suite, and
+// TestReplicaRequestManager_BoundsInlineBodiesAtRealConstants below for its
+// shipping-constant coverage.
 
 // bodyRetained reports whether a captured body still holds servable data.
 func bodyRetained(b *CapturedBody) bool {
