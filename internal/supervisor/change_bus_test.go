@@ -231,9 +231,7 @@ func TestChangeBus_BurstNeverBlocksEmitterAndCoalesces(t *testing.T) {
 // burst, its wake-driven snapshot converges on the final state -- the property
 // the SSE stream depends on (convergence, not event counts).
 func TestChangeBus_RapidTransitionsConvergeOnFinalState(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"svc": newGracefulFake(9201),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"svc": 9201}, "3s")
 
 	_, ch := sup.Subscribe()
 
@@ -285,9 +283,7 @@ func TestChangeBus_RapidTransitionsConvergeOnFinalState(t *testing.T) {
 // start -> running, stop -> stopped, start again, and a restart-count bump are
 // each observable to a wake-driven subscriber.
 func TestChangeBus_ConvergesOnStartStopAndRestartCount(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"svc": newGracefulFake(9301),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"svc": 9301}, "3s")
 
 	_, ch := sup.Subscribe()
 
@@ -481,10 +477,7 @@ func TestChangeBus_ConvergesOnWaitingThenRunning(t *testing.T) {
 // both the lock discipline (no notify fires under a supervisor/process lock) and
 // the absence of data races on the bus itself.
 func TestChangeBus_SnapshotFromWakeHandlerUnderChurn(t *testing.T) {
-	sup := newStopSupervisor(t, map[string]*fakeProcess{
-		"a": newGracefulFake(9501),
-		"b": newGracefulFake(9502),
-	}, "3s")
+	sup := newRestartSupervisor(t, map[string]int{"a": 9501, "b": 9601}, "3s")
 
 	const subscribers = 4
 	var wg sync.WaitGroup
@@ -514,8 +507,8 @@ func TestChangeBus_SnapshotFromWakeHandlerUnderChurn(t *testing.T) {
 		go func(name string) {
 			defer churn.Done()
 			for i := 0; i < 5; i++ {
-				_ = sup.StopProcess(context.Background(), name)
-				_ = sup.StartProcess(context.Background(), name)
+				require.NoError(t, sup.StopProcess(context.Background(), name))
+				require.NoError(t, sup.StartProcess(context.Background(), name))
 			}
 		}(name)
 	}
