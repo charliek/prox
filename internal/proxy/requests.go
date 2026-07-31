@@ -448,8 +448,11 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 
 	// Notify subscribers with the record as STORED, not as submitted: the
 	// replica body window can strip the arriving record itself (its timestamp
-	// may already be the oldest bodied one), and no entry point may advertise
-	// body data the ring will refuse to serve.
+	// may already be the oldest bodied one), and advertising data the ring
+	// refused to store would be wrong at commit time. A LATER strip can still
+	// race this post-unlock delivery — the same accepted staleness as any
+	// subscriber-held copy (see evictDetailWindowLocked); only Upsert, which
+	// notifies under mu, pins the notified copy to the ring's state exactly.
 	m.notifySubscribers(stored)
 	return true
 }
