@@ -346,7 +346,12 @@ func streamRequests(ctx context.Context, socketPath string, snapClient *Client, 
 // applies zero records.
 //
 // Records outside the daemon's captured-body detail window arrive with their
-// bodies already marked evicted (D9b); they replay into localRM as-is.
+// bodies already marked evicted (D9b); they replay into localRM as-is. A
+// record still inside that window arrives WITH its body — the daemon's
+// eviction publishes no event, so nothing on this path strips it later; it is
+// localRM's own timestamp-ordered inline-body window (see
+// proxy.NewReplicaRequestManager) that bounds bodies retained on the live
+// path, backfill included.
 //
 // On any failure — non-200, decode error, timeout, or ctx cancellation — it
 // logs one warning and returns, leaving the stream to run in degraded,

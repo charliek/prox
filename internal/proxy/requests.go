@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"container/heap"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -216,6 +217,102 @@ type RequestManager struct {
 	// through onEvict. A value <= 0, or one >= capacity, disables the window —
 	// every record keeps its bodies.
 	detailWindow int
+
+	// bodyWindow bounds how many records in this ring may hold RETAINED INLINE
+	// captured body data (CapturedBody.Data). It is the counterpart of
+	// detailWindow for a ring that REPLICATES records captured elsewhere, and
+	// the two are mutually exclusive: the shared constructor panics if both are
+	// set, because composing a position window and a timestamp window would
+	// make the strip order depend on which one fired first.
+	//
+	// Where a capture-owning ring bounds bodies by ring POSITION, a replica
+	// must bound them by the daemon-supplied Timestamp, because arrival
+	// position on a replica is not recency. The forwarder's backfill
+	// deliberately races the live event stream, so a record delivered live
+	// before its backfill copy arrives sinks toward the ring's OLDEST position
+	// even though it is one of the newest requests; a position window would
+	// strip a body the daemon still serves. Timestamps ride the wire verbatim
+	// from the daemon's single clock, so that same record still ranks as new.
+	//
+	// Only inline Data is counted and stripped. A spilled FilePath body costs
+	// this ring no memory — the bytes live in the daemon's capture dir, which
+	// the replica does not own — and it self-corrects: once the daemon unlinks
+	// the file, the local load path already reports "evicted". Stripping it
+	// here would refuse a body the daemon still serves for zero memory gain.
+	// A strip therefore never needs to unlink anything, so this path produces
+	// no cleanup IDs and never reaches the eviction callback.
+	//
+	// A value <= 0 disables the mechanism entirely (no allocation, no
+	// bookkeeping); a value >= capacity is legal and simply never binds before
+	// ring capacity does.
+	bodyWindow int
+
+	// bodyHeap orders the slots that hold retained inline body data by
+	// (Timestamp, insertion ordinal), oldest first, so enforcing the bound is
+	// one pop. bodySlots is the inverse: bodySlots[s] is the heap entry
+	// belonging to the CURRENT occupant of ring slot s, or nil when that
+	// occupant holds no retained inline body.
+	//
+	// Identity here is the SLOT, not the record ID: the ring deliberately
+	// permits duplicate explicit IDs, so an ID does not name a unique
+	// occupant. Every mutation that changes a slot's occupant goes through
+	// replaceSlotLocked, which updates both structures eagerly, making a stale
+	// entry unrepresentable rather than merely unlikely.
+	// Both are nil when bodyWindow <= 0. Guarded by mu, like the ring itself.
+	bodyHeap  bodyWindowHeap
+	bodySlots []*bodyHeapEntry
+
+	// bodySeq is the monotonic insertion ordinal that breaks Timestamp ties in
+	// bodyHeap, so records sharing a timestamp are stripped in arrival order
+	// rather than in whatever order the heap happens to lay them out.
+	bodySeq uint64
+}
+
+// bodyHeapEntry records one ring slot's membership in the replica body window.
+// heapIdx is the entry's live position in bodyHeap, maintained by Swap, so an
+// entry can be removed in O(log n) when its slot is vacated instead of being
+// searched for.
+type bodyHeapEntry struct {
+	ts      int64
+	seq     uint64
+	slot    int
+	heapIdx int
+}
+
+// bodyWindowHeap is a container/heap min-heap of bodyHeapEntry ordered by
+// (ts, seq). Its minimum is the oldest record still holding inline body data —
+// the one a strip must take.
+type bodyWindowHeap []*bodyHeapEntry
+
+func (h bodyWindowHeap) Len() int { return len(h) }
+
+func (h bodyWindowHeap) Less(i, j int) bool {
+	if h[i].ts != h[j].ts {
+		return h[i].ts < h[j].ts
+	}
+	return h[i].seq < h[j].seq
+}
+
+func (h bodyWindowHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIdx = i
+	h[j].heapIdx = j
+}
+
+func (h *bodyWindowHeap) Push(x any) {
+	entry := x.(*bodyHeapEntry)
+	entry.heapIdx = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *bodyWindowHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	old[n-1] = nil // drop the reference so the entry can be collected
+	entry.heapIdx = -1
+	*h = old[:n-1]
+	return entry
 }
 
 // NewRequestManager creates a new request manager with the specified buffer
@@ -227,20 +324,32 @@ func NewRequestManager(capacity int) *RequestManager {
 
 // NewReplicaRequestManager creates a request manager for a ring that REPLICATES
 // records captured elsewhere (the forwarder-fed project-local ring in shared
-// mode) rather than owning capture itself. The detail window is disabled: the
-// window's job is bounding capture memory where capture happens, and for a
-// replica that bound is already enforced upstream — records past the daemon's
-// window arrive with their bodies stripped (CapturedBody.Evicted), so the
-// replica can never hold more bodied records than the daemon's window allows.
+// mode) rather than owning capture itself. It runs the timestamp-ordered body
+// window (bodyWindow) instead of the position-ordered detail window, bounding
+// retained INLINE body data at constants.ProxyRequestDetailWindow records —
+// parity with a capture-owning ring's inline worst case.
 //
-// Running the window here would be worse than redundant: the forwarder's
-// backfill deliberately races the live SSE loop, and Upsert's monotonic no-op
-// on an already-final record means a record that arrived live BEFORE its
-// backfill slot sinks toward the replica's oldest end — a position skew that is
-// cosmetic until a local window turns it into evicting the body of a request
-// the daemon still serves (cursor review, C5).
+// A replica needs its own bound because upstream stripping does not reach it:
+// the daemon's detail window publishes no event when it drops a body, so a
+// record forwarded LIVE arrives with its body and keeps it locally forever,
+// long after the daemon has evicted it. Only BACKFILL-delivered records past
+// the daemon's window arrive already marked CapturedBody.Evicted.
+//
+// The window is ordered by the daemon-supplied Timestamp, not by ring position,
+// because position on a replica is not recency: the forwarder's backfill
+// deliberately races the live event stream and Upsert treats a final record as
+// terminal, so a record delivered live BEFORE its backfill copy sinks toward
+// the ring's oldest position while still being one of the newest requests. A
+// position window would strip its body while the daemon still serves it;
+// timestamp order ranks it correctly, because Timestamp is set once daemon-side
+// and rides the wire verbatim. That is a bounded approximation of daemon truth,
+// not a mirror of it — a clock step can change WHICH record is stripped, never
+// HOW MANY retain data.
+//
+// Spilled (FilePath) bodies are exempt: they cost this ring no memory and the
+// daemon's disk truth is authoritative on load. See the bodyWindow field.
 func NewReplicaRequestManager(capacity int) *RequestManager {
-	return newRequestManagerWithDetailWindow(capacity, 0)
+	return newReplicaRequestManagerWithBodyWindow(capacity, constants.ProxyRequestDetailWindow)
 }
 
 // newRequestManagerWithDetailWindow is NewRequestManager with an explicit
@@ -248,19 +357,58 @@ func NewReplicaRequestManager(capacity int) *RequestManager {
 // of records instead of thousands. Deliberately unexported: the window is not a
 // configurable knob (see docs/reference/configuration.md), so production code
 // must not be able to pick an arbitrary window — the only sanctioned variants
-// are the default and the replica's disabled window above. A non-positive
-// detailWindow keeps bodies for every record in the ring.
+// are the default and the replica's window above. A non-positive detailWindow
+// keeps bodies for every record in the ring.
 func newRequestManagerWithDetailWindow(capacity, detailWindow int) *RequestManager {
+	return newRequestManagerWithWindows(capacity, detailWindow, 0)
+}
+
+// newReplicaRequestManagerWithBodyWindow is NewReplicaRequestManager with an
+// explicit inline-body window, so tests can exercise the window with a handful
+// of records instead of thousands. Unexported for the same reason as its detail
+// window sibling: the window is a constant, not a knob. A non-positive window
+// keeps every inline body.
+func newReplicaRequestManagerWithBodyWindow(capacity, bodyWindow int) *RequestManager {
+	return newRequestManagerWithWindows(capacity, 0, bodyWindow)
+}
+
+// newRequestManagerWithWindows is the single constructor behind every variant.
+//
+// It PANICS when both windows are requested. They are alternative answers to
+// the same question — how much captured body data may this ring hold — chosen
+// by whether the ring owns capture or replicates it, and running both would
+// leave the strip order dependent on which fired first. No caller has any
+// reason to ask for both, so a construction-time panic is cheaper than a
+// semantics nobody would be able to reason about.
+//
+// The panic is load-bearing, not merely tidy: evictDetailWindowLocked strips a
+// slot's inline body by writing m.buffer directly, without going through
+// bodyWindowVacateLocked, so a co-running pair would leave the body heap
+// charging for bytes that are gone and break the bodySlots invariant. Anyone
+// tempted to delete this guard must make that path window-aware first.
+func newRequestManagerWithWindows(capacity, detailWindow, bodyWindow int) *RequestManager {
 	if capacity <= 0 {
 		capacity = 1
 	}
-	return &RequestManager{
+	if detailWindow != 0 && bodyWindow != 0 {
+		panic(fmt.Sprintf("proxy: request manager cannot run both windows (detailWindow=%d, bodyWindow=%d)", detailWindow, bodyWindow))
+	}
+	m := &RequestManager{
 		buffer:       make([]RequestRecord, capacity),
 		capacity:     capacity,
 		subs:         make(map[string]*RequestSubscription),
 		idIndex:      make(map[string]int, capacity),
 		detailWindow: detailWindow,
+		bodyWindow:   bodyWindow,
 	}
+	if bodyWindow > 0 {
+		m.bodySlots = make([]*bodyHeapEntry, capacity)
+		// The heap holds at most one entry per slot, and at most one over the
+		// window (push-then-drain), so it can be sized once instead of doubling
+		// its way there as the ring warms up.
+		m.bodyHeap = make(bodyWindowHeap, 0, min(bodyWindow+1, capacity))
+	}
+	return m
 }
 
 // SetEvictionCallback sets the callback to be invoked when requests are evicted.
@@ -292,14 +440,20 @@ func (m *RequestManager) Record(record RequestRecord) bool {
 		m.mu.Unlock()
 		return false
 	}
-	evictIDs, onEvict := m.appendRecord(record)
+	stored, evictIDs, onEvict := m.appendRecord(record)
 	m.mu.Unlock()
 
 	// Call eviction callbacks outside of lock
 	runEvictions(onEvict, evictIDs)
 
-	// Notify subscribers
-	m.notifySubscribers(record)
+	// Notify subscribers with the record as STORED, not as submitted: the
+	// replica body window can strip the arriving record itself (its timestamp
+	// may already be the oldest bodied one), and advertising data the ring
+	// refused to store would be wrong at commit time. A LATER strip can still
+	// race this post-unlock delivery — the same accepted staleness as any
+	// subscriber-held copy (see evictDetailWindowLocked); only Upsert, which
+	// notifies under mu, pins the notified copy to the ring's state exactly.
+	m.notifySubscribers(stored)
 	return true
 }
 
@@ -336,27 +490,37 @@ func (m *RequestManager) evictIndex(id string, slot int) {
 // both the overwrite (evictIndex) and the insert (#71), so the map stays in
 // lock-step on both append paths.
 //
-// It returns the IDs whose on-disk capture files the caller must clean up after
-// releasing m.mu (disk IO must not run under the lock), together with the
+// It returns the record as actually STORED, which is not always the record
+// passed in: on a ring running the replica body window the new record can be
+// the one the window strips (its timestamp may already be the oldest bodied
+// one). Callers notify subscribers with this copy, never with their own.
+//
+// It also returns the IDs whose on-disk capture files the caller must clean up
+// after releasing m.mu (disk IO must not run under the lock), together with the
 // eviction callback. Two independent things can land in that list per append:
 // the record pushed out of the ring entirely, and — because the append advanced
 // head by one — the record that just fell outside the captured-body detail
 // window (D9b). Both are amortized O(1): the
 // window boundary moves exactly one slot per append, so at most ONE record
-// crosses it and no scan is needed.
+// crosses it and no scan is needed. The body window contributes nothing here:
+// it only ever drops inline bytes, which need no disk work.
 //
 // This is the shared append arm behind Record and Upsert's insert case. Caller
 // holds m.mu.
-func (m *RequestManager) appendRecord(record RequestRecord) (evictIDs []string, onEvict EvictionCallback) {
+func (m *RequestManager) appendRecord(record RequestRecord) (stored RequestRecord, evictIDs []string, onEvict EvictionCallback) {
+	slot := m.head
 	if m.count == m.capacity {
-		evicted := m.buffer[m.head]
+		evicted := m.buffer[slot]
 		if evicted.ID != "" && evicted.Details != nil {
 			evictIDs = append(evictIDs, evicted.ID)
 		}
-		m.evictIndex(evicted.ID, m.head)
+		m.evictIndex(evicted.ID, slot)
 	}
-	m.buffer[m.head] = record
-	m.idIndex[record.ID] = m.head // newest copy of this ID lives here (#71)
+	// The slot's previous occupant is leaving whether or not the ring was full,
+	// so its body-window membership goes with it — replaceSlotLocked hands that
+	// membership to the arriving record, and may strip the arrival itself.
+	stored = m.replaceSlotLocked(slot, record)
+	m.idIndex[record.ID] = slot // newest copy of this ID lives here (#71)
 	m.head = (m.head + 1) % m.capacity
 	if m.count < m.capacity {
 		m.count++
@@ -364,7 +528,7 @@ func (m *RequestManager) appendRecord(record RequestRecord) (evictIDs []string, 
 	if id := m.evictDetailWindowLocked(); id != "" {
 		evictIDs = append(evictIDs, id)
 	}
-	return evictIDs, m.onEvict
+	return stored, evictIDs, m.onEvict
 }
 
 // evictDetailWindowLocked strips the captured body data from the single record
@@ -472,6 +636,200 @@ func evictedBody(body *CapturedBody) (evicted *CapturedBody, spilled bool) {
 	return &copied, body.FilePath != ""
 }
 
+// hasRetainedInlineBody reports whether record still holds captured body bytes
+// IN THIS PROCESS'S MEMORY — the single predicate behind the replica body
+// window's accounting and its strip. A record qualifies when it has captured
+// Details and at least one body with un-evicted inline Data.
+//
+// Spilled bodies deliberately do NOT qualify: a FilePath costs the ring only
+// the string, and on a replica the bytes belong to the daemon (see the
+// bodyWindow field). Counting them would make the window strip records for
+// memory it never held.
+func hasRetainedInlineBody(record RequestRecord) bool {
+	if record.Details == nil {
+		return false
+	}
+	return hasRetainedInlineData(record.Details.RequestBody) || hasRetainedInlineData(record.Details.ResponseBody)
+}
+
+// hasRetainedInlineData is hasRetainedInlineBody for a single body. Named for
+// the question it answers, not the value it returns: its file neighbours
+// evictedBody and strippedInlineBody are noun-phrase functions that hand back a
+// *CapturedBody, and this one is a predicate.
+func hasRetainedInlineData(body *CapturedBody) bool {
+	return body != nil && !body.Evicted && len(body.Data) > 0
+}
+
+// stripInlineBodies returns a copy of record whose retained INLINE body bytes
+// are gone and marked Evicted, so a later load reports unavailable_reason
+// "evicted" rather than masquerading as an empty body. It is evictBodies'
+// sibling for the replica body window, and differs from it in exactly one way:
+// a spilled body is left completely untouched — FilePath intact, Evicted
+// unset — because dropping it would free no memory here and would refuse a
+// body the daemon still serves. Consequently a strip never produces work for
+// the eviction callback: there is nothing to unlink.
+//
+// Headers and every other captured field survive, and the copy-on-write
+// discipline is evictBodies': fresh *RequestDetails and *CapturedBody values
+// rather than mutation, because subscribers, Recent, and GetByID all hand out
+// record copies that SHARE those pointers. Mutating them would race a reader
+// serializing the record outside m.mu; swapping the pointer under m.mu is safe
+// because every reader takes its copy under the lock.
+//
+// The two early returns are defence only: the window hands this function
+// nothing but records its heap has already certified as holding retained inline
+// data. Unlike evictBodies — whose caller really does test Details identity to
+// skip a slot rewrite — no caller here consults the returned pointer.
+//
+// Data and FilePath are mutually exclusive on a captured body (a body is
+// spilled or inline, never both), so a stripped body never ends up marked
+// evicted while still naming a readable file.
+func stripInlineBodies(record RequestRecord) RequestRecord {
+	if record.Details == nil {
+		return record
+	}
+	reqBody := strippedInlineBody(record.Details.RequestBody)
+	resBody := strippedInlineBody(record.Details.ResponseBody)
+	if reqBody == record.Details.RequestBody && resBody == record.Details.ResponseBody {
+		return record
+	}
+	// Copy-then-override, not a field-by-field rebuild: a field added to
+	// RequestDetails later must survive stripping by construction.
+	details := *record.Details
+	details.RequestBody = reqBody
+	details.ResponseBody = resBody
+	record.Details = &details
+	return record
+}
+
+// strippedInlineBody returns body without its inline data, allocating a copy so
+// the original (shared with readers) is never mutated. A body with no retained
+// inline data — nil, already evicted, spilled, or never bodied at all — is
+// returned as-is.
+func strippedInlineBody(body *CapturedBody) *CapturedBody {
+	if !hasRetainedInlineData(body) {
+		return body
+	}
+	copied := *body
+	copied.Data = nil
+	copied.Evicted = true
+	return &copied
+}
+
+// bodyWindowVacateLocked drops slot's body-window membership because its
+// occupant is being replaced or removed. Every path that changes what lives in
+// a slot calls it, which is what keeps a heap entry from outliving the record
+// that created it. Caller holds m.mu.
+func (m *RequestManager) bodyWindowVacateLocked(slot int) {
+	if m.bodyWindow <= 0 {
+		return
+	}
+	if entry := m.bodySlots[slot]; entry != nil {
+		heap.Remove(&m.bodyHeap, entry.heapIdx)
+		m.bodySlots[slot] = nil
+	}
+}
+
+// newBodyEntryLocked mints the heap entry for slot's current occupant. It is the
+// single place the heap's sort key is derived, so the ordering rule below has
+// one definition rather than one per insertion path. Caller holds m.mu.
+func (m *RequestManager) newBodyEntryLocked(slot int) *bodyHeapEntry {
+	m.bodySeq++
+	return &bodyHeapEntry{
+		// UnixNano on a zero or regressed Timestamp sorts oldest, so such a
+		// record is stripped first. That is the memory-safe direction, and the
+		// alternative (trusting an unusable timestamp) would let a record with
+		// no clock reading hold memory ahead of records that have one.
+		ts:   m.buffer[slot].Timestamp.UnixNano(),
+		seq:  m.bodySeq,
+		slot: slot,
+	}
+}
+
+// bodyWindowStoreLocked registers slot's NEW occupant with the body window and
+// re-enforces the bound. Callers must have written the record into
+// m.buffer[slot] and vacated the previous occupant first — replaceSlotLocked is
+// the one sanctioned way to do both.
+//
+// It reads and writes m.buffer[slot] rather than taking and returning a record,
+// because the strip loop can take the record just stored — a completion whose
+// start-timestamp is already the oldest, or a backfilled record arriving after
+// fresher live ones. Self-stripping is the correct outcome, and keeping the ring
+// slot as the only copy is what stops a caller from notifying subscribers with a
+// record the ring no longer serves.
+//
+// Enforcement is immediate rather than eventual: the loop runs until the heap
+// is back within the window, so the memory bound holds after every mutation.
+// Caller holds m.mu.
+func (m *RequestManager) bodyWindowStoreLocked(slot int) {
+	if m.bodyWindow <= 0 || !hasRetainedInlineBody(m.buffer[slot]) {
+		return
+	}
+
+	entry := m.newBodyEntryLocked(slot)
+	heap.Push(&m.bodyHeap, entry)
+	m.bodySlots[slot] = entry
+
+	for len(m.bodyHeap) > m.bodyWindow {
+		victim := heap.Pop(&m.bodyHeap).(*bodyHeapEntry)
+		m.bodySlots[victim.slot] = nil
+		m.buffer[victim.slot] = stripInlineBodies(m.buffer[victim.slot])
+	}
+}
+
+// replaceSlotLocked makes record the occupant of slot, transferring body-window
+// membership from the outgoing occupant to it, and returns the record AS STORED.
+//
+// It is the only sanctioned way to change a slot's occupant: the body window's
+// "no entry outlives the record that created it" invariant depends on vacate and
+// store bracketing every such write, and a helper makes that structural instead
+// of a rule each call site has to remember.
+//
+// The returned record is not always the one passed in — the window can strip the
+// arrival itself (see bodyWindowStoreLocked) — and callers must notify
+// subscribers with the returned copy, never with their own. Caller holds m.mu.
+func (m *RequestManager) replaceSlotLocked(slot int, record RequestRecord) RequestRecord {
+	m.bodyWindowVacateLocked(slot)
+	m.buffer[slot] = record
+	m.bodyWindowStoreLocked(slot)
+	return m.buffer[slot]
+}
+
+// rebuildBodyWindowLocked re-links the body window after PurgeByProject's
+// compaction moved records between slots: entries[i] is the surviving heap
+// entry for the record now living in slot i (nil when that record holds no
+// retained inline body). O(n) with heap.Init, on a path that runs only when a
+// project's records are dropped.
+//
+// The surviving entries are REUSED, not re-minted, because seq is more than a
+// unique ordinal: it is the equal-timestamp tie-break, and it records
+// BODY-INSERTION order, which ring order cannot reconstruct — an in-place
+// completion gains its body long after its slot was appended. Minting fresh
+// entries in ring order would silently reorder which same-timestamp record the
+// next strip takes.
+//
+// The bound cannot be violated by a rebuild — a purge only removes records — so
+// no strip loop is needed. Caller holds m.mu with the compacted buffer already
+// installed.
+func (m *RequestManager) rebuildBodyWindowLocked(entries []*bodyHeapEntry) {
+	if m.bodyWindow <= 0 {
+		return
+	}
+	clear(m.bodySlots)
+	clear(m.bodyHeap) // drop the references so the purged entries can be collected
+	m.bodyHeap = m.bodyHeap[:0]
+	for slot, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		entry.slot = slot
+		entry.heapIdx = len(m.bodyHeap)
+		m.bodyHeap = append(m.bodyHeap, entry)
+		m.bodySlots[slot] = entry
+	}
+	heap.Init(&m.bodyHeap)
+}
+
 // Upsert applies a record as a monotonic two-state transition keyed by ID:
 //
 //	existing absent               → append (Record's eviction logic) + notify
@@ -484,10 +842,13 @@ func evictedBody(body *CapturedBody) (evicted *CapturedBody, spilled bool) {
 // with no duplicate or regressed notifications. Replace-in-place keeps the
 // ring slot (no head/count change, no ring eviction) — safe because in-flight
 // records carry no Details, so the transition only ever adds capture state. The
-// one exception is the captured-body detail window (D9b): a completion landing
-// in a slot that has already aged out of the window has its bodies stripped
-// before it is stored, so a slow request cannot reintroduce body data outside
-// the window (see the case below).
+// one exception is the captured-body windows: a completion landing in a slot
+// that has already aged out of the POSITION window (D9b) has its bodies
+// stripped before it is stored, so a slow request cannot reintroduce body data
+// outside the window, and on a replica the completion joins the timestamp
+// window (bodyWindow) and may be stripped by it — including by its own
+// arrival. Either way the record NOTIFIED is the record stored (see the case
+// below).
 //
 // Unlike Record, subscribers are notified INSIDE the ring critical section:
 // same-ID notifications can never be observed out of transition order.
@@ -544,10 +905,17 @@ func (m *RequestManager) Upsert(record RequestRecord) bool {
 				evictIDs, onEvict = []string{record.ID}, m.onEvict
 			}
 		}
-		m.buffer[idx] = record
+		// The completion is what puts body data in this slot, so it is also
+		// what can push the replica body window over its bound — possibly
+		// stripping itself, when the request STARTED before every other bodied
+		// record in the ring. replaceSlotLocked also vacates the outgoing
+		// occupant: an in-flight record carries no Details today, but the
+		// invariant must not depend on that.
+		record = m.replaceSlotLocked(idx, record)
 	default:
-		evictIDs, onEvict = m.appendRecord(record)
+		record, evictIDs, onEvict = m.appendRecord(record)
 	}
+	// Always the stored copy — see appendRecord.
 	m.notifySubscribers(record)
 	m.mu.Unlock()
 
@@ -842,6 +1210,8 @@ func (m *RequestManager) matchesFilter(record RequestRecord, filter RequestFilte
 // and only removes records, so a surviving record's newest→oldest offset can
 // only shrink. Records can move INTO the window (they stay stripped — evicted
 // bodies are gone for good) but never out of it, so no new violation is created.
+// The replica's timestamp-ordered body window is keyed by SLOT rather than by
+// offset, so compaction DOES invalidate it; it is rebuilt below.
 func (m *RequestManager) PurgeByProject(projectDir string) {
 	if projectDir == "" {
 		return
@@ -853,8 +1223,15 @@ func (m *RequestManager) PurgeByProject(projectDir string) {
 	m.mu.Lock()
 	onEvict = m.onEvict
 
-	// Rebuild the buffer keeping only non-matching records in order.
+	// Rebuild the buffer keeping only non-matching records in order. The
+	// surviving body-window entries travel WITH their records (keptEntries[i]
+	// belongs to kept[i]) so the rebuild can preserve each one's (ts, seq) —
+	// see rebuildBodyWindowLocked for why they must not be re-minted.
 	kept := make([]RequestRecord, 0, m.count)
+	var keptEntries []*bodyHeapEntry
+	if m.bodyWindow > 0 {
+		keptEntries = make([]*bodyHeapEntry, 0, m.count)
+	}
 	for i := 0; i < m.count; i++ {
 		idx := (m.head - m.count + i + m.capacity) % m.capacity
 		rec := m.buffer[idx]
@@ -868,6 +1245,9 @@ func (m *RequestManager) PurgeByProject(projectDir string) {
 			continue
 		}
 		kept = append(kept, rec)
+		if m.bodyWindow > 0 {
+			keptEntries = append(keptEntries, m.bodySlots[idx])
+		}
 	}
 
 	compacted := make([]RequestRecord, m.capacity)
@@ -884,6 +1264,10 @@ func (m *RequestManager) PurgeByProject(projectDir string) {
 		newIndex[rec.ID] = p
 	}
 	m.idIndex = newIndex
+
+	// The body window's entries are slot-keyed, and compaction moved the
+	// records between slots, so it is rebuilt rather than patched.
+	m.rebuildBodyWindowLocked(keptEntries)
 	m.mu.Unlock()
 
 	// Call eviction callbacks outside of lock

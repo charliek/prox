@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charliek/prox/internal/config"
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/charliek/prox/internal/supervisor"
@@ -58,6 +60,26 @@ func newBodyTestHandlers(t *testing.T) (*Handlers, *proxy.RequestManager, string
 	return handlers, rm, cm.CaptureDir()
 }
 
+// getProxyRequestDetail GETs one already-recorded request with include=body,
+// returning both the parsed response and the raw JSON (some tests assert on the
+// wire form, e.g. that a FilePath never appears in it).
+func getProxyRequestDetail(t *testing.T, handlers *Handlers, id string) (ProxyRequestDetailResponse, string) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/v1/proxy/requests/"+id+"?include=body", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+
+	handlers.GetProxyRequest(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	raw := w.Body.String()
+	var resp ProxyRequestDetailResponse
+	require.NoError(t, json.Unmarshal([]byte(raw), &resp))
+	return resp, raw
+}
+
 // getRequestWithBody records a request whose response body is respBody, then
 // GETs it with include=body, returning both the parsed response and the raw JSON.
 func getRequestWithBody(t *testing.T, handlers *Handlers, rm *proxy.RequestManager, id string, respBody *proxy.CapturedBody) (ProxyRequestDetailResponse, string) {
@@ -76,20 +98,7 @@ func getRequestWithBody(t *testing.T, handlers *Handlers, rm *proxy.RequestManag
 			ResponseBody:    respBody,
 		},
 	})
-
-	req := httptest.NewRequest("GET", "/api/v1/proxy/requests/"+id+"?include=body", nil)
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", id)
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-	w := httptest.NewRecorder()
-
-	handlers.GetProxyRequest(w, req)
-	require.Equal(t, http.StatusOK, w.Code)
-
-	raw := w.Body.String()
-	var resp ProxyRequestDetailResponse
-	require.NoError(t, json.Unmarshal([]byte(raw), &resp))
-	return resp, raw
+	return getProxyRequestDetail(t, handlers, id)
 }
 
 func TestConvertCapturedBody_GzipRoundTrip(t *testing.T) {
@@ -262,6 +271,67 @@ func TestConvertCapturedBody_NeverExposesFilePath(t *testing.T) {
 	// file_path must never appear in the serialized JSON.
 	assert.NotContains(t, raw, "file_path")
 	assert.NotContains(t, raw, fp)
+}
+
+// TestGetProxyRequest_ReplicaBodyWindowEvicted proves the shared-mode display
+// path end to end: the project-local replica ring bounds retained inline body
+// data, and a record stripped by that bound surfaces through the local API as
+// unavailable_reason "evicted" — the same signal a missing spilled file
+// produces, so neither the handler nor the TUI needs a new case. The newest
+// record, still inside the window, must keep serving its body.
+func TestGetProxyRequest_ReplicaBodyWindowEvicted(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	t.Cleanup(logMgr.Close)
+
+	cfg := &config.Config{
+		API:       config.APIConfig{Port: 0},
+		Processes: map[string]config.ProcessConfig{},
+	}
+	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+
+	// The shared-mode replica: no capture manager, since it owns no files.
+	total := constants.ProxyRequestDetailWindow + 1
+	rm := proxy.NewReplicaRequestManager(total)
+	handlers.SetRequestManager(rm)
+
+	base := time.Now()
+	for i := 0; i < total; i++ {
+		rm.Upsert(proxy.RequestRecord{
+			ID:         fmt.Sprintf("w%05d", i),
+			Timestamp:  base.Add(time.Duration(i) * time.Millisecond),
+			Method:     "POST",
+			URL:        "/api/data",
+			StatusCode: 200,
+			Details: &proxy.RequestDetails{
+				ResponseHeaders: http.Header{"Content-Type": {"application/json"}},
+				ResponseBody: &proxy.CapturedBody{
+					Size: 7, CapturedSize: 7, ContentType: "application/json", Data: []byte("payload"),
+				},
+			},
+		})
+	}
+
+	get := func(id string) ProxyRequestDetailResponse {
+		t.Helper()
+		resp, _ := getProxyRequestDetail(t, handlers, id)
+		return resp
+	}
+
+	oldest := get("w00000")
+	require.NotNil(t, oldest.Details)
+	require.NotNil(t, oldest.Details.ResponseBody)
+	assert.Equal(t, "evicted", oldest.Details.ResponseBody.UnavailableReason,
+		"a window-stripped body must report the standard evicted reason")
+	assert.Empty(t, oldest.Details.ResponseBody.Data)
+	assert.Equal(t, int64(7), oldest.Details.ResponseBody.Size, "size metadata survives")
+	assert.NotEmpty(t, oldest.Details.ResponseHeaders, "headers survive the strip")
+
+	newest := get(fmt.Sprintf("w%05d", total-1))
+	require.NotNil(t, newest.Details)
+	require.NotNil(t, newest.Details.ResponseBody)
+	assert.Empty(t, newest.Details.ResponseBody.UnavailableReason)
+	assert.Equal(t, "payload", newest.Details.ResponseBody.Data)
 }
 
 func TestConvertCapturedBody_EvictedFile(t *testing.T) {
