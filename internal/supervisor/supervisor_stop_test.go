@@ -40,6 +40,8 @@ func (r *nameRunner) Start(_ context.Context, cfg domain.ProcessConfig, _ map[st
 // nameFactoryRunner mints a FRESH graceful fakeProcess on every Start, keyed by
 // process name: each name carries a base PID and a per-name launch counter, so
 // launch n of a given name comes back as a distinct live fake with PID base+n.
+// A name's series therefore occupies base..base+launches, so callers must space
+// their base PIDs further apart than any name's launch count.
 //
 // Tests that RESTART a process need this rather than nameRunner. A restart is a
 // new process with a new PID, but a fakeProcess is single-use -- its Wait()

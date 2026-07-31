@@ -506,16 +506,21 @@ func TestChangeBus_SnapshotFromWakeHandlerUnderChurn(t *testing.T) {
 		churn.Add(1)
 		go func(name string) {
 			defer churn.Done()
+			// assert, not require: FailNow off the test goroutine is
+			// unsupported, and it would abandon this name's remaining
+			// iterations — losing the churn the rest of the test needs.
 			for i := 0; i < 5; i++ {
-				require.NoError(t, sup.StopProcess(context.Background(), name))
-				require.NoError(t, sup.StartProcess(context.Background(), name))
+				assert.NoErrorf(t, sup.StopProcess(context.Background(), name), "%s stop #%d", name, i)
+				assert.NoErrorf(t, sup.StartProcess(context.Background(), name), "%s start #%d", name, i)
 			}
 		}(name)
 	}
 	churn.Wait()
 
 	// Stop closes the bus, which is what releases every subscriber goroutine.
-	_ = sup.Stop(context.Background())
+	// With graceful fakes a clean stop is the expected outcome; an error here
+	// would mean a surviving group, which this test should notice.
+	require.NoError(t, sup.Stop(context.Background()))
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
