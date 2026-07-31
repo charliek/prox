@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -386,32 +387,50 @@ func TestRequestManager_DetailWindow_HoldsWhileRingWrapsAndPurges(t *testing.T) 
 	}
 }
 
-// TestReplicaRequestManager_KeepsEveryBody pins the replica variant used for
-// the forwarder-fed project-local ring in shared mode: no detail window runs.
-// Body memory there is bounded UPSTREAM (records past the daemon's window
-// arrive already stripped), and the forwarder's backfill/live-event position
-// skew means a locally-run window could evict the body of a request the daemon
-// still serves (cursor review, C5) — so the replica must retain whatever the
-// wire delivered, at any ring depth.
-func TestReplicaRequestManager_KeepsEveryBody(t *testing.T) {
+// TestReplicaRequestManager_BoundsInlineBodiesAtRealConstants exercises the
+// replica variant — the forwarder-fed project-local ring in shared mode — at
+// the SHIPPING constant. The replica runs no POSITION window; it bounds
+// retained INLINE body data at ProxyRequestDetailWindow records ordered by the
+// daemon-supplied Timestamp instead (see NewReplicaRequestManager, and
+// requests_body_window_test.go for the mechanism's own suite).
+//
+// A replica needs its own bound because upstream stripping does not reach it:
+// the daemon publishes no event when its window drops a body, so a live-
+// forwarded record arrives WITH its body and would otherwise keep it forever.
+func TestReplicaRequestManager_BoundsInlineBodiesAtRealConstants(t *testing.T) {
 	const extra = 200
 	total := constants.ProxyRequestDetailWindow + extra
 
 	m := NewReplicaRequestManager(total) // > the default window, ring not full
+	base := time.Now()
 
 	for i := 0; i < total; i++ {
-		m.Record(RequestRecord{
-			ID:     fmt.Sprintf("r%04d", i),
-			Method: "GET",
-			URL:    fmt.Sprintf("/x/%d", i),
+		m.Upsert(RequestRecord{
+			ID:        fmt.Sprintf("r%04d", i),
+			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
+			Method:    "GET",
+			URL:       fmt.Sprintf("/x/%d", i),
 			Details: &RequestDetails{
-				RequestBody: &CapturedBody{Data: []byte("payload"), Size: 7},
+				RequestHeaders: map[string][]string{"X-Req": {fmt.Sprintf("%d", i)}},
+				RequestBody:    &CapturedBody{Data: []byte("payload"), Size: 7},
 			},
 		})
 	}
 
 	recs := m.Recent(RequestFilter{Limit: total})
-	require.Len(t, recs, total)
-	assert.Equal(t, total, detailedRecords(recs),
-		"a replica ring must never window-evict bodies")
+	require.Len(t, recs, total, "the replica drops bodies, never records")
+	assert.Equal(t, constants.ProxyRequestDetailWindow, inlineBodiedRecords(recs),
+		"exactly one window's worth of records keep inline body data")
+
+	for i, rec := range recs {
+		require.NotNil(t, rec.Details)
+		assert.NotEmpty(t, rec.Details.RequestHeaders, "%s keeps its headers either way", rec.ID)
+		require.NotNil(t, rec.Details.RequestBody)
+		if i < constants.ProxyRequestDetailWindow {
+			assert.False(t, rec.Details.RequestBody.Evicted, "newest-by-timestamp record %s keeps its body", rec.ID)
+			continue
+		}
+		assert.True(t, rec.Details.RequestBody.Evicted, "oldest-by-timestamp record %s is stripped", rec.ID)
+		assert.Nil(t, rec.Details.RequestBody.Data)
+	}
 }
