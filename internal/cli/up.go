@@ -451,6 +451,38 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 	}()
 
+	// Subscribe to logs SYNCHRONOUSLY, on this goroutine, before the supervisor
+	// starts any process (D2, #92). A process that crashes instantly (typo'd
+	// cmd:, missing binary) emits its error the moment the supervisor starts
+	// it; if the subscription were created later — even by an already-launched
+	// goroutine, since `go f()` gives no ordering guarantee that f has run
+	// before the next statement — that error can be broadcast before any
+	// subscriber exists and is lost to the terminal (though it remains
+	// retrievable via `prox logs`). Subscribing here, before sup.Start/
+	// StartProcesses below, closes the race: subscription channels are
+	// buffered and Send is a non-blocking select (subscription.go), so
+	// subscribing before the consumer goroutine runs is safe.
+	//
+	// Gated on !useTUI (known well before this point, checked at flag-parse
+	// time): a TUI session must have NO terminal log subscriber, since nothing
+	// would ever drain it, guaranteeing an overflow (which permanently closes
+	// the subscription, subscription.go) and a spurious "subscription
+	// overflowed" line every TUI session.
+	//
+	// The subscribe and the consumer goroutine start close together and both
+	// before supervisor start: Broadcast closes a subscription on its very
+	// first overflow, so subscribing early and only later getting around to
+	// draining it would itself risk losing the subscription before it is read.
+	var logCh <-chan domain.LogEntry
+	if !useTUI {
+		var subErr error
+		logCh, subErr = subscribeLogPrinter(logMgr)
+		if subErr != nil {
+			return fmt.Errorf("failed to subscribe to logs: %w", subErr)
+		}
+		go printLogEntries(logCh)
+	}
+
 	// Start supervisor
 	fmt.Printf("Starting prox with config: %s\n", configPath)
 	if isLocalhost(cfg.API.Host) {
@@ -539,8 +571,8 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	} else {
-		// Subscribe to logs and print to terminal
-		go printLogs(logMgr)
+		// Log subscription + consumer were already started above, before the
+		// supervisor started any process (D2, #92).
 
 		// Wait for shutdown. Both a signal (via forwardShutdownSignal above, which
 		// also logs it) and an API/TUI-quit trigger arrive as a coordinator trigger,
@@ -1207,13 +1239,24 @@ func localRequestManager(proxyService *proxy.Service, handlers *api.Handlers) *p
 	return handlers.GetRequestManager()
 }
 
-// printLogs subscribes to logs and prints them to terminal
-func printLogs(logMgr *logs.Manager) {
+// subscribeLogPrinter subscribes to logMgr and returns the entry channel. It is
+// split out from printLogEntries (below) so the caller can subscribe
+// SYNCHRONOUSLY, before starting anything that might emit a log line the
+// subscription needs to catch (D2, #92) — subscribing inside a goroutine (the
+// old shape) gives no guarantee the subscription exists before the next
+// statement in the caller runs.
+func subscribeLogPrinter(logMgr *logs.Manager) (<-chan domain.LogEntry, error) {
 	_, ch, err := logMgr.Subscribe(domain.LogFilter{})
 	if err != nil {
-		return
+		return nil, err
 	}
+	return ch, nil
+}
 
+// printLogEntries drains an already-open log channel (see subscribeLogPrinter)
+// and prints each entry to the terminal. It is the consumer half of the
+// subscribe/consume split and does no subscribing itself.
+func printLogEntries(ch <-chan domain.LogEntry) {
 	printer := NewLogPrinter()
 	for entry := range ch {
 		printer.PrintEntry(entry)

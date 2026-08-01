@@ -527,3 +527,67 @@ func TestIsTTY(t *testing.T) {
 		assert.False(t, isTTY(f), "a char device that is not a tty must be refused (cursor review, C2)")
 	})
 }
+
+// TestSubscribeLogPrinter_HappensBeforeWrite pins the deterministic half of the
+// D2/F2 fix (plan 020 C1, #92): subscribeLogPrinter must register the
+// subscription and its buffered channel SYNCHRONOUSLY, on the caller's
+// goroutine, before the caller does anything that could emit a log line the
+// subscription needs to catch.
+//
+// This is deliberately NOT a scheduler race: subscribeLogPrinter is called and
+// returns on this goroutine, and logMgr.Write then runs on that SAME goroutine
+// immediately after -- exactly the sequencing runUp relies on (subscribe, then
+// sup.Start/StartProcesses, both on the main goroutine, in that order, before
+// the consumer goroutine is even launched). Because Subscribe has already
+// registered the subscription's buffered channel by the time Write runs, the
+// entry is guaranteed to be sitting in the channel however late
+// printLogEntries' goroutine gets scheduled afterward -- covering the case a
+// process crashes and logs its error before the consumer goroutine has run
+// even once.
+//
+// The old code (printLogs) called logMgr.Subscribe as the first line INSIDE
+// the consumer goroutine (`go printLogs(logMgr)`), so nothing ordered that
+// Subscribe call before a Write happening on the caller's goroutine -- a
+// version of this test against that shape is racy by construction (confirmed
+// manually against a temporary revert; see the C1 commit report for the
+// observed failure).
+func TestSubscribeLogPrinter_HappensBeforeWrite(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100, SubscriptionBuffer: 10})
+	defer logMgr.Close()
+
+	ch, err := subscribeLogPrinter(logMgr)
+	require.NoError(t, err)
+
+	// Simulate an instantly-crashing process's error landing immediately after
+	// subscribeLogPrinter returns but before any consumer goroutine has even
+	// been launched -- exactly what sup.Start()/StartProcesses() can produce
+	// for a typo'd cmd or missing binary (F2).
+	logMgr.Write(domain.LogEntry{
+		Process: "ghost",
+		Stream:  domain.StreamStderr,
+		Line:    "exited unexpectedly (rc=127)",
+	})
+
+	// Only now start the consumer -- mirroring `go printLogEntries(ch)` running
+	// well after the write, which is safe precisely because the subscribe
+	// already happened first.
+	received := make(chan domain.LogEntry, 1)
+	go printLogEntriesInto(ch, received)
+
+	select {
+	case entry := <-received:
+		assert.Equal(t, "ghost", entry.Process)
+		assert.Equal(t, "exited unexpectedly (rc=127)", entry.Line)
+	case <-time.After(2 * time.Second):
+		t.Fatal("log entry written immediately after subscribeLogPrinter returned was never delivered")
+	}
+}
+
+// printLogEntriesInto mirrors printLogEntries' drain loop but forwards entries
+// to a test channel instead of the terminal, so the test above can assert on
+// the delivered entry without depending on stdout formatting.
+func printLogEntriesInto(ch <-chan domain.LogEntry, out chan<- domain.LogEntry) {
+	for entry := range ch {
+		out <- entry
+	}
+}
