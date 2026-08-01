@@ -16,12 +16,6 @@ const (
 	mouseDoubleClickWindow = 500 * time.Millisecond
 )
 
-// processChipHit records one process-panel chip's clickable rect for this frame.
-type processChipHit struct {
-	Index int
-	Rect  HitRect
-}
-
 // handleContentMouse routes non-menu mouse input after handleMenuMouse. Returns
 // whether the event was consumed and an optional command (requests paging).
 // Call only in ModeNormal with menu closed (plan 021 WS11 / Codex #5).
@@ -124,12 +118,12 @@ func (b *BaseModel) processPanelRowY() (int, bool) {
 
 // processPanelHit returns the process index under (x,y), or -1. Solo toggles
 // mirror the 1-9 keys (logs view only). Rects are recorded per frame in
-// processPanel (mainView clears processChipHits before each render).
+// processPanel (mainView clears hits.chips before each render).
 func (b *BaseModel) processPanelHit(x, y int) int {
 	if b.viewMode != ViewModeLogs {
 		return -1
 	}
-	for _, h := range b.processChipHits {
+	for _, h := range b.ensureHits().chips {
 		if h.Rect.Contains(x, y) {
 			return h.Index
 		}

@@ -159,16 +159,11 @@ type BaseModel struct {
 
 	// Menu bar open state (WS3). openMenu is -1 when closed, otherwise a MenuID.
 	// menuHighlight is the full-list index of the highlighted dropdown row.
-	// Hit-rects are recorded per render and cleared on close (strix stale-rect
-	// discipline / Codex #1).
+	// Hit-rects live in hits (shared across View value-copies — plan 022 WS0)
+	// and are cleared on close (strix stale-rect discipline / Codex #1).
 	openMenu      int
 	menuHighlight int
-	menuCellHits  []menuCellHit
-	menuDropdown  *menuDropdownHit
-
-	// processChipHits records per-frame clickable rects for process panel chips
-	// (logs view). Cleared in mainView before processPanel renders (WS11).
-	processChipHits []processChipHit
+	hits          *hitRegistry
 
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
 	// content. Rebuilt every updateViewport (plan 021 WS4 / Codex #2): when wrap
@@ -257,6 +252,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		helpConfig:          helpConfig,
 		settings:            DefaultSettings(),
 		openMenu:            -1, // closed
+		hits:                &hitRegistry{},
 	}
 	b.viewport.MouseWheelEnabled = false // TUI owns all wheel routing (Codex #5)
 	return b
@@ -2476,7 +2472,8 @@ func (b *BaseModel) processPanel() string {
 			items = append(items, segment)
 			if panelRowOK {
 				w := ansi.StringWidth(segment)
-				b.processChipHits = append(b.processChipHits, processChipHit{
+				hits := b.ensureHits()
+				hits.chips = append(hits.chips, processChipHit{
 					Index: i,
 					Rect:  HitRect{X: chipCol, Y: rowY, W: w, H: 1},
 				})
@@ -2675,7 +2672,8 @@ func (b *BaseModel) mainView(extraStatusInfo string) string {
 	}
 
 	if b.settings.ProcessPanel {
-		b.processChipHits = nil
+		h := b.ensureHits()
+		h.chips = h.chips[:0]
 		panel := b.processPanel()
 		for _, line := range strings.Split(panel, "\n") {
 			lines = append(lines, padFrameRow(line, b.width))

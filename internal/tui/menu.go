@@ -72,24 +72,6 @@ func (r HitRect) Contains(x, y int) bool {
 	return x >= r.X && x < r.X+r.W && y >= r.Y && y < r.Y+r.H
 }
 
-// menuCellHit records one top-level cell's clickable rect for this frame.
-type menuCellHit struct {
-	ID   MenuID
-	Rect HitRect
-}
-
-// menuDropdownHit is the last-drawn dropdown hit-map (strix stale-rect discipline).
-type menuDropdownHit struct {
-	Menu   MenuID
-	Bounds HitRect
-	Rows   []menuRowHit
-}
-
-type menuRowHit struct {
-	Cmd  MenuCommand // empty = separator / non-activatable
-	Rect HitRect
-}
-
 // menuOpen reports whether a dropdown is open.
 func (b *BaseModel) menuOpen() bool {
 	return b.openMenu >= 0
@@ -98,14 +80,15 @@ func (b *BaseModel) menuOpen() bool {
 func (b *BaseModel) closeMenu() {
 	b.openMenu = -1
 	b.menuHighlight = 0
-	b.menuDropdown = nil
+	b.ensureHits().hasDropdown = false
 }
 
 func (b *BaseModel) clearMenuHitRects() {
-	b.menuCellHits = nil
+	h := b.ensureHits()
+	h.menuCells = h.menuCells[:0]
 	// Stale dropdown hits must never match after close (strix app.rs:1152).
 	if !b.menuOpen() {
-		b.menuDropdown = nil
+		h.hasDropdown = false
 	}
 }
 
@@ -360,6 +343,7 @@ func (b *BaseModel) renderMenuBar() string {
 
 	x := leftW + gap
 	y := 0 // menu bar is always row 0 when visible; caller places it first
+	hits := b.ensureHits()
 	for _, c := range cells {
 		w := ansi.StringWidth(c.text)
 		style := rowBG
@@ -369,7 +353,7 @@ func (b *BaseModel) renderMenuBar() string {
 				Foreground(th.SelectionFG)
 		}
 		bld.WriteString(style.Render(c.text))
-		b.menuCellHits = append(b.menuCellHits, menuCellHit{
+		hits.menuCells = append(hits.menuCells, menuCellHit{
 			ID:   c.id,
 			Rect: HitRect{X: x, Y: y, W: w, H: 1},
 		})
@@ -420,7 +404,7 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 
 	// Anchor under the cell; clamp so the box stays on-screen.
 	boxX = 0
-	for _, h := range b.menuCellHits {
+	for _, h := range b.ensureHits().menuCells {
 		if h.ID == id {
 			boxX = h.Rect.X
 			break
@@ -480,11 +464,13 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 		}
 	}
 
-	b.menuDropdown = &menuDropdownHit{
+	hits := b.ensureHits()
+	hits.dropdown = menuDropdownHit{
 		Menu:   id,
 		Bounds: HitRect{X: boxX, Y: boxTop, W: boxW, H: len(rows)},
 		Rows:   hitRows,
 	}
+	hits.hasDropdown = true
 	return rows, boxX, boxW
 }
 
@@ -525,6 +511,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 	x, y := msg.X, msg.Y
+	hits := b.ensureHits()
 
 	// Mouse-open while a textinput mode is active: blur → ModeNormal first (Codex #4).
 	blurTextMode := func() {
@@ -536,7 +523,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	}
 
 	if b.settings.MenuBar {
-		for _, h := range b.menuCellHits {
+		for _, h := range hits.menuCells {
 			if h.Rect.Contains(x, y) {
 				blurTextMode()
 				if b.menuOpen() && MenuID(b.openMenu) == h.ID {
@@ -549,7 +536,8 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		}
 	}
 
-	if d := b.menuDropdown; d != nil && d.Bounds.Contains(x, y) {
+	if hits.hasDropdown && hits.dropdown.Bounds.Contains(x, y) {
+		d := &hits.dropdown
 		fresh := b.menuOpen() && MenuID(b.openMenu) == d.Menu
 		if !fresh {
 			b.closeMenu()

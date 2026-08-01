@@ -158,10 +158,11 @@ func TestThemeMenu_MouseActivate(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = openThemeMenu(m)
 	_ = m.mainView("")
-	require.NotNil(t, m.menuDropdown)
+	hits := m.ensureHits()
+	require.True(t, hits.hasDropdown)
 
 	// Index 2 = light preset.
-	row := m.menuDropdown.Rows[2]
+	row := hits.dropdown.Rows[2]
 	require.Equal(t, menuCmdSetTheme("light"), row.Cmd)
 	m = clientUpdate(m, tea.MouseMsg{
 		X:      row.Rect.X,

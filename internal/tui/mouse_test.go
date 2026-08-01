@@ -174,7 +174,7 @@ func TestMouse_ClickProcessPanelSoloToggle(t *testing.T) {
 	}
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
 	_ = m.mainView("")
-	require.Len(t, m.processChipHits, 2)
+	require.Len(t, m.ensureHits().chips, 2)
 
 	rowY, ok := m.processPanelRowY()
 	require.True(t, ok)
@@ -192,11 +192,11 @@ func TestMouse_ProcessChipHitsRefreshPerFrame(t *testing.T) {
 	}
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	_ = m.mainView("")
-	require.Len(t, m.processChipHits, 1)
+	require.Len(t, m.ensureHits().chips, 1)
 
 	m.processes = append(m.processes, domain.ProcessInfo{Name: "api", State: domain.ProcessStateRunning})
 	_ = m.mainView("")
-	require.Len(t, m.processChipHits, 2, "chip rects are re-recorded each frame")
+	require.Len(t, m.ensureHits().chips, 2, "chip rects are re-recorded each frame")
 }
 
 func TestMouse_ClickLogLineParksCursorAndDisengagesFollow(t *testing.T) {
@@ -281,16 +281,17 @@ func TestMouse_ClickAfterMenuCloseIgnoresStaleRects(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.mainView("")
-	require.NotNil(t, m.menuDropdown)
+	hits := m.ensureHits()
+	require.True(t, hits.hasDropdown)
 
-	stale := m.menuDropdown.Rows[0]
+	stale := hits.dropdown.Rows[0]
 	m = clientUpdate(m, tea.MouseMsg{
 		X: 0, Y: 10,
 		Action: tea.MouseActionPress,
 		Button: tea.MouseButtonLeft,
 	})
 	require.False(t, m.menuOpen())
-	require.Nil(t, m.menuDropdown)
+	require.False(t, m.ensureHits().hasDropdown)
 
 	m = clientUpdate(m, tea.MouseMsg{
 		X: stale.Rect.X, Y: stale.Rect.Y,
