@@ -159,10 +159,13 @@ type BaseModel struct {
 
 	// Menu bar open state (WS3). openMenu is -1 when closed, otherwise a MenuID.
 	// menuHighlight is the full-list index of the highlighted dropdown row.
+	// menuWindow is the first visible item index — reset on open/sibling slide,
+	// follows the highlight (see deriveMenuWindowStart).
 	// Hit-rects live in hits (shared across View value-copies — plan 022 WS0)
 	// and are cleared on close (strix stale-rect discipline / Codex #1).
 	openMenu      int
 	menuHighlight int
+	menuWindow    int
 	hits          *hitRegistry
 
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
@@ -274,6 +277,7 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	b.width = msg.Width
 	b.height = msg.Height
 	b.relayout()
+	b.clampMenuWindow()
 }
 
 // chromeAbove is the number of rows above the viewport (menu bar + process

@@ -27,8 +27,9 @@ type menuDropdownHit struct {
 }
 
 type menuRowHit struct {
-	Cmd  MenuCommand // empty = separator / non-activatable
-	Rect HitRect
+	Cmd   MenuCommand // empty = separator / indicator / non-activatable
+	Index int         // full-list items index; -1 when non-activatable
+	Rect  HitRect
 }
 
 // processChipHit records one process-panel chip's clickable rect for this frame.

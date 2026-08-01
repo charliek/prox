@@ -18,7 +18,8 @@ const (
 
 // handleContentMouse routes non-menu mouse input after handleMenuMouse. Returns
 // whether the event was consumed and an optional command (requests paging).
-// Call only in ModeNormal with menu closed (plan 021 WS11 / Codex #5).
+// Call only in ModeNormal with menu closed — handleMenuMouse consumes wheel
+// whenever a menu is open (plan 022 WS3), so this never sees menu-open wheels.
 func (m *ClientModel) handleContentMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress {
 		return false, nil

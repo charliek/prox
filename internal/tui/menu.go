@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -80,6 +81,7 @@ func (b *BaseModel) menuOpen() bool {
 func (b *BaseModel) closeMenu() {
 	b.openMenu = -1
 	b.menuHighlight = 0
+	b.menuWindow = 0
 	b.ensureHits().hasDropdown = false
 }
 
@@ -96,6 +98,7 @@ func (b *BaseModel) clearMenuHitRects() {
 func (b *BaseModel) openMenuFirst(id MenuID) {
 	b.openMenu = int(id)
 	b.menuHighlight = b.menuFirstSelectable(id)
+	b.menuWindow = 0
 }
 
 func (b *BaseModel) menuFirstSelectable(id MenuID) int {
@@ -163,7 +166,17 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	}
 }
 
+// menuStep moves the highlight by one selectable row. wrap=true (keyboard)
+// wraps modulo n skipping separators; wrap=false (wheel) clamps at the ends.
 func (b *BaseModel) menuStep(id MenuID, item int, down bool) int {
+	return b.menuStepDir(id, item, down, true)
+}
+
+func (b *BaseModel) menuStepClamp(id MenuID, item int, down bool) int {
+	return b.menuStepDir(id, item, down, false)
+}
+
+func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
 	items := b.menuItems(id)
 	n := len(items)
 	if n == 0 {
@@ -176,6 +189,18 @@ func (b *BaseModel) menuStep(id MenuID, item int, down bool) int {
 	if idx >= n {
 		idx = n - 1
 	}
+	if !wrap {
+		step := -1
+		if down {
+			step = 1
+		}
+		for j := idx + step; j >= 0 && j < n; j += step {
+			if !items[j].Separator {
+				return j
+			}
+		}
+		return idx
+	}
 	for range n {
 		if down {
 			idx = (idx + 1) % n
@@ -187,6 +212,134 @@ func (b *BaseModel) menuStep(id MenuID, item int, down bool) int {
 		}
 	}
 	return idx
+}
+
+// menuReservedBottom is status + hints — dropdowns never cover them (plan 022 WS3).
+const menuReservedBottom = 2
+
+func (b *BaseModel) menuBoxTop() int {
+	if b.settings.MenuBar {
+		return 1
+	}
+	return 0
+}
+
+func (b *BaseModel) menuAvail() int {
+	return b.height - b.menuBoxTop() - menuReservedBottom
+}
+
+// menuWindowMaxOffset is the largest menuWindow for n item rows and avail.
+func menuWindowMaxOffset(n, avail int) int {
+	if avail < 1 || n <= avail {
+		return 0
+	}
+	if avail < 4 {
+		return n - avail
+	}
+	// End window: top indicator only → avail-1 item rows.
+	return n - (avail - 1)
+}
+
+// menuWindowLayout returns the visible item slice [visStart, visEnd) and whether
+// top/bottom "… N more …" indicator rows are shown for the given window start.
+func menuWindowLayout(n, avail, start int) (visStart, visEnd int, topInd, botInd bool) {
+	if avail < 1 || n == 0 {
+		return 0, 0, false, false
+	}
+	if n <= avail {
+		return 0, n, false, false
+	}
+	maxStart := menuWindowMaxOffset(n, avail)
+	if start < 0 {
+		start = 0
+	}
+	if start > maxStart {
+		start = maxStart
+	}
+	if avail < 4 {
+		return start, start + avail, false, false
+	}
+	topInd = start > 0
+	contentCap := avail
+	if topInd {
+		contentCap--
+	}
+	if start+contentCap < n {
+		botInd = true
+		contentCap--
+	}
+	end := start + contentCap
+	if end > n {
+		end = n
+	}
+	return start, end, topInd, botInd
+}
+
+// followMenuWindow adjusts menuWindow after a highlight move so the highlight
+// stays visible. Wrap last→first resets to 0; first→last jumps to maxOffset
+// (strix derived-window semantics — plan 022 WS3).
+func (b *BaseModel) followMenuWindow(prevHighlight int, movedDown bool) {
+	if !b.menuOpen() {
+		return
+	}
+	id := MenuID(b.openMenu)
+	items := b.menuItems(id)
+	n := len(items)
+	avail := b.menuAvail()
+	h := b.menuHighlight
+
+	if movedDown && h < prevHighlight {
+		b.menuWindow = 0
+		return
+	}
+	if !movedDown && h > prevHighlight {
+		b.menuWindow = menuWindowMaxOffset(n, avail)
+		return
+	}
+	b.menuWindow = deriveMenuWindowStart(n, avail, b.menuWindow, h)
+}
+
+// clampMenuWindow keeps menuWindow in range and showing the highlight. Call
+// after resize / highlight moves (not from View — value receiver).
+func (b *BaseModel) clampMenuWindow() {
+	if !b.menuOpen() {
+		return
+	}
+	items := b.menuItems(MenuID(b.openMenu))
+	b.menuWindow = deriveMenuWindowStart(len(items), b.menuAvail(),
+		b.menuWindow, b.menuHighlight)
+}
+
+// deriveMenuWindowStart is THE window-start algorithm (plan 022 WS3): clamp to
+// [0, maxOffset], then adjust minimally so highlight is visible. Input handlers
+// persist its result into menuWindow; dropdownBoxRows re-derives per frame so
+// View (a value receiver) never depends on the stored offset being fresh.
+func deriveMenuWindowStart(n, avail, window, highlight int) int {
+	if avail < 1 || n == 0 {
+		return 0
+	}
+	maxStart := menuWindowMaxOffset(n, avail)
+	if window > maxStart {
+		window = maxStart
+	}
+	if window < 0 {
+		window = 0
+	}
+	start, end, _, _ := menuWindowLayout(n, avail, window)
+	if highlight >= start && highlight < end {
+		return start
+	}
+	if highlight < start {
+		return highlight
+	}
+	for start < maxStart {
+		start++
+		_, end, _, _ = menuWindowLayout(n, avail, start)
+		if highlight < end {
+			return start
+		}
+	}
+	return maxStart
 }
 
 func (b *BaseModel) openMenuSibling(next bool) {
@@ -223,9 +376,13 @@ func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) tea.Cmd {
 	case "right", "tab":
 		b.openMenuSibling(true)
 	case "up", "k":
+		prev := b.menuHighlight
 		b.menuHighlight = b.menuStep(id, b.menuHighlight, false)
+		b.followMenuWindow(prev, false)
 	case "down", "j":
+		prev := b.menuHighlight
 		b.menuHighlight = b.menuStep(id, b.menuHighlight, true)
+		b.followMenuWindow(prev, true)
 	case "enter", " ":
 		cmd := b.activateMenuItem(id, b.menuHighlight)
 		b.closeMenu()
@@ -369,8 +526,9 @@ func (b *BaseModel) renderKeyHints() string {
 	return padFrameRow(s.Dim.Render("m menu · / search · s filter · ? help · q quit"), b.width)
 }
 
-// dropdownBoxRows builds the opaque themed dropdown rows (uniform width) and
-// records row hit-rects. Returns box rows, anchor x, and box width.
+// dropdownBoxRows builds the windowed dropdown rows (indicators + visible
+// items) and records hit-rects matching EXACTLY those rows; activatable rows
+// carry their full-list Index so hover/click map visible → item (plan 022 WS3).
 func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	if !b.menuOpen() || !b.settings.MenuBar {
 		return nil, 0, 0
@@ -380,8 +538,10 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 
 	th := CurrentTheme()
 	const pad = 1 // 1-space padding (strix plain look / user brief)
+	n := len(items)
 
-	// Inner content width: marker gutter + label.
+	// Inner content width: marker gutter + label (and indicator text when the
+	// list actually scrolls — indicators are a prox addition, plan 022 WS3).
 	maxInner := 0
 	for _, it := range items {
 		if it.Separator {
@@ -394,6 +554,13 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	}
 	if maxInner == 0 {
 		maxInner = ansi.StringWidth("(coming soon)")
+	}
+	if avail := b.menuAvail(); n > avail && avail >= 4 {
+		// Widest possible "… N more …" for this list.
+		indW := ansi.StringWidth(fmt.Sprintf("… %d more …", n))
+		if indW > maxInner {
+			maxInner = indW
+		}
 	}
 	innerW := maxInner + pad*2
 	boxW = innerW
@@ -417,32 +584,58 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 		boxX = 0
 	}
 
-	boxTop := 1 // immediately under the menu bar
-	if !b.settings.MenuBar {
-		boxTop = 0
+	boxTop := b.menuBoxTop()
+	avail := b.menuAvail()
+	if avail < 1 || n == 0 {
+		// Degenerate: menu state open, no rows / no hits (plan 022 WS3).
+		b.ensureHits().hasDropdown = false
+		return nil, boxX, boxW
 	}
 
-	hitRows := make([]menuRowHit, 0, len(items))
-	rows = make([]string, 0, len(items))
-	for i, it := range items {
-		var content string
+	visStart, visEnd, topInd, botInd := menuWindowLayout(n, avail,
+		deriveMenuWindowStart(n, avail, b.menuWindow, b.menuHighlight))
+
+	dimStyle := lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+	hitRows := make([]menuRowHit, 0, avail)
+	rows = make([]string, 0, avail)
+	rowY := boxTop
+
+	renderInd := func(hidden int) {
+		label := fmt.Sprintf("… %d more …", hidden)
+		content := strings.Repeat(" ", pad) + label
+		content = padFrameRow(content, innerW)
+		row := padFrameRow(dimStyle.Render(ansi.Cut(content, 0, innerW)), boxW)
+		rows = append(rows, row)
+		hitRows = append(hitRows, menuRowHit{
+			Index: -1,
+			Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
+		})
+		rowY++
+	}
+
+	if topInd {
+		renderInd(visStart)
+	}
+
+	for i := visStart; i < visEnd; i++ {
+		it := items[i]
 		switch {
 		case it.Separator:
-			content = strings.Repeat("─", max(1, innerW-pad*2))
+			content := strings.Repeat("─", max(1, innerW-pad*2))
 			content = strings.Repeat(" ", pad) + content + strings.Repeat(" ", pad)
 			content = ansi.Cut(content, 0, innerW)
-			style := lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
-			row := padFrameRow(style.Render(content), boxW)
+			row := padFrameRow(dimStyle.Render(content), boxW)
 			rows = append(rows, row)
 			hitRows = append(hitRows, menuRowHit{
-				Rect: HitRect{X: boxX, Y: boxTop + i, W: boxW, H: 1},
+				Index: -1,
+				Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
 			})
 		default:
 			label := menuMarker(it) + " " + it.Label
 			if it.Cmd == "" && it.Label == "(coming soon)" {
 				label = it.Label
 			}
-			content = strings.Repeat(" ", pad) + label
+			content := strings.Repeat(" ", pad) + label
 			content = padFrameRow(content, innerW)
 
 			var style lipgloss.Style
@@ -451,17 +644,28 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 					Background(th.SelectionBG).
 					Foreground(th.SelectionFG)
 			} else if it.Cmd == "" {
-				style = lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+				style = dimStyle
 			} else {
 				style = lipgloss.NewStyle().Foreground(th.FG).Background(th.BG)
 			}
 			row := padFrameRow(style.Render(ansi.Cut(content, 0, innerW)), boxW)
 			rows = append(rows, row)
+			cmd := it.Cmd
+			idx := i
+			if cmd == "" {
+				idx = -1
+			}
 			hitRows = append(hitRows, menuRowHit{
-				Cmd:  it.Cmd,
-				Rect: HitRect{X: boxX, Y: boxTop + i, W: boxW, H: 1},
+				Cmd:   cmd,
+				Index: idx,
+				Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
 			})
 		}
+		rowY++
+	}
+
+	if botInd {
+		renderInd(n - visEnd)
 	}
 
 	hits := b.ensureHits()
@@ -497,16 +701,26 @@ func (b *BaseModel) applyMenuOverlay(lines []string) []string {
 	if len(rows) == 0 {
 		return lines
 	}
-	boxTop := 1
-	if !b.settings.MenuBar {
-		boxTop = 0
-	}
-	return overlayLines(lines, boxX, boxTop, b.width, rows)
+	return overlayLines(lines, boxX, b.menuBoxTop(), b.width, rows)
 }
 
-// handleMenuMouse handles menu-bar / dropdown clicks. Returns whether the event
-// is fully consumed and an optional command from an activated item.
+// handleMenuMouse handles menu-bar / dropdown clicks and menu-open wheel.
+// Returns whether the event is fully consumed and an optional command from an
+// activated item. Wheel with a menu open is always consumed (plan 022 WS3).
 func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
+	if msg.Action == tea.MouseActionPress &&
+		(msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown) {
+		if !b.menuOpen() {
+			return false, nil
+		}
+		id := MenuID(b.openMenu)
+		down := msg.Button == tea.MouseButtonWheelDown
+		prev := b.menuHighlight
+		b.menuHighlight = b.menuStepClamp(id, b.menuHighlight, down)
+		b.followMenuWindow(prev, down)
+		return true, nil
+	}
+
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return false, nil
 	}
@@ -545,8 +759,8 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		}
 		for _, row := range d.Rows {
 			if row.Rect.Contains(x, y) {
-				if row.Cmd != "" {
-					cmd := b.activateMenuCommand(row.Cmd)
+				if row.Cmd != "" && row.Index >= 0 {
+					cmd := b.activateMenuItem(d.Menu, row.Index)
 					b.closeMenu()
 					return true, cmd
 				}
