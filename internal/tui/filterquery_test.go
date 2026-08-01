@@ -2,6 +2,7 @@ package tui
 
 import (
 	"math/rand"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -101,6 +102,41 @@ func TestParseLogsFilter(t *testing.T) {
 			},
 		},
 		{
+			name:  "re single",
+			query: "re:timeout",
+			check: func(t *testing.T, e LogsFilterExpr) {
+				require.Len(t, e.res, 1)
+				assert.Equal(t, "timeout", e.res[0].String())
+			},
+		},
+		{
+			name:  "re quoted whitespace",
+			query: `re:"foo bar"`,
+			check: func(t *testing.T, e LogsFilterExpr) {
+				require.Len(t, e.res, 1)
+				assert.Equal(t, "foo bar", e.res[0].String())
+			},
+		},
+		{
+			name:  "re multiple AND + negation",
+			query: `re:err.* re:timeout -re:health`,
+			check: func(t *testing.T, e LogsFilterExpr) {
+				require.Len(t, e.res, 2)
+				assert.Equal(t, "err.*", e.res[0].String())
+				assert.Equal(t, "timeout", e.res[1].String())
+				require.Len(t, e.negRes, 1)
+				assert.Equal(t, "health", e.negRes[0].String())
+			},
+		},
+		{
+			name:  "re case-sensitive flag",
+			query: `re:(?i)Error`,
+			check: func(t *testing.T, e LogsFilterExpr) {
+				require.Len(t, e.res, 1)
+				assert.Equal(t, "(?i)Error", e.res[0].String())
+			},
+		},
+		{
 			name:    "unknown field",
 			query:   "method:GET",
 			wantErr: true,
@@ -123,6 +159,24 @@ func TestParseLogsFilter(t *testing.T) {
 			query:   "foo status:200",
 			wantErr: true,
 			errPos:  4,
+		},
+		{
+			name:    "empty re",
+			query:   "re:",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "bad re compile",
+			query:   "re:(unclosed",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "re too long",
+			query:   "re:" + strings.Repeat("a", 257),
+			wantErr: true,
+			errPos:  0,
 		},
 	}
 	for _, tt := range tests {
@@ -181,6 +235,45 @@ func TestParseRequestsFilter(t *testing.T) {
 			},
 		},
 		{
+			name:  "status gte",
+			query: "status:>=400",
+			check: func(t *testing.T, e RequestsFilterExpr) {
+				require.Len(t, e.statuses, 1)
+				assert.Equal(t, 400, e.statuses[0].min)
+				assert.Equal(t, 0, e.statuses[0].max)
+				assert.Equal(t, 0, e.statuses[0].exact)
+			},
+		},
+		{
+			name:  "status lte",
+			query: "status:<=299",
+			check: func(t *testing.T, e RequestsFilterExpr) {
+				require.Len(t, e.statuses, 1)
+				assert.Equal(t, 299, e.statuses[0].max)
+				assert.Equal(t, 0, e.statuses[0].min)
+			},
+		},
+		{
+			name:  "status inclusive range",
+			query: "status:200-399",
+			check: func(t *testing.T, e RequestsFilterExpr) {
+				require.Len(t, e.statuses, 1)
+				assert.Equal(t, 200, e.statuses[0].min)
+				assert.Equal(t, 399, e.statuses[0].max)
+			},
+		},
+		{
+			name:  "status range + neg gte",
+			query: "status:200-299 -status:>=500",
+			check: func(t *testing.T, e RequestsFilterExpr) {
+				require.Len(t, e.statuses, 1)
+				assert.Equal(t, 200, e.statuses[0].min)
+				assert.Equal(t, 299, e.statuses[0].max)
+				require.Len(t, e.negStatuses, 1)
+				assert.Equal(t, 500, e.negStatuses[0].min)
+			},
+		},
+		{
 			name:  "host url",
 			query: "host:api.local url:/orders",
 			check: func(t *testing.T, e RequestsFilterExpr) {
@@ -220,6 +313,12 @@ func TestParseRequestsFilter(t *testing.T) {
 			errPos:  0,
 		},
 		{
+			name:    "sub field removed",
+			query:   "sub:web",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
 			name:    "bad status",
 			query:   "status:abc",
 			wantErr: true,
@@ -234,6 +333,66 @@ func TestParseRequestsFilter(t *testing.T) {
 		{
 			name:    "bad status class digit",
 			query:   "status:9xx",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status reversed range",
+			query:   "status:399-200",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status range endpoint low",
+			query:   "status:99-200",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status range endpoint high",
+			query:   "status:200-600",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status gte out of range",
+			query:   "status:>=99",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status lte out of range",
+			query:   "status:<=600",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status malformed operator gt",
+			query:   "status:>400",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status malformed operator lt",
+			query:   "status:<500",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status partial gte",
+			query:   "status:>=",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status partial range hi",
+			query:   "status:200-",
+			wantErr: true,
+			errPos:  0,
+		},
+		{
+			name:    "status partial number in gte",
+			query:   "status:>=4xx",
 			wantErr: true,
 			errPos:  0,
 		},
@@ -291,6 +450,19 @@ func TestLogsFilterExpr_Match(t *testing.T) {
 	assert.True(t, expr4.Match(mk("x", "info"), meta(LogLevelInfo, true)))
 	assert.True(t, expr4.Match(mk("x", "unknown"), meta(0, false)), "unknown passes -level")
 	assert.False(t, expr4.Match(mk("x", "err"), meta(LogLevelError, true)))
+
+	// re: AND + -re: against raw line (case-sensitive by default)
+	expr5, err := ParseLogsFilter(`re:err.* re:timeout -re:health`)
+	require.NoError(t, err)
+	assert.True(t, expr5.Match(mk("x", "error: timeout"), meta(0, false)))
+	assert.False(t, expr5.Match(mk("x", "error only"), meta(0, false)), "missing second re")
+	assert.False(t, expr5.Match(mk("x", "Error: timeout"), meta(0, false)), "case-sensitive")
+	assert.False(t, expr5.Match(mk("x", "error: timeout health"), meta(0, false)), "neg re")
+
+	expr6, err := ParseLogsFilter(`re:(?i)Error`)
+	require.NoError(t, err)
+	assert.True(t, expr6.Match(mk("x", "error"), meta(0, false)))
+	assert.True(t, expr6.Match(mk("x", "ERROR"), meta(0, false)))
 }
 
 func TestRequestsFilterExpr_Match(t *testing.T) {
@@ -345,6 +517,26 @@ func TestRequestsFilterExpr_Match(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, expr7.Match(mk("GET", "", "", "/", 200, false)))
 	assert.True(t, expr7.Match(mk("POST", "", "", "/", 200, false)))
+
+	// status >= / <= / range
+	expr8, err := ParseRequestsFilter("status:>=500")
+	require.NoError(t, err)
+	assert.True(t, expr8.Match(mk("GET", "", "", "/", 500, false)))
+	assert.True(t, expr8.Match(mk("GET", "", "", "/", 599, false)))
+	assert.False(t, expr8.Match(mk("GET", "", "", "/", 499, false)))
+
+	expr9, err := ParseRequestsFilter("status:<=299")
+	require.NoError(t, err)
+	assert.True(t, expr9.Match(mk("GET", "", "", "/", 200, false)))
+	assert.True(t, expr9.Match(mk("GET", "", "", "/", 299, false)))
+	assert.False(t, expr9.Match(mk("GET", "", "", "/", 300, false)))
+
+	expr10, err := ParseRequestsFilter("status:200-399")
+	require.NoError(t, err)
+	assert.True(t, expr10.Match(mk("GET", "", "", "/", 200, false)))
+	assert.True(t, expr10.Match(mk("GET", "", "", "/", 399, false)))
+	assert.False(t, expr10.Match(mk("GET", "", "", "/", 199, false)))
+	assert.False(t, expr10.Match(mk("GET", "", "", "/", 400, false)))
 }
 
 func TestFilterSerializeRoundTrip(t *testing.T) {
@@ -354,6 +546,9 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 		"proc:api proc:web level:error -health",
 		"level:warn -proc:db foo",
 		`proc:"my app" level:info`,
+		`re:timeout`,
+		`re:"foo bar" -re:health`,
+		`re:err.* re:timeout`,
 	}
 	for _, q := range logsQueries {
 		t.Run("logs/"+q, func(t *testing.T) {
@@ -375,6 +570,10 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 		"method:POST status:5xx url:/orders",
 		"status:200 host:api in_flight:true -health",
 		"method:GET method:POST status:4xx",
+		"status:>=400",
+		"status:<=299",
+		"status:200-399",
+		"status:>=500 -status:<=199",
 	}
 	for _, q := range reqQueries {
 		t.Run("requests/"+q, func(t *testing.T) {
@@ -389,9 +588,14 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 	}
 
 	// Menu-edit-friendly ordering: fields before bare, positives before negs in group.
-	e, err := ParseLogsFilter("-health level:error proc:web proc:api")
+	e, err := ParseLogsFilter("-health level:error proc:web proc:api re:boom")
 	require.NoError(t, err)
-	assert.Equal(t, "proc:web proc:api level:error -health", e.Serialize())
+	assert.Equal(t, "proc:web proc:api level:error re:boom -health", e.Serialize())
+
+	// re: with whitespace uses quoted field form.
+	eRe, err := ParseLogsFilter(`re:"foo bar"`)
+	require.NoError(t, err)
+	assert.Equal(t, `re:"foo bar"`, eRe.Serialize())
 }
 
 // Confirmed B4 failing shapes (plan 023 §2): non-field-shaped colon+quoted
@@ -450,6 +654,40 @@ func TestQuoteIfNeededUsesFilterSpace(t *testing.T) {
 	assert.Equal(t, "plain", quoteIfNeeded("plain"))
 }
 
+// Values with both whitespace and `"` are unrepresentable (no escapes). The
+// tokenizer ends the quoted field at the first closing quote; trailing junk
+// is a clear parse error (plan 023 A5).
+func TestParseRejectsQuoteEscapeInRE(t *testing.T) {
+	_, err := ParseLogsFilter(`re:"a \"b\""`)
+	require.Error(t, err)
+	var fq *FilterQueryError
+	require.ErrorAs(t, err, &fq)
+	assert.Contains(t, fq.Msg, "junk after closing quote")
+}
+
+func TestParseStatusMatchDistinctErrors(t *testing.T) {
+	tests := []struct {
+		query   string
+		msgPart string
+	}{
+		{"status:399-200", "reversed status range"},
+		{"status:99-200", "out of range"},
+		{"status:>=600", "out of range"},
+		{"status:>400", "malformed status operator"},
+		{"status:>=", "partial status number"},
+		{"status:200-", "partial status number"},
+		{"status:>=4xx", "partial status number"},
+		{"status:abc", "bad status"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			_, err := ParseRequestsFilter(tt.query)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.msgPart)
+		})
+	}
+}
+
 // Property: every parseable query survives parse → serialize → parse with
 // expr-equivalence. Seeded with the confirmed B4 shapes; then random mixes.
 func TestSerializeRoundTripProperty(t *testing.T) {
@@ -465,6 +703,9 @@ func TestSerializeRoundTripProperty(t *testing.T) {
 		`proc:"my app" level:error -health`,
 		"level:warn -proc:db foo bar",
 		`15:04 a.b:1`,
+		`re:timeout`,
+		`re:"foo bar" -re:health`,
+		`re:(?i)err.*`,
 	}
 	for _, q := range logsSeeds {
 		assertLogsRoundTrip(t, q)
@@ -481,6 +722,9 @@ func TestSerializeRoundTripProperty(t *testing.T) {
 		"method:POST status:5xx url:/orders",
 		"status:200 host:api in_flight:true -health",
 		`method:GET host:"my host" url:"/a b"`,
+		"status:>=400",
+		"status:<=299",
+		"status:200-399",
 	}
 	for _, q := range reqSeeds {
 		assertRequestsRoundTrip(t, q)
@@ -522,7 +766,7 @@ func genLogsFilterQuery(rng *rand.Rand) string {
 		if rng.Intn(4) == 0 {
 			neg = "-"
 		}
-		switch rng.Intn(6) {
+		switch rng.Intn(7) {
 		case 0:
 			parts = append(parts, neg+"proc:"+genFieldValue(rng, []string{"api", "web", "db", "my app", "worker-1"}))
 		case 1:
@@ -531,6 +775,8 @@ func genLogsFilterQuery(rng *rand.Rand) string {
 		case 2:
 			// Confirmed-shape non-field colon+quote bare term.
 			parts = append(parts, neg+genColonQuoteTerm(rng))
+		case 3:
+			parts = append(parts, neg+"re:"+genREPattern(rng))
 		default:
 			parts = append(parts, neg+genBareWord(rng))
 		}
@@ -547,12 +793,12 @@ func genRequestsFilterQuery(rng *rand.Rand) string {
 		if rng.Intn(4) == 0 {
 			neg = "-"
 		}
-		switch rng.Intn(8) {
+		switch rng.Intn(9) {
 		case 0:
 			methods := []string{"GET", "POST", "PUT", "DELETE", "patch"}
 			parts = append(parts, neg+"method:"+methods[rng.Intn(len(methods))])
 		case 1:
-			statuses := []string{"200", "404", "500", "2xx", "4xx", "5XX"}
+			statuses := []string{"200", "404", "500", "2xx", "4xx", "5XX", ">=400", "<=299", "200-399", "100-599"}
 			parts = append(parts, neg+"status:"+statuses[rng.Intn(len(statuses))])
 		case 2:
 			parts = append(parts, neg+"host:"+genFieldValue(rng, []string{"api", "web.local", "my host"}))
@@ -579,6 +825,12 @@ func genFieldValue(rng *rand.Rand, choices []string) string {
 		return `"` + v + `"`
 	}
 	return v
+}
+
+func genREPattern(rng *rand.Rand) string {
+	// Always-valid RE2 patterns; quote when whitespace is present.
+	patterns := []string{"timeout", "err.*", "(?i)error", "foo bar", "[0-9]+", "a+b"}
+	return genFieldValue(rng, patterns)
 }
 
 func genBareWord(rng *rand.Rand) string {
@@ -756,19 +1008,21 @@ func TestStringFilter_LiveReparseViaKeys(t *testing.T) {
 
 // equalLogsFilterExpr reports whether a and b are equivalent: same constraints
 // in the same order per slot. Order is identity because Serialize preserves
-// parse order. Unknown levels are ignored (Serialize drops them). C4 extends
-// this when new fields land.
+// parse order. Unknown levels are ignored (Serialize drops them). re: patterns
+// compare by regexp source string (pointers differ across compiles).
 func equalLogsFilterExpr(a, b LogsFilterExpr) bool {
 	return slices.Equal(a.procs, b.procs) &&
 		slices.Equal(a.negProcs, b.negProcs) &&
 		equalLevelsDropUnknown(a.levels, b.levels) &&
 		equalLevelsDropUnknown(a.negLevels, b.negLevels) &&
+		equalRegexpSlices(a.res, b.res) &&
+		equalRegexpSlices(a.negRes, b.negRes) &&
 		slices.Equal(a.terms, b.terms) &&
 		slices.Equal(a.negTerms, b.negTerms)
 }
 
 // equalRequestsFilterExpr is the requests counterpart of equalLogsFilterExpr.
-// C4 extends this when status-range forms land.
+// statusMatch values (exact/class/gte/lte/range) compare by struct equality.
 func equalRequestsFilterExpr(a, b RequestsFilterExpr) bool {
 	return slices.Equal(a.methods, b.methods) &&
 		slices.Equal(a.negMethods, b.negMethods) &&
@@ -782,6 +1036,24 @@ func equalRequestsFilterExpr(a, b RequestsFilterExpr) bool {
 		equalBoolPtr(a.negInFlight, b.negInFlight) &&
 		slices.Equal(a.terms, b.terms) &&
 		slices.Equal(a.negTerms, b.negTerms)
+}
+
+func equalRegexpSlices(a, b []*regexp.Regexp) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] == nil || b[i] == nil {
+			if a[i] != b[i] {
+				return false
+			}
+			continue
+		}
+		if a[i].String() != b[i].String() {
+			return false
+		}
+	}
+	return true
 }
 
 func equalLevelsDropUnknown(a, b []LogLevel) bool {

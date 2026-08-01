@@ -139,12 +139,22 @@ Menu choices persist view toggles and theme to `~/.prox/tui/config.toml` (`theme
 ```text
 proc:api level:error -health
 proc:web proc:worker level:warn
-re:timeout
+re:timeout -re:health
+re:"foo bar"
 ```
 
-Fields: `proc:` (repeatable), `level:error|warn|info|debug|trace` (repeatable), `re:<regex>` (≤256 chars). Bare words are case-insensitive AND substring matches on the line. `-` negates any token. Invalid syntax keeps the last good filter and shows a hint in the status bar.
+Fields:
 
-A line's level is detected at ingest from (first match wins): a JSON `level`/`lvl`/`severity` key (string, or pino/bunyan numeric), a logfmt `level=`/`lvl=` token, or a standalone UPPERCASE level token early in the line — the shape python logging, tracing's text format, pino-pretty, and uvicorn emit in local dev. `warning` maps to warn; `fatal`/`critical` map to error. Lines with no detectable level are excluded from positive `level:` filters (and untinted).
+- `proc:` — process name (repeatable; positives OR)
+- `level:error|warn|info|debug|trace` — detected level (repeatable; positives OR; `warning`→warn, `fatal`/`critical`→error)
+- `re:<pattern>` — RE2 regex, ≤256 bytes, case-sensitive (opt into `(?i)`); compiled once at parse; multiple `re:` terms AND together; `-re:` excludes matches. Matches the raw log line (same as bare terms).
+- Bare words — case-insensitive AND substring matches on the raw line
+
+`-` negates any token. Invalid syntax (including bad `re:` compile) keeps the last good filter and shows a hint in the status bar. Values with whitespace use `field:"quoted"` form; there are no escapes — a value containing both whitespace and `"` is unrepresentable.
+
+JSON object log lines may *display* as a compact `path=value` summary, but filter/`/` search still match the raw line.
+
+A line's level is detected at ingest from (first match wins): a JSON `level`/`lvl`/`severity` key (string, or pino/bunyan numeric), a logfmt `level=`/`lvl=` token, or a standalone UPPERCASE level token early in the line — the shape python logging, tracing's text format, pino-pretty, and uvicorn emit in local dev. Lines with no detectable level are excluded from positive `level:` filters (and untinted).
 
 The **Filter menu** edits the same state as the `s` bar; menu changes rewrite the bar text canonically.
 
@@ -171,10 +181,19 @@ The requests view has an explicit **cursor row** (marked with `❯`). Navigation
 
 ```text
 method:GET status:5xx host:api url:/orders
-sub:web method:POST
+status:>=400 status:200-399 in_flight:true
 ```
 
-Fields: `sub:`, `method:` (repeatable), `status:` (`500`, `5xx`, `>=400`, `200-299`, …), `url:` (repeatable). Bare terms OR-match URL, method, and subdomain (back-compat with the old substring filter).
+Fields:
+
+- `method:` — HTTP method (repeatable; case-insensitive; positives OR)
+- `status:` — exact (`200`), class (`4xx`/`5XX`), inequality (`>=400`, `<=299`), or inclusive range (`200-399`). Endpoints must be 100–599; reversed ranges and malformed/partial operators are rejected with distinct errors. Positives OR; `-status:` excludes.
+- `host:` — case-insensitive hostname substring (repeatable)
+- `url:` — case-insensitive path+query substring (repeatable)
+- `in_flight:true|false` — single-valued constraint
+- Bare terms — each AND'd; a term matches if it appears in method, host, URL, or subdomain
+
+`-` negates any token. Invalid syntax keeps the last good filter and shows a hint in the status bar.
 
 **Auto-follow** pins the cursor to the newest row. Scrolling or moving up pauses follow; `G`/`End`/`F`, or moving onto the newest row, resumes it.
 

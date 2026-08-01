@@ -2,12 +2,14 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
 )
 
@@ -53,14 +55,18 @@ type requestsFilterState struct {
 
 // LogsFilterExpr is the evaluated form of a logs-view filter query (plan 021
 // WS6). Within-field positives are OR'd; everything else is AND'd. Empty expr
-// matches every entry.
+// matches every entry. re: patterns are compiled once at parse time (RE2,
+// case-sensitive; use (?i) for case-fold) and AND'd like bare terms; matching
+// uses the raw entry line (same as bare terms — no ANSI strip).
 type LogsFilterExpr struct {
-	procs     []string   // positive proc: values (OR)
-	negProcs  []string   // -proc: values (each AND-excluded)
-	levels    []LogLevel // positive level: values (OR)
-	negLevels []LogLevel // -level: values (each AND-excluded)
-	terms     []string   // bare words (AND, case-insensitive line substrings)
-	negTerms  []string   // -bare words (AND-excluded)
+	procs     []string         // positive proc: values (OR)
+	negProcs  []string         // -proc: values (each AND-excluded)
+	levels    []LogLevel       // positive level: values (OR)
+	negLevels []LogLevel       // -level: values (each AND-excluded)
+	res       []*regexp.Regexp // positive re: patterns (AND; compiled at parse)
+	negRes    []*regexp.Regexp // -re: patterns (each must NOT match)
+	terms     []string         // bare words (AND, case-insensitive line substrings)
+	negTerms  []string         // -bare words (AND-excluded)
 }
 
 // RequestsFilterExpr is the evaluated form of a requests-view filter query.
@@ -80,10 +86,13 @@ type RequestsFilterExpr struct {
 	negTerms    []string      // -bare
 }
 
-// statusMatch is either an exact status code or an Nxx class (e.g. 4xx → 400–499).
+// statusMatch is an exact code, Nxx class, inequality (>=N / <=N), or inclusive
+// range (N-M). Exactly one form is set per value.
 type statusMatch struct {
-	exact int // >0 when exact
-	class int // 1–5 when Nxx (hundreds digit); 0 when exact
+	exact int // >0 when exact code
+	class int // 1–5 when Nxx (hundreds digit)
+	min   int // >0 for >=N (alone) or range lower bound
+	max   int // >0 for <=N (alone) or range upper bound
 }
 
 func (s statusMatch) matches(code int) bool {
@@ -94,6 +103,15 @@ func (s statusMatch) matches(code int) bool {
 		lo := s.class * 100
 		return code >= lo && code < lo+100
 	}
+	if s.min > 0 && s.max > 0 {
+		return code >= s.min && code <= s.max
+	}
+	if s.min > 0 {
+		return code >= s.min
+	}
+	if s.max > 0 {
+		return code <= s.max
+	}
 	return false
 }
 
@@ -103,6 +121,15 @@ func (s statusMatch) String() string {
 	}
 	if s.class > 0 {
 		return fmt.Sprintf("%dxx", s.class)
+	}
+	if s.min > 0 && s.max > 0 {
+		return fmt.Sprintf("%d-%d", s.min, s.max)
+	}
+	if s.min > 0 {
+		return fmt.Sprintf(">=%d", s.min)
+	}
+	if s.max > 0 {
+		return fmt.Sprintf("<=%d", s.max)
 	}
 	return ""
 }
@@ -160,6 +187,11 @@ func tokenizeFilter(query string) ([]filterToken, error) {
 					return nil, &FilterQueryError{Pos: afterColon, Msg: "unclosed quote"}
 				}
 				i = j + 1
+				// No escapes: the first closing quote ends the token. Junk
+				// glued after it (e.g. re:"a \"b\"") is a parse error.
+				if i < n && !isFilterSpace(query[i]) {
+					return nil, &FilterQueryError{Pos: i, Msg: "junk after closing quote"}
+				}
 				body := query[bodyStart:i]
 				toks = append(toks, filterToken{raw: query[start:i], pos: start, neg: neg, body: body})
 				continue
@@ -256,6 +288,16 @@ func ParseLogsFilter(query string) (LogsFilterExpr, error) {
 			} else {
 				expr.levels = append(expr.levels, lvl)
 			}
+		case "re":
+			re, err := parseREPattern(value, tok.pos)
+			if err != nil {
+				return LogsFilterExpr{}, err
+			}
+			if tok.neg {
+				expr.negRes = append(expr.negRes, re)
+			} else {
+				expr.res = append(expr.res, re)
+			}
 		default:
 			return LogsFilterExpr{}, &FilterQueryError{Pos: tok.pos, Msg: fmt.Sprintf("unknown field %q", field)}
 		}
@@ -346,11 +388,85 @@ func parseStatusMatch(value string, pos int) (statusMatch, error) {
 	if len(v) == 3 && v[1] == 'x' && v[2] == 'x' && v[0] >= '1' && v[0] <= '5' {
 		return statusMatch{class: int(v[0] - '0')}, nil
 	}
-	code, err := strconv.Atoi(v)
-	if err != nil || code < 100 || code > 599 {
-		return statusMatch{}, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("bad status %q", value)}
+	if strings.HasPrefix(v, ">=") {
+		n, err := parseStatusEndpoint(v[2:], pos)
+		if err != nil {
+			return statusMatch{}, err
+		}
+		return statusMatch{min: n}, nil
+	}
+	if strings.HasPrefix(v, "<=") {
+		n, err := parseStatusEndpoint(v[2:], pos)
+		if err != nil {
+			return statusMatch{}, err
+		}
+		return statusMatch{max: n}, nil
+	}
+	if strings.HasPrefix(v, ">") || strings.HasPrefix(v, "<") {
+		return statusMatch{}, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("malformed status operator in %q", value)}
+	}
+	if dash := strings.IndexByte(v, '-'); dash > 0 {
+		lo, err := parseStatusEndpoint(v[:dash], pos)
+		if err != nil {
+			return statusMatch{}, err
+		}
+		hi, err := parseStatusEndpoint(v[dash+1:], pos)
+		if err != nil {
+			return statusMatch{}, err
+		}
+		if lo > hi {
+			return statusMatch{}, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("reversed status range %d-%d", lo, hi)}
+		}
+		return statusMatch{min: lo, max: hi}, nil
+	}
+	code, err := parseStatusEndpoint(v, pos)
+	if err != nil {
+		// Keep the historical "bad status" wording for plain exact/garbage forms.
+		if fq, ok := err.(*FilterQueryError); ok && strings.HasPrefix(fq.Msg, "partial status number") {
+			return statusMatch{}, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("bad status %q", value)}
+		}
+		return statusMatch{}, err
 	}
 	return statusMatch{exact: code}, nil
+}
+
+// parseStatusEndpoint parses a full decimal status code in 100–599.
+// Empty or non-digit input → "partial status number"; out-of-range → distinct.
+func parseStatusEndpoint(s string, pos int) (int, error) {
+	if s == "" || !isAllDigits(s) {
+		return 0, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("partial status number %q", s)}
+	}
+	code, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("partial status number %q", s)}
+	}
+	if code < 100 || code > 599 {
+		return 0, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("status %d out of range (100-599)", code)}
+	}
+	return code, nil
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseREPattern(value string, pos int) (*regexp.Regexp, error) {
+	if value == "" {
+		return nil, &FilterQueryError{Pos: pos, Msg: "empty re value"}
+	}
+	if len(value) > logs.MaxPatternLength {
+		return nil, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("re pattern exceeds %d bytes", logs.MaxPatternLength)}
+	}
+	re, err := regexp.Compile(value)
+	if err != nil {
+		return nil, &FilterQueryError{Pos: pos, Msg: fmt.Sprintf("bad re pattern: %v", err)}
+	}
+	return re, nil
 }
 
 func parseInFlight(value string, pos int) (bool, error) {
@@ -414,6 +530,17 @@ func (e LogsFilterExpr) Match(entry domain.LogEntry, meta logMeta) bool {
 	}
 	for _, t := range e.negTerms {
 		if containsIgnoreCase(entry.Line, t) {
+			return false
+		}
+	}
+	// re: matches the raw line (same as bare terms — no ANSI strip).
+	for _, re := range e.res {
+		if !re.MatchString(entry.Line) {
+			return false
+		}
+	}
+	for _, re := range e.negRes {
+		if re.MatchString(entry.Line) {
 			return false
 		}
 	}
@@ -524,7 +651,7 @@ func requestBareMatch(req proxy.RequestRecord, term string) bool {
 }
 
 // Serialize returns the canonical string form of a logs filter (C8 menu edits
-// regenerate the bar from this). Field order: proc, level, then bare terms;
+// regenerate the bar from this). Field order: proc, level, re, then bare terms;
 // positives before negations within each group. Bare terms are echoed
 // verbatim (never re-quoted) so colon+quoted non-field shapes round-trip;
 // Unknown levels are dropped. Round-trips stably through ParseLogsFilter.
@@ -545,6 +672,12 @@ func (e LogsFilterExpr) Serialize() string {
 		if tok := levelToken(l); tok != "" {
 			parts = append(parts, "-level:"+tok)
 		}
+	}
+	for _, re := range e.res {
+		parts = append(parts, "re:"+quoteIfNeeded(re.String()))
+	}
+	for _, re := range e.negRes {
+		parts = append(parts, "-re:"+quoteIfNeeded(re.String()))
 	}
 	// Bare terms: verbatim. A whitespace-bearing term only arises from a
 	// non-field-shaped colon+quoted token, which already carries quotes in
@@ -641,6 +774,7 @@ func levelToken(l LogLevel) string {
 func (e LogsFilterExpr) IsEmpty() bool {
 	return len(e.procs) == 0 && len(e.negProcs) == 0 &&
 		len(e.levels) == 0 && len(e.negLevels) == 0 &&
+		len(e.res) == 0 && len(e.negRes) == 0 &&
 		len(e.terms) == 0 && len(e.negTerms) == 0
 }
 
