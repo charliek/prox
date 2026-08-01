@@ -5,6 +5,15 @@ import "github.com/charmbracelet/lipgloss"
 // styleSet holds every lipgloss style the TUI render path uses. Built wholesale
 // from a Theme; never field-mutated after publish (see SetTheme).
 type styleSet struct {
+	// Base is FG+BG under FullFill themes; empty under legacy. Row builders wrap
+	// every plain segment, separator, and padding run in Base (plan 023 B1).
+	Base lipgloss.Style
+
+	// HeaderSep / StatusSep paint the raw join separators between header chips
+	// and status segments with the chrome BG under FullFill; empty under
+	// legacy (no-op Render keeps byte identity).
+	HeaderSep, StatusSep lipgloss.Style
+
 	Running, Stopped, Crashed   lipgloss.Style
 	Starting, Stopping, Waiting lipgloss.Style
 	Blocked, Completed          lipgloss.Style
@@ -71,83 +80,120 @@ func CurrentTheme() *Theme { return currentTheme }
 // CurrentThemeName returns the canonical name of the active theme.
 func CurrentThemeName() string { return currentThemeName }
 
+// fillBG adds Background(t.BG) when t.FullFill so FG-only segments still paint
+// the theme surface (SGR-reset law). Styles with their own chrome BG skip this.
+func fillBG(st lipgloss.Style, t *Theme) lipgloss.Style {
+	if t.FullFill {
+		return st.Background(t.BG)
+	}
+	return st
+}
+
 func buildStyleSet(t *Theme) styleSet {
+	base := lipgloss.NewStyle()
+	if t.FullFill {
+		base = lipgloss.NewStyle().Foreground(t.FG).Background(t.BG)
+	}
+
+	header := lipgloss.NewStyle().
+		Background(t.HeaderBG).
+		Padding(0, 1)
+	// legacy keeps MarginBottom for byte-identical escape output; FullFill
+	// themes replace the margin with an explicitly Base-styled blank row in
+	// mainView (margins use MarginBackground, not Background — plan 023 B1).
+	if !t.FullFill {
+		header = header.MarginBottom(1)
+	}
+
+	help := lipgloss.NewStyle().
+		Background(t.BG).
+		Padding(1, 2).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Border)
+	if t.FullFill {
+		help = help.BorderBackground(t.BG)
+	}
+
+	headerSep := lipgloss.NewStyle()
+	statusSep := lipgloss.NewStyle()
+	if t.FullFill {
+		headerSep = headerSep.Background(t.HeaderBG)
+		statusSep = statusSep.Background(t.FooterBG)
+	}
+
 	ss := styleSet{
-		Running:  lipgloss.NewStyle().Foreground(t.OK).Bold(true),
-		Stopped:  lipgloss.NewStyle().Foreground(t.Dim),
-		Crashed:  lipgloss.NewStyle().Foreground(t.Err).Bold(true),
-		Starting: lipgloss.NewStyle().Foreground(t.Warn),
-		Stopping: lipgloss.NewStyle().Foreground(t.Warn),
+		Base:      base,
+		HeaderSep: headerSep,
+		StatusSep: statusSep,
+
+		Running:  fillBG(lipgloss.NewStyle().Foreground(t.OK).Bold(true), t),
+		Stopped:  fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
+		Crashed:  fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t),
+		Starting: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
+		Stopping: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
 		// Gated-launch + task terminal states (plan 013 D5). Waiting is a
 		// distinct amber; blocked shares the crashed red (bold); completed
 		// rests gray like stopped.
-		Waiting:   lipgloss.NewStyle().Foreground(t.Waiting),
-		Blocked:   lipgloss.NewStyle().Foreground(t.Err).Bold(true),
-		Completed: lipgloss.NewStyle().Foreground(t.Dim),
+		Waiting:   fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t),
+		Blocked:   fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t),
+		Completed: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
 
-		DefaultProcess: lipgloss.NewStyle(),
-		Warn:           lipgloss.NewStyle().Foreground(t.Warn),
+		DefaultProcess: base,
+		Warn:           fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
 
 		// Health dots reuse OK/Err (plan 018 D13) so they stay consistent with
 		// process-state colouring.
-		HealthyDot:   lipgloss.NewStyle().Foreground(t.OK),
-		UnhealthyDot: lipgloss.NewStyle().Foreground(t.Err),
+		HealthyDot:   fillBG(lipgloss.NewStyle().Foreground(t.OK), t),
+		UnhealthyDot: fillBG(lipgloss.NewStyle().Foreground(t.Err), t),
 
 		// Header/Status match pre-theme construction (BG + padding only — no
 		// FG) so the legacy preset's escape codes stay byte-identical.
-		Header: lipgloss.NewStyle().
-			Background(t.HeaderBG).
-			Padding(0, 1).
-			MarginBottom(1),
+		Header: header,
 		Status: lipgloss.NewStyle().
 			Background(t.FooterBG).
 			Padding(0, 1),
-		Help: lipgloss.NewStyle().
-			Background(t.BG).
-			Padding(1, 2).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(t.Border),
+		Help: help,
 
 		Err: lipgloss.NewStyle().
 			Foreground(t.ErrBadgeFG).
 			Background(t.ErrBadgeBG).
 			Bold(true),
-		Dim: lipgloss.NewStyle().Foreground(t.Dim),
+		Dim: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
 
-		HTTPSuccess:  lipgloss.NewStyle().Foreground(t.HTTPSuccess),
-		HTTPRedirect: lipgloss.NewStyle().Foreground(t.HTTPRedirect),
-		HTTPWarning:  lipgloss.NewStyle().Foreground(t.HTTPWarning),
-		HTTPError:    lipgloss.NewStyle().Foreground(t.HTTPError),
+		HTTPSuccess:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
+		HTTPRedirect: fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t),
+		HTTPWarning:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
+		HTTPError:    fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
 
 		// Method colors (C9): GET=info-ish redirect cyan, POST=OK, PUT=waiting,
 		// DELETE=err, PATCH=warn. Unknown methods stay default FG.
-		HTTPGet:    lipgloss.NewStyle().Foreground(t.HTTPRedirect),
-		HTTPPost:   lipgloss.NewStyle().Foreground(t.HTTPSuccess),
-		HTTPPut:    lipgloss.NewStyle().Foreground(t.Waiting),
-		HTTPDelete: lipgloss.NewStyle().Foreground(t.HTTPError),
-		HTTPPatch:  lipgloss.NewStyle().Foreground(t.HTTPWarning),
+		HTTPGet:    fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t),
+		HTTPPost:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
+		HTTPPut:    fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t),
+		HTTPDelete: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
+		HTTPPatch:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
 
-		Status2xx: lipgloss.NewStyle().Foreground(t.HTTPSuccess),
-		Status4xx: lipgloss.NewStyle().Foreground(t.HTTPWarning),
-		Status5xx: lipgloss.NewStyle().Foreground(t.HTTPError),
+		Status2xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
+		Status4xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
+		Status5xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
 
-		LogError: lipgloss.NewStyle().Foreground(t.LogError),
-		LogWarn:  lipgloss.NewStyle().Foreground(t.LogWarn),
-		LogInfo:  lipgloss.NewStyle().Foreground(t.LogInfo),
-		LogDebug: lipgloss.NewStyle().Foreground(t.LogDebug),
+		LogError: fillBG(lipgloss.NewStyle().Foreground(t.LogError), t),
+		LogWarn:  fillBG(lipgloss.NewStyle().Foreground(t.LogWarn), t),
+		LogInfo:  fillBG(lipgloss.NewStyle().Foreground(t.LogInfo), t),
+		LogDebug: fillBG(lipgloss.NewStyle().Foreground(t.LogDebug), t),
 
-		JSONKey:    lipgloss.NewStyle().Foreground(t.JSONKey),
-		JSONString: lipgloss.NewStyle().Foreground(t.JSONString),
-		JSONNumber: lipgloss.NewStyle().Foreground(t.JSONNumber),
-		JSONBool:   lipgloss.NewStyle().Foreground(t.JSONBool),
-		JSONNull:   lipgloss.NewStyle().Foreground(t.Dim), // Theme has no JSONNull slot
+		JSONKey:    fillBG(lipgloss.NewStyle().Foreground(t.JSONKey), t),
+		JSONString: fillBG(lipgloss.NewStyle().Foreground(t.JSONString), t),
+		JSONNumber: fillBG(lipgloss.NewStyle().Foreground(t.JSONNumber), t),
+		JSONBool:   fillBG(lipgloss.NewStyle().Foreground(t.JSONBool), t),
+		JSONNull:   fillBG(lipgloss.NewStyle().Foreground(t.Dim), t), // Theme has no JSONNull slot
 
-		Bold: lipgloss.NewStyle().Foreground(t.FG).Bold(true),
+		Bold: fillBG(lipgloss.NewStyle().Foreground(t.FG).Bold(true), t),
 
 		// Cursor styles only the "❯ " marker, never the whole row: each row is a
 		// concatenation of individually styled segments whose ANSI resets would
 		// terminate an outer attribute mid-line (D10).
-		Cursor: lipgloss.NewStyle().Foreground(t.Cursor).Bold(true),
+		Cursor: fillBG(lipgloss.NewStyle().Foreground(t.Cursor).Bold(true), t),
 		// SearchHighlight applies only to the exact matched run of a `/`-search
 		// hit, and only when query and line are plain ASCII with no ESC byte —
 		// otherwise case-folding could shift byte offsets or the run could land
@@ -161,7 +207,7 @@ func buildStyleSet(t *Theme) styleSet {
 
 	ss.ProcessColors = make([]lipgloss.Style, 0, len(t.ProcPalette))
 	for _, c := range t.ProcPalette {
-		ss.ProcessColors = append(ss.ProcessColors, lipgloss.NewStyle().Foreground(c))
+		ss.ProcessColors = append(ss.ProcessColors, fillBG(lipgloss.NewStyle().Foreground(c), t))
 	}
 	return ss
 }

@@ -40,7 +40,8 @@ func TestFormatLogEntry_UndetectedByteIdentical(t *testing.T) {
 	got := m.formatLogEntry(entry)
 	proc := getProcessStyle("api", m.processes).Render("api       ")
 	ts := s.Dim.Render("15:04:05")
-	want := ts + " " + proc + " " + "hello plain world"
+	sep := s.Base.Render(" ")
+	want := ts + sep + proc + sep + "hello plain world"
 	assert.Equal(t, want, got)
 }
 
@@ -243,7 +244,7 @@ func TestFormatProxyRequest_DurationScale(t *testing.T) {
 		})
 	}
 	assert.Contains(t, mk(50), s.HTTPSuccess.Render("   50ms"))
-	assert.Contains(t, mk(300), "  300ms")
+	assert.Contains(t, mk(300), s.Base.Render("  300ms"))
 	assert.NotContains(t, mk(300), s.Warn.Render("  300ms"))
 	assert.Contains(t, mk(800), s.Warn.Render("  800ms"))
 	assert.Contains(t, mk(3000), s.HTTPError.Render(" 3000ms"))
@@ -271,7 +272,7 @@ func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {
 		Method: "POST", URL: "/api/v1/things", StatusCode: 200, DurationMs: 12,
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, s.Bold.Render("POST")+" /api/v1/things")
+	assert.Contains(t, out, s.Bold.Render("POST")+s.Base.Render(" ")+s.Base.Render("/api/v1/things"))
 	assert.NotContains(t, out, "Method:   POST")
 }
 
@@ -306,7 +307,7 @@ func TestFormatRequestDetail_NonJSONBodyUnchanged(t *testing.T) {
 		},
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, "  "+plain)
+	assert.Contains(t, out, s.Base.Render("  ")+plain)
 	assert.NotContains(t, out, s.JSONKey.Render(`"hello"`))
 }
 

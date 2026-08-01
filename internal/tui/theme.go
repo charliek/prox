@@ -43,6 +43,11 @@ type Theme struct {
 
 	// ProcPalette cycles process-name colours (9 entries in every preset).
 	ProcPalette []lipgloss.Color
+
+	// FullFill asks buildStyleSet to put a background on every style and to
+	// expose styles.Base for raw segments/padding (plan 023 B1). legacy keeps
+	// FullFill=false so its escape output stays byte-identical to pre-theme.
+	FullFill bool
 }
 
 // Canonical preset names in cycle order. tokyo-night is the default.
@@ -236,6 +241,7 @@ func tokyoNightTheme() *Theme {
 			info, ok, waiting, purple, cyan, errc,
 			rgb(115, 218, 202), rgb(255, 158, 100), rgb(192, 202, 245),
 		},
+		FullFill: true,
 	}
 }
 
@@ -265,6 +271,7 @@ func darkTheme() *Theme {
 			info, ok, waiting, purple, cyan, errc,
 			rgb(95, 215, 175), rgb(215, 135, 95), rgb(228, 228, 228),
 		},
+		FullFill: true,
 	}
 }
 
@@ -294,6 +301,7 @@ func lightTheme() *Theme {
 			info, ok, waiting, purple, cyan, errc,
 			rgb(8, 151, 156), rgb(210, 105, 30), rgb(56, 58, 66),
 		},
+		FullFill: true,
 	}
 }
 
@@ -323,6 +331,7 @@ func catppuccinTheme() *Theme {
 			info, ok, waiting, purple, cyan, errc,
 			rgb(148, 226, 213), rgb(250, 179, 135), rgb(205, 214, 244),
 		},
+		FullFill: true,
 	}
 }
 
@@ -352,6 +361,7 @@ func gruvboxTheme() *Theme {
 			aqua, ok, waiting, purple, green, errc,
 			rgb(69, 133, 136), rgb(214, 93, 14), rgb(235, 219, 178),
 		},
+		FullFill: true,
 	}
 }
 

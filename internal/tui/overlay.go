@@ -22,19 +22,28 @@ const (
 	osc8Terminator = "\x1b]8;;\x1b\\"
 )
 
-// padFrameRow pads or truncates s to exactly width display columns.
-func padFrameRow(s string, width int) string {
+// fillPad returns n columns of padding carrying styles.Base (theme BG under
+// FullFill; plain spaces under legacy — Base is a no-op style then).
+func fillPad(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return s.Base.Render(strings.Repeat(" ", n))
+}
+
+// padFrameRow pads or truncates row to exactly width display columns.
+func padFrameRow(row string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	w := ansi.StringWidth(s)
+	w := ansi.StringWidth(row)
 	switch {
 	case w > width:
-		return ansi.Cut(s, 0, width)
+		return ansi.Cut(row, 0, width)
 	case w < width:
-		return s + strings.Repeat(" ", width-w)
+		return row + fillPad(width-w)
 	default:
-		return s
+		return row
 	}
 }
 
@@ -66,7 +75,7 @@ func overlayRow(base string, x, frameWidth int, box string) string {
 	left := ansi.Cut(base, 0, x)
 	// Wide-grapheme pad: Cut may yield a shorter visual prefix than x.
 	for ansi.StringWidth(left) < x {
-		left += " "
+		left += fillPad(1)
 	}
 
 	rightStart := x + boxW
@@ -90,7 +99,7 @@ func overlayRow(base string, x, frameWidth int, box string) string {
 			remain--
 		}
 		for ansi.StringWidth(right) < remain {
-			right += " "
+			right += fillPad(1)
 		}
 	}
 
@@ -127,4 +136,22 @@ func overlayLines(lines []string, x, y, frameWidth int, boxRows []string) []stri
 		out[y+i] = overlayRow(out[y+i], x, frameWidth, row)
 	}
 	return out
+}
+
+// trimTrailingSpacesANSI removes trailing display cells that are a single
+// space. Used before padFrameRow on viewport rows: bubbletea's viewport pads
+// with raw spaces to Width, which would leave default-BG holes under FullFill
+// (padFrameRow is a no-op when the row is already full width).
+func trimTrailingSpacesANSI(row string) string {
+	for {
+		w := ansi.StringWidth(row)
+		if w <= 0 {
+			return row
+		}
+		last := ansi.Cut(row, w-1, w)
+		if ansi.Strip(last) != " " {
+			return row
+		}
+		row = ansi.Cut(row, 0, w-1)
+	}
 }

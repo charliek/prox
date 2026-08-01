@@ -296,7 +296,7 @@ func (b *BaseModel) chromeAbove() int {
 		h++ // menu bar row
 	}
 	if b.settings.ProcessPanel {
-		h += 2 // content line + Header MarginBottom
+		h += 2 // content line + spacer (Header MarginBottom, or Base blank row)
 	}
 	return h
 }
@@ -1628,7 +1628,7 @@ func (b *BaseModel) updateViewport() {
 		for i, req := range requests {
 			// Prefix the cursor row with a styled marker and every other row
 			// with two spaces so columns stay aligned (D10).
-			marker := "  "
+			marker := s.Base.Render("  ")
 			if i == b.cursorIdx {
 				marker = s.Cursor.Render("❯ ")
 			}
@@ -1654,7 +1654,7 @@ func (b *BaseModel) updateViewport() {
 		for i, entry := range entries {
 			line := b.formatLogEntry(entry)
 			if searching {
-				marker := "  "
+				marker := s.Base.Render("  ")
 				if i == b.logCursorIdx {
 					marker = s.Cursor.Render("❯ ")
 				}
@@ -1726,7 +1726,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 	var lines []string
 
 	if b.detailLoading {
-		lines = append(lines, "Loading request details...")
+		lines = append(lines, s.Base.Render("Loading request details..."))
 		return lines
 	}
 
@@ -1736,7 +1736,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 	}
 
 	if b.requestDetail == nil {
-		lines = append(lines, "No request selected")
+		lines = append(lines, s.Base.Render("No request selected"))
 		return lines
 	}
 
@@ -1745,18 +1745,18 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// Header: bold method + full URL (curl-ish first line, plan 021 C9).
 	lines = append(lines, s.Header.Render(fmt.Sprintf("Request: %s", d.ID)))
 	lines = append(lines, "")
-	lines = append(lines, s.Bold.Render(d.Method)+" "+d.URL)
-	lines = append(lines, fmt.Sprintf("  Time:     %s", d.Timestamp))
-	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
+	lines = append(lines, s.Bold.Render(d.Method)+s.Base.Render(" ")+s.Base.Render(d.URL))
+	lines = append(lines, s.Base.Render(fmt.Sprintf("  Time:     %s", d.Timestamp)))
+	lines = append(lines, s.Base.Render(fmt.Sprintf("  Status:   %d", d.StatusCode)))
 	switch {
 	case d.InFlight && d.Stale:
-		lines = append(lines, "  Duration: (in flight, stale?)")
+		lines = append(lines, s.Base.Render("  Duration: (in flight, stale?)"))
 	case d.InFlight:
-		lines = append(lines, "  Duration: (in flight)")
+		lines = append(lines, s.Base.Render("  Duration: (in flight)"))
 	default:
-		lines = append(lines, fmt.Sprintf("  Duration: %dms", d.DurationMs))
+		lines = append(lines, s.Base.Render(fmt.Sprintf("  Duration: %dms", d.DurationMs)))
 	}
-	lines = append(lines, fmt.Sprintf("  Remote:   %s", d.RemoteAddr))
+	lines = append(lines, s.Base.Render(fmt.Sprintf("  Remote:   %s", d.RemoteAddr)))
 
 	// Details arrive only on completion: an in-flight record is guaranteed
 	// nil Details (see proxy.RequestRecord.InFlight), so it never has
@@ -1824,7 +1824,7 @@ func formatHeaderTable(headers map[string][]string) []string {
 	for _, name := range keys {
 		for _, value := range headers[name] {
 			padded := name + strings.Repeat(" ", maxKey-len(name))
-			lines = append(lines, fmt.Sprintf("  %s  %s", s.Dim.Render(padded), value))
+			lines = append(lines, s.Base.Render("  ")+s.Dim.Render(padded)+s.Base.Render("  ")+s.Base.Render(value))
 		}
 	}
 	return lines
@@ -1902,7 +1902,7 @@ func renderBodyLines(body *BodyData) []string {
 		if prettyJSON {
 			safe = highlightJSONText(safe)
 		}
-		lines = append(lines, "  "+safe)
+		lines = append(lines, s.Base.Render("  ")+safe)
 	}
 	return lines
 }
@@ -1953,8 +1953,12 @@ func renderBinaryPreview(data string, dataBase64 bool) []string {
 	}
 
 	lines := hexPreviewLines(raw, hexPreviewMaxBytes)
-	if len(raw) > hexPreviewMaxBytes && len(lines) > 0 {
-		lines[len(lines)-1] = s.Dim.Render(lines[len(lines)-1])
+	for i := range lines {
+		if len(raw) > hexPreviewMaxBytes && i == len(lines)-1 {
+			lines[i] = s.Dim.Render(lines[i])
+			continue
+		}
+		lines[i] = s.Base.Render(lines[i])
 	}
 	return lines
 }
@@ -2123,7 +2127,8 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	case req.StatusCode >= 400:
 		statusTok = s.Status4xx.Render(statusTok)
 	case req.StatusCode >= 300:
-		// 3xx: default FG (plan/brief) — leave unstyled.
+		// 3xx: default FG (plan/brief) — Base so FullFill paints theme BG.
+		statusTok = s.Base.Render(statusTok)
 	case req.StatusCode >= 200:
 		statusTok = s.Status2xx.Render(statusTok)
 	}
@@ -2146,19 +2151,19 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	case durationMs >= 500:
 		duration = s.Warn.Render(fmt.Sprintf("%5dms", durationMs))
 	case durationMs >= 100:
-		duration = fmt.Sprintf("%5dms", durationMs) // default FG
+		duration = s.Base.Render(fmt.Sprintf("%5dms", durationMs)) // default FG
 	default:
 		duration = s.HTTPSuccess.Render(fmt.Sprintf("%5dms", durationMs))
 	}
 
-	return fmt.Sprintf("%s  %s  %s %s %s  %s",
-		s.Dim.Render(ts),
-		s.Dim.Render(subdomain),
-		method,
-		statusTok,
-		duration,
-		req.URL,
-	)
+	sep2 := s.Base.Render("  ")
+	sep1 := s.Base.Render(" ")
+	return s.Dim.Render(ts) + sep2 +
+		s.Dim.Render(subdomain) + sep2 +
+		method + sep1 +
+		statusTok + sep1 +
+		duration + sep2 +
+		s.Base.Render(req.URL)
 }
 
 // httpMethodStyle returns the C9 method colour; unknown verbs stay unstyled FG.
@@ -2175,7 +2180,7 @@ func httpMethodStyle(method string) lipgloss.Style {
 	case "PATCH":
 		return s.HTTPPatch
 	default:
-		return lipgloss.NewStyle()
+		return s.Base
 	}
 }
 
@@ -2212,11 +2217,12 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 	// Timestamps toggle (plan 021 WS4): omitting the fixed-width `15:04:05 `
 	// prefix shifts the process-name column left — intentional, no padding
 	// compensation. Default true preserves today's always-on rendering.
+	sep := s.Base.Render(" ")
 	if b.settings.Timestamps {
 		ts := s.Dim.Render(entry.Timestamp.Format("15:04:05"))
-		return fmt.Sprintf("%s %s%s %s", ts, prefix, streamIndicator, content)
+		return ts + sep + prefix + streamIndicator + sep + content
 	}
-	return fmt.Sprintf("%s%s %s", prefix, streamIndicator, content)
+	return prefix + streamIndicator + sep + content
 }
 
 // formatLogContent builds the log-line body (after ts/process/ERR prefix):
@@ -2460,7 +2466,7 @@ func (b *BaseModel) processPanel() string {
 		}
 	}
 
-	header := lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(items, "  "))
+	header := lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(items, s.HeaderSep.Render(chipSep)))
 	if b.width > 0 {
 		// Header Padding(0,1) consumes 2 columns; cut so Render fits the frame.
 		inner := b.width - 2
@@ -2632,7 +2638,7 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 	leftPart := s.Status.Width(leftWidth).MaxHeight(1).Render(left)
 	rightPart := s.Status.MaxHeight(1).Render(right)
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftPart, "  ", rightPart)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftPart, s.StatusSep.Render("  "), rightPart)
 }
 
 // mainView renders the main TUI layout. Chrome rows are derived from settings
@@ -2651,9 +2657,21 @@ func (b *BaseModel) mainView(extraStatusInfo string) string {
 		for _, line := range strings.Split(panel, "\n") {
 			lines = append(lines, padFrameRow(line, b.width))
 		}
+		// FullFill themes drop Header MarginBottom; emit the spacer as an
+		// explicitly Base-styled blank row so it carries theme BG (margins use
+		// MarginBackground, not Background — plan 023 B1).
+		if CurrentTheme().FullFill {
+			lines = append(lines, padFrameRow("", b.width))
+		}
 	}
 
 	for _, line := range strings.Split(b.viewport.View(), "\n") {
+		// Under FullFill, viewport rows pad to Width with raw spaces; trim and
+		// re-pad with Base-styled fill so no default-BG holes remain. Legacy
+		// skips the trim entirely (padFrameRow is already byte-identical).
+		if CurrentTheme().FullFill {
+			line = trimTrailingSpacesANSI(line)
+		}
 		lines = append(lines, padFrameRow(line, b.width))
 	}
 

@@ -326,7 +326,7 @@ func TestFormatRequestDetail_BodySections(t *testing.T) {
 	assert.Contains(t, stripANSI(out), `"key": "value"`)
 	assert.Contains(t, out, "Response Body (10 bytes)")
 	assert.Contains(t, out, "(body no longer available)")
-	assert.Contains(t, out, s.Bold.Render("POST")+" /api/v1/things")
+	assert.Contains(t, out, s.Bold.Render("POST")+s.Base.Render(" ")+s.Base.Render("/api/v1/things"))
 }
 
 // TestFormatRequestDetail_InFlight_ShowsDurationNote verifies the Duration
@@ -470,13 +470,12 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 			{Name: "web", State: domain.ProcessStateRunning},
 			{Name: "worker", State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres"}},
 		}
-		// Constructed the same way processPanel built its output before the
-		// health dot existed: styled "key:name[+gated detail]" segments,
-		// joined by two spaces, wrapped in s.Header — no dot anywhere.
+		// joinSep mirrors processPanel's HeaderSep-styled separators under
+		// FullFill (empty under legacy) — no dot anywhere.
 		want := s.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
 			processStyle(domain.ProcessStateRunning).Render("1:web"),
 			processStyle(domain.ProcessStateWaiting).Render("2:worker (waiting on: postgres)"),
-		}, "  ")))
+		}, s.HeaderSep.Render("  "))))
 		assert.Equal(t, want, b.processPanel())
 	})
 }
