@@ -30,6 +30,14 @@ type RestartResultMsg struct {
 // RestartResultClearMsg is sent to clear the restart result after a delay
 type RestartResultClearMsg struct{}
 
+// StatusFlashClearMsg clears a short-lived status-bar flash (theme cycle, etc.).
+type StatusFlashClearMsg struct{}
+
+// StartupWarningsMsg delivers non-fatal settings/theme load warnings to the log pane.
+type StartupWarningsMsg struct {
+	Warnings []string
+}
+
 // RequestDetailMsg is sent when request details are loaded. Seq is the
 // fetchRequestDetail call's sequence number (ClientModel.detailFetchSeq at
 // dispatch time) — the handler drops any msg whose Seq doesn't match the
@@ -96,10 +104,20 @@ type BodyData struct {
 // restartResultClearDelay is how long to show restart result before clearing
 const restartResultClearDelay = 3 * time.Second
 
+// statusFlashClearDelay matches restart feedback timing for consistency.
+const statusFlashClearDelay = 3 * time.Second
+
 // restartResultClearCmd returns a command that clears the restart result after a delay
 func restartResultClearCmd() tea.Cmd {
 	return tea.Tick(restartResultClearDelay, func(t time.Time) tea.Msg {
 		return RestartResultClearMsg{}
+	})
+}
+
+// statusFlashClearCmd returns a command that clears the status flash after a delay.
+func statusFlashClearCmd() tea.Cmd {
+	return tea.Tick(statusFlashClearDelay, func(t time.Time) tea.Msg {
+		return StatusFlashClearMsg{}
 	})
 }
 
@@ -169,6 +187,9 @@ type ClientModel struct {
 	// fetches), so it lives here rather than on BaseModel, matching
 	// connectionError above.
 	detailFetchSeq int
+
+	// startupWarnings are surfaced as system log lines on first Update (WS2).
+	startupWarnings []string
 }
 
 // NewClientModel creates a new TUI model for client mode
@@ -189,10 +210,20 @@ func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 // With no ShutdownCh (attach) there is nothing to wait for and Init returns nil,
 // which is also what the no-poll proof in client_model_test.go pins.
 func (m ClientModel) Init() tea.Cmd {
-	if m.opts.ShutdownCh == nil {
+	var cmds []tea.Cmd
+	if m.opts.ShutdownCh != nil {
+		cmds = append(cmds, waitForExternalShutdown(m.opts.ShutdownCh))
+	}
+	if len(m.startupWarnings) > 0 {
+		warnings := m.startupWarnings
+		cmds = append(cmds, func() tea.Msg {
+			return StartupWarningsMsg{Warnings: warnings}
+		})
+	}
+	if len(cmds) == 0 {
 		return nil
 	}
-	return waitForExternalShutdown(m.opts.ShutdownCh)
+	return tea.Batch(cmds...)
 }
 
 // waitForExternalShutdown blocks in a command goroutine until ch closes (or
@@ -338,6 +369,14 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastRestartProcess = ""
 		m.lastRestartError = nil
 
+	case StatusFlashClearMsg:
+		m.statusFlash = ""
+
+	case StartupWarningsMsg:
+		for _, w := range msg.Warnings {
+			m.appendLogEntry(systemLogEntry(w))
+		}
+
 	case RequestDetailMsg:
 		// Every mutation — including detailLoading, previously cleared
 		// before this guard for ALL results including stale ones — lives
@@ -447,15 +486,16 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// cursor onto the oldest visible row, which is scroll-back's trigger (D11):
 	// the check has to run HERE rather than inside handleNavigationKey, which
 	// returns a bool and cannot dispatch a command.
-	if m.handleNavigationKey(msg) {
-		// The command is evaluated BEFORE m is copied into the return values:
-		// maybeFetchOlderRequests mutates m (pagingPhase=loading), and Go does
-		// not specify the order of a plain operand relative to a call in the
-		// same return statement — `return m, m.maybeFetchOlderRequests()` could
-		// legally return a model copy without the mutation, silently breaking
-		// single-flight (CodeRabbit, PR #88).
+	handled, navCmd := m.handleNavigationKey(msg)
+	if handled {
+		// maybeFetchOlderRequests is evaluated BEFORE m is copied into the
+		// return values: it mutates m (pagingPhase=loading), and Go does not
+		// specify the order of a plain operand relative to a call in the same
+		// return statement — `return m, tea.Batch(navCmd, m.maybeFetchOlderRequests())`
+		// could legally return a model copy without the mutation, silently
+		// breaking single-flight (CodeRabbit, PR #88).
 		cmd := m.maybeFetchOlderRequests()
-		return m, cmd
+		return m, tea.Batch(navCmd, cmd)
 	}
 
 	return m, nil
@@ -546,6 +586,8 @@ func (m ClientModel) View() string {
 			// One wording for every transient degraded processes-stream state:
 			// the per-stream detail lives in the status bar's health segments.
 			statusInfo = "Connection error (retrying...)"
+		} else if m.statusFlash != "" {
+			statusInfo = m.statusFlash
 		} else if m.lastRestartProcess != "" {
 			if m.lastRestartError != nil {
 				statusInfo = "Restart failed: " + truncateError(m.lastRestartError, maxErrorDisplayLen)

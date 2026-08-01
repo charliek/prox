@@ -66,7 +66,16 @@ type TUIClient interface {
 // returns from Init (see ClientOptions.ShutdownCh), so every quit — user
 // keypress or out-of-band request — arrives as a message through Update.
 func RunClient(client TUIClient, opts ClientOptions) error {
+	settings, warnings := LoadSettings()
+	if settings.Theme != "" {
+		_, themeWarnings := SetThemeByName(settings.Theme)
+		warnings = append(warnings, themeWarnings...)
+	}
+
 	model := NewClientModel(client, opts)
+	model.settings = settings
+	model.startupWarnings = warnings
+
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	ctx, cancel := context.WithCancel(context.Background())

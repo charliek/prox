@@ -130,6 +130,13 @@ type BaseModel struct {
 	lastRestartProcess string
 	lastRestartError   error
 
+	// statusFlash is a short-lived status-bar message (theme cycle, save errors).
+	statusFlash string
+
+	// settings are persisted at ~/.prox/tui/config.toml (WS2). View bools are
+	// round-tripped here; C4 applies them to rendering.
+	settings Settings
+
 	// Request detail view
 	selectedRequestID string
 	requestDetail     *RequestDetailData
@@ -196,6 +203,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		followMode:      true,
 		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
+		settings:        DefaultSettings(),
 	}
 }
 
@@ -623,10 +631,31 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	return true
 }
 
-// handleNavigationKey handles common navigation keys
-// Returns true if the key was handled
-func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
+// cycleTheme advances the active theme, persists the choice, and schedules a
+// status-bar flash. Mid-session callers must re-render the viewport (cached
+// styled strings) and re-apply textinput styles (WS1).
+func (b *BaseModel) cycleTheme() tea.Cmd {
+	name, theme := CycleTheme(CurrentThemeName())
+	currentThemeName = name
+	SetTheme(theme)
+	b.settings.Theme = name
+
+	if err := SaveSettings(b.settings); err != nil {
+		b.statusFlash = "settings not saved: " + err.Error()
+	} else {
+		b.statusFlash = "theme: " + name
+	}
+	applyTextInputTheme(&b.textInput)
+	b.updateViewport()
+	return statusFlashClearCmd()
+}
+
+// handleNavigationKey handles common navigation keys.
+// Returns whether the key was handled and an optional command.
+func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
+	case "t":
+		return true, b.cycleTheme()
 	case "tab":
 		// Toggle between Logs and Requests views (only if not in detail view)
 		switch b.viewMode {
@@ -637,18 +666,18 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		}
 		// In detail view, tab does nothing
 		b.updateViewport()
-		return true
+		return true, nil
 
 	case "?":
 		b.mode = ModeHelp
-		return true
+		return true, nil
 
 	case "f":
 		if b.viewMode != ViewModeRequestDetail {
 			b.mode = ModeFilter
 			b.textInput.Focus()
 		}
-		return true
+		return true, nil
 
 	case "/":
 		if b.viewMode != ViewModeRequestDetail {
@@ -656,7 +685,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.textInput.SetValue("")
 			b.textInput.Focus()
 		}
-		return true
+		return true, nil
 
 	case "s":
 		if b.viewMode != ViewModeRequestDetail {
@@ -664,7 +693,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.textInput.SetValue("")
 			b.textInput.Focus()
 		}
-		return true
+		return true, nil
 
 	case "n", "N":
 		// Search navigation: n jumps to the next match strictly after the
@@ -679,16 +708,16 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		case ViewModeRequests:
 			b.cycleRequestSearchMatch(dir)
 			b.updateViewport()
-			return true
+			return true, nil
 		case ViewModeLogs:
 			// One-shot scroll to the landed match, after the re-render (updateViewport
 			// deliberately never scrolls the logs viewport — see seekLogSearchMatch).
 			b.seekLogSearchMatch(dir)
 			b.updateViewport()
 			b.ensureLogCursorVisible()
-			return true
+			return true, nil
 		}
-		return false
+		return false, nil
 
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		// Solo process in logs view only (1-9 keys do nothing in requests view)
@@ -705,7 +734,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 				b.updateViewport()
 			}
 		}
-		return true
+		return true, nil
 
 	case "esc":
 		// In detail view, go back to requests list
@@ -716,7 +745,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.detailError = nil
 			b.detailRefreshFailed = false
 			b.updateViewport()
-			return true
+			return true, nil
 		}
 		// Clear filters and both views' search queries (D13/D8). Resetting the
 		// logs cursor to the no-cursor sentinel makes the next `/` seed its
@@ -728,41 +757,41 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 		b.logCursorSeq = 0
 		b.logCursorIdx = -1
 		b.updateViewport()
-		return true
+		return true, nil
 
 	case "up", "k":
 		if b.viewMode == ViewModeRequests {
 			b.moveRequestCursor(-1)
-			return true
+			return true, nil
 		}
 		b.viewport.LineUp(1)
 		b.followMode = false
-		return true
+		return true, nil
 
 	case "down", "j":
 		if b.viewMode == ViewModeRequests {
 			b.moveRequestCursor(1)
-			return true
+			return true, nil
 		}
 		b.viewport.LineDown(1)
-		return true
+		return true, nil
 
 	case "pgup":
 		if b.viewMode == ViewModeRequests {
 			b.moveRequestCursor(-b.halfPageStep())
-			return true
+			return true, nil
 		}
 		b.viewport.HalfViewUp()
 		b.followMode = false
-		return true
+		return true, nil
 
 	case "pgdown":
 		if b.viewMode == ViewModeRequests {
 			b.moveRequestCursor(b.halfPageStep())
-			return true
+			return true, nil
 		}
 		b.viewport.HalfViewDown()
-		return true
+		return true, nil
 
 	case "home", "g":
 		if b.viewMode == ViewModeRequests {
@@ -770,11 +799,11 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.setRequestCursor(requests, 0)
 			b.followMode = false
 			b.updateViewport()
-			return true
+			return true, nil
 		}
 		b.viewport.GotoTop()
 		b.followMode = false
-		return true
+		return true, nil
 
 	case "end", "G":
 		if b.viewMode == ViewModeRequests {
@@ -782,11 +811,11 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 			b.followMode = true
 			b.setRequestCursor(requests, len(requests)-1)
 			b.updateViewport()
-			return true
+			return true, nil
 		}
 		b.viewport.GotoBottom()
 		b.followMode = true
-		return true
+		return true, nil
 
 	case "F":
 		if b.viewMode == ViewModeRequests {
@@ -797,16 +826,16 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) bool {
 				b.setRequestCursor(requests, len(requests)-1)
 			}
 			b.updateViewport()
-			return true
+			return true, nil
 		}
 		b.followMode = !b.followMode
 		if b.followMode {
 			b.viewport.GotoBottom()
 		}
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // moveRequestCursor moves the requests-view cursor by delta rows (negative =
