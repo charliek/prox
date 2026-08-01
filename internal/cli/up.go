@@ -562,10 +562,15 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		// The token goes in through memory (see NewClientWithToken) rather than being
 		// re-read from ~/.prox/token.
 		client := NewClientWithToken(dialableAPIURL(cfg.API.Host, boundAPIPort(apiListener, cfg.API.Port)), token)
-		if err := tui.RunClient(client, tui.ClientOptions{
+		tuiOpts := tui.ClientOptions{
 			Help:       tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
 			ShutdownCh: coordinator.TriggerCh(),
-		}); err != nil {
+		}
+		if cfg.Proxy != nil {
+			tuiOpts.ProxyHTTPSPort = cfg.Proxy.HTTPSPort
+			tuiOpts.ProxyHTTPPort = cfg.Proxy.HTTPPort
+		}
+		if err := tui.RunClient(client, tuiOpts); err != nil {
 			// Printed now for the interactive user, and retained: a session
 			// whose TUI failed must not exit 0 just because shutdown went
 			// cleanly — scripted callers need to tell the two apart

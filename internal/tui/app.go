@@ -300,6 +300,7 @@ func streamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) prox
 		Method:     req.Method,
 		URL:        req.URL,
 		Subdomain:  req.Subdomain,
+		Hostname:   req.Hostname, // plan 021 C10 / Codex #10 — was dropped before
 		StatusCode: req.StatusCode,
 		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
 		RemoteAddr: req.RemoteAddr,

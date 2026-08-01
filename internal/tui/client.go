@@ -47,6 +47,10 @@ type RequestDetailMsg struct {
 	ID      string
 	Seq     int
 	Details *RequestDetailData
+	// Raw is the wire GET /api/v1/proxy/requests/{id}?include=body payload.
+	// Retained for Y copy — RequestDetailData drops hostname and other fields
+	// (plan 021 WS10 / Codex #10).
+	Raw *api.ProxyRequestDetailResponse
 }
 
 // RequestDetailErrorMsg is sent when loading request details fails. Seq is
@@ -143,6 +147,12 @@ type ClientOptions struct {
 	// C3 only adds the field + cwd fallback.
 	ProjectName string
 
+	// ProxyHTTPSPort/ProxyHTTPPort are the local proxy listen ports (up --tui
+	// only). Attach passes 0 — curl copy omits :port for shared-daemon-on-443
+	// (plan 021 WS10 / panel B2). HTTPPort is reserved; curl is HTTPS-first.
+	ProxyHTTPSPort int
+	ProxyHTTPPort  int
+
 	// ShutdownCh, when non-nil, quits the program on close. This is how an
 	// out-of-band shutdown request (POST /shutdown, via the coordinator's
 	// trigger channel) reaches a --tui daemon, which otherwise blocks in
@@ -195,6 +205,10 @@ type ClientModel struct {
 
 	// startupWarnings are surfaced as system log lines on first Update (WS2).
 	startupWarnings []string
+
+	// requestDetailRaw is the last applied wire detail response for Y copy
+	// (plan 021 WS10 / Codex #10). Cleared when leaving detail view.
+	requestDetailRaw *api.ProxyRequestDetailResponse
 }
 
 // NewClientModel creates a new TUI model for client mode
@@ -403,6 +417,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !supersededByFinal {
 				m.detailLoading = false
 				m.requestDetail = msg.Details
+				m.requestDetailRaw = msg.Raw
 				m.detailError = nil
 				m.detailRefreshFailed = false
 				m.updateViewport()
@@ -485,6 +500,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.viewMode = ViewModeRequestDetail
 				m.detailLoading = true
 				m.requestDetail = nil
+				m.requestDetailRaw = nil
 				m.detailError = nil
 				m.detailRefreshFailed = false
 				m.renderDetailFromTop()
@@ -495,8 +511,18 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 4. Menu openers (m/v/f) + common navigation.
+	// 4. Grab-for-agent copy (WS10): y/c/Y in requests + detail; logs y when
+	// a /-search cursor is parked.
+	if handled, cmd := m.handleCopyKey(msg); handled {
+		return m, cmd
+	}
+
+	// 5. Menu openers (m/v/f) + common navigation.
+	wasDetail := m.viewMode == ViewModeRequestDetail
 	handled, navCmd := m.handleNavigationKey(msg)
+	if wasDetail && m.viewMode != ViewModeRequestDetail {
+		m.requestDetailRaw = nil
+	}
 	if handled {
 		// maybeFetchOlderRequests is evaluated BEFORE m is copied into the
 		// return values: it mutates m (pagingPhase=loading), and Go does not
@@ -549,7 +575,7 @@ func (m ClientModel) fetchRequestDetail(id string, seq int) tea.Cmd {
 			}
 		}
 
-		return RequestDetailMsg{ID: id, Seq: seq, Details: detail}
+		return RequestDetailMsg{ID: id, Seq: seq, Details: detail, Raw: resp}
 	}
 }
 
