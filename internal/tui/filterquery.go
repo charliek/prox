@@ -525,8 +525,9 @@ func requestBareMatch(req proxy.RequestRecord, term string) bool {
 
 // Serialize returns the canonical string form of a logs filter (C8 menu edits
 // regenerate the bar from this). Field order: proc, level, then bare terms;
-// positives before negations within each group. Round-trips stably through
-// ParseLogsFilter.
+// positives before negations within each group. Bare terms are echoed
+// verbatim (never re-quoted) so colon+quoted non-field shapes round-trip;
+// Unknown levels are dropped. Round-trips stably through ParseLogsFilter.
 func (e LogsFilterExpr) Serialize() string {
 	var parts []string
 	for _, p := range e.procs {
@@ -536,22 +537,28 @@ func (e LogsFilterExpr) Serialize() string {
 		parts = append(parts, "-proc:"+quoteIfNeeded(p))
 	}
 	for _, l := range e.levels {
-		parts = append(parts, "level:"+levelToken(l))
+		if tok := levelToken(l); tok != "" {
+			parts = append(parts, "level:"+tok)
+		}
 	}
 	for _, l := range e.negLevels {
-		parts = append(parts, "-level:"+levelToken(l))
+		if tok := levelToken(l); tok != "" {
+			parts = append(parts, "-level:"+tok)
+		}
 	}
-	for _, t := range e.terms {
-		parts = append(parts, quoteIfNeeded(t))
-	}
+	// Bare terms: verbatim. A whitespace-bearing term only arises from a
+	// non-field-shaped colon+quoted token, which already carries quotes in
+	// the one position tokenizeFilter honors (plan 023 A4).
+	parts = append(parts, e.terms...)
 	for _, t := range e.negTerms {
-		parts = append(parts, "-"+quoteIfNeeded(t))
+		parts = append(parts, "-"+t)
 	}
 	return strings.Join(parts, " ")
 }
 
 // Serialize returns the canonical string form of a requests filter.
 // Order: method, status, host, url, in_flight, then bare terms.
+// Bare terms are echoed verbatim; see LogsFilterExpr.Serialize.
 func (e RequestsFilterExpr) Serialize() string {
 	var parts []string
 	for _, m := range e.methods {
@@ -584,25 +591,35 @@ func (e RequestsFilterExpr) Serialize() string {
 	if e.negInFlight != nil {
 		parts = append(parts, "-in_flight:"+strconv.FormatBool(*e.negInFlight))
 	}
-	for _, t := range e.terms {
-		parts = append(parts, quoteIfNeeded(t))
-	}
+	parts = append(parts, e.terms...)
 	for _, t := range e.negTerms {
-		parts = append(parts, "-"+quoteIfNeeded(t))
+		parts = append(parts, "-"+t)
 	}
 	return strings.Join(parts, " ")
 }
 
-// quoteIfNeeded quotes only when whitespace (or emptiness) demands it. A
-// value containing `"` but no whitespace is left bare — the unquoted
+// quoteIfNeeded quotes a FIELD VALUE when emptiness or any isFilterSpace
+// character demands it. Bare terms must NOT go through this — see Serialize.
+// A value containing `"` but no whitespace is left bare — the unquoted
 // tokenizer round-trips it intact, whereas quoting would force a strip.
 func quoteIfNeeded(v string) string {
-	if v == "" || strings.ContainsAny(v, " \t") {
+	if v == "" || containsFilterSpace(v) {
 		return `"` + strings.ReplaceAll(v, `"`, "") + `"`
 	}
 	return v
 }
 
+func containsFilterSpace(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if isFilterSpace(v[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// levelToken returns the serializable level name, or "" for Unknown (and any
+// other non-filterable value) so Serialize can drop it.
 func levelToken(l LogLevel) string {
 	switch l {
 	case LogLevelTrace:
@@ -616,7 +633,7 @@ func levelToken(l LogLevel) string {
 	case LogLevelError:
 		return "error"
 	default:
-		return "unknown"
+		return ""
 	}
 }
 

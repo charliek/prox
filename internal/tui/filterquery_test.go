@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"math/rand"
+	"slices"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -359,9 +362,8 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 			s1 := e1.Serialize()
 			e2, err := ParseLogsFilter(s1)
 			require.NoError(t, err)
-			s2 := e2.Serialize()
-			assert.Equal(t, s1, s2, "serialize(parse(x)) must be stable")
-			// Empty stays empty.
+			assert.True(t, equalLogsFilterExpr(e1, e2), "parse→serialize→parse must be expr-equivalent\n  in=%q\n  ser=%q\n  e1=%+v\n  e2=%+v", q, s1, e1, e2)
+			assert.Equal(t, s1, e2.Serialize(), "serialize must be stable")
 			if q == "" {
 				assert.Empty(t, s1)
 			}
@@ -381,8 +383,8 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 			s1 := e1.Serialize()
 			e2, err := ParseRequestsFilter(s1)
 			require.NoError(t, err)
-			s2 := e2.Serialize()
-			assert.Equal(t, s1, s2)
+			assert.True(t, equalRequestsFilterExpr(e1, e2), "parse→serialize→parse must be expr-equivalent\n  in=%q\n  ser=%q", q, s1)
+			assert.Equal(t, s1, e2.Serialize())
 		})
 	}
 
@@ -390,6 +392,206 @@ func TestFilterSerializeRoundTrip(t *testing.T) {
 	e, err := ParseLogsFilter("-health level:error proc:web proc:api")
 	require.NoError(t, err)
 	assert.Equal(t, "proc:web proc:api level:error -health", e.Serialize())
+}
+
+// Confirmed B4 failing shapes (plan 023 §2): non-field-shaped colon+quoted
+// tokens become bare terms that must serialize verbatim.
+func TestSerializeBareTermVerbatim(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{name: "non-field colon+quote", query: `a.b:"x y"`, want: `a.b:"x y"`},
+		{name: "negated non-field colon+quote", query: `-a.b:"x y"`, want: `-a.b:"x y"`},
+		{name: "colon-leading quoted", query: `:"a b:"`, want: `:"a b:"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e1, err := ParseLogsFilter(tt.query)
+			require.NoError(t, err)
+			got := e1.Serialize()
+			assert.Equal(t, tt.want, got)
+			e2, err := ParseLogsFilter(got)
+			require.NoError(t, err)
+			assert.True(t, equalLogsFilterExpr(e1, e2), "round-trip expr mismatch\n  ser=%q\n  e1=%+v\n  e2=%+v", got, e1, e2)
+
+			// Same shapes are legal bare terms on the requests grammar too.
+			r1, err := ParseRequestsFilter(tt.query)
+			require.NoError(t, err)
+			rs := r1.Serialize()
+			assert.Equal(t, tt.want, rs)
+			r2, err := ParseRequestsFilter(rs)
+			require.NoError(t, err)
+			assert.True(t, equalRequestsFilterExpr(r1, r2))
+		})
+	}
+}
+
+func TestSerializeDropsUnknownLevels(t *testing.T) {
+	e := LogsFilterExpr{
+		levels:    []LogLevel{LogLevelError, LogLevelUnknown, LogLevelInfo},
+		negLevels: []LogLevel{LogLevelUnknown, LogLevelWarn},
+		terms:     []string{"keep"},
+	}
+	assert.Equal(t, "level:error level:info -level:warn keep", e.Serialize())
+
+	// Equivalence ignores Unknown on both sides.
+	withUnknown := LogsFilterExpr{levels: []LogLevel{LogLevelInfo, LogLevelUnknown}}
+	without := LogsFilterExpr{levels: []LogLevel{LogLevelInfo}}
+	assert.True(t, equalLogsFilterExpr(withUnknown, without))
+}
+
+func TestQuoteIfNeededUsesFilterSpace(t *testing.T) {
+	// Tab / newline / CR are isFilterSpace — field values must quote them.
+	assert.Equal(t, `"a`+"\t"+`b"`, quoteIfNeeded("a\tb"))
+	assert.Equal(t, `"a`+"\n"+`b"`, quoteIfNeeded("a\nb"))
+	assert.Equal(t, `"a b"`, quoteIfNeeded("a b"))
+	assert.Equal(t, "plain", quoteIfNeeded("plain"))
+}
+
+// Property: every parseable query survives parse → serialize → parse with
+// expr-equivalence. Seeded with the confirmed B4 shapes; then random mixes.
+func TestSerializeRoundTripProperty(t *testing.T) {
+	const iterations = 500
+	rng := rand.New(rand.NewSource(23)) // deterministic corpus
+
+	logsSeeds := []string{
+		`a.b:"x y"`,
+		`-a.b:"x y"`,
+		`:"a b:"`,
+		"",
+		"proc:api",
+		`proc:"my app" level:error -health`,
+		"level:warn -proc:db foo bar",
+		`15:04 a.b:1`,
+	}
+	for _, q := range logsSeeds {
+		assertLogsRoundTrip(t, q)
+	}
+	for i := 0; i < iterations; i++ {
+		assertLogsRoundTrip(t, genLogsFilterQuery(rng))
+	}
+
+	reqSeeds := []string{
+		`a.b:"x y"`,
+		`-a.b:"x y"`,
+		`:"a b:"`,
+		"",
+		"method:POST status:5xx url:/orders",
+		"status:200 host:api in_flight:true -health",
+		`method:GET host:"my host" url:"/a b"`,
+	}
+	for _, q := range reqSeeds {
+		assertRequestsRoundTrip(t, q)
+	}
+	for i := 0; i < iterations; i++ {
+		assertRequestsRoundTrip(t, genRequestsFilterQuery(rng))
+	}
+}
+
+func assertLogsRoundTrip(t *testing.T, q string) {
+	t.Helper()
+	e1, err := ParseLogsFilter(q)
+	require.NoError(t, err, "seed/gen must be parseable: %q", q)
+	s := e1.Serialize()
+	e2, err := ParseLogsFilter(s)
+	require.NoError(t, err, "serialize must reparse: in=%q ser=%q", q, s)
+	if !equalLogsFilterExpr(e1, e2) {
+		t.Fatalf("expr inequivalent after round-trip\n  in=%q\n  ser=%q\n  e1=%+v\n  e2=%+v", q, s, e1, e2)
+	}
+}
+
+func assertRequestsRoundTrip(t *testing.T, q string) {
+	t.Helper()
+	e1, err := ParseRequestsFilter(q)
+	require.NoError(t, err, "seed/gen must be parseable: %q", q)
+	s := e1.Serialize()
+	e2, err := ParseRequestsFilter(s)
+	require.NoError(t, err, "serialize must reparse: in=%q ser=%q", q, s)
+	if !equalRequestsFilterExpr(e1, e2) {
+		t.Fatalf("expr inequivalent after round-trip\n  in=%q\n  ser=%q\n  e1=%+v\n  e2=%+v", q, s, e1, e2)
+	}
+}
+
+func genLogsFilterQuery(rng *rand.Rand) string {
+	var parts []string
+	n := rng.Intn(5) // 0..4 atoms
+	for i := 0; i < n; i++ {
+		neg := ""
+		if rng.Intn(4) == 0 {
+			neg = "-"
+		}
+		switch rng.Intn(6) {
+		case 0:
+			parts = append(parts, neg+"proc:"+genFieldValue(rng, []string{"api", "web", "db", "my app", "worker-1"}))
+		case 1:
+			lvls := []string{"trace", "debug", "info", "warn", "error", "warning", "fatal"}
+			parts = append(parts, neg+"level:"+lvls[rng.Intn(len(lvls))])
+		case 2:
+			// Confirmed-shape non-field colon+quote bare term.
+			parts = append(parts, neg+genColonQuoteTerm(rng))
+		default:
+			parts = append(parts, neg+genBareWord(rng))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func genRequestsFilterQuery(rng *rand.Rand) string {
+	var parts []string
+	n := rng.Intn(5)
+	inFlightSet := false
+	for i := 0; i < n; i++ {
+		neg := ""
+		if rng.Intn(4) == 0 {
+			neg = "-"
+		}
+		switch rng.Intn(8) {
+		case 0:
+			methods := []string{"GET", "POST", "PUT", "DELETE", "patch"}
+			parts = append(parts, neg+"method:"+methods[rng.Intn(len(methods))])
+		case 1:
+			statuses := []string{"200", "404", "500", "2xx", "4xx", "5XX"}
+			parts = append(parts, neg+"status:"+statuses[rng.Intn(len(statuses))])
+		case 2:
+			parts = append(parts, neg+"host:"+genFieldValue(rng, []string{"api", "web.local", "my host"}))
+		case 3:
+			parts = append(parts, neg+"url:"+genFieldValue(rng, []string{"/orders", "/a b", "/health"}))
+		case 4:
+			if inFlightSet {
+				continue
+			}
+			inFlightSet = true
+			parts = append(parts, neg+"in_flight:"+[]string{"true", "false"}[rng.Intn(2)])
+		case 5:
+			parts = append(parts, neg+genColonQuoteTerm(rng))
+		default:
+			parts = append(parts, neg+genBareWord(rng))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func genFieldValue(rng *rand.Rand, choices []string) string {
+	v := choices[rng.Intn(len(choices))]
+	if containsFilterSpace(v) {
+		return `"` + v + `"`
+	}
+	return v
+}
+
+func genBareWord(rng *rand.Rand) string {
+	words := []string{"foo", "bar", "health", "15:04", "a.b:1", "err", "timeout"}
+	return words[rng.Intn(len(words))]
+}
+
+func genColonQuoteTerm(rng *rand.Rand) string {
+	// Pre-colon part is NOT field-shaped (dot / digit / empty) and must not
+	// itself contain ':', so the tokenizer's first-colon+quote scan fires.
+	prefixes := []string{"a.b", "x.y.z", "1", "Foo", ""}
+	inners := []string{"x y", "a b:", "hello world", "p q"}
+	return prefixes[rng.Intn(len(prefixes))] + `:"` + inners[rng.Intn(len(inners))] + `"`
 }
 
 func TestStringFilter_BareSubstringParity(t *testing.T) {
@@ -550,4 +752,58 @@ func TestStringFilter_LiveReparseViaKeys(t *testing.T) {
 	assert.NoError(t, m.logsFilter.ParseErr)
 	assert.Len(t, m.filteredEntries(), 1)
 	assert.Equal(t, "alpha line", m.filteredEntries()[0].Line)
+}
+
+// equalLogsFilterExpr reports whether a and b are equivalent: same constraints
+// in the same order per slot. Order is identity because Serialize preserves
+// parse order. Unknown levels are ignored (Serialize drops them). C4 extends
+// this when new fields land.
+func equalLogsFilterExpr(a, b LogsFilterExpr) bool {
+	return slices.Equal(a.procs, b.procs) &&
+		slices.Equal(a.negProcs, b.negProcs) &&
+		equalLevelsDropUnknown(a.levels, b.levels) &&
+		equalLevelsDropUnknown(a.negLevels, b.negLevels) &&
+		slices.Equal(a.terms, b.terms) &&
+		slices.Equal(a.negTerms, b.negTerms)
+}
+
+// equalRequestsFilterExpr is the requests counterpart of equalLogsFilterExpr.
+// C4 extends this when status-range forms land.
+func equalRequestsFilterExpr(a, b RequestsFilterExpr) bool {
+	return slices.Equal(a.methods, b.methods) &&
+		slices.Equal(a.negMethods, b.negMethods) &&
+		slices.Equal(a.statuses, b.statuses) &&
+		slices.Equal(a.negStatuses, b.negStatuses) &&
+		slices.Equal(a.hosts, b.hosts) &&
+		slices.Equal(a.negHosts, b.negHosts) &&
+		slices.Equal(a.urls, b.urls) &&
+		slices.Equal(a.negURLs, b.negURLs) &&
+		equalBoolPtr(a.inFlight, b.inFlight) &&
+		equalBoolPtr(a.negInFlight, b.negInFlight) &&
+		slices.Equal(a.terms, b.terms) &&
+		slices.Equal(a.negTerms, b.negTerms)
+}
+
+func equalLevelsDropUnknown(a, b []LogLevel) bool {
+	return slices.Equal(dropUnknownLevels(a), dropUnknownLevels(b))
+}
+
+func dropUnknownLevels(in []LogLevel) []LogLevel {
+	if len(in) == 0 {
+		return nil
+	}
+	var out []LogLevel
+	for _, l := range in {
+		if l != LogLevelUnknown {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func equalBoolPtr(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
