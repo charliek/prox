@@ -185,9 +185,9 @@ func AvailableThemes() []string {
 	return append(names, user...)
 }
 
-// CycleTheme returns the theme after current in AvailableThemes, wrapping.
+// nextThemeName returns the name after current in AvailableThemes, wrapping.
 // A current no longer present restarts at index 0.
-func CycleTheme(current string) (string, *Theme) {
+func nextThemeName(current string) string {
 	names := AvailableThemes()
 	next := 0
 	for i, n := range names {
@@ -196,7 +196,13 @@ func CycleTheme(current string) (string, *Theme) {
 			break
 		}
 	}
-	c, t, _ := ResolveTheme(names[next])
+	return names[next]
+}
+
+// CycleTheme returns the theme after current in AvailableThemes, wrapping.
+// A current no longer present restarts at index 0.
+func CycleTheme(current string) (string, *Theme) {
+	c, t, _ := ResolveTheme(nextThemeName(current))
 	return c, t
 }
 

@@ -704,23 +704,35 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	return true
 }
 
-// cycleTheme advances the active theme, persists the choice, and schedules a
-// status-bar flash. Mid-session callers must re-render the viewport (cached
-// styled strings) and re-apply textinput styles (WS1).
+// cycleTheme advances the active theme via the same path as the Theme menu
+// (WS5 — one mutate+persist pair, no behavior duplication).
 func (b *BaseModel) cycleTheme() tea.Cmd {
-	name, theme := CycleTheme(CurrentThemeName())
-	currentThemeName = name
-	SetTheme(theme)
-	b.settings.Theme = name
+	return b.setThemeByName(nextThemeName(CurrentThemeName()))
+}
+
+// setThemeByName resolves name, installs the theme, persists, flashes, and
+// re-renders. Canonical name and ResolveTheme warnings are surfaced in the
+// status flash (WS2/WS5).
+func (b *BaseModel) setThemeByName(name string) tea.Cmd {
+	canonical, warnings := SetThemeByName(name)
+	b.settings.Theme = canonical
 
 	if err := SaveSettings(b.settings); err != nil {
 		b.statusFlash = "settings not saved: " + err.Error()
 	} else {
-		b.statusFlash = "theme: " + name
+		b.statusFlash = themeFlashMessage(canonical, warnings)
 	}
 	applyTextInputTheme(&b.textInput)
 	b.updateViewport()
 	return statusFlashClearCmd()
+}
+
+func themeFlashMessage(canonical string, warnings []string) string {
+	msg := "theme: " + canonical
+	if len(warnings) > 0 {
+		msg += " — " + warnings[0]
+	}
+	return msg
 }
 
 // setViewMode switches the active view and tears down detail state when leaving

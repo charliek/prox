@@ -49,6 +49,8 @@ const (
 	MenuCmdToggleProcessPanel MenuCommand = "toggle-process-panel"
 	MenuCmdToggleTimestamps   MenuCommand = "toggle-timestamps"
 	MenuCmdToggleWrap         MenuCommand = "toggle-wrap"
+
+	menuCmdSetThemePrefix = "set-theme:"
 )
 
 // MenuItem is one dropdown row. Checked/Selected are nil for plain rows;
@@ -123,10 +125,22 @@ func (b *BaseModel) menuFirstSelectable(id MenuID) int {
 	return 0
 }
 
+func menuCmdSetTheme(name string) MenuCommand {
+	return MenuCommand(menuCmdSetThemePrefix + name)
+}
+
+func parseSetThemeCmd(cmd MenuCommand) (name string, ok bool) {
+	s := string(cmd)
+	if !strings.HasPrefix(s, menuCmdSetThemePrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(s, menuCmdSetThemePrefix), true
+}
+
 // menuItems builds rows live from state so markers never drift (WS3).
-// View menu final order (WS4): Logs/Requests radios, sep, Process panel /
-// Timestamps / Wrap lines / Follow checks. Filter/Theme stay placeholders
-// until C5/C8.
+// View menu (WS4): Logs/Requests radios, sep, Process panel / Timestamps /
+// Wrap lines / Follow checks. Theme menu (WS5): preset radios then user
+// stems. Filter stays a placeholder until C8.
 func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	switch id {
 	case MenuView:
@@ -145,7 +159,21 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 			{Label: "Wrap lines", Checked: &wrap, Cmd: MenuCmdToggleWrap},
 			{Label: "Follow", Checked: &follow, Cmd: MenuCmdToggleFollow},
 		}
-	case MenuFilter, MenuTheme:
+	case MenuTheme:
+		names := AvailableThemes()
+		current := CurrentThemeName()
+		items := make([]MenuItem, len(names))
+		selected := make([]bool, len(names))
+		for i, name := range names {
+			selected[i] = name == current
+			items[i] = MenuItem{
+				Label:    name,
+				Selected: &selected[i],
+				Cmd:      menuCmdSetTheme(name),
+			}
+		}
+		return items
+	case MenuFilter:
 		return []MenuItem{{Label: "(coming soon)"}}
 	default:
 		return nil
@@ -239,6 +267,9 @@ func (b *BaseModel) activateMenuItem(id MenuID, item int) tea.Cmd {
 }
 
 func (b *BaseModel) activateMenuCommand(cmd MenuCommand) tea.Cmd {
+	if name, ok := parseSetThemeCmd(cmd); ok {
+		return b.setThemeByName(name)
+	}
 	switch cmd {
 	case MenuCmdSetLogs:
 		b.setViewMode(ViewModeLogs)
