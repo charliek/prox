@@ -73,13 +73,17 @@ func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 func TestTUI_HandleKey_EscClearsFilters(t *testing.T) {
 	model := newTestModel()
 	model.soloProcess = "test"
-	model.searchPattern = "pattern"
+	model.setLogsFilterQuery("pattern")
+	model.setRequestsFilterQuery("status:500")
 
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyEscape})
 	m := newModel.(ClientModel)
 
 	assert.Empty(t, m.soloProcess)
-	assert.Empty(t, m.searchPattern)
+	assert.Empty(t, m.logsFilter.RawQuery)
+	assert.True(t, m.logsFilter.LastGood.IsEmpty())
+	assert.Empty(t, m.requestsFilter.RawQuery)
+	assert.True(t, m.requestsFilter.LastGood.IsEmpty())
 }
 
 func TestTUI_LogEntryMsg(t *testing.T) {
@@ -144,9 +148,9 @@ func TestFilteredEntries(t *testing.T) {
 		assert.Equal(t, "web", e.Process)
 	}
 
-	// String filter
+	// String filter (bare substring — same as today's s-bar)
 	model.soloProcess = ""
-	model.searchPattern = "log 1"
+	model.setLogsFilterQuery("log 1")
 	entries = model.filteredEntries()
 	assert.Len(t, entries, 2)
 	for _, e := range entries {
@@ -260,12 +264,12 @@ func TestFilteredProxyRequests(t *testing.T) {
 	assert.Len(t, requests, 4)
 
 	// String filter on URL
-	model.searchPattern = "users"
+	model.setRequestsFilterQuery("users")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 
 	// String filter on method
-	model.searchPattern = "GET"
+	model.setRequestsFilterQuery("GET")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 	for _, r := range requests {
@@ -273,7 +277,7 @@ func TestFilteredProxyRequests(t *testing.T) {
 	}
 
 	// String filter on subdomain
-	model.searchPattern = "api"
+	model.setRequestsFilterQuery("api")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 	for _, r := range requests {
@@ -281,7 +285,7 @@ func TestFilteredProxyRequests(t *testing.T) {
 	}
 
 	// Case-insensitive filter
-	model.searchPattern = "API"
+	model.setRequestsFilterQuery("API")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 }
@@ -358,7 +362,7 @@ func TestTUI_ProxyRequestMsg(t *testing.T) {
 	assert.Len(t, filtered, 2)
 
 	// Test filtering
-	m.searchPattern = "users"
+	m.setRequestsFilterQuery("users")
 	filtered = m.filteredProxyRequests()
 	assert.Len(t, filtered, 1)
 	assert.Equal(t, "/api/users", filtered[0].URL)
@@ -784,7 +788,7 @@ func TestRequestsCursor_VisibilityResize(t *testing.T) {
 func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 	m := newRequestsModel(40, 5)
 	// Narrow to rows /path/030../path/039 (10 rows), follow off.
-	m.searchPattern = "/path/03"
+	m.setRequestsFilterQuery("/path/03")
 	m.followMode = false
 	m.updateViewport()
 
@@ -797,7 +801,8 @@ func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 	// esc clears the filter; the cursor's row (req-032, full-list index 32) must
 	// remain and be scrolled on-screen.
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
-	assert.Empty(t, m.searchPattern)
+	assert.Empty(t, m.requestsFilter.RawQuery)
+	assert.True(t, m.requestsFilter.LastGood.IsEmpty())
 	assert.Equal(t, "req-032", m.cursorID)
 	assert.Equal(t, 32, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
@@ -1117,7 +1122,7 @@ func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
 	reqs[12].URL = "/match/c" // api  -> in the filtered list
 
 	m := newSearchModel(40, reqs)
-	m.searchPattern = "api" // active `s` filter: only the 10 api rows remain
+	m.setRequestsFilterQuery("api") // active `s` filter: only the 10 api rows remain
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g'))
@@ -1129,7 +1134,7 @@ func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
 	assert.Equal(t, "req-012", m.cursorID)
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "req-004", m.cursorID, "wraps over api matches only, skipping the filtered-out web row")
-	assert.Equal(t, "api", m.searchPattern, "the `s` filter is untouched")
+	assert.Equal(t, "api", m.requestsFilter.RawQuery, "the `s` filter is untouched")
 }
 
 func TestRequestsSearch_DoesNotFilter(t *testing.T) {
@@ -1139,7 +1144,7 @@ func TestRequestsSearch_DoesNotFilter(t *testing.T) {
 	before := len(m.filteredProxyRequests())
 
 	m = commitSearch(m, "needle")
-	assert.Empty(t, m.searchPattern, "/ in the requests view must not touch the `s` filter")
+	assert.Empty(t, m.requestsFilter.RawQuery, "/ in the requests view must not touch the `s` filter")
 	assert.Equal(t, "needle", m.requestSearchQuery)
 	assert.Len(t, m.filteredProxyRequests(), before, "/ navigates; it must not hide rows")
 	assert.Len(t, m.proxyRequests, 10)
@@ -1218,7 +1223,7 @@ func TestLogsSearch_SlashNavigates(t *testing.T) {
 
 	m = commitSearch(m, "drop")
 	assert.Equal(t, "drop", m.logSearchQuery, "logs-view / commits the navigation query")
-	assert.Empty(t, m.searchPattern, "logs-view / must not touch the `s` filter")
+	assert.Empty(t, m.logsFilter.RawQuery, "logs-view / must not touch the `s` filter")
 	assert.Empty(t, m.requestSearchQuery, "logs-view / must not set the requests query")
 	assert.Len(t, m.filteredEntries(), before, "logs-view / navigates; it must not hide lines")
 	assert.Equal(t, "drop it", logCursorLine(t, m), "the cursor lands on the matching line")
@@ -1272,7 +1277,7 @@ func TestLogsSearch_ComposesWithFilter(t *testing.T) {
 	m := newLogsModel(20, []string{
 		"keep needle a", "drop needle b", "keep plain", "keep needle c", "drop needle d",
 	})
-	m.searchPattern = "keep" // active `s` filter -> rows 0,2,3 survive
+	m.setLogsFilterQuery("keep") // active `s` filter -> rows 0,2,3 survive
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g')) // origin -> top of the filtered list
@@ -1283,7 +1288,7 @@ func TestLogsSearch_ComposesWithFilter(t *testing.T) {
 	assert.Equal(t, "keep needle c", logCursorLine(t, m), "n skips the filtered-out drop rows")
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "keep needle a", logCursorLine(t, m), "wraps over the filtered matches only")
-	assert.Equal(t, "keep", m.searchPattern, "the `s` filter is untouched")
+	assert.Equal(t, "keep", m.logsFilter.RawQuery, "the `s` filter is untouched")
 }
 
 func TestLogsSearch_NoMatch(t *testing.T) {
@@ -1509,7 +1514,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	reqs[3].URL = "/path/needle" // matches both the `path` filter and the search
 	m := newSearchModel(40, reqs)
 	m.soloProcess = "web" // a logs concept: must NOT appear in the requests view
-	m.searchPattern = "path"
+	m.setRequestsFilterQuery("path")
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g'))

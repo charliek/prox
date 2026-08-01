@@ -89,20 +89,26 @@ type BaseModel struct {
 	// Filtering
 	filterProcesses map[string]bool // Which processes to show
 	soloProcess     string          // Single process to show (1-9 keys)
-	searchPattern   string          // Current search/filter pattern (the `s` filter)
+
+	// Per-view s-bar filter state (plan 021 WS6 / Codex #3). Grammars are
+	// mutually incompatible, so each view keeps its own {RawQuery,LastGood,
+	// ParseErr}. Filters persist across Tab; `/` search is untouched and
+	// composes within the filtered list.
+	logsFilter     logsFilterState
+	requestsFilter requestsFilterState
 
 	// requestSearchQuery is the requests-view `/` search term. It is DELIBERATELY
-	// separate from searchPattern: in the requests view `/` navigates (jumps the
+	// separate from the `s` filter: in the requests view `/` navigates (jumps the
 	// cursor to matches) rather than filtering, so it composes with — never
-	// overwrites — an active `s` filter. Match state is never stored; n/N rescan
+	// overwrites — an active filter. Match state is never stored; n/N rescan
 	// the filtered list at keypress time (D12/D13).
 	requestSearchQuery string
 
 	// logSearchQuery is the logs-view `/` search term. Like requestSearchQuery
-	// (and unlike searchPattern, the `s` filter) it NAVIGATES rather than
-	// filters: `/` jumps the logs cursor to the first matching line and n/N
-	// cycle, leaving every line visible. Match state is never stored; the seek
-	// helpers rescan filteredEntries() at keypress time (D6-D8).
+	// (and unlike the `s` filter) it NAVIGATES rather than filters: `/` jumps
+	// the logs cursor to the first matching line and n/N cycle, leaving every
+	// line visible. Match state is never stored; the seek helpers rescan
+	// filteredEntries() at keypress time (D6-D8).
 	logSearchQuery string
 
 	// logSeq is a session-local monotonic counter stamped onto each ingested
@@ -662,20 +668,19 @@ func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		b.textInput.Blur()
 		if b.viewMode == ViewModeRequests {
 			// Requests view: `/` is navigation, not filtration. Commit the query
-			// to requestSearchQuery (searchPattern — the `s` filter — untouched)
-			// and jump the cursor to the first match at-or-after it (D12).
+			// to requestSearchQuery (`s` filter untouched) and jump the cursor
+			// to the first match at-or-after it (D12).
 			b.requestSearchQuery = b.textInput.Value()
 			b.jumpToRequestSearchMatch()
 			b.updateViewport()
 			return true, nil
 		}
 		// Logs view: `/` is navigation, not filtration (D6/D8) — it mirrors the
-		// requests view. Commit the query to logSearchQuery (searchPattern — the
-		// `s` filter — is untouched) and jump the cursor to the first match
-		// at-or-after the current position, wrapping. The scroll-to-match is a
-		// one-shot here rather than wired into updateViewport, which also runs on
-		// streaming arrivals and free j/k scroll where re-scrolling would fight
-		// the reader.
+		// requests view. Commit the query to logSearchQuery (`s` filter
+		// untouched) and jump the cursor to the first match at-or-after the
+		// current position, wrapping. The scroll-to-match is a one-shot here
+		// rather than wired into updateViewport, which also runs on streaming
+		// arrivals and free j/k scroll where re-scrolling would fight the reader.
 		b.logSearchQuery = b.textInput.Value()
 		b.seekLogSearchMatch(0)
 		b.updateViewport()
@@ -688,18 +693,21 @@ func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	return true, cmd
 }
 
-// handleStringFilterKey handles keys in string filter mode
+// handleStringFilterKey handles keys in string filter mode. Esc clears the
+// ACTIVE view's filter (raw + expr) and exits; Enter exits keeping the query;
+// every other key live-reparses the active RawQuery (plan 021 WS6 / Codex #3).
 func (b *BaseModel) handleStringFilterKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		b.mode = ModeNormal
 		b.textInput.Blur()
-		b.searchPattern = ""
+		b.clearActiveFilter()
 		b.updateViewport()
 		return true, nil
 
 	case "enter":
-		b.searchPattern = b.textInput.Value()
+		// Keep the query already applied by live-reparse; just exit the bar.
+		b.applyActiveFilterQuery(b.textInput.Value())
 		b.mode = ModeNormal
 		b.textInput.Blur()
 		b.updateViewport()
@@ -708,10 +716,84 @@ func (b *BaseModel) handleStringFilterKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 	var cmd tea.Cmd
 	b.textInput, cmd = b.textInput.Update(msg)
-	// Live update filter
-	b.searchPattern = b.textInput.Value()
+	b.applyActiveFilterQuery(b.textInput.Value())
 	b.updateViewport()
 	return true, cmd
+}
+
+// applyActiveFilterQuery sets the active view's RawQuery and live-reparses.
+// On success LastGood updates; on ParseErr LastGood is retained so mid-typing
+// invalid queries keep the prior filter applied.
+func (b *BaseModel) applyActiveFilterQuery(q string) {
+	switch b.viewMode {
+	case ViewModeRequests, ViewModeRequestDetail:
+		b.requestsFilter.RawQuery = q
+		expr, err := ParseRequestsFilter(q)
+		b.requestsFilter.ParseErr = err
+		if err == nil {
+			b.requestsFilter.LastGood = expr
+		}
+	default:
+		b.logsFilter.RawQuery = q
+		expr, err := ParseLogsFilter(q)
+		b.logsFilter.ParseErr = err
+		if err == nil {
+			b.logsFilter.LastGood = expr
+		}
+	}
+}
+
+// clearActiveFilter clears the active view's filter state (Esc inside the s bar).
+func (b *BaseModel) clearActiveFilter() {
+	switch b.viewMode {
+	case ViewModeRequests, ViewModeRequestDetail:
+		b.requestsFilter = requestsFilterState{}
+	default:
+		b.logsFilter = logsFilterState{}
+	}
+}
+
+// clearAllFilters clears both views' s-bar filters (normal-mode Esc).
+func (b *BaseModel) clearAllFilters() {
+	b.logsFilter = logsFilterState{}
+	b.requestsFilter = requestsFilterState{}
+}
+
+// activeFilterRaw returns the active view's RawQuery (for status / seeding).
+func (b *BaseModel) activeFilterRaw() string {
+	if b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail {
+		return b.requestsFilter.RawQuery
+	}
+	return b.logsFilter.RawQuery
+}
+
+// activeFilterParseErr returns the active view's ParseErr.
+func (b *BaseModel) activeFilterParseErr() error {
+	if b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail {
+		return b.requestsFilter.ParseErr
+	}
+	return b.logsFilter.ParseErr
+}
+
+// setLogsFilterQuery is a test/helper path that applies a logs filter as if the
+// s bar had accepted q (updates RawQuery + LastGood, clears ParseErr on success).
+func (b *BaseModel) setLogsFilterQuery(q string) {
+	b.logsFilter.RawQuery = q
+	expr, err := ParseLogsFilter(q)
+	b.logsFilter.ParseErr = err
+	if err == nil {
+		b.logsFilter.LastGood = expr
+	}
+}
+
+// setRequestsFilterQuery is the requests-view counterpart of setLogsFilterQuery.
+func (b *BaseModel) setRequestsFilterQuery(q string) {
+	b.requestsFilter.RawQuery = q
+	expr, err := ParseRequestsFilter(q)
+	b.requestsFilter.ParseErr = err
+	if err == nil {
+		b.requestsFilter.LastGood = expr
+	}
 }
 
 // handleHelpKey handles keys in help mode
@@ -924,7 +1006,9 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "s":
 		if b.viewMode != ViewModeRequestDetail {
 			b.mode = ModeStringFilter
-			b.textInput.SetValue("")
+			// Seed from the active view's RawQuery so edits resume mid-query
+			// (plan 021 WS6 / Codex #3).
+			b.textInput.SetValue(b.activeFilterRaw())
 			b.textInput.Focus()
 		}
 		return true, nil
@@ -977,11 +1061,12 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.setViewMode(ViewModeRequests)
 			return true, nil
 		}
-		// Clear filters and both views' search queries (D13/D8). Resetting the
-		// logs cursor to the no-cursor sentinel makes the next `/` seed its
-		// origin from the viewport again rather than the stale prior match.
+		// Clear both views' filters and both views' search queries (D13/D8,
+		// Codex #3). Resetting the logs cursor to the no-cursor sentinel makes
+		// the next `/` seed its origin from the viewport again rather than the
+		// stale prior match.
 		b.soloProcess = ""
-		b.searchPattern = ""
+		b.clearAllFilters()
 		b.requestSearchQuery = ""
 		b.logSearchQuery = ""
 		b.logCursorSeq = 0
@@ -1906,9 +1991,13 @@ func shouldPrettyPrintJSON(body *BodyData) bool {
 	return json.Valid([]byte(body.Data))
 }
 
-// filteredEntries returns log entries after applying filters
+// filteredEntries returns log entries after applying filters. The s-bar query
+// is evaluated via logsFilter.LastGood (plan 021 WS6); filterProcesses (ModeFilter
+// a/n toggles) stays independent until C8 folds it into FilterExpr.
 func (b *BaseModel) filteredEntries() []domain.LogEntry {
 	var result []domain.LogEntry
+	expr := b.logsFilter.LastGood
+	useExpr := !expr.IsEmpty()
 
 	for _, entry := range b.logEntries {
 		// Process filter
@@ -1921,9 +2010,9 @@ func (b *BaseModel) filteredEntries() []domain.LogEntry {
 			continue
 		}
 
-		// String filter
-		if b.searchPattern != "" {
-			if !containsIgnoreCase(entry.Line, b.searchPattern) {
+		if useExpr {
+			meta := b.logMeta[entry.DisplaySeq] // zero value (no level) when missing
+			if !expr.Match(entry, meta) {
 				continue
 			}
 		}
@@ -1938,19 +2027,15 @@ func (b *BaseModel) filteredEntries() []domain.LogEntry {
 // front for the no-match-dropped case: this runs two or three times per
 // keypress (cursor move, viewport rebuild, status bar) over a list that now
 // reaches constants.MaxProxyRequests, and regrowing from nil each time is the
-// bulk of that cost.
+// bulk of that cost. The s-bar query uses requestsFilter.LastGood (WS6).
 func (b *BaseModel) filteredProxyRequests() []proxy.RequestRecord {
 	result := make([]proxy.RequestRecord, 0, len(b.proxyRequests))
+	expr := b.requestsFilter.LastGood
+	useExpr := !expr.IsEmpty()
 
 	for _, req := range b.proxyRequests {
-		// String filter (on URL, method, and subdomain)
-		if b.searchPattern != "" {
-			matchesURL := containsIgnoreCase(req.URL, b.searchPattern)
-			matchesMethod := containsIgnoreCase(req.Method, b.searchPattern)
-			matchesSubdomain := containsIgnoreCase(req.Subdomain, b.searchPattern)
-			if !matchesURL && !matchesMethod && !matchesSubdomain {
-				continue
-			}
+		if useExpr && !expr.Match(req) {
+			continue
 		}
 
 		result = append(result, req)
@@ -2219,18 +2304,20 @@ func (b *BaseModel) processPanel() string {
 // statusLeftDefault builds the left status-bar text for normal mode (no input
 // prompt active). requests is the requests-view filtered list (unused in the
 // logs view), passed in so callers can share one filteredProxyRequests() scan
-// with the visible/total count. Precedence differs by view (D13):
+// with the visible/total count. Precedence differs by view (D13 / Codex #3):
 //   - Requests view: the `/` search indicator wins when a query is set —
 //     "/<query> (i/k)" with i the cursor's 1-based position among matches when
 //     the cursor is on a match, else "/<query> (k matches)" (0 included) — with
-//     "| filter: <pattern>" appended when the `s` filter is also active. soloProcess
+//     "| filter: <raw>" appended when the `s` filter is also active. soloProcess
 //     is a logs-view concept and is never shown here.
-//   - Logs view: the `/` search indicator wins when a query is set —
-//     "/<query> (i/k)" (cursor on match i of k) or "/<query> (k matches)" when
-//     the cursor is off any match — then solo, then the `s` filter (D10). The
-//     `s` filter and search compose (search navigates within the filtered set).
+//   - Logs view: same search-indicator shape, then solo, then the `s` filter.
+//     Both views now show the raw filter query when set (Codex #3 unified the
+//     prior asymmetry where requests appended it and logs hid it). An invalid
+//     mid-edit query keeps LastGood filtering and adds an "invalid filter" hint.
 //   - Otherwise (either view): the `s` filter line, then the default hint.
 func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.RequestRecord, entries []domain.LogEntry) string {
+	filterRaw, filterInvalid := b.statusFilterBits()
+
 	if b.viewMode == ViewModeRequests && b.requestSearchQuery != "" {
 		position, total := b.requestSearchMatchInfo(requests)
 		var indicator string
@@ -2239,25 +2326,50 @@ func (b *BaseModel) statusLeftDefault(extraInfo string, requests []proxy.Request
 		} else {
 			indicator = fmt.Sprintf("/%s (%d matches)", b.requestSearchQuery, total)
 		}
-		if b.searchPattern != "" {
-			indicator += fmt.Sprintf(" | filter: %s", b.searchPattern)
+		if filterRaw != "" {
+			indicator += fmt.Sprintf(" | filter: %s", filterRaw)
+			if filterInvalid {
+				indicator += " [invalid filter]"
+			}
 		}
 		return indicator
 	}
 	if b.viewMode == ViewModeLogs && b.logSearchQuery != "" {
 		position, total := b.logSearchMatchInfo(entries)
+		var indicator string
 		if position > 0 {
-			return fmt.Sprintf("/%s (%d/%d)", b.logSearchQuery, position, total)
+			indicator = fmt.Sprintf("/%s (%d/%d)", b.logSearchQuery, position, total)
+		} else {
+			indicator = fmt.Sprintf("/%s (%d matches)", b.logSearchQuery, total)
 		}
-		return fmt.Sprintf("/%s (%d matches)", b.logSearchQuery, total)
+		if filterRaw != "" {
+			indicator += fmt.Sprintf(" | filter: %s", filterRaw)
+			if filterInvalid {
+				indicator += " [invalid filter]"
+			}
+		}
+		return indicator
 	}
 	if b.viewMode != ViewModeRequests && b.soloProcess != "" {
 		return fmt.Sprintf("Showing: %s (ESC to clear)", b.soloProcess)
 	}
-	if b.searchPattern != "" {
-		return fmt.Sprintf("Filter: %s (ESC to clear)", b.searchPattern)
+	if filterRaw != "" {
+		msg := fmt.Sprintf("Filter: %s", filterRaw)
+		if filterInvalid {
+			msg += " [invalid filter]"
+		}
+		return msg + " (ESC to clear)"
 	}
 	return b.statusDefaultHint(extraInfo)
+}
+
+// statusFilterBits returns the active view's raw filter query and whether it
+// currently fails to parse (LastGood still evaluates).
+func (b *BaseModel) statusFilterBits() (raw string, invalid bool) {
+	if b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail {
+		return b.requestsFilter.RawQuery, b.requestsFilter.ParseErr != nil
+	}
+	return b.logsFilter.RawQuery, b.logsFilter.ParseErr != nil
 }
 
 // statusDefaultHint is the fallback status-bar hint shown when no filter, search,
@@ -2302,6 +2414,9 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		left = "Search: " + b.textInput.View()
 	case ModeStringFilter:
 		left = "String filter: " + b.textInput.View()
+		if b.activeFilterParseErr() != nil {
+			left += " [invalid filter]"
+		}
 	default:
 		left = b.statusLeftDefault(extraInfo, requests, entries)
 	}

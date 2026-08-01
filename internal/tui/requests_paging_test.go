@@ -129,7 +129,7 @@ func TestRequestsPaging_PageSuccessPrependsOldestFirst(t *testing.T) {
 func TestRequestsPaging_TriggerUsesFilteredOldestRow(t *testing.T) {
 	stub := &stubTUIClient{snapshot: olderPage(1), nextBeforeID: "cur-2"}
 	m := primedPagingModel(stub, 5, "cur-1")
-	m.searchPattern = "/path/003" // only req-003 visible; req-000..002 are older
+	m.setRequestsFilterQuery("/path/003") // only req-003 visible; req-000..002 are older
 	m.updateViewport()
 
 	m, cmd := gotoOldest(m)
