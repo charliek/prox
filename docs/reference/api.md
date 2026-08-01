@@ -6,7 +6,7 @@
 http://{host}:{port}/api/v1
 ```
 
-By default, `{port}` is a dynamically assigned free localhost port chosen at startup — discover it with `prox status` (which reports the API address), or pin it by setting `api.port` in `prox.yaml`. The examples below assume `api.port: 5555` is set in `prox.yaml`.
+By default, `{port}` is a dynamically assigned free localhost port chosen at startup — discover it with `prox status` (which reports the API address), or pin it by setting `api.port` in `prox.yaml`. The examples below assume `api.port: 5555` is set in `prox.yaml`; prox itself does not pin a port by default, so substitute whatever port `prox status` reports unless you've explicitly set `api.port`.
 
 ## Authentication
 

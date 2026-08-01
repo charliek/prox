@@ -14,9 +14,6 @@ const (
 	// DefaultAPIHost is the default host for the API server
 	DefaultAPIHost = "127.0.0.1"
 
-	// DefaultAPIPort is the default port for the API server
-	DefaultAPIPort = 5555
-
 	// DefaultAPIAddress is the default API address for client connections
 	DefaultAPIAddress = "http://127.0.0.1:5555"
 

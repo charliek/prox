@@ -197,6 +197,7 @@ Once the proxy is enabled, `prox requests` and `prox requests <id> --body` work 
 
 By default, the API binds to a dynamic (auto-assigned) localhost port chosen at startup. Run `prox status` to see the address currently in use, or pin a fixed port by adding this to `prox.yaml`:
 
+<!-- doclint:pin-example -- deliberate api.port pinning demonstration, see internal/docslint -->
 ```yaml
 api:
   port: 5555
