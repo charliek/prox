@@ -141,7 +141,7 @@ func TestViewToggles_MenuMatchesKey(t *testing.T) {
 }
 
 func TestViewToggles_DoNotFireInTextModes(t *testing.T) {
-	for _, mode := range []Mode{ModeFilter, ModeSearch, ModeStringFilter} {
+	for _, mode := range []Mode{ModeSearch, ModeStringFilter} {
 		for _, key := range []rune{'p', 'T', 'w'} {
 			m := newTestModel()
 			m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})

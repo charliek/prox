@@ -174,7 +174,7 @@ func TestSetViewMode_DetailTeardown(t *testing.T) {
 }
 
 func TestMenu_VOpenerDoesNotFireInTextModes(t *testing.T) {
-	for _, mode := range []Mode{ModeFilter, ModeSearch, ModeStringFilter} {
+	for _, mode := range []Mode{ModeSearch, ModeStringFilter} {
 		m := newTestModel()
 		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 		m.mode = mode
@@ -188,13 +188,13 @@ func TestMenu_VOpenerDoesNotFireInTextModes(t *testing.T) {
 	}
 }
 
-func TestMenu_FStillOpensModeFilter(t *testing.T) {
-	// Pinned: C3 does not rebind f to the Filter menu (C8 does).
+func TestMenu_FOpensFilterMenu(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('f'))
-	assert.Equal(t, ModeFilter, m.mode)
-	assert.False(t, m.menuOpen())
+	assert.True(t, m.menuOpen())
+	assert.Equal(t, int(MenuFilter), m.openMenu)
+	assert.Equal(t, ModeNormal, m.mode)
 }
 
 func TestMenu_MouseOpenBlursTextInput(t *testing.T) {

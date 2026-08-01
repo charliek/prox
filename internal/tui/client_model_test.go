@@ -315,14 +315,11 @@ func TestClientModel_NeverPollsProcesses(t *testing.T) {
 	assert.Zero(t, stub.getProcessesCalls(), "nothing in attach mode may poll REST /processes")
 }
 
-// TestClientModel_ProcessesMsgUpdatesListAndFilterMap pins that a snapshot
-// delivered by the stream lands exactly as the poll's result did: the process
-// list is replaced wholesale and every new name is registered (defaulting to
-// visible) in the filter map, while an existing name's filter choice is left
-// alone.
-func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
+// TestClientModel_ProcessesMsgUpdatesList pins that a snapshot delivered by the
+// stream lands exactly as the poll's result did: the process list is replaced
+// wholesale.
+func TestClientModel_ProcessesMsgUpdatesList(t *testing.T) {
 	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
-	m.filterProcesses["web"] = false // the user hid this one earlier
 
 	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{
 		{Name: "web", State: domain.ProcessState("running"), PID: 10},
@@ -332,8 +329,6 @@ func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
 	require.Len(t, m.processes, 2)
 	assert.Equal(t, "web", m.processes[0].Name)
 	assert.Equal(t, 10, m.processes[0].PID)
-	assert.False(t, m.filterProcesses["web"], "an existing filter choice survives a snapshot")
-	assert.True(t, m.filterProcesses["api"], "a newly seen process defaults to visible")
 
 	// A later snapshot replaces the list wholesale (processes can disappear).
 	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{{Name: "api"}}))

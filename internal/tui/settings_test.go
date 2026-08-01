@@ -235,14 +235,14 @@ func TestThemeCycleKey(t *testing.T) {
 	assert.Equal(t, "dark", loaded.Theme)
 }
 
-func TestThemeCycleKey_NoOpInFilterMode(t *testing.T) {
+func TestThemeCycleKey_NoOpInStringFilterMode(t *testing.T) {
 	withTestTheme(t, "tokyo-night")
 
 	dir := t.TempDir()
 	withTestSettingsPath(t, filepath.Join(dir, "config.toml"))
 
 	m := newTestModel()
-	m.mode = ModeFilter
+	m.mode = ModeStringFilter
 	m.textInput.Focus()
 	m.textInput.SetValue("")
 

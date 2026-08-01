@@ -368,12 +368,6 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// alone, and the OK transition that precedes the first snapshot has
 		// already cleared it.
 		m.processes = []domain.ProcessInfo(msg)
-		// Update filter map with any new processes
-		for _, p := range m.processes {
-			if _, ok := m.filterProcesses[p.Name]; !ok {
-				m.filterProcesses[p.Name] = true
-			}
-		}
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process
@@ -436,7 +430,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, cmd)
 
 	// Handle text input if in filter/search mode
-	if m.mode == ModeFilter || m.mode == ModeSearch || m.mode == ModeStringFilter {
+	if m.mode == ModeSearch || m.mode == ModeStringFilter {
 		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
 	}
@@ -446,7 +440,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey processes keyboard input.
 // Key routing order (Codex #4, pinned): open-menu capture → text/help modes →
-// client actions (q/r/Enter) → menu openers (m/v) + normal navigation.
+// client actions (q/r/Enter) → menu openers (m/v/f) + normal navigation.
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 1. Open-menu capture: every key consumed, never re-dispatched.
 	if m.menuOpen() {
@@ -455,9 +449,6 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 2. Mode-specific keys (textinput / help).
 	switch m.mode {
-	case ModeFilter:
-		_, cmd := m.handleFilterKey(msg)
-		return m, cmd
 	case ModeSearch:
 		_, cmd := m.handleSearchKey(msg)
 		return m, cmd
@@ -504,7 +495,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 4. Menu openers (m/v) + common navigation. `f` stays ModeFilter until C8.
+	// 4. Menu openers (m/v/f) + common navigation.
 	handled, navCmd := m.handleNavigationKey(msg)
 	if handled {
 		// maybeFetchOlderRequests is evaluated BEFORE m is copied into the

@@ -25,7 +25,6 @@ type Mode int
 
 const (
 	ModeNormal Mode = iota
-	ModeFilter
 	ModeSearch
 	ModeStringFilter
 	ModeHelp
@@ -87,8 +86,7 @@ type BaseModel struct {
 	viewMode ViewMode // Logs or Requests view
 
 	// Filtering
-	filterProcesses map[string]bool // Which processes to show
-	soloProcess     string          // Single process to show (1-9 keys)
+	soloProcess string // Single process to show (1-9 keys)
 
 	// Per-view s-bar filter state (plan 021 WS6 / Codex #3). Grammars are
 	// mutually incompatible, so each view keeps its own {RawQuery,LastGood,
@@ -229,20 +227,19 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 	applyTextInputTheme(&ti)
 
 	return BaseModel{
-		processes:       make([]domain.ProcessInfo, 0),
-		logEntries:      make([]domain.LogEntry, 0),
-		proxyRequests:   make([]proxy.RequestRecord, 0),
-		textInput:       ti,
-		mode:            ModeNormal,
-		viewMode:        ViewModeLogs,
-		filterProcesses: make(map[string]bool),
-		streamHealth:    make(map[StreamID]stream.Status),
-		streamDropped:   make(map[StreamID]bool),
-		followMode:      true,
-		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
-		helpConfig:      helpConfig,
-		settings:        DefaultSettings(),
-		openMenu:        -1, // closed
+		processes:     make([]domain.ProcessInfo, 0),
+		logEntries:    make([]domain.LogEntry, 0),
+		proxyRequests: make([]proxy.RequestRecord, 0),
+		textInput:     ti,
+		mode:          ModeNormal,
+		viewMode:      ViewModeLogs,
+		streamHealth:  make(map[StreamID]stream.Status),
+		streamDropped: make(map[StreamID]bool),
+		followMode:    true,
+		logCursorIdx:  -1, // no-cursor sentinel (pairs with logCursorSeq 0)
+		helpConfig:    helpConfig,
+		settings:      DefaultSettings(),
+		openMenu:      -1, // closed
 	}
 }
 
@@ -621,40 +618,6 @@ func (b *BaseModel) requestIsStale(req proxy.RequestRecord) bool {
 	return req.StaleAt(time.Now())
 }
 
-// handleFilterKey handles keys in filter mode
-func (b *BaseModel) handleFilterKey(msg tea.KeyMsg) (bool, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		b.mode = ModeNormal
-		b.textInput.Blur()
-		return true, nil
-
-	case "enter":
-		b.mode = ModeNormal
-		b.textInput.Blur()
-		b.updateViewport()
-		return true, nil
-
-	case "a":
-		// Select all
-		for name := range b.filterProcesses {
-			b.filterProcesses[name] = true
-		}
-		return true, nil
-
-	case "n":
-		// Select none
-		for name := range b.filterProcesses {
-			b.filterProcesses[name] = false
-		}
-		return true, nil
-	}
-
-	var cmd tea.Cmd
-	b.textInput, cmd = b.textInput.Update(msg)
-	return true, cmd
-}
-
 // handleSearchKey handles keys in search mode
 func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
@@ -964,12 +927,16 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		// Open the View menu when the bar is visible. `v` was free; Theme has
 		// no mnemonic (`t` stays cycle — panel B1). Keyboard path to Theme:
 		// open View then Right/Tab sibling-switch.
-		//
-		// NOTE: `f` is NOT a Filter-menu mnemonic yet — it still opens
-		// ModeFilter (C8 rebinds `f` to the Filter dropdown). Until then the
-		// Filter cell is click/sibling-only (pinned C3 resolution).
 		if b.settings.MenuBar {
 			b.openMenuFirst(MenuView)
+		}
+		return true, nil
+
+	case "f":
+		// Open the Filter menu when the bar is visible (WS8 / panel S3). Consumed
+		// no-op when hidden; textinput modes never reach here (Codex #4).
+		if b.settings.MenuBar {
+			b.openMenuFirst(MenuFilter)
 		}
 		return true, nil
 
@@ -986,13 +953,6 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 	case "?":
 		b.mode = ModeHelp
-		return true, nil
-
-	case "f":
-		if b.viewMode != ViewModeRequestDetail {
-			b.mode = ModeFilter
-			b.textInput.Focus()
-		}
 		return true, nil
 
 	case "/":
@@ -1992,8 +1952,8 @@ func shouldPrettyPrintJSON(body *BodyData) bool {
 }
 
 // filteredEntries returns log entries after applying filters. The s-bar query
-// is evaluated via logsFilter.LastGood (plan 021 WS6); filterProcesses (ModeFilter
-// a/n toggles) stays independent until C8 folds it into FilterExpr.
+// is evaluated via logsFilter.LastGood (plan 021 WS6); process inclusion is
+// expressed with proc:/-proc: clauses (WS8 retired ModeFilter/filterProcesses).
 func (b *BaseModel) filteredEntries() []domain.LogEntry {
 	var result []domain.LogEntry
 	expr := b.logsFilter.LastGood
@@ -2002,11 +1962,6 @@ func (b *BaseModel) filteredEntries() []domain.LogEntry {
 	for _, entry := range b.logEntries {
 		// Process filter
 		if b.soloProcess != "" && entry.Process != b.soloProcess {
-			continue
-		}
-
-		// Check filterProcesses map
-		if show, ok := b.filterProcesses[entry.Process]; ok && !show {
 			continue
 		}
 
@@ -2408,12 +2363,10 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 
 	// Left side: mode/filter info
 	switch b.mode {
-	case ModeFilter:
-		left = "Filter: " + b.textInput.View()
 	case ModeSearch:
 		left = "Search: " + b.textInput.View()
 	case ModeStringFilter:
-		left = "String filter: " + b.textInput.View()
+		left = "Filter: " + b.textInput.View()
 		if b.activeFilterParseErr() != nil {
 			left += " [invalid filter]"
 		}

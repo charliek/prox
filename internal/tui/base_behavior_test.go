@@ -51,11 +51,14 @@ func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 	m := newModel.(ClientModel)
 	assert.Equal(t, ModeHelp, m.mode)
 
-	// Test switching to filter mode
+	// Test switching to filter menu (f opens Filter dropdown when menu bar visible)
 	model = newTestModel()
+	model = clientUpdate(model, tea.WindowSizeMsg{Width: 80, Height: 24})
 	newModel, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	m = newModel.(ClientModel)
-	assert.Equal(t, ModeFilter, m.mode)
+	assert.True(t, m.menuOpen())
+	assert.Equal(t, int(MenuFilter), m.openMenu)
+	assert.Equal(t, ModeNormal, m.mode)
 
 	// Test switching to search mode
 	model = newTestModel()

@@ -139,8 +139,8 @@ func parseSetThemeCmd(cmd MenuCommand) (name string, ok bool) {
 
 // menuItems builds rows live from state so markers never drift (WS3).
 // View menu (WS4): Logs/Requests radios, sep, Process panel / Timestamps /
-// Wrap lines / Follow checks. Theme menu (WS5): preset radios then user
-// stems. Filter stays a placeholder until C8.
+// Wrap lines / Follow checks. Filter menu (WS8): per-view check/radio rows.
+// Theme menu (WS5): preset radios then user stems.
 func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	switch id {
 	case MenuView:
@@ -174,7 +174,7 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 		}
 		return items
 	case MenuFilter:
-		return []MenuItem{{Label: "(coming soon)"}}
+		return b.filterMenuItems()
 	default:
 		return nil
 	}
@@ -283,6 +283,9 @@ func (b *BaseModel) activateMenuCommand(cmd MenuCommand) tea.Cmd {
 		return b.toggleTimestamps()
 	case MenuCmdToggleWrap:
 		return b.toggleWrap()
+	}
+	if b.activateFilterMenuCommand(cmd) {
+		return nil
 	}
 	return nil
 }
@@ -527,7 +530,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	// Mouse-open while a textinput mode is active: blur → ModeNormal first (Codex #4).
 	blurTextMode := func() {
 		switch b.mode {
-		case ModeFilter, ModeSearch, ModeStringFilter:
+		case ModeSearch, ModeStringFilter:
 			b.mode = ModeNormal
 			b.textInput.Blur()
 		}
