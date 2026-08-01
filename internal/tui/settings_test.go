@@ -15,6 +15,22 @@ import (
 	"github.com/charliek/prox/internal/domain"
 )
 
+// TestMain redirects the DEFAULT settings path to a throwaway file for the
+// whole test process: a test that persists without an explicit
+// withTestSettingsPath override must never write the developer's real
+// ~/.prox/tui/config.toml (TestMenu_FNoOpWhenMenuBarHidden did exactly that —
+// menu_bar=false showed up in the real config).
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "prox-tui-test-config")
+	if err != nil {
+		panic(err)
+	}
+	settingsPathFunc = func() string { return filepath.Join(dir, "config.toml") }
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func withTestSettingsPath(t *testing.T, path string) {
 	t.Helper()
 	prev := settingsPathFunc

@@ -225,6 +225,10 @@ type BaseModel struct {
 	// Mouse double-click on a requests row (plan 021 WS11 / Codex #5).
 	lastRequestClickIdx int
 	lastRequestClickAt  time.Time
+
+	// helpOffset scrolls the help overlay when its content exceeds the
+	// terminal height (renderHelp clamps; reset on open/close).
+	helpOffset int
 }
 
 // newBaseModel creates a new BaseModel with the given help configuration
@@ -777,9 +781,36 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "esc", "?", "q", "enter":
 		b.mode = ModeNormal
+		b.helpOffset = 0
 		return true
+	case "j", "down":
+		b.helpOffset++ // upper bound clamped in renderHelp
+	case "k", "up":
+		if b.helpOffset > 0 {
+			b.helpOffset--
+		}
+	case "pgdown":
+		b.helpOffset += b.helpPageStep()
+	case "pgup":
+		b.helpOffset -= b.helpPageStep()
+		if b.helpOffset < 0 {
+			b.helpOffset = 0
+		}
+	case "g", "home":
+		b.helpOffset = 0
+	case "G", "end":
+		b.helpOffset = 1 << 30 // clamped to the last page in renderHelp
 	}
 	return true
+}
+
+// helpPageStep is the scroll step for pgup/pgdn in the help overlay.
+func (b *BaseModel) helpPageStep() int {
+	step := (b.height - 4) / 2
+	if step < 1 {
+		return 1
+	}
+	return step
 }
 
 // cycleTheme advances the active theme via the same path as the Theme menu
@@ -966,6 +997,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 	case "?":
 		b.mode = ModeHelp
+		b.helpOffset = 0
 		return true, nil
 
 	case "/":
@@ -2632,6 +2664,36 @@ func (b *BaseModel) helpView() string {
 	}
 }
 
+// renderHelp renders help text inside the s.Help box, windowing the content
+// to the terminal height when it would overflow (the box is the whole frame,
+// so an over-tall box used to scroll its top sections off-screen — Phase 5
+// verification). One content row is reserved for a scroll indicator when
+// windowing; helpOffset is clamped here so height changes self-heal.
+func (b *BaseModel) renderHelp(raw string) string {
+	lines := strings.Split(raw, "\n")
+	budget := b.height - 4 // s.Help border (2) + padding (2)
+	if budget < 6 {
+		budget = 6
+	}
+	if len(lines) <= budget {
+		b.helpOffset = 0
+		return s.Help.Render(raw)
+	}
+	contentRows := budget - 1 // last row: scroll indicator
+	maxOffset := len(lines) - contentRows
+	if b.helpOffset > maxOffset {
+		b.helpOffset = maxOffset
+	}
+	end := b.helpOffset + contentRows
+	if end > len(lines) {
+		end = len(lines)
+	}
+	windowed := append([]string{}, lines[b.helpOffset:end]...)
+	windowed = append(windowed, s.Dim.Render(fmt.Sprintf("… lines %d-%d of %d (j/k scroll, esc closes) …",
+		b.helpOffset+1, end, len(lines))))
+	return s.Help.Render(strings.Join(windowed, "\n"))
+}
+
 func (b *BaseModel) helpTitle(suffix string) string {
 	title := "Prox - Process Manager"
 	if b.helpConfig.TitleSuffix != "" {
@@ -2696,10 +2758,10 @@ Mouse:
   click chip   Solo/unsolo process
   menu bar     Click cells or use v/f; ←/→ switch open menus
 
-Press any key to close help...`,
+esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Logs View]"), b.helpQuit())
 
-	return s.Help.Render(help)
+	return b.renderHelp(help)
 }
 
 // requestsHelpView renders the help overlay for requests view.
@@ -2744,10 +2806,10 @@ Mouse:
   click        Select row; double-click opens detail
   menu bar     Click cells or v/f; ←/→ between menus
 
-Press any key to close help...`,
+esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Requests View]"), b.helpQuit())
 
-	return s.Help.Render(help)
+	return b.renderHelp(help)
 }
 
 // detailHelpView renders the help overlay for request detail view.
@@ -2769,10 +2831,10 @@ View & chrome:
   ?            This help
   q/Ctrl+C     %s
 
-Press any key to close help...`,
+esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Request Detail]"), b.helpQuit())
 
-	return s.Help.Render(help)
+	return b.renderHelp(help)
 }
 
 // containsIgnoreCase performs a case-insensitive substring search

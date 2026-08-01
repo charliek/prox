@@ -817,7 +817,8 @@ func TestClientModel_HelpConfigFromOptions(t *testing.T) {
 		QuitMessage: "Quit (stops all processes)",
 	}}
 	m := NewClientModel(&stubTUIClient{}, opts)
-	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	// Tall frame: renderHelp windows over-tall content (WS11 scrollable help).
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 80})
 	m = nm.(ClientModel)
 	m.mode = ModeHelp
 

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -228,6 +229,9 @@ func TestMenu_FOpensFilterDropdownWhenBarVisible(t *testing.T) {
 }
 
 func TestMenu_FNoOpWhenMenuBarHidden(t *testing.T) {
+	dir := t.TempDir()
+	withTestSettingsPath(t, filepath.Join(dir, "config.toml"))
+
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('m'))

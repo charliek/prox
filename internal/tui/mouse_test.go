@@ -318,6 +318,8 @@ func TestMouse_IgnoredInTextInputModes(t *testing.T) {
 
 func TestHelpView_NoDeadBindings(t *testing.T) {
 	m := newTestModel()
+	// Large frame so renderHelp shows every section without windowing.
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 80})
 	logs := m.logsHelpView()
 	assert.Contains(t, logs, "Copy")
 	assert.Contains(t, logs, "  y            Copy")
