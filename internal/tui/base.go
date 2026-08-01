@@ -785,6 +785,7 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	case "esc", "?", "q", "enter":
 		b.mode = ModeNormal
 		b.helpOffset = 0
+		b.clearRequestClickTracker()
 		return true
 	case "j", "down":
 		b.helpOffset++
@@ -1038,6 +1039,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "?":
 		b.mode = ModeHelp
 		b.helpOffset = 0
+		b.clearRequestClickTracker()
 		return true, nil
 
 	case "/":

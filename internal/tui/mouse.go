@@ -16,6 +16,12 @@ const (
 	mouseDoubleClickWindow = 500 * time.Millisecond
 )
 
+// clearRequestClickTracker disarms the manual requests double-click detector
+// (plan 022 §2 — wheel, menu capture, help open/dismiss clear; free motion preserves).
+func (b *BaseModel) clearRequestClickTracker() {
+	b.lastRequestClickIdx = -1
+}
+
 // handleContentMouse routes non-menu mouse input after handleMenuMouse. Returns
 // whether the event was consumed and an optional command (requests paging).
 // Call only in ModeNormal with menu closed — handleMenuMouse consumes wheel
@@ -26,6 +32,7 @@ func (m *ClientModel) handleContentMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	}
 
 	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		m.clearRequestClickTracker()
 		dir := wheelScrollRows
 		if msg.Button == tea.MouseButtonWheelUp {
 			dir = -dir

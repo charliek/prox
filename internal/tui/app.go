@@ -79,10 +79,14 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 		model.projectName = resolveProjectName(opts.ProjectName)
 	}
 
-	// WithMouseCellMotion enables menu and content mouse routing (WS11).
+	// WithMouseAllMotion (?1003) enables free-motion menu hover (plan 022 WS2,
+	// strix parity). Motion floods input at cell rate: hover handlers stay O(1)
+	// and mutate only on effective change, so the renderer's identical-frame
+	// skip suppresses tty writes. Documented fallback if real terminals suffer:
+	// toggle mouse only while a menu is open, then drag-only.
 	// viewport.MouseWheelEnabled is false on the model so bubbles does not
 	// double-scroll wheel events (Codex #5).
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	ctx, cancel := context.WithCancel(context.Background())
 
