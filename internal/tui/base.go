@@ -165,6 +165,10 @@ type BaseModel struct {
 	// translate through these spans so 1-entry==1-row is no longer assumed.
 	logRowSpans map[int64]logRowSpan
 
+	// logMeta caches ingest-time level + JSON shape per DisplaySeq (plan 021 WS7).
+	// Pruned in appendLogEntry when the ring drops entries (Codex #11).
+	logMeta map[int64]logMeta
+
 	// Request detail view
 	selectedRequestID string
 	requestDetail     *RequestDetailData
@@ -336,9 +340,25 @@ func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
 	// field and is left untouched (D7).
 	b.logSeq++
 	entry.DisplaySeq = b.logSeq
+
+	if b.logMeta == nil {
+		b.logMeta = make(map[int64]logMeta)
+	}
+	level, hasLevel := classifyLevel(entry.Line)
+	b.logMeta[entry.DisplaySeq] = logMeta{
+		level:    level,
+		hasLevel: hasLevel,
+		isJSON:   isJSONObject(entry.Line),
+	}
+
 	b.logEntries = append(b.logEntries, entry)
 	// Keep only last entries - create new slice to release memory from old entries
 	if len(b.logEntries) > maxLogEntries {
+		// Drop meta for evicted entries before the slice copy (Codex #11).
+		drop := b.logEntries[:len(b.logEntries)-maxLogEntries]
+		for _, e := range drop {
+			delete(b.logMeta, e.DisplaySeq)
+		}
 		newEntries := make([]domain.LogEntry, maxLogEntries)
 		copy(newEntries, b.logEntries[len(b.logEntries)-maxLogEntries:])
 		b.logEntries = newEntries
