@@ -7,6 +7,7 @@ import (
 
 	"github.com/charliek/prox/internal/domain"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -183,4 +184,60 @@ func TestHelpModalRect_WidthClamp(t *testing.T) {
 
 	_, _, w150, _ := helpModalRect(150, 40, 10)
 	assert.Equal(t, 100, w150, "70% of 150 is 105 → clamped down to 100")
+}
+
+// TestHelp_DrawnBoxMatchesGeometry (T2) pins help modal render honesty:
+// every drawn row's ansi.StringWidth == geometry W, row count == geometry H,
+// and all four rounded-border corner glyphs are present. Asserts dimensions
+// only — not exact border-row content (C10 splices a title into the top
+// border). Plan 023 A2 / B2.
+func TestHelp_DrawnBoxMatchesGeometry(t *testing.T) {
+	cases := []struct {
+		name    string
+		w, h    int
+		corners bool // bordered box expected (outer W >= 3)
+	}{
+		{name: "90x26", w: 90, h: 26, corners: true},
+		{name: "90x30", w: 90, h: 30, corners: true},
+		{name: "120x60", w: 120, h: 60, corners: true},
+		// frameW=8 → helpModalRect W=4 (< 6 chrome): drop side padding, keep
+		// border. Height must clear the full bordered box so corners survive
+		// the rows[:h] clamp (the regression T2 exists to catch).
+		{name: "tiny-degraded", w: 8, h: 40, corners: true},
+		// frameW=5/6 → W=1/2 (< 3): borderless rung. Geometry must stay
+		// honest (row count == H incl. the 2+2 vertical chrome); no corners.
+		{name: "borderless-w1", w: 5, h: 40},
+		{name: "borderless-w2", w: 6, h: 40},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel()
+			m = clientUpdate(m, tea.WindowSizeMsg{Width: tc.w, Height: tc.h})
+			m = clientUpdate(m, keyRune('?'))
+			require.Equal(t, ModeHelp, m.mode)
+
+			geo := m.helpModalGeometry()
+			rows, _, _ := m.helpModalBoxRows()
+			require.NotEmpty(t, rows)
+			assert.Equal(t, geo.H, len(rows), "row count must equal geometry H")
+			assert.LessOrEqual(t, geo.W, tc.w, "box must never exceed frame width")
+			if tc.name == "tiny-degraded" {
+				assert.Less(t, geo.W, helpModalHorizChrome,
+					"tiny-frame case should exercise degraded chrome")
+			}
+
+			var joined strings.Builder
+			for i, row := range rows {
+				assert.Equal(t, geo.W, ansi.StringWidth(row),
+					"row %d width must equal geometry W", i)
+				joined.WriteString(row)
+			}
+			if tc.corners {
+				box := joined.String()
+				for _, corner := range []string{"╭", "╮", "╰", "╯"} {
+					assert.Contains(t, box, corner, "corner %s must be present", corner)
+				}
+			}
+		})
+	}
 }

@@ -26,6 +26,8 @@ const (
 	helpModalFrameChrome = 4
 
 	// helpModalHorizChrome is border L/R (2) + padding L/R (4) — s.Help too.
+	// When the outer box is narrower than this, helpHorizChrome degrades:
+	// drop side padding first, then the border (plan 023 A2).
 	helpModalHorizChrome = 6
 )
 
@@ -97,10 +99,24 @@ func wrapHelpLines(raw string, width int) []string {
 	return out
 }
 
-// helpInnerWidth is the content width inside a box of outer width boxW
-// (s.Help border + Padding(1, 2)).
+// helpHorizChrome is the horizontal chrome for an outer box of width boxW.
+// Full chrome is border+side-padding (6). Below that: border only when at
+// least one content column remains (≥3), else none — never claim more
+// chrome than fits (plan 023 A2 degraded).
+func helpHorizChrome(boxW int) int {
+	switch {
+	case boxW >= helpModalHorizChrome:
+		return helpModalHorizChrome
+	case boxW >= 3:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// helpInnerWidth is the content width inside a box of outer width boxW.
 func helpInnerWidth(boxW int) int {
-	w := boxW - helpModalHorizChrome
+	w := boxW - helpHorizChrome(boxW)
 	if w < 1 {
 		return 1
 	}
@@ -282,8 +298,8 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 			end = len(body)
 		}
 		visible = append(visible, body[offset:end]...)
-		visible = append(visible, s.Dim.Render(fmt.Sprintf(
-			"… lines %d-%d of %d (j/k scroll) …", offset+1, end, len(body))))
+		visible = append(visible, ansi.Cut(s.Dim.Render(fmt.Sprintf(
+			"… lines %d-%d of %d (j/k scroll) …", offset+1, end, len(body))), 0, innerW))
 	}
 
 	// Truncate title/footer to inner width so the bordered box stays uniform.
@@ -295,7 +311,27 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 	parts = append(parts, visible...)
 	parts = append(parts, footer)
 
-	box := s.Help.Width(innerW).Render(strings.Join(parts, "\n"))
+	// lipgloss Width(n) is padding-INCLUSIVE; border is added after. Passing
+	// content width shrinks the drawn box by 4 (B2). For outer w with full
+	// chrome, Width(w-2) yields outer w. Degraded: drop side padding, then
+	// the border — never render wider than the frame (padFrameRow clamps).
+	// The borderless rung keeps Padding(2,0): helpModalFrameChrome budgets
+	// 2+2 vertical chrome regardless of the horizontal ladder.
+	style := s.Help
+	widthArg := w - 2
+	switch {
+	case w >= helpModalHorizChrome:
+		// Full Padding(1, 2) + border.
+	case w >= 3:
+		style = style.Padding(1, 0)
+	default:
+		style = style.Padding(2, 0).UnsetBorderStyle()
+		widthArg = w
+	}
+	if widthArg < 1 {
+		widthArg = 1
+	}
+	box := style.Width(widthArg).Render(strings.Join(parts, "\n"))
 	rows = strings.Split(box, "\n")
 	// Degenerate clamp: never exceed the rect height/width.
 	if len(rows) > h {

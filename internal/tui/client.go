@@ -466,10 +466,17 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleKey processes keyboard input.
-// Key routing order (plan 022 WS4, pinned): open-menu capture (with ?→help
-// special case) → text/help modes → client actions (q/r/Enter) → menu openers
-// + normal navigation. Text modes consume ? as text; ModeHelp captures all keys.
+// Key routing order (plan 023 A3): ctrl+c quit (before every capture layer) →
+// open-menu capture (with ?→help special case) → text/help modes → client
+// actions (q/r/Enter) → menu openers + normal navigation. Text modes consume ?
+// as text. ModeHelp captures all keys except ctrl+c; q closes help without
+// quitting.
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Global quit before open-menu capture and mode dispatch (plan 023 A3 / B3).
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+
 	// 1. Open-menu capture: every key consumed, never re-dispatched.
 	if m.menuOpen() {
 		return m, m.handleMenuKey(msg)
@@ -490,7 +497,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 3. Client actions.
 	switch msg.String() {
-	case "q", "ctrl+c":
+	case "q":
 		return m, tea.Quit
 
 	case "r":

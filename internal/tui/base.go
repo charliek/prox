@@ -787,9 +787,11 @@ func (b *BaseModel) setRequestsFilterQuery(q string) {
 	}
 }
 
-// handleHelpKey handles keys in help mode. ModeHelp captures ALL keys: scroll
-// keys scroll; esc/?/q/enter close; anything else is swallowed (plan 022 WS4).
-// Intentional divergence from strix (dismiss-on-any-key): ours stays scrollable.
+// handleHelpKey handles keys in help mode. ModeHelp captures all keys except
+// ctrl+c (which quits globally before mode dispatch — plan 023 A3): scroll
+// keys scroll; esc/?/q/enter close; anything else is swallowed. q closes help
+// without quitting. Intentional divergence from strix (dismiss-on-any-key):
+// ours stays scrollable.
 func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "esc", "?", "q", "enter":

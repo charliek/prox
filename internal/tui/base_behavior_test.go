@@ -43,6 +43,66 @@ func TestTUI_HandleKey_Quit(t *testing.T) {
 	_ = newModel
 }
 
+// TestCtrlC_QuitsFromAllCaptureStates (T6) pins ctrl+c as a global quit that
+// fires before every capture layer: mode dispatch (help/search/filter) and
+// open-menu key capture (plan 023 A3 / B3). q keeps per-mode behavior.
+func TestCtrlC_QuitsFromAllCaptureStates(t *testing.T) {
+	ctrlC := tea.KeyMsg{Type: tea.KeyCtrlC}
+
+	assertQuits := func(t *testing.T, m ClientModel) {
+		t.Helper()
+		_, cmd := clientUpdateModel(m, ctrlC)
+		assert.Equal(t, tea.QuitMsg{}, runCmdWithin(t, cmd))
+	}
+
+	t.Run("Normal", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		require.Equal(t, ModeNormal, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("Help", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('?'))
+		require.Equal(t, ModeHelp, m.mode)
+		assertQuits(t, m)
+
+		// q closes help without quitting (per-mode behavior preserved).
+		m = newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('?'))
+		m, cmd := clientUpdateModel(m, keyRune('q'))
+		assert.Equal(t, ModeNormal, m.mode)
+		assert.Nil(t, cmd, "q in help must not quit")
+	})
+
+	t.Run("Search", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('/'))
+		require.Equal(t, ModeSearch, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("StringFilter", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('s'))
+		require.Equal(t, ModeStringFilter, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("OpenDropdown", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('v'))
+		require.True(t, m.menuOpen())
+		assertQuits(t, m)
+	})
+}
+
 func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 	model := newTestModel()
 
