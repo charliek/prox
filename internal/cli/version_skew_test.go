@@ -55,8 +55,91 @@ func TestRecoverFromVersionSkew_BusyLists(t *testing.T) {
 	assert.Contains(t, msg, "/projects/a")
 	assert.Contains(t, msg, "/projects/b")
 	assert.Equal(t, 1, strings.Count(msg, "/projects/a\n"), "duplicate route dir must be listed once")
-	assert.Contains(t, msg, "prox proxy stop --force")
+	assert.Contains(t, msg, "prox down")
 	assert.Contains(t, msg, "prox up")
+	assert.NotContains(t, msg, "--force")
+	assert.NotContains(t, msg, "prox restart")
+}
+
+// TestVersionSkewFatalError_PhasedRemediation pins the D3 fix for F3: the old
+// text told the user to run `prox up` on a project that is, by construction,
+// still running (always fails with "prox is already running"), suggested a
+// bare `prox restart` that cobra rejects (ExactArgs(1)), and raced the
+// daemon's own ~5s empty-registry auto-shutdown via `--force`. The remediation
+// must instead be phased — stop every project, THEN check/stop the daemon,
+// THEN start every project — so no step can run against a daemon or project
+// left in the wrong state by an earlier step.
+func TestVersionSkewFatalError_PhasedRemediation(t *testing.T) {
+	vme := &proxyd.VersionMismatchError{DaemonVersion: "0.1.2", ClientVersion: "0.2.0"}
+
+	t.Run("project list", func(t *testing.T) {
+		routes := []proxyd.RouteInfo{route("/projects/a"), route("/projects/b")}
+		msg := versionSkewFatalError(vme, routes).Error()
+
+		// Version numbers are preserved.
+		assert.Contains(t, msg, "0.1.2")
+		assert.Contains(t, msg, "0.2.0")
+
+		// The unwinnable defects (F3) must be gone.
+		assert.NotContains(t, msg, "--force", "no --force: stopping projects first removes the self-heal race")
+		assert.NotContains(t, msg, "prox restart", "bare 'prox restart' fails cobra's ExactArgs(1)")
+
+		// Every registered dir must appear in both the stop phase and the start
+		// phase (not just once, anywhere in the message).
+		stopA := strings.Index(msg, "cd /projects/a && prox down")
+		stopB := strings.Index(msg, "cd /projects/b && prox down")
+		startA := strings.Index(msg, "cd /projects/a && prox up")
+		startB := strings.Index(msg, "cd /projects/b && prox up")
+		require.True(t, stopA >= 0, "stop phase must mention /projects/a")
+		require.True(t, stopB >= 0, "stop phase must mention /projects/b")
+		require.True(t, startA >= 0, "start phase must mention /projects/a")
+		require.True(t, startB >= 0, "start phase must mention /projects/b")
+
+		// Ordering, not mere containment: every stop must precede the daemon
+		// check, which must precede every start. Containment alone would have
+		// passed the old broken (unordered, per-project down/up) text too.
+		daemonCheck := strings.Index(msg, "prox proxy status")
+		require.True(t, daemonCheck >= 0, "message must include a daemon-status check between the phases")
+		assert.Less(t, stopA, daemonCheck, "stop phase must precede the daemon check")
+		assert.Less(t, stopB, daemonCheck, "stop phase must precede the daemon check")
+		assert.Less(t, daemonCheck, startA, "daemon check must precede the start phase")
+		assert.Less(t, daemonCheck, startB, "daemon check must precede the start phase")
+
+		// The wording must tolerate the daemon already being gone (it races its
+		// own ~5s empty-registry auto-shutdown) rather than reading as an error.
+		assert.Contains(t, msg, "not running", "expected outcome of the daemon check must be stated")
+	})
+
+	t.Run("nil dirs degrades to generic phased remediation", func(t *testing.T) {
+		msg := versionSkewFatalError(vme, nil).Error()
+
+		assert.Contains(t, msg, "0.1.2")
+		assert.Contains(t, msg, "0.2.0")
+		assert.NotContains(t, msg, "--force")
+		assert.NotContains(t, msg, "prox restart")
+
+		stop := strings.Index(msg, "prox down")
+		daemonCheck := strings.Index(msg, "prox proxy status")
+		start := strings.Index(msg, "prox up")
+		require.True(t, stop >= 0, "generic remediation must still mention prox down")
+		require.True(t, daemonCheck >= 0, "generic remediation must still include a daemon-status check")
+		require.True(t, start >= 0, "generic remediation must still mention prox up")
+		assert.Less(t, stop, daemonCheck, "stop step must precede the daemon check")
+		assert.Less(t, daemonCheck, start, "daemon check must precede the start step")
+		assert.Contains(t, msg, "not running", "expected outcome of the daemon check must be stated")
+	})
+
+	t.Run("empty (non-nil) dirs behaves the same as nil", func(t *testing.T) {
+		// dedupeProjectDirs can also yield an empty-but-non-nil slice (routes
+		// present but all with empty ProjectDir, e.g. a very old daemon) — must
+		// not panic and must degrade identically to the nil case.
+		routes := []proxyd.RouteInfo{{ProjectDir: ""}, {ProjectDir: ""}}
+		require.NotPanics(t, func() {
+			msg := versionSkewFatalError(vme, routes).Error()
+			assert.Contains(t, msg, "prox down")
+			assert.Contains(t, msg, "prox up")
+		})
+	})
 }
 
 // TestRecoverFromVersionSkew_IdleHealSuccess pins the happy heal path: an idle
@@ -156,7 +239,10 @@ func TestRecoverFromVersionSkew_ProbeTimeoutFatal(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "0.1.2")
-	assert.Contains(t, err.Error(), "prox proxy stop --force")
+	assert.Contains(t, err.Error(), "prox down")
+	assert.Contains(t, err.Error(), "prox up")
+	assert.NotContains(t, err.Error(), "--force")
+	assert.NotContains(t, err.Error(), "prox restart")
 	assert.NotContains(t, err.Error(), "registered project", "no project list when status is unknown")
 }
 
