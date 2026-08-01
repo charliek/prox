@@ -80,8 +80,20 @@ func NewClientWithToken(baseURL, token string) *Client {
 
 // GetStatus gets supervisor status
 func (c *Client) GetStatus() (*api.StatusResponse, error) {
+	return c.GetStatusWithContext(context.Background())
+}
+
+// GetStatusWithContext is GetStatus with a caller-supplied context, following
+// the same pattern as GetLogs/GetProxyRequests. The ownership probe on the
+// discovery path (plan 020 C3) needs it: that probe runs before EVERY client
+// command and must be bounded by constants.OwnershipProbeTimeout, not by the
+// 30s httpClient timeout, so a wedged listener on the recorded port cannot hang
+// the CLI. Sharing the Client (and therefore its token) with the real request
+// that follows is deliberate — a 401 here guarantees a 401 there, which is why
+// the probe passes auth failures through instead of refusing.
+func (c *Client) GetStatusWithContext(ctx context.Context) (*api.StatusResponse, error) {
 	var resp api.StatusResponse
-	if err := c.get("/api/v1/status", &resp); err != nil {
+	if err := c.getCtx(ctx, "/api/v1/status", &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

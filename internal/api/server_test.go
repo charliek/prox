@@ -52,7 +52,7 @@ func TestCorsMiddleware_LocalhostOrigins(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	for _, tt := range tests {
@@ -84,7 +84,7 @@ func TestCorsMiddleware_OptionsRequest(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	req := httptest.NewRequest("OPTIONS", "/api/v1/status", nil)
@@ -108,7 +108,7 @@ func TestAuthMiddleware_Disabled(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	// Auth disabled
 	server := NewServer(ServerConfig{
@@ -134,7 +134,7 @@ func TestAuthMiddleware_Enabled_MissingHeader(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host:        "127.0.0.1",
@@ -161,7 +161,7 @@ func TestAuthMiddleware_Enabled_InvalidFormat(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host:        "127.0.0.1",
@@ -202,7 +202,7 @@ func TestAuthMiddleware_Enabled_InvalidToken(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host:        "127.0.0.1",
@@ -230,7 +230,7 @@ func TestAuthMiddleware_Enabled_ValidToken(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host:        "127.0.0.1",
@@ -257,7 +257,7 @@ func TestAuthMiddleware_HealthEndpointNoAuth(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host:        "127.0.0.1",
@@ -285,7 +285,7 @@ func TestServerAddr(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host: "127.0.0.1",
@@ -304,7 +304,7 @@ func TestServerStartShutdown(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	// Use port 0 to get a random available port
 	server := NewServer(ServerConfig{
@@ -349,7 +349,7 @@ func TestServerShutdown_NilServer(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	server := NewServer(ServerConfig{
 		Host: "127.0.0.1",
@@ -472,7 +472,7 @@ func TestSSEStreamSurvivesTimeoutBoundary(t *testing.T) {
 
 	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100, SubscriptionBuffer: 10})
 	defer logMgr.Close()
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	r := chi.NewRouter()
 	r.Group(func(r chi.Router) {
@@ -545,7 +545,7 @@ func TestRegisterRoutes_RoutingSmoke(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	cases := []struct {
@@ -586,7 +586,7 @@ func TestShutdownRouteInLifecycleGroup(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	// Probe the deadline the router grants /shutdown. NOTE: probeRouter is a
@@ -637,7 +637,7 @@ func TestShutdownRoute_WaitedResponseThroughRealRouter(t *testing.T) {
 			{Name: "web", Err: fmt.Errorf("%w: web", domain.ErrProcessGroupNotReaped)},
 		},
 	})
-	handlers := NewHandlers(sup, logMgr, "test.yaml", fake)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", fake)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	rec := httptest.NewRecorder()

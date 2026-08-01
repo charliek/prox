@@ -2,8 +2,16 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
 
 	"github.com/charliek/prox/internal/config"
 	"github.com/charliek/prox/internal/constants"
@@ -82,7 +90,7 @@ func needsAPIDiscovery(cmd *cobra.Command) bool {
 
 // clientCommands is the discovery allowlist: the commands that talk to the
 // daemon API via apiAddr and therefore need the address discovered from
-// .prox/prox.state (or the config file) when --addr is not given. Every
+// .prox/prox.state when --addr is not given. Every
 // command whose handler calls NewClient with apiAddr MUST be listed here, or
 // it silently talks to the :5555 default and breaks against dynamic-port
 // daemons (the default) — the exact bug 'start' had (#41) and 'requests' had
@@ -128,7 +136,7 @@ var versionCmd = &cobra.Command{
 func init() {
 	// Persistent flags available to all subcommands
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", constants.DefaultConfigFile, "Config file")
-	rootCmd.PersistentFlags().StringVar(&apiAddr, "addr", constants.DefaultAPIAddress, "API address for remote commands (used only when passed explicitly; otherwise discovered from .prox/prox.state or the config file)")
+	rootCmd.PersistentFlags().StringVar(&apiAddr, "addr", constants.DefaultAPIAddress, "API address for remote commands (used only when passed explicitly, which also skips the project-ownership check; otherwise discovered from .prox/prox.state)")
 	rootCmd.PersistentFlags().BoolVarP(&detach, "detach", "d", false, "Run in background (daemon mode)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 
@@ -139,58 +147,286 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
-// loadAPIAddrFromConfig attempts to read the API address from the config file.
-// Returns empty string if config doesn't exist or can't be read.
-func loadAPIAddrFromConfig() string {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return "" // Config doesn't exist or is invalid, use default
-	}
-
-	host := cfg.API.Host
-	if host == "" {
-		host = constants.DefaultAPIHost
-	}
-	port := cfg.API.Port
-	if port == 0 {
-		return "" // Port is dynamic, must discover from state file
-	}
-
-	return fmt.Sprintf("http://%s:%d", host, port)
-}
-
-// errNoRunningInstance is returned by discoverAPIAddress when neither the
-// state file nor the config file yields an API address and the caller did
-// not pass --addr explicitly. There is deliberately no silent fallback to
-// constants.DefaultAPIAddress here (see D3 in the hardening plan): dialing
-// the compiled-in :5555 default against a dynamic-port daemon silently talks
-// to nothing, or worse, to an unrelated daemon.
+// errNoRunningInstance is returned by discoverAPIAddress when this directory
+// has no .prox/prox.state and the caller did not pass --addr explicitly. There
+// is deliberately no silent fallback to constants.DefaultAPIAddress here (see
+// D3 in the hardening plan): dialing the compiled-in :5555 default against a
+// dynamic-port daemon silently talks to nothing, or worse, to an unrelated
+// daemon.
+//
+// The config file is deliberately NOT a second discovery source (plan 020 C3).
+// `prox up` writes .prox/prox.state (a FATAL step) strictly before it binds the
+// API listener, so a listening daemon always has a state file; the old
+// api.port-from-prox.yaml fallback could therefore only ever fire when the
+// state file had been deleted out from under a running prox — a case --addr
+// already answers — and it was inert for dynamic ports (the default) anyway.
+// Removing it also removes the only route by which the CLIENT's own --config
+// resolution could feed the ownership decision below.
 var errNoRunningInstance = fmt.Errorf(
 	"no running prox instance found in this directory (no .prox/prox.state); run from the project directory, or pass --addr",
 )
 
-// discoverAPIAddress attempts to discover the API address.
-// Priority:
-// 1. State file (.prox/prox.state) - for running instances
-// 2. Config file (prox.yaml) - for a configured (non-dynamic) port
-// It returns an error if neither source yields an address; callers must not
-// fall back to constants.DefaultAPIAddress implicitly.
+// discoverAPIAddress resolves the API address from this directory's
+// .prox/prox.state -- the single authoritative discovery source -- and then
+// VERIFIES that the prox answering there belongs to this project before
+// returning it (plan 020 C3).
+//
+// The verification is not paranoia: two projects that pin the same api.port,
+// or one stale state file left by a dead daemon whose port has since been
+// reused, previously made `prox status` report another project's processes and
+// `prox down` stop another project's daemon. Confirmed destructive.
+//
+// It returns an error whenever it cannot positively establish ownership;
+// callers must not fall back to constants.DefaultAPIAddress implicitly.
 func discoverAPIAddress() (string, error) {
-	// First, try to load from state file
 	cwd, err := os.Getwd()
-	if err == nil {
-		state, err := daemon.LoadState(cwd)
-		if err == nil {
-			return fmt.Sprintf("http://%s:%d", state.Host, state.Port), nil
+	if err != nil {
+		return "", fmt.Errorf("cannot determine the current directory to find a running prox: %w", err)
+	}
+
+	state, err := daemon.LoadState(cwd)
+	if err != nil {
+		return "", errNoRunningInstance
+	}
+
+	// net.JoinHostPort, not fmt.Sprintf("%s:%d"): an IPv6 host (api.host: "::1")
+	// must be bracketed or the URL parses as garbage ("http://::1:5552").
+	hostPort := net.JoinHostPort(state.Host, strconv.Itoa(state.Port))
+	addr := "http://" + hostPort
+
+	if err := verifyProjectOwnership(addr, hostPort, cwd, state); err != nil {
+		return "", err
+	}
+	return addr, nil
+}
+
+// verifyProjectOwnership probes GET /status at addr and decides whether the
+// responder is this project's prox. Identity is the PROJECT DIRECTORY, compared
+// with os.SameFile.
+//
+// Why the project directory and not the config file: two project roots can
+// legitimately share one config (`prox up -c ../shared/prox.yaml`), and a
+// config-path comparison would then declare each the owner of the other -- the
+// exact cross-project control this function exists to prevent. It would also
+// falsely refuse in the common cases where the two paths merely differ in FORM:
+// a symlinked project root, `-c $(pwd)/prox.yaml` vs a bare `prox status`,
+// prox.yml vs prox.yaml.
+//
+// Why os.SameFile and not string comparison: SameFile compares device+inode, so
+// /tmp vs /private/tmp on Darwin, a symlinked root, and every other path-form
+// difference collapse in one call. String comparison would falsely refuse for
+// all of them -- and a false refusal here locks a user out of their own project.
+//
+// Failure policy is per-cause rather than blanket fail-closed; see the branches
+// below. In particular an auth failure PASSES THROUGH: the probe and the real
+// request that follows share one Client and one token, so a 401 here guarantees
+// a 401 there, and refusing would only replace a precise UNAUTHORIZED with a
+// vague "could not verify owner".
+func verifyProjectOwnership(addr, hostPort, cwd string, state *daemon.State) error {
+	ctx, cancel := context.WithTimeout(context.Background(), constants.OwnershipProbeTimeout)
+	defer cancel()
+
+	status, err := NewClient(addr).GetStatusWithContext(ctx)
+	if err != nil {
+		return classifyOwnershipProbeFailure(err, hostPort, state)
+	}
+
+	// Require a POSITIVE prox marker. json.Unmarshal ignores unknown fields and
+	// tolerates missing ones, so an unrelated service answering `{}` (or any
+	// other JSON object) decodes cleanly into an all-zero StatusResponse.
+	// api_version is non-omitempty in the wire format, so every real prox sends
+	// it and its absence means "not a prox".
+	if status.APIVersion == "" {
+		return errNotAProx(hostPort)
+	}
+
+	// Authoritative check.
+	if status.ProjectDir != "" {
+		if samePath(status.ProjectDir, cwd) {
+			return nil
 		}
+		// A reported project directory that no longer EXISTS proves nothing:
+		// the overwhelmingly likely cause is that this very project was renamed
+		// or moved while its daemon kept running (the state file travels with
+		// the directory, so it is still discovered here, but the daemon still
+		// reports the path it started in). samePath would then fall back to a
+		// string comparison and refuse -- locking the owner out of their own
+		// running daemon, including out of `prox down`.
+		//
+		// So: absent evidence, do not refuse. This mirrors the rule one branch
+		// below for a config file deleted out from under a live prox. A genuine
+		// FOREIGN project is a live project, and a live project's directory
+		// exists -- which is exactly the case samePath already decided above.
+		if _, err := os.Stat(status.ProjectDir); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr,
+				"Warning: the prox on %s reports project directory %s, which no longer exists (renamed or moved?); cannot verify it belongs to this project\n",
+				hostPort, status.ProjectDir)
+			return nil
+		}
+		return errOwnedByAnotherProject(
+			fmt.Sprintf("A prox for %s is listening on %s.", status.ProjectDir, hostPort),
+			"Run commands from that directory, or target it deliberately with", addr)
 	}
 
-	// Fall back to config file
-	if addr := loadAPIAddrFromConfig(); addr != "" {
-		return addr, nil
+	// Older daemon with no project_dir: compare config paths. BOTH sides here
+	// were written by daemons (the responder's own -c, and the -c recorded in
+	// the state file THIS directory's daemon wrote), never by this client's
+	// --config resolution, so a form divergence between them is impossible and
+	// the comparison cannot false-refuse on `-c`/symlink/prox.yml differences.
+	if status.ConfigFile != "" && state.ConfigFile != "" {
+		if samePath(status.ConfigFile, state.ConfigFile) {
+			return nil
+		}
+		return errOwnedByAnotherProject(
+			fmt.Sprintf("A prox using config %s is listening on %s.", status.ConfigFile, hostPort),
+			"Run commands from that project's directory, or target it deliberately with", addr)
 	}
 
-	return "", errNoRunningInstance
+	// Neither identity field: an older daemon that reports nothing to match on.
+	// ALLOW, loudly. Refusing here would lock a user out of a daemon they could
+	// then no longer stop -- exactly mid-upgrade, when it is least welcome.
+	fmt.Fprintf(os.Stderr,
+		"Warning: the prox on %s reports no project identity (older version); cannot verify it belongs to this project\n",
+		hostPort)
+	return nil
+}
+
+// classifyOwnershipProbeFailure maps a failed /status probe to a policy. The
+// causes are deliberately NOT collapsed into one blanket refusal: which of them
+// occurred changes both what is safe to do and what the user must be told.
+func classifyOwnershipProbeFailure(err error, hostPort string, state *daemon.State) error {
+	// Answered with an HTTP error status.
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden {
+			// PASS THROUGH, so the real request produces the authoritative auth
+			// error instead of a vague "could not verify owner". Auth is off for
+			// loopback binds, so this only fires when the user enabled auth or
+			// bound a non-local host -- typically with a ~/.prox/token another
+			// project's `prox up` overwrote (that file is one global slot).
+			//
+			// Safety rests on the real request carrying the SAME credentials, so
+			// a rejection here means a rejection there too. Note it is the same
+			// token, not the same *Client: the probe and the command each build
+			// their own client, both reading that one token file moments apart
+			// (codex review finding -- the original comment overclaimed).
+			//
+			// Residual, accepted: a 401 body carries no api_version, so this
+			// branch cannot confirm the responder is a prox at all. Acting on an
+			// unverified responder is bounded -- reaching a destructive outcome
+			// would need an unrelated service on exactly this port that both
+			// 401s /api/v1/status AND implements a prox lifecycle endpoint
+			// compatibly. Anything short of that fails the real request too.
+			return nil
+		}
+		// Any other status: something is there, but it does not behave like a
+		// prox's /status.
+		return errNotAProx(hostPort)
+	}
+
+	// Accepted the connection but never (fully) answered: a wedged or
+	// blackholed listener. FAIL CLOSED -- we learned nothing about who owns it.
+	if isProbeTimeout(err) {
+		return fmt.Errorf(
+			"could not verify which project owns %s (timed out).\nTarget it deliberately with\n  --addr http://%s",
+			hostPort, hostPort)
+	}
+
+	// Answered, but with something that is not a status payload.
+	if isDecodeFailure(err) {
+		return errNotAProx(hostPort)
+	}
+
+	// Nothing is listening (connection refused, no route, ...). The state file
+	// is stale: its daemon is gone and nothing took the port. This is the only
+	// branch that reports the ordinary "not running" outcome, and it does so
+	// instead of surfacing a raw dial error.
+	if isUnreachable(err) {
+		hint := ""
+		if state.PID > 0 && !daemon.IsProcessAlive(state.PID, 0) {
+			// A liveness HINT only: State carries no start-time token, so this
+			// cannot detect PID reuse and is never used to skip the probe.
+			hint = fmt.Sprintf(" (pid %d is gone)", state.PID)
+		}
+		return fmt.Errorf(
+			"no running prox instance found in this directory: .prox/prox.state points at %s%s, but nothing is listening there.\nStart it with 'prox up', or pass --addr to target a prox elsewhere",
+			hostPort, hint)
+	}
+
+	// Unclassifiable: fail closed rather than act on an unverified daemon.
+	return fmt.Errorf(
+		"could not verify which project owns %s: %w.\nTarget it deliberately with\n  --addr http://%s",
+		hostPort, err, hostPort)
+}
+
+// errNotAProx is deliberately distinct from the "no running prox instance"
+// wording: telling a user their prox is not running, when in fact an unrelated
+// service has taken the port, sends them off debugging the wrong thing.
+func errNotAProx(hostPort string) error {
+	return fmt.Errorf(
+		"something is listening on %s but it is not a prox for this project.\n.prox/prox.state is stale or another service took the port; stop that service and run 'prox up', or pass --addr to target a prox elsewhere",
+		hostPort)
+}
+
+// errOwnedByAnotherProject names the owner AND a copy-pasteable escape hatch.
+// Naming the owner is the point: "prox is not running" alone, while another
+// project's daemon sits on the recorded port, is actively misleading.
+func errOwnedByAnotherProject(ownerLine, escapeLead, addr string) error {
+	return fmt.Errorf("prox is not running for this project.\n%s\n%s\n  --addr %s", ownerLine, escapeLead, addr)
+}
+
+// samePath reports whether a and b name the same filesystem object, by
+// device+inode. It falls back to comparing cleaned absolute paths only when a
+// Stat fails -- a config file deleted while its prox still runs must not make
+// that healthy daemon uncontrollable.
+func samePath(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr == nil && berr == nil {
+		return os.SameFile(ai, bi)
+	}
+	return cleanAbs(a) == cleanAbs(b)
+}
+
+func cleanAbs(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return filepath.Clean(p)
+}
+
+// isProbeTimeout reports whether err ended the probe at its deadline rather
+// than by a refused/failed connection.
+func isProbeTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// isDecodeFailure reports whether err came from parsing the response body
+// rather than from reaching the server. Checked BEFORE isUnreachable because a
+// body that is empty or truncated surfaces as io.EOF / io.ErrUnexpectedEOF,
+// which must read as "responded, but not a prox", not "nothing is listening".
+func isDecodeFailure(err error) bool {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	return errors.As(err, &syntaxErr) ||
+		errors.As(err, &typeErr) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// isUnreachable reports whether err came from the transport (dial refused, DNS,
+// reset, ...). http.Client.Do wraps every such failure in *url.Error.
+func isUnreachable(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // getProcessNames returns the names that are valid targets for start/stop/restart

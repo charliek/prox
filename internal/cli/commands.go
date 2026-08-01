@@ -453,7 +453,18 @@ func runStop(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		cwd = "" // daemon.LoadState falls back to os.Getwd internally
 	}
-	return runFullStop(client, cwd, stopStateWaitTimeout)
+	stateWait := stopStateWaitTimeout
+	if apiAddrExplicitlySet {
+		// --addr deliberately targets a daemon that need not be this
+		// directory's, so this directory's state/PID files say nothing about
+		// ITS teardown -- and when this directory has its own (possibly stale)
+		// state file, waiting on it turns a clean remote stop into a 15s hang
+		// and a bogus "shutdown incomplete" exit 1. That is precisely the path
+		// the ownership refusal in root.go sends people down, so it must not
+		// be a trap. 0 skips the local-exit confirmation (see runFullStop).
+		stateWait = 0
+	}
+	return runFullStop(client, cwd, stateWait)
 }
 
 // runFullStop performs a waited full daemon stop and maps the outcome to the CLI
@@ -469,7 +480,9 @@ func runStop(cmd *cobra.Command, args []string) error {
 //     daemon's own teardown was never confirmed, so this joins the
 //     survivors-branch error family instead of the exit-0 old-daemon branch.
 //     stateWaitTimeout is a parameter so tests can inject a short bound and
-//     exercise the poll-timeout branch.
+//     exercise the poll-timeout branch. A stateWaitTimeout of 0 skips the
+//     local-exit confirmation entirely, for callers (explicit --addr) whose
+//     target daemon is not this directory's.
 func runFullStop(client *Client, cwd string, stateWaitTimeout time.Duration) error {
 	result, err := client.Shutdown(true)
 	if err != nil {
@@ -495,7 +508,7 @@ func runFullStop(client *Client, cwd string, stateWaitTimeout time.Duration) err
 
 	// Clean process-stop verdict. Confirm the daemon itself has exited by waiting
 	// (bounded) for the state + PID files to disappear.
-	if waitForDaemonExit(cwd, stateWaitTimeout) {
+	if stateWaitTimeout <= 0 || waitForDaemonExit(cwd, stateWaitTimeout) {
 		fmt.Println("Stopped prox")
 		return nil
 	}
@@ -632,33 +645,20 @@ Examples:
 }
 
 func runAttach(cmd *cobra.Command, args []string) error {
-	// Get working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get working directory: %w", err)
-	}
-
-	// Check if daemon is running
-	state, err := daemon.GetRunningState(cwd)
-	if err != nil {
-		if err == daemon.ErrNotRunning {
-			return fmt.Errorf("prox is not running\nStart it with 'prox up -d' first")
-		}
-		return fmt.Errorf("failed to get daemon state: %w", err)
-	}
-
-	// Use discovered API address or explicitly set one
-	addr := apiAddr
-	if !apiAddrExplicitlySet {
-		addr = fmt.Sprintf("http://%s:%d", state.Host, state.Port)
-	}
-
-	// Create client
-	client := NewClient(addr)
+	// apiAddr is authoritative here, exactly as it is for every other client
+	// command: the root PersistentPreRunE hook has already either left an
+	// explicitly-passed --addr untouched, or resolved the address from
+	// .prox/prox.state AND verified the prox answering there belongs to this
+	// project (attach is in the clientCommands allowlist).
+	//
+	// Attach used to re-derive all of that itself via daemon.GetRunningState,
+	// and returned "prox is not running" BEFORE it ever consulted
+	// apiAddrExplicitlySet -- which broke --addr, the documented escape hatch,
+	// for the one command most likely to want it (plan 020 C3 part D).
+	client := NewClient(apiAddr)
 
 	// Verify connection
-	_, err = client.GetStatus()
-	if err != nil {
+	if _, err := client.GetStatus(); err != nil {
 		return clientError(err, "Is prox running? Try 'prox up -d' first.")
 	}
 

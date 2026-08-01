@@ -385,8 +385,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	// Create API handlers and server. The handlers get the absolute config path
-	// so GET /status reports the same file the reload path re-reads (#33, D3).
-	handlers := api.NewHandlers(sup, logMgr, absConfigPath, coordinator)
+	// so GET /status reports the same file the reload path re-reads (#33, D3),
+	// and cwd -- the SAME directory state.Write used above -- so GET /status
+	// reports this daemon's project identity and a client can tell whether the
+	// prox answering on a discovered port is its own (plan 020 C3).
+	handlers := api.NewHandlers(sup, logMgr, absConfigPath, cwd, coordinator)
 
 	// The proxy runtime is the single source of truth for the proxy path (D5):
 	// it feeds the `prox status` proxy block via the handlers, receives forwarder

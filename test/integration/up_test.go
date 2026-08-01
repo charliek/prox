@@ -258,10 +258,18 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	if exit2 != 0 && exit2 != 1 {
 		t.Errorf("second prox stop exited %d, want 0 or 1\noutput:\n%s", exit2, out2)
 	}
+	// "no running prox instance" is the outcome when the second stop lands
+	// after the daemon finished tearing down and removed .prox/prox.state.
+	// Before plan 020 C3 this window produced "connection refused" instead:
+	// discovery fell back to the config file's pinned api.port and dialed a
+	// dead address. With that fallback gone (the state file is the single
+	// discovery source), the same window is now reported as what it actually
+	// is. Both are correct "the daemon is already gone" outcomes.
 	recognized := strings.Contains(out2, "Stopped") ||
 		strings.Contains(out2, "Shutdown initiated") ||
 		strings.Contains(out2, "outcome unknown") ||
 		strings.Contains(out2, "not running") ||
+		strings.Contains(out2, "no running prox instance") ||
 		strings.Contains(out2, "connection refused")
 	if !recognized {
 		t.Errorf("second prox stop produced an unrecognized outcome (exit %d):\n%s", exit2, out2)

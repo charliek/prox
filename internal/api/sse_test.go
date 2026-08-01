@@ -35,7 +35,7 @@ func TestStreamLogs_Headers(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	// Create a request with a context that can be canceled
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,7 +87,7 @@ func TestStreamLogs_FilterParsing(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	tests := []struct {
 		name        string
@@ -141,7 +141,7 @@ func TestStreamLogs_DataFormat(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest("GET", "/api/v1/logs/stream", nil).WithContext(ctx)
@@ -246,7 +246,7 @@ func TestStreamLogs_Handshake(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest("GET", "/api/v1/logs/stream", nil).WithContext(ctx)
@@ -295,7 +295,7 @@ func TestStreamLogs_InvalidPattern(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	// Invalid regex pattern
 	req := httptest.NewRequest("GET", "/api/v1/logs/stream?pattern=[invalid&regex=true", nil)
@@ -350,7 +350,7 @@ func TestStreamLogs_NoFlusher_ReturnsJSONError(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 
 	req := httptest.NewRequest("GET", "/api/v1/logs/stream", nil)
 	w := &noFlushWriter{}
@@ -447,7 +447,7 @@ func TestStreamLogs_Heartbeat(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 	handlers.sseHeartbeatInterval = 20 * time.Millisecond
 
 	srv := httptest.NewServer(http.HandlerFunc(handlers.StreamLogs))
@@ -492,7 +492,7 @@ func TestStreamLogs_ClientDisconnect_ReturnsHandler(t *testing.T) {
 	})
 	defer logMgr.Close()
 
-	handlers := NewHandlers(nil, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(nil, logMgr, "test.yaml", "", nil)
 	handlers.sseHeartbeatInterval = 10 * time.Millisecond
 
 	done := make(chan struct{})

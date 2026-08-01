@@ -28,7 +28,19 @@ type StatusResponse struct {
 	Status        string `json:"status"`
 	UptimeSeconds int64  `json:"uptime_seconds"`
 	ConfigFile    string `json:"config_file,omitempty"`
-	APIVersion    string `json:"api_version"`
+	// ProjectDir is the daemon's project directory: the directory it was
+	// started in, and the one whose .prox/prox.state it wrote (plan 020 C3).
+	// It is the IDENTITY a client checks before acting on an address it
+	// discovered from a state file — "does the prox answering on this port
+	// belong to the project I am standing in?". The project directory, not the
+	// config file, is the right basis: two project roots can legitimately share
+	// one config (`prox up -c ../shared/prox.yaml`), and a config-path
+	// comparison would then let each control the other.
+	//
+	// Additive and omitempty, so an older daemon simply omits it and clients
+	// fall back to comparing config paths.
+	ProjectDir string `json:"project_dir,omitempty"`
+	APIVersion string `json:"api_version"`
 	// Proxy reports shared-proxy health (D5). Present whenever a
 	// ProxyStatusProvider was injected (the normal `prox up` path); omitted only
 	// where none is set (e.g. unit-test handlers), so those consumers see no

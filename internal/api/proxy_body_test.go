@@ -48,7 +48,7 @@ func newBodyTestHandlers(t *testing.T) (*Handlers, *proxy.RequestManager, string
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	rm := proxy.NewRequestManager(100)
 	handlers.SetRequestManager(rm)
@@ -288,7 +288,7 @@ func TestGetProxyRequest_ReplicaBodyWindowEvicted(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// The shared-mode replica: no capture manager, since it owns no files.
 	total := constants.ProxyRequestDetailWindow + 1
