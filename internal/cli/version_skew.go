@@ -191,14 +191,36 @@ func versionSkewFatalError(vme *proxyd.VersionMismatchError, routes []proxyd.Rou
 			fmt.Fprintf(&b, "\n  - %s", d)
 		}
 	}
-	b.WriteString("\n\nTo resolve, stop the shared proxy, then restart each project on this version:")
-	b.WriteString("\n  prox proxy stop --force")
+	// Phased deliberately: all the project shutdowns, THEN the daemon, THEN the
+	// restarts. Interleaving down/up per project cannot work -- the first
+	// project's new-version `prox up` would run while the other old-version
+	// projects are still registered, hit the old daemon, and fail this same
+	// skew check again. Stopping every project first also removes the need for
+	// `prox proxy stop --force` and the ~15s self-heal race that made the old
+	// instructions unwinnable (constants.ForwarderHealAfterDown).
+	b.WriteString("\n\nTo resolve, stop every affected project, then restart them on this version:")
 	if len(dirs) > 0 {
+		b.WriteString("\n\n  1. Stop each project:")
 		for _, d := range dirs {
-			fmt.Fprintf(&b, "\n  (cd %s && prox up)   # or: prox restart", d)
+			fmt.Fprintf(&b, "\n       (cd %s && prox down)", d)
 		}
 	} else {
-		b.WriteString("\n  then run 'prox up' (or 'prox restart') in each affected project")
+		b.WriteString("\n\n  1. Stop each affected project:  prox down  (run in each project directory)")
+	}
+	// The daemon schedules its own shutdown shortly after the registry empties
+	// (proxyd.Server), so "already gone" is the EXPECTED outcome of step 2, not
+	// a failure -- the wording has to say so or the user will think something
+	// went wrong.
+	b.WriteString("\n  2. Confirm the shared proxy has exited:")
+	b.WriteString("\n       prox proxy status     # expect: not running (it may already have exited on its own)")
+	b.WriteString("\n     If it is still up:  prox proxy stop")
+	if len(dirs) > 0 {
+		b.WriteString("\n  3. Restart each project:")
+		for _, d := range dirs {
+			fmt.Fprintf(&b, "\n       (cd %s && prox up)", d)
+		}
+	} else {
+		b.WriteString("\n  3. Restart each project:  prox up  (run in each project directory)")
 	}
 	return errors.New(b.String())
 }

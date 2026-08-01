@@ -93,7 +93,7 @@ func setupProcessStreamServer(t *testing.T) (*Handlers, *supervisor.Supervisor, 
 	_, err := sup.Start(context.Background())
 	require.NoError(t, err)
 
-	handlers := NewHandlers(sup, logMgr, "test.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "test.yaml", "", nil)
 
 	cleanup := func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

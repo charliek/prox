@@ -16,9 +16,7 @@ processes:
 ## Full Example
 
 ```yaml
-api:
-  port: 5555
-  host: 127.0.0.1
+# api: { port: 5555 }   # optional: pin the API port; omit for a dynamic one
 
 env_file: .env
 

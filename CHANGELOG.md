@@ -34,6 +34,55 @@ every feature, key binding, and fix lands in both at once.
   state color so it can't be swallowed or recolored. A process with no
   healthcheck (or one still reporting `unknown`) renders exactly as before.
 
+### Fixed
+
+- **A prox command can no longer control a *different* project's prox** (plan
+  020). Commands discovered a running prox from `.prox/prox.state`, or failing
+  that from `api.port` in the local `prox.yaml`, and then trusted whatever was
+  listening there. With two projects on the same `api.port` — or one stale
+  state file whose port had since been taken — `prox status` reported another
+  project's processes as yours and `prox down` stopped another project
+  outright. Every client command now verifies that the prox answering owns
+  *this* project before acting, and refuses by name when it does not:
+
+  ```
+  Error: prox is not running for this project.
+  A prox for /Users/you/projects/other is listening on 127.0.0.1:5552.
+  Run commands from that directory, or target it deliberately with
+    --addr http://127.0.0.1:5552
+  ```
+
+  Identity is the project directory, compared by device+inode, so symlinked
+  roots, `/tmp` vs `/private/tmp`, a custom `-c`, and `prox.yml` vs
+  `prox.yaml` all still resolve to "yes, that's yours". Git worktrees of one
+  repo are correctly treated as separate projects — they are separate
+  directories running potentially different code — with no VCS knowledge in
+  prox. `--addr` bypasses the check entirely for deliberate cross-directory
+  work, and now genuinely does so for `prox attach`, which previously failed
+  before it ever consulted the flag.
+- **The examples no longer teach a pinned `api.port`** (plan 020). `api.port`
+  is dynamic by default and that is the safe mode, but four shipped examples
+  presented a pinned `api: {port: 5555}` block as the baseline shape of a
+  `prox.yaml` — so copied configs, including agent-authored ones, collided on
+  one port. This is the root cause of the cross-project bug above. **This
+  repo's own `prox.yaml` no longer pins the port either**, so its dev API port
+  is now dynamic; use `prox status` to see the actual port.
+- **Foreground `prox up` no longer swallows the reason a process crashed**
+  (plan 020). Logs were subscribed after the supervisor had already started
+  the processes, so a process that died instantly — a typo in `cmd:`, a
+  missing binary — could emit its error before anything was listening, leaving
+  the banner and then silence. The subscription is now established before any
+  process starts. (Foreground `prox up` still does not exit on its own when
+  every process is dead; that is tracked separately.)
+- **The version-skew message's instructions now work when followed** (plan
+  020). On a shared-daemon version mismatch, prox told you to run
+  `prox proxy stop --force` and then `prox up` in each project — but `prox up`
+  fails there ("already running"), bare `prox restart` requires a process
+  name, and the still-running old projects resurrected an old daemon within
+  ~15s, so the retry hit the same error. The instructions are now phased —
+  stop every project, confirm the proxy has exited, then restart them — which
+  also removes the need for `--force` and the resurrection race entirely.
+
 ### Changed
 
 - **`prox up --tui` runs the same API-client TUI as `prox attach`** (plan

@@ -14,9 +14,6 @@ const (
 	// DefaultAPIHost is the default host for the API server
 	DefaultAPIHost = "127.0.0.1"
 
-	// DefaultAPIPort is the default port for the API server
-	DefaultAPIPort = 5555
-
 	// DefaultAPIAddress is the default API address for client connections
 	DefaultAPIAddress = "http://127.0.0.1:5555"
 
@@ -71,6 +68,24 @@ const (
 	// DaemonHealthProbeTimeout bounds a single /health probe used while polling
 	// for an old daemon's socket to stop answering during a version-skew heal.
 	DaemonHealthProbeTimeout = 1 * time.Second
+
+	// OwnershipProbeTimeout bounds the GET /api/v1/status probe every client
+	// command issues against the address discovered from .prox/prox.state, to
+	// verify the daemon answering there actually belongs to THIS project
+	// (plan 020 C3). It sits on the hot path of every `prox status`/`stop`/
+	// `logs`/... invocation, so it must stay short: the 30s Client.httpClient
+	// timeout and the 11m LifecycleTimeoutCeiling would both turn a wedged or
+	// blackholed listener on the recorded port into a hang.
+	//
+	// A healthy loopback daemon answers in ~5ms (measured), so this is three
+	// orders of magnitude of slack. It is deliberately NOT tighter: exceeding
+	// the deadline fails CLOSED, so an over-tight bound turns a merely slow
+	// daemon into a false refusal -- and a false refusal locks a user out of
+	// their own project, which is worse than the bug this check fixes. /status
+	// is not identity-only (it takes supervisor/dependency locks and may probe
+	// shared-proxy health), so a loaded machine, a stalled filesystem or a
+	// debugger-attached daemon can legitimately be slow (codex review finding).
+	OwnershipProbeTimeout = 5 * time.Second
 
 	// DaemonProxyProbeTimeout bounds the live /health probe `prox status` issues
 	// against the shared daemon to report proxy health (D5). Short so a downed

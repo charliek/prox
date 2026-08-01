@@ -11,12 +11,23 @@ prox <command> [options]
 | Flag | Description |
 |------|-------------|
 | `--config, -c` | Config file path (default: `prox.yaml`) |
-| `--addr` | API address for client commands. Used only when passed explicitly; otherwise auto-discovered from `.prox/prox.state` (or `prox.yaml` for a pinned `api.port`) |
+| `--addr` | API address for client commands. Used only when passed explicitly (which also skips the project-ownership check); otherwise auto-discovered from `.prox/prox.state` |
 | `--detach, -d` | Run in background (daemon mode) |
 | `--verbose, -v` | Enable verbose output |
 | `--version` | Show version information |
 
-**No implicit `:5555` fallback.** Client commands (`status`, `logs`, `stop`, `start`, `restart`, `down`, `attach`, `requests`) discover the running instance from `.prox/prox.state` in the current directory. If no state file (or configured port) is found and `--addr` was not passed explicitly, the command errors instead of silently dialing the compiled-in `127.0.0.1:5555` default — run the command from the project directory, or pass `--addr host:port`. `version`, `up`, `proxy`, and `completion` are unaffected (they never need discovery).
+**No implicit `:5555` fallback.** Client commands (`status`, `logs`, `stop`, `start`, `restart`, `down`, `attach`, `requests`) discover the running instance from `.prox/prox.state` in the current directory — the single discovery source. A pinned `api.port` in `prox.yaml` is **not** a fallback: `prox up` always writes the state file before it binds the API listener, so a running instance always has one. If no state file is found and `--addr` was not passed explicitly, the command errors instead of silently dialing the compiled-in `127.0.0.1:5555` default — run the command from the project directory, or pass `--addr host:port`. `version`, `up`, `proxy`, and `completion` are unaffected (they never need discovery).
+
+**Ownership check.** Before acting on a discovered address, client commands probe `GET /api/v1/status` (5s budget) and confirm the responding daemon's project directory is the directory you are standing in (compared by device+inode, so symlinked roots and `/tmp` vs `/private/tmp` match). Without this, a stale `.prox/prox.state` — or two projects pinning the same `api.port` — let `prox status` report another project's processes and `prox down` stop another project's daemon. If another project owns the port, prox refuses and names it:
+
+```
+Error: prox is not running for this project.
+A prox for /Users/you/projects/other is listening on 127.0.0.1:5552.
+Run commands from that directory, or target it deliberately with
+  --addr http://127.0.0.1:5552
+```
+
+An explicit `--addr` skips both discovery and this check — it is the deliberate "I know what I'm targeting" escape hatch. A daemon too old to report its project directory is compared by config path instead, and one reporting neither identity is allowed through with a warning rather than locking you out mid-upgrade.
 
 ## Commands
 

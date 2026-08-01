@@ -258,10 +258,18 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	if exit2 != 0 && exit2 != 1 {
 		t.Errorf("second prox stop exited %d, want 0 or 1\noutput:\n%s", exit2, out2)
 	}
+	// "no running prox instance" is the outcome when the second stop lands
+	// after the daemon finished tearing down and removed .prox/prox.state.
+	// Before plan 020 C3 this window produced "connection refused" instead:
+	// discovery fell back to the config file's pinned api.port and dialed a
+	// dead address. With that fallback gone (the state file is the single
+	// discovery source), the same window is now reported as what it actually
+	// is. Both are correct "the daemon is already gone" outcomes.
 	recognized := strings.Contains(out2, "Stopped") ||
 		strings.Contains(out2, "Shutdown initiated") ||
 		strings.Contains(out2, "outcome unknown") ||
 		strings.Contains(out2, "not running") ||
+		strings.Contains(out2, "no running prox instance") ||
 		strings.Contains(out2, "connection refused")
 	if !recognized {
 		t.Errorf("second prox stop produced an unrecognized outcome (exit %d):\n%s", exit2, out2)
@@ -392,6 +400,79 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "failed to start") {
 		t.Errorf("expected failure diagnostics mentioning 'failed to start', got:\n%s", out)
+	}
+}
+
+// TestUpCommand_InstantCrashLogsAlwaysVisible is a regression test for F2 (plan
+// 020 C1): a process that crashes immediately after `prox up` starts it (a
+// typo'd cmd, a missing binary) must have its crash reason land in the
+// terminal output EVERY time, not intermittently.
+//
+// Before the fix, the terminal log printer subscribed to the log manager
+// inside a goroutine started well after sup.Start()/StartProcesses()
+// (`go printLogs(logMgr)`, with printLogs calling Subscribe as its first
+// line) -- racing the crashed process's log line. The process here (a bad
+// binary run via `sh -c`) crashes almost instantly and is never restarted (a
+// crashed process just sits crashed, there is no backoff loop that would
+// eventually paper over a lost first line), so whether the line was lost came
+// down to goroutine-scheduling luck at that single moment: roughly half the
+// time the subscription did not exist yet and the line was silently dropped
+// from the terminal (though still recoverable via `prox logs`).
+//
+// This loops N>=20 real, separate `prox up` invocations -- the race is a
+// once-per-invocation window, not something repeated restarts inside one
+// process would exercise -- and asserts the crash reason appears in EVERY
+// one. A single-shot version of this test passes against the old code
+// roughly half the time and proves nothing (verified manually: see the C1
+// commit report).
+func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	const iterations = 20
+	const addr = "http://127.0.0.1:15558"
+	const marker = "exited unexpectedly"
+
+	for i := range iterations {
+		prox := startProxWithOutput(t, binary, "up", "-c", configPath("instant_crash"))
+
+		// Backstop the orderly shutdown below: startProxWithOutput registers no
+		// cleanup of its own, and waitForAPI/t.Fatalf can abandon the loop before
+		// stopProx runs, stranding a child that holds port 15558 and poisons every
+		// later test (codex review finding). Kill is a no-op once the process has
+		// already exited normally.
+		t.Cleanup(func() {
+			if prox.cmd.Process != nil {
+				_ = prox.cmd.Process.Kill()
+			}
+		})
+
+		// Confirms the daemon itself came up; the process crash happens
+		// concurrently with (just after) supervisor start, so this does not run
+		// past the window we're testing.
+		waitForAPI(t, addr, 10*time.Second)
+
+		// Give the crashed process's log line a short, bounded window to reach
+		// the terminal. Bounded deliberately short: ghost is never restarted, so
+		// nothing will ever produce the line later -- if it isn't here within the
+		// window, it was lost.
+		deadline := time.Now().Add(3 * time.Second)
+		out := prox.Output()
+		for time.Now().Before(deadline) && !strings.Contains(out, marker) {
+			time.Sleep(20 * time.Millisecond)
+			out = prox.Output()
+		}
+
+		// Shut down before asserting, so a failed iteration doesn't leak the
+		// daemon (and its port) into the next one.
+		_ = stopProx(t, addr)
+		if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+			t.Logf("iteration %d: prox up did not exit cleanly: %v", i, err)
+		}
+
+		if !strings.Contains(out, marker) || !strings.Contains(out, "ghost") {
+			t.Fatalf("iteration %d: crash reason missing from terminal output; wanted \"ghost\" + %q, got:\n%s", i, marker, out)
+		}
 	}
 }
 

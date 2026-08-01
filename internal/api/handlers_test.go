@@ -39,7 +39,7 @@ func setupTestServer(t *testing.T) (*Server, *supervisor.Supervisor, *logs.Manag
 	_, err := sup.Start(ctx)
 	require.NoError(t, err)
 
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 	server := NewServer(ServerConfig{Host: "127.0.0.1", Port: 0}, handlers)
 
 	cleanup := func() {
@@ -207,7 +207,7 @@ func TestGetLogs(t *testing.T) {
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
 
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	t.Run("get all logs", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/logs", nil)
@@ -290,7 +290,7 @@ func TestGetLogs_MaxLinesLimit(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Request a huge number of lines
 	req := httptest.NewRequest("GET", "/api/v1/logs?lines=999999999", nil)
@@ -311,7 +311,7 @@ func TestGetLogs_InvalidLinesParameter(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Request with invalid lines value - should use default
 	req := httptest.NewRequest("GET", "/api/v1/logs?lines=invalid", nil)
@@ -331,7 +331,7 @@ func TestGetLogs_NegativeLinesParameter(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Request with negative lines value - should use default
 	req := httptest.NewRequest("GET", "/api/v1/logs?lines=-1", nil)
@@ -351,7 +351,7 @@ func TestGetLogs_InvalidRegexPattern(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Request with invalid regex pattern
 	req := httptest.NewRequest("GET", "/api/v1/logs?pattern=[invalid&regex=true", nil)
@@ -388,7 +388,7 @@ func TestGetLogs_SinceSeq(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=5", nil)
 	w := httptest.NewRecorder()
@@ -434,7 +434,7 @@ func TestGetLogs_SinceSeq_RolledBuffer(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=1", nil)
 	w := httptest.NewRecorder()
@@ -463,7 +463,7 @@ func TestGetLogs_SinceSeq_ParseError(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	req := httptest.NewRequest("GET", "/api/v1/logs?since_seq=not-a-number", nil)
 	w := httptest.NewRecorder()
@@ -611,7 +611,7 @@ func TestGetProxyRequests(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Create request manager and add some test requests
 	rm := proxy.NewRequestManager(100)
@@ -820,7 +820,7 @@ func TestGetProxyRequests_CursorGone(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	// Capacity 2: recording a third record evicts "r1" from the ring.
 	rm := proxy.NewRequestManager(2)
@@ -865,7 +865,7 @@ func TestGetProxyRequests_ProxyNotEnabled(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 	// Don't set request manager to simulate proxy not enabled
 
 	req := httptest.NewRequest("GET", "/api/v1/proxy/requests", nil)
@@ -890,7 +890,7 @@ func TestStreamProxyRequests(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	rm := proxy.NewRequestManager(100)
 	handlers.SetRequestManager(rm)
@@ -1140,7 +1140,7 @@ func TestStreamProxyRequests_Heartbeat(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 	handlers.sseHeartbeatInterval = 20 * time.Millisecond
 
 	rm := proxy.NewRequestManager(100)
@@ -1192,7 +1192,7 @@ func TestStreamProxyRequests_ClientDisconnect_ReturnsHandler(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 	handlers.sseHeartbeatInterval = 10 * time.Millisecond
 
 	rm := proxy.NewRequestManager(100)
@@ -1226,7 +1226,7 @@ func TestStreamProxyRequests_ProxyNotEnabled(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 	// Don't set request manager
 
 	req := httptest.NewRequest("GET", "/api/v1/proxy/requests/stream", nil)
@@ -1251,7 +1251,7 @@ func TestGetProxyRequest(t *testing.T) {
 		Processes: map[string]config.ProcessConfig{},
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supervisor.DefaultSupervisorConfig())
-	handlers := NewHandlers(sup, logMgr, "prox.yaml", nil)
+	handlers := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 
 	rm := proxy.NewRequestManager(100)
 	handlers.SetRequestManager(rm)
@@ -1323,7 +1323,7 @@ func TestGetProxyRequest(t *testing.T) {
 	})
 
 	t.Run("returns 503 when proxy not enabled", func(t *testing.T) {
-		h := NewHandlers(sup, logMgr, "prox.yaml", nil)
+		h := NewHandlers(sup, logMgr, "prox.yaml", "", nil)
 		// Don't set request manager
 
 		req := httptest.NewRequest("GET", "/api/v1/proxy/requests/abc1234", nil)
@@ -1535,7 +1535,7 @@ func (f *fakeShutdownController) complete(outcome *domain.ProcessStopError) {
 func TestShutdownHandler_WaitClean(t *testing.T) {
 	fake := newFakeShutdownController()
 	fake.complete(nil) // clean verdict already latched
-	h := NewHandlers(nil, nil, "prox.yaml", fake)
+	h := NewHandlers(nil, nil, "prox.yaml", "", fake)
 
 	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
 	w := httptest.NewRecorder()
@@ -1558,7 +1558,7 @@ func TestShutdownHandler_WaitFailures(t *testing.T) {
 			{Name: "web", Err: fmt.Errorf("%w: web", domain.ErrProcessGroupNotReaped)},
 		},
 	})
-	h := NewHandlers(nil, nil, "prox.yaml", fake)
+	h := NewHandlers(nil, nil, "prox.yaml", "", fake)
 
 	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
 	w := httptest.NewRecorder()
@@ -1580,7 +1580,7 @@ func TestShutdownHandler_WaitFailures(t *testing.T) {
 // the verdict lands, the handler returns without writing a body.
 func TestShutdownHandler_WaitClientGone(t *testing.T) {
 	fake := newFakeShutdownController() // never completed
-	h := NewHandlers(nil, nil, "prox.yaml", fake)
+	h := NewHandlers(nil, nil, "prox.yaml", "", fake)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil).WithContext(ctx)
@@ -1607,7 +1607,7 @@ func TestShutdownHandler_WaitClientGone(t *testing.T) {
 // immediately and triggers shutdown asynchronously.
 func TestShutdownHandler_LegacyAsync(t *testing.T) {
 	fake := newFakeShutdownController()
-	h := NewHandlers(nil, nil, "prox.yaml", fake)
+	h := NewHandlers(nil, nil, "prox.yaml", "", fake)
 
 	req := httptest.NewRequest("POST", "/api/v1/shutdown", nil)
 	w := httptest.NewRecorder()
@@ -1625,7 +1625,7 @@ func TestShutdownHandler_LegacyAsync(t *testing.T) {
 // TestShutdownHandler_NilControllerAcks: a handler with no coordinator wired
 // still acks (used by tests that never exercise the shutdown path).
 func TestShutdownHandler_NilControllerAcks(t *testing.T) {
-	h := NewHandlers(nil, nil, "prox.yaml", nil)
+	h := NewHandlers(nil, nil, "prox.yaml", "", nil)
 	req := httptest.NewRequest("POST", "/api/v1/shutdown?wait=true", nil)
 	w := httptest.NewRecorder()
 	h.Shutdown(w, req)

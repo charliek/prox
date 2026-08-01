@@ -44,8 +44,15 @@ type Handlers struct {
 	requestManager *proxy.RequestManager
 	captureManager *proxy.CaptureManager
 	configFile     string
-	shutdown       ShutdownController
-	proxyStatus    ProxyStatusProvider
+	// projectDir is the daemon's project directory -- the SAME cwd it wrote
+	// .prox/prox.state into (internal/cli/up.go). GET /status reports it so a
+	// client can verify the daemon answering on a discovered address belongs to
+	// the project the client is standing in (plan 020 C3). Empty is allowed
+	// (unit-test handlers): the field is then omitted and clients degrade to
+	// the config-path comparison.
+	projectDir  string
+	shutdown    ShutdownController
+	proxyStatus ProxyStatusProvider
 
 	// sseHeartbeatInterval overrides constants.SSEHeartbeatInterval for the SSE
 	// handlers (StreamLogs, StreamProxyRequests, StreamProcesses). Zero means
@@ -90,12 +97,15 @@ func (h *Handlers) processStreamDebounce() time.Duration {
 }
 
 // NewHandlers creates new HTTP handlers. shutdown may be nil in tests that never
-// exercise POST /shutdown; the handler guards against it.
-func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile string, shutdown ShutdownController) *Handlers {
+// exercise POST /shutdown; the handler guards against it. projectDir must be the
+// same directory the daemon wrote .prox/prox.state into (plan 020 C3); "" is
+// tolerated and simply omits project_dir from GET /status.
+func NewHandlers(sup *supervisor.Supervisor, logMgr *logs.Manager, configFile, projectDir string, shutdown ShutdownController) *Handlers {
 	return &Handlers{
 		supervisor:                    sup,
 		logManager:                    logMgr,
 		configFile:                    configFile,
+		projectDir:                    projectDir,
 		shutdown:                      shutdown,
 		processStreamDebounceInterval: processStreamDebounceDefault,
 	}
@@ -135,6 +145,7 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 		Status:        status.State,
 		UptimeSeconds: status.UptimeSeconds(),
 		ConfigFile:    h.configFile,
+		ProjectDir:    h.projectDir,
 		APIVersion:    "v1",
 	}
 	if h.proxyStatus != nil {

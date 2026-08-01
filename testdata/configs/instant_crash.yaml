@@ -1,0 +1,7 @@
+api:
+  port: 15558  # Dedicated port for the instant-crash log-visibility regression test (plan 020 C1)
+  host: 127.0.0.1
+
+processes:
+  ghost:
+    cmd: /no/such/binary-xyz
