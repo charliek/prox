@@ -470,7 +470,11 @@ func TestDiscoverAPIAddress_VanishedProjectDirAllowed(t *testing.T) {
 		"project_dir": vanished,
 		"config_file": filepath.Join(vanished, "prox.yaml"),
 	}))
-	writeStateFile(t, dir, host, port, filepath.Join(dir, "prox.yaml"))
+	// Model an actual rename: the state file travels WITH the directory, so it
+	// still records the pre-rename config path -- the same static string the
+	// daemon keeps reporting. That agreement is what identifies the renamed
+	// owner once its project directory no longer Stats.
+	writeStateFile(t, dir, host, port, filepath.Join(vanished, "prox.yaml"))
 
 	addr, err := discoverAPIAddress()
 	if err != nil {
@@ -478,6 +482,40 @@ func TestDiscoverAPIAddress_VanishedProjectDirAllowed(t *testing.T) {
 	}
 	if want := "http://" + net.JoinHostPort(host, strconv.Itoa(port)); addr != want {
 		t.Errorf("addr = %q, want %q", addr, want)
+	}
+}
+
+// TestDiscoverAPIAddress_VanishedProjectDirForeignConfigRefused is the
+// companion guard to the test above, and closes a hole the first version of
+// that escape valve opened (CodeRabbit review finding).
+//
+// "The daemon's project directory no longer exists" does NOT by itself mean
+// the daemon is ours: a renamed project's daemon keeps running, so a THIRD
+// project whose stale state file points at its port would otherwise sail
+// through and stop it -- the destructive outcome C3 exists to prevent. When
+// the vanished-dir path is taken, the daemon-written config paths must still
+// agree.
+func TestDiscoverAPIAddress_VanishedProjectDirForeignConfigRefused(t *testing.T) {
+	dir := withTempCwd(t)
+
+	vanished := filepath.Join(t.TempDir(), "renamed-away")
+
+	host, port := startFakeDaemon(t, statusHandler(map[string]any{
+		"status":      "running",
+		"api_version": "v1",
+		"project_dir": vanished,
+		// A FOREIGN config -- not the one this directory's state file records.
+		"config_file": filepath.Join(vanished, "prox.yaml"),
+	}))
+	// This directory's state file names its OWN config.
+	writeStateFile(t, dir, host, port, filepath.Join(dir, "prox.yaml"))
+
+	addr, err := discoverAPIAddress()
+	if err == nil {
+		t.Fatalf("a vanished project dir must not license control of a foreign daemon; got addr %q", addr)
+	}
+	if !strings.Contains(err.Error(), "not running for this project") {
+		t.Errorf("expected an ownership refusal, got: %v", err)
 	}
 }
 
@@ -629,12 +667,6 @@ func TestDiscoverAPIAddress_NotAProx(t *testing.T) {
 				http.NotFound(w, r)
 			}),
 		},
-		{
-			name: "500 from an unrelated server",
-			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Error(w, "boom", http.StatusInternalServerError)
-			}),
-		},
 	}
 
 	for _, tc := range cases {
@@ -654,6 +686,30 @@ func TestDiscoverAPIAddress_NotAProx(t *testing.T) {
 				t.Errorf("must not degrade to 'no running prox instance', got: %v", err)
 			}
 		})
+	}
+}
+
+// TestDiscoverAPIAddress_ServerErrorIsNotBlamedOnASquatter pins the 5xx branch
+// (CodeRabbit review finding). A daemon that answers its own status check with
+// a 500 is far more plausibly the user's own unwell prox than an unrelated
+// service squatting the port -- so it must still fail closed, but must NOT
+// tell the user to hunt down and stop a service that does not exist.
+func TestDiscoverAPIAddress_ServerErrorIsNotBlamedOnASquatter(t *testing.T) {
+	dir := withTempCwd(t)
+	host, port := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	writeStateFile(t, dir, host, port, filepath.Join(dir, "prox.yaml"))
+
+	addr, err := discoverAPIAddress()
+	if err == nil {
+		t.Fatalf("a 500 must still fail closed, got addr %q", addr)
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") {
+		t.Errorf("error should report the status it got, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "not a prox") {
+		t.Errorf("a 500 must not be blamed on an unrelated service, got: %v", err)
 	}
 }
 

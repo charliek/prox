@@ -186,7 +186,18 @@ func discoverAPIAddress() (string, error) {
 
 	state, err := daemon.LoadState(cwd)
 	if err != nil {
-		return "", errNoRunningInstance
+		if errors.Is(err, daemon.ErrStateNotFound) {
+			return "", errNoRunningInstance
+		}
+		// The file EXISTS but could not be read or parsed -- a partial write
+		// from a crash or a full disk, say. Saying "no .prox/prox.state" here
+		// would be flatly untrue and would send the user to re-read advice
+		// they are already following (CodeRabbit review finding). It matters
+		// more now that the pinned-api.port fallback is gone: this message is
+		// the only remaining guidance for that state.
+		return "", fmt.Errorf(
+			"%s is unreadable: %w\nDelete it and run 'prox up', or pass --addr to target a running prox",
+			daemon.StatePath(cwd), err)
 	}
 
 	// net.JoinHostPort, not fmt.Sprintf("%s:%d"): an IPv6 host (api.host: "::1")
@@ -245,23 +256,39 @@ func verifyProjectOwnership(addr, hostPort, cwd string, state *daemon.State) err
 		if samePath(status.ProjectDir, cwd) {
 			return nil
 		}
-		// A reported project directory that no longer EXISTS proves nothing:
-		// the overwhelmingly likely cause is that this very project was renamed
-		// or moved while its daemon kept running (the state file travels with
-		// the directory, so it is still discovered here, but the daemon still
-		// reports the path it started in). samePath would then fall back to a
-		// string comparison and refuse -- locking the owner out of their own
-		// running daemon, including out of `prox down`.
+		// A reported project directory that no longer EXISTS is usually THIS
+		// project, renamed or moved while its daemon kept running: the state
+		// file travels with the directory (so it is still discovered here) but
+		// the daemon goes on reporting the path it started in. That path no
+		// longer Stats, so samePath degrades to a string comparison and
+		// refuses -- locking the owner out of their own live daemon, including
+		// out of `prox down`.
 		//
-		// So: absent evidence, do not refuse. This mirrors the rule one branch
-		// below for a config file deleted out from under a live prox. A genuine
-		// FOREIGN project is a live project, and a live project's directory
-		// exists -- which is exactly the case samePath already decided above.
-		if _, err := os.Stat(status.ProjectDir); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr,
-				"Warning: the prox on %s reports project directory %s, which no longer exists (renamed or moved?); cannot verify it belongs to this project\n",
-				hostPort, status.ProjectDir)
-			return nil
+		// But "the directory is gone" is NOT on its own a licence to proceed.
+		// A renamed daemon is still a running daemon, so a THIRD project whose
+		// stale state file happens to point at its port would sail through a
+		// bare allow-on-vanished-dir and stop it -- the exact destructive
+		// outcome this check exists to prevent (CodeRabbit review finding; my
+		// first cut at this branch had that hole).
+		//
+		// So fall back to the config-path rung instead of allowing outright.
+		// Both sides of that comparison are daemon-written and, for a rename,
+		// identical by construction: the state file's ConfigFile and the
+		// daemon's reported config_file are the same static pre-rename string
+		// (up.go writes absConfigPath into both). So the renamed owner still
+		// matches and is not locked out, while a foreign project -- whose own
+		// state file names its own config -- still mismatches and is refused.
+		if _, err := os.Stat(status.ProjectDir); os.IsNotExist(err) &&
+			status.ConfigFile != "" && state.ConfigFile != "" {
+			if samePath(status.ConfigFile, state.ConfigFile) {
+				fmt.Fprintf(os.Stderr,
+					"Warning: the prox on %s reports project directory %s, which no longer exists (renamed or moved?); matched it by config file instead\n",
+					hostPort, status.ProjectDir)
+				return nil
+			}
+			return errOwnedByAnotherProject(
+				fmt.Sprintf("A prox using config %s is listening on %s.", status.ConfigFile, hostPort),
+				"Run commands from that project's directory, or target it deliberately with", addr)
 		}
 		return errOwnedByAnotherProject(
 			fmt.Sprintf("A prox for %s is listening on %s.", status.ProjectDir, hostPort),
@@ -318,6 +345,17 @@ func classifyOwnershipProbeFailure(err error, hostPort string, state *daemon.Sta
 			// 401s /api/v1/status AND implements a prox lifecycle endpoint
 			// compatibly. Anything short of that fails the real request too.
 			return nil
+		}
+		// A 5xx is far more plausibly "your own prox is unwell" than "an
+		// unrelated service took the port" -- an unrelated service answering
+		// /api/v1/status at all is already unlikely, and answering it with a
+		// 500 more so. Telling that user to hunt down and stop a squatter
+		// sends them after something that does not exist (CodeRabbit review
+		// finding). Fail closed either way; only the advice differs.
+		if apiErr.Status >= http.StatusInternalServerError {
+			return fmt.Errorf(
+				"the prox on %s answered its status check with HTTP %d, so its project could not be verified.\nCheck its log (.prox/prox.log), or target it deliberately with\n  --addr http://%s",
+				hostPort, apiErr.Status, hostPort)
 		}
 		// Any other status: something is there, but it does not behave like a
 		// prox's /status.
