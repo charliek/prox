@@ -11,7 +11,6 @@ import (
 )
 
 // Settings holds TUI preferences persisted at ~/.prox/tui/config.toml.
-// View bools are loaded and round-tripped here; C4 applies them to rendering.
 type Settings struct {
 	Theme        string
 	ProcessPanel bool
@@ -39,8 +38,7 @@ func defaultSettingsPath() string {
 }
 
 // DefaultSettings returns schema defaults. Defaults preserve today's behavior:
-// the process panel shows, timestamps always render (formatLogEntry), no
-// soft-wrap — so panel/timestamps true, wrap false.
+// the process panel shows, timestamps render, no soft-wrap, menu bar on.
 func DefaultSettings() Settings {
 	return Settings{
 		ProcessPanel: true,

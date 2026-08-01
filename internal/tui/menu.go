@@ -43,9 +43,12 @@ func menuCellText(id MenuID) string {
 type MenuCommand string
 
 const (
-	MenuCmdSetLogs      MenuCommand = "set-logs"
-	MenuCmdSetRequests  MenuCommand = "set-requests"
-	MenuCmdToggleFollow MenuCommand = "toggle-follow"
+	MenuCmdSetLogs            MenuCommand = "set-logs"
+	MenuCmdSetRequests        MenuCommand = "set-requests"
+	MenuCmdToggleFollow       MenuCommand = "toggle-follow"
+	MenuCmdToggleProcessPanel MenuCommand = "toggle-process-panel"
+	MenuCmdToggleTimestamps   MenuCommand = "toggle-timestamps"
+	MenuCmdToggleWrap         MenuCommand = "toggle-wrap"
 )
 
 // MenuItem is one dropdown row. Checked/Selected are nil for plain rows;
@@ -121,18 +124,25 @@ func (b *BaseModel) menuFirstSelectable(id MenuID) int {
 }
 
 // menuItems builds rows live from state so markers never drift (WS3).
-// C3 ships only the real View rows that need no later commits (adversarial S2).
-// Filter/Theme render a single dim "(coming soon)" placeholder (C5/C8 fill them).
+// View menu final order (WS4): Logs/Requests radios, sep, Process panel /
+// Timestamps / Wrap lines / Follow checks. Filter/Theme stay placeholders
+// until C5/C8.
 func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	switch id {
 	case MenuView:
 		logsOn := b.viewMode == ViewModeLogs
 		reqsOn := b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail
+		panel := b.settings.ProcessPanel
+		timestamps := b.settings.Timestamps
+		wrap := b.settings.Wrap
 		follow := b.followMode
 		return []MenuItem{
 			{Label: "Logs", Selected: &logsOn, Cmd: MenuCmdSetLogs},
 			{Label: "Requests", Selected: &reqsOn, Cmd: MenuCmdSetRequests},
 			{Separator: true},
+			{Label: "Process panel", Checked: &panel, Cmd: MenuCmdToggleProcessPanel},
+			{Label: "Timestamps", Checked: &timestamps, Cmd: MenuCmdToggleTimestamps},
+			{Label: "Wrap lines", Checked: &wrap, Cmd: MenuCmdToggleWrap},
 			{Label: "Follow", Checked: &follow, Cmd: MenuCmdToggleFollow},
 		}
 	case MenuFilter, MenuTheme:
@@ -190,9 +200,10 @@ func (b *BaseModel) openMenuSibling(next bool) {
 
 // handleMenuKey routes keys while a dropdown is open (strix on_key_menu exactly).
 // Every key is consumed; non-nav keys close without re-dispatch (Codex #4).
-func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) {
+// Returns a command from an activated item (e.g. settings-save flash clear).
+func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) tea.Cmd {
 	if !b.menuOpen() {
-		return
+		return nil
 	}
 	id := MenuID(b.openMenu)
 	switch msg.String() {
@@ -205,27 +216,29 @@ func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) {
 	case "down", "j":
 		b.menuHighlight = b.menuStep(id, b.menuHighlight, true)
 	case "enter", " ":
-		b.activateMenuItem(id, b.menuHighlight)
+		cmd := b.activateMenuItem(id, b.menuHighlight)
 		b.closeMenu()
+		return cmd
 	default:
 		// Esc and every other key: close, consumed, never re-dispatched.
 		b.closeMenu()
 	}
+	return nil
 }
 
-func (b *BaseModel) activateMenuItem(id MenuID, item int) {
+func (b *BaseModel) activateMenuItem(id MenuID, item int) tea.Cmd {
 	items := b.menuItems(id)
 	if item < 0 || item >= len(items) {
-		return
+		return nil
 	}
 	it := items[item]
 	if it.Separator || it.Cmd == "" {
-		return
+		return nil
 	}
-	b.activateMenuCommand(it.Cmd)
+	return b.activateMenuCommand(it.Cmd)
 }
 
-func (b *BaseModel) activateMenuCommand(cmd MenuCommand) {
+func (b *BaseModel) activateMenuCommand(cmd MenuCommand) tea.Cmd {
 	switch cmd {
 	case MenuCmdSetLogs:
 		b.setViewMode(ViewModeLogs)
@@ -233,7 +246,14 @@ func (b *BaseModel) activateMenuCommand(cmd MenuCommand) {
 		b.setViewMode(ViewModeRequests)
 	case MenuCmdToggleFollow:
 		b.toggleFollow()
+	case MenuCmdToggleProcessPanel:
+		return b.toggleProcessPanel()
+	case MenuCmdToggleTimestamps:
+		return b.toggleTimestamps()
+	case MenuCmdToggleWrap:
+		return b.toggleWrap()
 	}
+	return nil
 }
 
 // toggleMenuBar flips settings.MenuBar, persists, and relayouts (Codex #8).
@@ -465,11 +485,11 @@ func (b *BaseModel) applyMenuOverlay(lines []string) []string {
 	return overlayLines(lines, boxX, boxTop, b.width, rows)
 }
 
-// handleMenuMouse handles menu-bar / dropdown clicks. Returns true when the
-// event is fully consumed. Wheel is intentionally NOT handled here (C11).
-func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) bool {
+// handleMenuMouse handles menu-bar / dropdown clicks. Returns whether the event
+// is fully consumed and an optional command from an activated item.
+func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
-		return false
+		return false, nil
 	}
 	x, y := msg.X, msg.Y
 
@@ -491,7 +511,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) bool {
 				} else {
 					b.openMenuFirst(h.ID)
 				}
-				return true
+				return true, nil
 			}
 		}
 	}
@@ -500,24 +520,25 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) bool {
 		fresh := b.menuOpen() && MenuID(b.openMenu) == d.Menu
 		if !fresh {
 			b.closeMenu()
-			return true
+			return true, nil
 		}
 		for _, row := range d.Rows {
 			if row.Rect.Contains(x, y) {
 				if row.Cmd != "" {
-					b.activateMenuCommand(row.Cmd)
+					cmd := b.activateMenuCommand(row.Cmd)
 					b.closeMenu()
+					return true, cmd
 				}
-				return true
+				return true, nil
 			}
 		}
 		// Click on dropdown padding/border: consume, stay open.
-		return true
+		return true, nil
 	}
 
 	if b.menuOpen() {
 		b.closeMenu()
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }

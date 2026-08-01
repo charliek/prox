@@ -40,6 +40,13 @@ const (
 	ViewModeRequestDetail
 )
 
+// logRowSpan is the inclusive display-row range an entry occupies in the logs
+// viewport after soft-wrap (plan 021 WS4 / Codex #2). When wrap is off,
+// First == Last (identity mapping).
+type logRowSpan struct {
+	First, Last int
+}
+
 // maxLogEntries is the maximum number of log entries to keep in memory
 const maxLogEntries = 1000
 
@@ -134,8 +141,8 @@ type BaseModel struct {
 	// statusFlash is a short-lived status-bar message (theme cycle, save errors).
 	statusFlash string
 
-	// settings are persisted at ~/.prox/tui/config.toml (WS2). View bools are
-	// round-tripped here; C4 applies them to rendering.
+	// settings are persisted at ~/.prox/tui/config.toml (WS2). View bools drive
+	// chrome (ProcessPanel/MenuBar) and log rendering (Timestamps/Wrap) — C4.
 	settings Settings
 
 	// projectName is shown in the menu bar (WS3). Set from ClientOptions or
@@ -150,6 +157,13 @@ type BaseModel struct {
 	menuHighlight int
 	menuCellHits  []menuCellHit
 	menuDropdown  *menuDropdownHit
+
+	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
+	// content. Rebuilt every updateViewport (plan 021 WS4 / Codex #2): when wrap
+	// is off the span is identity (entry i → {i,i} in filtered order); when wrap
+	// is on a long line spans multiple rows. Search origin and cursor visibility
+	// translate through these spans so 1-entry==1-row is no longer assumed.
+	logRowSpans map[int64]logRowSpan
 
 	// Request detail view
 	selectedRequestID string
@@ -745,6 +759,69 @@ func (b *BaseModel) toggleFollow() {
 	}
 }
 
+// toggleProcessPanel flips settings.ProcessPanel, persists, and relayouts
+// (viewport height changes by ±2 — plan 021 WS4 / Codex #8).
+func (b *BaseModel) toggleProcessPanel() tea.Cmd {
+	b.settings.ProcessPanel = !b.settings.ProcessPanel
+	b.relayout()
+	if err := SaveSettings(b.settings); err != nil {
+		b.statusFlash = "settings not saved: " + err.Error()
+		return statusFlashClearCmd()
+	}
+	return nil
+}
+
+// toggleTimestamps flips settings.Timestamps, persists, and re-renders (log
+// lines are cached styled strings — plan 021 WS4).
+func (b *BaseModel) toggleTimestamps() tea.Cmd {
+	b.settings.Timestamps = !b.settings.Timestamps
+	var cmd tea.Cmd
+	if err := SaveSettings(b.settings); err != nil {
+		b.statusFlash = "settings not saved: " + err.Error()
+		cmd = statusFlashClearCmd()
+	}
+	b.updateViewport()
+	return cmd
+}
+
+// toggleWrap flips settings.Wrap, persists, and re-renders with DisplaySeq
+// top-anchor preservation when not following (plan 021 WS4 / Codex #2).
+func (b *BaseModel) toggleWrap() tea.Cmd {
+	var anchorSeq int64
+	if !b.followMode && b.viewMode == ViewModeLogs {
+		anchorSeq = b.displaySeqAtYOffset(b.viewport.YOffset)
+	}
+	b.settings.Wrap = !b.settings.Wrap
+	var cmd tea.Cmd
+	if err := SaveSettings(b.settings); err != nil {
+		b.statusFlash = "settings not saved: " + err.Error()
+		cmd = statusFlashClearCmd()
+	}
+	b.updateViewport()
+	if b.viewMode == ViewModeLogs {
+		if b.followMode {
+			b.viewport.GotoBottom()
+		} else if anchorSeq != 0 {
+			if sp, ok := b.logRowSpans[anchorSeq]; ok {
+				b.viewport.SetYOffset(sp.First)
+			}
+		}
+	}
+	return cmd
+}
+
+// displaySeqAtYOffset returns the DisplaySeq of the entry whose span contains
+// display row y, or 0 when unknown (no spans / empty). Used as the wrap-toggle
+// top anchor (Codex #2).
+func (b *BaseModel) displaySeqAtYOffset(y int) int64 {
+	for seq, sp := range b.logRowSpans {
+		if y >= sp.First && y <= sp.Last {
+			return seq
+		}
+	}
+	return 0
+}
+
 // handleNavigationKey handles common navigation keys.
 // Returns whether the key was handled and an optional command.
 func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
@@ -755,6 +832,19 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "m":
 		// Toggle menu bar visibility and persist (WS3).
 		return true, b.toggleMenuBar()
+
+	case "p":
+		// Process panel visibility (WS4). Textinput modes never reach here
+		// (Codex #4 routing); verified free in discovery.
+		return true, b.toggleProcessPanel()
+
+	case "T":
+		// Timestamps in log lines (WS4). Distinct from `t` (theme cycle).
+		return true, b.toggleTimestamps()
+
+	case "w":
+		// Soft-wrap log lines (WS4 / Codex #2).
+		return true, b.toggleWrap()
 
 	case "v":
 		// Open the View menu when the bar is visible. `v` was free; Theme has
@@ -1127,7 +1217,30 @@ func (b *BaseModel) logSearchOriginIdx(entries []domain.LogEntry) int {
 	if b.followMode {
 		return n - 1
 	}
-	return clampIndex(b.viewport.YOffset, n)
+	// YOffset is a display row, not an entry index — translate through spans
+	// (Codex #2). When wrap is off spans are identity, so this matches the
+	// pre-C4 clampIndex(YOffset, n) behavior.
+	return b.entryIndexContainingRow(entries, b.viewport.YOffset)
+}
+
+// entryIndexContainingRow returns the filtered-list index of the entry whose
+// display-row span contains row. Falls back to clamping row as an entry index
+// when spans are missing (should not happen after updateViewport).
+func (b *BaseModel) entryIndexContainingRow(entries []domain.LogEntry, row int) int {
+	n := len(entries)
+	if n == 0 {
+		return 0
+	}
+	for i, e := range entries {
+		sp, ok := b.logRowSpans[e.DisplaySeq]
+		if !ok {
+			continue
+		}
+		if row >= sp.First && row <= sp.Last {
+			return i
+		}
+	}
+	return clampIndex(row, n)
 }
 
 // clampIndex clamps idx into [0, n-1] for a non-empty n (callers guard n > 0).
@@ -1207,9 +1320,10 @@ func (b *BaseModel) resolveLogCursor(entries []domain.LogEntry) {
 }
 
 // ensureLogCursorVisible scrolls the logs viewport the minimum amount needed to
-// bring the cursor row on-screen. Called ONLY from the /,n,N handlers as a
-// one-shot (mirrors ensureCursorVisible but is deliberately NOT wired into
-// updateViewport, so streaming re-renders and free j/k scroll are never yanked).
+// bring the cursor entry's display-row span on-screen. Called ONLY from the
+// /,n,N handlers as a one-shot (mirrors ensureCursorVisible but is deliberately
+// NOT wired into updateViewport, so streaming re-renders and free j/k scroll
+// are never yanked). Translates through logRowSpans (Codex #2 / adversarial B3).
 func (b *BaseModel) ensureLogCursorVisible() {
 	if b.logCursorIdx < 0 {
 		return // no-cursor sentinel (empty list or no active search)
@@ -1219,10 +1333,21 @@ func (b *BaseModel) ensureLogCursorVisible() {
 	if maxOffset := b.viewport.TotalLineCount() - b.viewport.Height; b.viewport.YOffset > maxOffset {
 		b.viewport.SetYOffset(max(0, maxOffset))
 	}
-	if b.logCursorIdx < b.viewport.YOffset {
-		b.viewport.SetYOffset(b.logCursorIdx)
-	} else if b.logCursorIdx >= b.viewport.YOffset+b.viewport.Height {
-		b.viewport.SetYOffset(b.logCursorIdx - b.viewport.Height + 1)
+	sp, ok := b.logRowSpans[b.logCursorSeq]
+	if !ok {
+		// Spans missing (should not happen after updateViewport): fall back to
+		// the pre-C4 1-entry==1-row math.
+		if b.logCursorIdx < b.viewport.YOffset {
+			b.viewport.SetYOffset(b.logCursorIdx)
+		} else if b.logCursorIdx >= b.viewport.YOffset+b.viewport.Height {
+			b.viewport.SetYOffset(b.logCursorIdx - b.viewport.Height + 1)
+		}
+		return
+	}
+	if sp.Last < b.viewport.YOffset {
+		b.viewport.SetYOffset(sp.First)
+	} else if sp.First >= b.viewport.YOffset+b.viewport.Height {
+		b.viewport.SetYOffset(sp.Last - b.viewport.Height + 1)
 	}
 }
 
@@ -1350,8 +1475,10 @@ func (b *BaseModel) updateViewport() {
 
 	switch b.viewMode {
 	case ViewModeRequestDetail:
+		b.logRowSpans = nil
 		lines = b.formatRequestDetail()
 	case ViewModeRequests:
+		b.logRowSpans = nil
 		requests := b.filteredProxyRequests()
 		// Resolve the cursor against the just-computed filtered list BEFORE
 		// formatting so the marker (baked into content below) and the scroll
@@ -1377,6 +1504,12 @@ func (b *BaseModel) updateViewport() {
 		if searching {
 			b.resolveLogCursor(entries)
 		}
+		// Rebuild DisplaySeq→row spans every render (Codex #2). Wrap is isolated
+		// so the no-wrap path stays byte-identical to pre-C4.
+		b.logRowSpans = make(map[int64]logRowSpan, len(entries))
+		row := 0
+		wrapOn := b.settings.Wrap
+		wrapWidth := b.viewport.Width
 		for i, entry := range entries {
 			line := b.formatLogEntry(entry)
 			if searching {
@@ -1386,7 +1519,25 @@ func (b *BaseModel) updateViewport() {
 				}
 				line = marker + line
 			}
-			lines = append(lines, line)
+			if wrapOn && wrapWidth > 0 {
+				// Highlight before wrap — offsets stay valid on the unwrapped
+				// string (plan 021 WS4). Requests never take this branch.
+				wrapped := ansi.Wordwrap(line, wrapWidth, "")
+				parts := strings.Split(wrapped, "\n")
+				if len(parts) == 0 {
+					parts = []string{""}
+				}
+				first := row
+				for _, p := range parts {
+					lines = append(lines, p)
+					row++
+				}
+				b.logRowSpans[entry.DisplaySeq] = logRowSpan{First: first, Last: row - 1}
+			} else {
+				lines = append(lines, line)
+				b.logRowSpans[entry.DisplaySeq] = logRowSpan{First: row, Last: row}
+				row++
+			}
 		}
 	}
 
@@ -1395,13 +1546,21 @@ func (b *BaseModel) updateViewport() {
 
 	// Cursor visibility invariant for the requests view (D7). Runs after
 	// SetContent so the marker is on-screen after every transition, not just
-	// keypresses. Follow mode overrides to the bottom. Logs/detail views keep
-	// their own scroll untouched.
-	if b.viewMode == ViewModeRequests {
+	// keypresses. Follow mode overrides to the bottom.
+	//
+	// Logs follow also GotoBottoms here (Codex #2): pre-C4 this was requests-
+	// only and renderAfterLogEntries covered live arrivals, but wrap makes the
+	// gap visible — SetContent can leave YOffset off the true bottom.
+	switch b.viewMode {
+	case ViewModeRequests:
 		if b.followMode {
 			b.viewport.GotoBottom()
 		} else {
 			b.ensureCursorVisible()
+		}
+	case ViewModeLogs:
+		if b.followMode {
+			b.viewport.GotoBottom()
 		}
 	}
 }
@@ -1851,15 +2010,11 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 	// Get process color
 	procStyle := getProcessStyle(entry.Process, b.processes)
 
-	// Format timestamp
-	ts := entry.Timestamp.Format("15:04:05")
-
 	// Format process name with padding
 	procName := fmt.Sprintf("%-10s", entry.Process)
 
 	// Build line
 	prefix := procStyle.Render(procName)
-	timestamp := s.Dim.Render(ts)
 
 	// Stream indicator
 	streamIndicator := ""
@@ -1867,7 +2022,15 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 		streamIndicator = s.Err.Render(" ERR ")
 	}
 
-	return fmt.Sprintf("%s %s%s %s", timestamp, prefix, streamIndicator, b.highlightLogLine(entry.Line))
+	line := b.highlightLogLine(entry.Line)
+	// Timestamps toggle (plan 021 WS4): omitting the fixed-width `15:04:05 `
+	// prefix shifts the process-name column left — intentional, no padding
+	// compensation. Default true preserves today's always-on rendering.
+	if b.settings.Timestamps {
+		ts := s.Dim.Render(entry.Timestamp.Format("15:04:05"))
+		return fmt.Sprintf("%s %s%s %s", ts, prefix, streamIndicator, line)
+	}
+	return fmt.Sprintf("%s%s %s", prefix, streamIndicator, line)
 }
 
 // highlightLogLine wraps the first case-insensitive match of the active

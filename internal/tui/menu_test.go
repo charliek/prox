@@ -75,17 +75,23 @@ func TestMenu_OpenCloseNavigation(t *testing.T) {
 	assert.Equal(t, int(MenuView), m.openMenu)
 	assert.Equal(t, 0, m.menuHighlight, "first selectable row")
 
-	// Down skips nothing initially; next is Requests (idx 1), then sep, then Follow.
+	// Down: Requests (1), skip sep (2), Process panel (3), …
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
 	assert.Equal(t, 1, m.menuHighlight)
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
 	assert.Equal(t, 3, m.menuHighlight, "skips separator at idx 2")
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
+	assert.Equal(t, 4, m.menuHighlight, "Timestamps")
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
+	assert.Equal(t, 5, m.menuHighlight, "Wrap lines")
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
+	assert.Equal(t, 6, m.menuHighlight, "Follow")
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyDown})
 	assert.Equal(t, 0, m.menuHighlight, "wraps to first selectable")
 
 	// Up wraps the other way.
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyUp})
-	assert.Equal(t, 3, m.menuHighlight)
+	assert.Equal(t, 6, m.menuHighlight)
 
 	// Sibling switch: Right → Filter, then Theme, then View.
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyRight})
@@ -130,9 +136,11 @@ func TestMenu_ViewRadioAndFollow(t *testing.T) {
 	assert.Equal(t, ViewModeLogs, m.viewMode)
 
 	m = clientUpdate(m, keyRune('v'))
-	m = clientUpdate(m, keyRune('j'))
-	m = clientUpdate(m, keyRune('j')) // Follow (skip sep)
-	require.Equal(t, 3, m.menuHighlight)
+	// Logs(0) → Requests(1) → Process panel(3) → Timestamps(4) → Wrap(5) → Follow(6)
+	for range 5 {
+		m = clientUpdate(m, keyRune('j'))
+	}
+	require.Equal(t, 6, m.menuHighlight)
 	m = clientUpdate(m, keyRune(' '))
 	assert.False(t, m.followMode, "Follow check toggles off")
 }

@@ -300,8 +300,8 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Menu clicks only in C3. Wheel / viewport forwarding stay on the
 		// bubbles default until C11 owns full mouse routing
 		// (viewport.MouseWheelEnabled=false + handled-flag).
-		if m.handleMenuMouse(msg) {
-			return m, nil
+		if handled, cmd := m.handleMenuMouse(msg); handled {
+			return m, cmd
 		}
 
 	case ExternalShutdownMsg:
@@ -450,8 +450,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 1. Open-menu capture: every key consumed, never re-dispatched.
 	if m.menuOpen() {
-		m.handleMenuKey(msg)
-		return m, nil
+		return m, m.handleMenuKey(msg)
 	}
 
 	// 2. Mode-specific keys (textinput / help).
