@@ -265,11 +265,10 @@ func TestFormatProxyRequest_InFlightDim(t *testing.T) {
 func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {
 	pinANSIProfile(t)
 	withTestTheme(t, "tokyo-night")
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID: "req-1", Timestamp: "2026-07-18 00:00:00.000",
-			Method: "POST", URL: "/api/v1/things", StatusCode: 200, DurationMs: 12,
-		},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID: "req-1", Timestamp: "2026-07-18 00:00:00.000",
+		Method: "POST", URL: "/api/v1/things", StatusCode: 200, DurationMs: 12,
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
 	assert.Contains(t, out, s.Bold.Render("POST")+" /api/v1/things")
@@ -279,13 +278,12 @@ func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {
 func TestFormatRequestDetail_JSONBodySyntaxColor(t *testing.T) {
 	pinANSIProfile(t)
 	withTestTheme(t, "tokyo-night")
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID: "req-1", Timestamp: "t", Method: "POST", URL: "/x", StatusCode: 200,
-			RequestBody: &BodyData{
-				Size: 40, ContentType: "application/json",
-				Data: `{"s":"hi","n":1,"b":true,"z":null}`,
-			},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID: "req-1", Timestamp: "t", Method: "POST", URL: "/x", StatusCode: 200,
+		RequestBody: &BodyData{
+			Size: 40, ContentType: "application/json",
+			Data: `{"s":"hi","n":1,"b":true,"z":null}`,
 		},
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
@@ -300,12 +298,11 @@ func TestFormatRequestDetail_NonJSONBodyUnchanged(t *testing.T) {
 	pinANSIProfile(t)
 	withTestTheme(t, "tokyo-night")
 	plain := "hello: not-json"
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID: "req-1", Timestamp: "t", Method: "POST", URL: "/x", StatusCode: 200,
-			RequestBody: &BodyData{
-				Size: int64(len(plain)), ContentType: "text/plain", Data: plain,
-			},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID: "req-1", Timestamp: "t", Method: "POST", URL: "/x", StatusCode: 200,
+		RequestBody: &BodyData{
+			Size: int64(len(plain)), ContentType: "text/plain", Data: plain,
 		},
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")

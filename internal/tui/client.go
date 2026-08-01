@@ -618,6 +618,10 @@ func clientBodyToBodyData(body *api.CapturedBodyResponse) *BodyData {
 // View renders the TUI. ModeHelp returns the live main frame with the help
 // modal spliced on top (plan 022 WS4) — log streams keep updating behind it.
 func (m ClientModel) View() string {
+	// Frame-top reset: every renderer re-records or loses (plan 023 A1).
+	// Must run before the !ready early return so a connecting frame cannot
+	// leave prior-session rects live.
+	m.mustHits().resetFrame()
 	if !m.ready {
 		return "Connecting to prox..."
 	}

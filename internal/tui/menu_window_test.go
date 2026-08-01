@@ -42,7 +42,7 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	require.GreaterOrEqual(t, len(items), 12)
 
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	avail := m.menuAvail()
 	require.Equal(t, 9, avail)
@@ -63,7 +63,7 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	assert.Equal(t, menuWindowMaxOffset(len(items), avail), m.menuWindow)
 
 	_ = m.View()
-	hits = m.ensureHits()
+	hits = m.mustHits()
 	topInd := hits.dropdown.Rows[0]
 	assert.Equal(t, MenuCommand(""), topInd.Cmd)
 	assert.Equal(t, -1, topInd.Index)
@@ -82,7 +82,7 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	require.Less(t, m.menuWindow, maxOff)
 
 	_ = m.View()
-	hits = m.ensureHits()
+	hits = m.mustHits()
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 3)
 	assert.Equal(t, -1, hits.dropdown.Rows[0].Index, "top indicator")
 	assert.Equal(t, -1, hits.dropdown.Rows[len(hits.dropdown.Rows)-1].Index, "bottom indicator")
@@ -93,7 +93,7 @@ func TestMenuWindow_NoIndicatorsWhenAvailSmall(t *testing.T) {
 	m := openThemeAtHeight(t, 5, 6)
 	require.Equal(t, 2, m.menuAvail())
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	assert.Equal(t, 2, hits.dropdown.Bounds.H)
 	for _, r := range hits.dropdown.Rows {
@@ -227,32 +227,90 @@ func TestMenuWheel_ClosedStillScrollsViewport(t *testing.T) {
 	assert.Equal(t, wheelScrollRows, m.viewport.YOffset)
 }
 
+// assertDropdownRectGeometry pins the shared geometry honesty checks used by
+// every menu (plan 023 C1 rect-honesty generalization).
+func assertDropdownRectGeometry(t *testing.T, m ClientModel) {
+	t.Helper()
+	hits := m.mustHits()
+	require.True(t, hits.hasDropdown)
+	frameH := m.height
+	avail := m.menuAvail()
+	for _, r := range hits.dropdown.Rows {
+		assert.GreaterOrEqual(t, r.Rect.Y, 1)
+		assert.Less(t, r.Rect.Y, frameH-menuReservedBottom,
+			"row Y=%d must stay above status+hints", r.Rect.Y)
+		assert.Less(t, r.Rect.Y+r.Rect.H, frameH)
+		assert.Equal(t, hits.dropdown.Bounds.X, r.Rect.X, "row X matches bounds")
+		assert.Equal(t, hits.dropdown.Bounds.W, r.Rect.W, "row W matches bounds")
+	}
+	assert.LessOrEqual(t, hits.dropdown.Bounds.H, avail)
+	assert.Equal(t, hits.dropdown.Bounds.H, len(hits.dropdown.Rows))
+}
+
+// TestMenuWindow_RectHonesty generalizes rect-honesty over View/Filter/Theme
+// and standard sizes (plan 023 C1). Theme keeps the scroll-indicator +
+// click-to-activate depth of the original test; View/Filter assert geometry
+// and that each visible activatable rect activates (menu closes).
 func TestMenuWindow_RectHonesty(t *testing.T) {
-	dir := t.TempDir()
-	withTestSettingsPath(t, filepath.Join(dir, "config.toml"))
-	m := openThemeAtHeight(t, 12, 6)
+	sizes := []struct{ w, h int }{
+		{80, 24},
+		{120, 40},
+		{60, 16},
+		{80, 12}, // Theme overflows here (12 items > avail 9): exercises indicators
+	}
+	menus := []struct {
+		name MenuID
+		open func(ClientModel) ClientModel
+	}{
+		{MenuView, func(m ClientModel) ClientModel { return clientUpdate(m, keyRune('v')) }},
+		{MenuFilter, func(m ClientModel) ClientModel { return clientUpdate(m, keyRune('f')) }},
+		{MenuTheme, openThemeMenu},
+	}
+
+	for _, sz := range sizes {
+		for _, menu := range menus {
+			t.Run(fmt.Sprintf("%s_%dx%d", menuLabel(menu.name), sz.w, sz.h), func(t *testing.T) {
+				dir := t.TempDir()
+				withTestSettingsPath(t, filepath.Join(dir, "config.toml"))
+				if menu.name == MenuTheme {
+					seedUserThemes(t, 6)
+					withTestTheme(t, "tokyo-night")
+				}
+				m := newTestModel()
+				m.projectName = "demo"
+				m = clientUpdate(m, tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+				m = menu.open(m)
+				require.True(t, m.menuOpen())
+				require.Equal(t, int(menu.name), m.openMenu)
+
+				if menu.name == MenuTheme {
+					assertThemeRectHonesty(t, m)
+					return
+				}
+				assertMenuRectHonestyActivate(t, m, menu.name)
+			})
+		}
+	}
+}
+
+// assertThemeRectHonesty preserves the original Theme honesty depth: scroll
+// to a middle window with indicators, geometry checks, indicator click is
+// consumed-only, and every visible activatable row click selects that theme.
+func assertThemeRectHonesty(t *testing.T, m ClientModel) {
+	t.Helper()
 	items := m.menuItems(MenuTheme)
 	avail := m.menuAvail()
+	require.Greater(t, avail, 0)
 
-	// Scroll to middle so both indicators show.
 	target := len(items) / 2
 	for m.menuHighlight < target {
 		m = clientUpdate(m, keyRune('j'))
 	}
 
 	_ = m.View()
-	hits := m.ensureHits()
-	require.True(t, hits.hasDropdown)
-	frameH := m.height
-	for _, r := range hits.dropdown.Rows {
-		assert.GreaterOrEqual(t, r.Rect.Y, 1)
-		assert.Less(t, r.Rect.Y, frameH-menuReservedBottom,
-			"row Y=%d must stay above status+hints", r.Rect.Y)
-		assert.Less(t, r.Rect.Y+r.Rect.H, frameH)
-	}
-	assert.LessOrEqual(t, hits.dropdown.Bounds.H, avail)
+	assertDropdownRectGeometry(t, m)
+	hits := m.mustHits()
 
-	// Snapshot activatable rows, then click each (re-open + re-scroll each time).
 	type targetRow struct {
 		index int
 		label string
@@ -267,21 +325,27 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 		activatable = append(activatable, targetRow{index: r.Index, label: items[r.Index].Label})
 	}
 	require.NotEmpty(t, activatable)
-	require.True(t, hasInd)
+	if len(items) > avail {
+		require.True(t, hasInd, "overflow Theme menu must show an indicator")
+	}
 
 	// Indicator click: consumed only.
 	mInd := m
 	_ = mInd.View()
 	var indRect HitRect
-	for _, r := range mInd.ensureHits().dropdown.Rows {
+	foundInd := false
+	for _, r := range mInd.mustHits().dropdown.Rows {
 		if r.Index < 0 {
 			indRect = r.Rect
+			foundInd = true
 			break
 		}
 	}
-	mInd = clientUpdate(mInd, clickAt(indRect.X+1, indRect.Y))
-	assert.True(t, mInd.menuOpen(), "indicator click stays open")
-	assert.Equal(t, "tokyo-night", CurrentThemeName())
+	if foundInd {
+		mInd = clientUpdate(mInd, clickAt(indRect.X+1, indRect.Y))
+		assert.True(t, mInd.menuOpen(), "indicator click stays open")
+		assert.Equal(t, "tokyo-night", CurrentThemeName())
+	}
 
 	for _, want := range activatable {
 		SetThemeByName("tokyo-night")
@@ -293,7 +357,7 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 		_ = m2.View()
 		var row menuRowHit
 		found := false
-		for _, hr := range m2.ensureHits().dropdown.Rows {
+		for _, hr := range m2.mustHits().dropdown.Rows {
 			if hr.Index == want.index {
 				row = hr
 				found = true
@@ -308,6 +372,42 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 	SetThemeByName("tokyo-night")
 }
 
+// assertMenuRectHonestyActivate checks geometry then clicks every visible
+// activatable row (re-opening between clicks) and asserts the menu closes.
+func assertMenuRectHonestyActivate(t *testing.T, m ClientModel, id MenuID) {
+	t.Helper()
+	_ = m.View()
+	assertDropdownRectGeometry(t, m)
+	hits := m.mustHits()
+
+	var indexes []int
+	for _, r := range hits.dropdown.Rows {
+		if r.Cmd == "" || r.Index < 0 {
+			continue
+		}
+		indexes = append(indexes, r.Index)
+	}
+	require.NotEmpty(t, indexes)
+
+	for _, idx := range indexes {
+		m2 := m
+		m2.openMenuFirst(id)
+		_ = m2.View()
+		var row menuRowHit
+		found := false
+		for _, hr := range m2.mustHits().dropdown.Rows {
+			if hr.Index == idx {
+				row = hr
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "index %d visible in %s", idx, menuLabel(id))
+		m2 = clientUpdate(m2, clickAt(row.Rect.X+1, row.Rect.Y))
+		assert.False(t, m2.menuOpen(), "activatable rect for index %d must activate", idx)
+	}
+}
+
 func TestMenuWindow_DegenerateAvailZero(t *testing.T) {
 	// avail = height - boxTop - 2 < 1 → height < 4 with menu bar.
 	m := openThemeAtHeight(t, 3, 6)
@@ -315,7 +415,7 @@ func TestMenuWindow_DegenerateAvailZero(t *testing.T) {
 	require.True(t, m.menuOpen())
 
 	_ = m.View() // must not panic
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	assert.False(t, hits.hasDropdown)
 	assert.Empty(t, hits.dropdown.Rows)
 
@@ -379,7 +479,7 @@ func TestMenuWindow_ViewMenuIndexOnHits(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 
 	var foundSep, foundReqs bool

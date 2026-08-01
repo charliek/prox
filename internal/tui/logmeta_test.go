@@ -100,7 +100,7 @@ func TestIsJSONObject(t *testing.T) {
 }
 
 func TestLogMeta_AppendLogEntry(t *testing.T) {
-	m := &BaseModel{}
+	m := newTestBaseModel()
 	entry := domain.LogEntry{Line: `{"level":"error","msg":"x"}`}
 	m.appendLogEntry(entry)
 
@@ -114,7 +114,7 @@ func TestLogMeta_AppendLogEntry(t *testing.T) {
 }
 
 func TestLogMeta_AppendLogEntry_PlainLine(t *testing.T) {
-	m := &BaseModel{}
+	m := newTestBaseModel()
 	m.appendLogEntry(domain.LogEntry{Line: "something happened"})
 
 	seq := m.logEntries[0].DisplaySeq
@@ -141,7 +141,7 @@ func survivingDisplaySeqs(entries []domain.LogEntry) map[int64]struct{} {
 }
 
 func TestLogMeta_EvictionOneAtATime(t *testing.T) {
-	m := &BaseModel{}
+	m := newTestBaseModel()
 	for i := 0; i < maxLogEntries+50; i++ {
 		m.appendLogEntry(domain.LogEntry{
 			Timestamp: time.Now(),
@@ -153,7 +153,7 @@ func TestLogMeta_EvictionOneAtATime(t *testing.T) {
 }
 
 func TestLogMeta_EvictionSyncBatch(t *testing.T) {
-	m := &BaseModel{}
+	m := newTestBaseModel()
 	entries := make([]domain.LogEntry, maxLogEntries+50)
 	for i := range entries {
 		entries[i] = domain.LogEntry{

@@ -38,11 +38,22 @@ type processChipHit struct {
 	Rect  HitRect
 }
 
-// ensureHits returns the shared hit registry, allocating lazily so tests that
-// construct &BaseModel{} without newBaseModel never nil-pointer on access.
-func (b *BaseModel) ensureHits() *hitRegistry {
+// resetFrame clears every hit slice and zeroes the dropdown object so stale
+// rects cannot survive a frame where their renderer did not re-record
+// (plan 023 A1 / B1). Called at the top of ClientModel.View.
+func (h *hitRegistry) resetFrame() {
+	h.menuCells = h.menuCells[:0]
+	h.chips = h.chips[:0]
+	h.dropdown = menuDropdownHit{}
+	h.hasDropdown = false
+}
+
+// mustHits returns the shared hit registry. Panics if nil — there is no
+// lazy-alloc path (that silently reintroduced the View value-copy bug).
+// Production models get a registry from newBaseModel; tests use newTestBaseModel.
+func (b *BaseModel) mustHits() *hitRegistry {
 	if b.hits == nil {
-		b.hits = &hitRegistry{}
+		panic("tui: hitRegistry is nil; construct via newBaseModel or newTestBaseModel")
 	}
 	return b.hits
 }

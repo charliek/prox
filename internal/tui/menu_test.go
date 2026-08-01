@@ -203,13 +203,13 @@ func TestMenu_MouseOpenBlursTextInput(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	// Render once so hit-rects exist.
 	_ = m.mainView("")
-	require.NotEmpty(t, m.ensureHits().menuCells)
+	require.NotEmpty(t, m.mustHits().menuCells)
 
 	m.mode = ModeStringFilter
 	m.textInput.Focus()
 	m.textInput.SetValue("partial")
 
-	viewHit := m.ensureHits().menuCells[0]
+	viewHit := m.mustHits().menuCells[0]
 	m = clientUpdate(m, tea.MouseMsg{
 		X:      viewHit.Rect.X,
 		Y:      viewHit.Rect.Y,
@@ -226,7 +226,7 @@ func TestMenu_MouseClickDropdownActivates(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.mainView("") // record dropdown hits
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 2)
 

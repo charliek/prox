@@ -32,7 +32,7 @@ func TestHover_SiblingSlideWhileOpen(t *testing.T) {
 	require.True(t, m.menuOpen())
 	require.Equal(t, int(MenuView), m.openMenu)
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.GreaterOrEqual(t, len(hits.menuCells), 2)
 	filterCell := hits.menuCells[1]
 	require.Equal(t, MenuFilter, filterCell.ID)
@@ -47,7 +47,7 @@ func TestHover_CellDoesNotOpenMenu(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.NotEmpty(t, hits.menuCells)
 	cell := hits.menuCells[0]
 
@@ -60,7 +60,7 @@ func TestHover_DropdownRowMovesHighlight(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 
 	// Requests row (index 1).
@@ -83,7 +83,7 @@ func TestHover_SeparatorRowNoOp(t *testing.T) {
 	m = clientUpdate(m, keyRune('v'))
 	before := m.menuHighlight
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 
 	var sep menuRowHit
 	for _, row := range hits.dropdown.Rows {
@@ -112,7 +112,7 @@ func TestHover_WindowFollowsPastEdge(t *testing.T) {
 	_ = m.View()
 	var target menuRowHit
 	minIdx := -1
-	for _, row := range m.ensureHits().dropdown.Rows {
+	for _, row := range m.mustHits().dropdown.Rows {
 		if row.Index >= 0 && row.Index < hlBefore {
 			if minIdx < 0 || row.Index < minIdx {
 				minIdx = row.Index
@@ -133,7 +133,7 @@ func TestHover_GateIdenticalMotionNoChange(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.View()
-	hits := m.ensureHits()
+	hits := m.mustHits()
 	require.Equal(t, m.menuHighlight, hits.dropdown.Rows[0].Index,
 		"precond: first row is the current highlight → repeat motion is a no-op")
 	row := hits.dropdown.Rows[0]
@@ -156,13 +156,13 @@ func TestHover_StaleDropdownRectsRejected(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	_ = m.View() // View dropdown rects recorded
-	stale := m.ensureHits().dropdown
+	stale := m.mustHits().dropdown
 	require.Equal(t, MenuView, stale.Menu)
 	row := stale.Rows[1] // Requests row rect (stale after slide)
 
 	// Hover-slide to Filter; hits.dropdown is now STALE until next render.
 	var filterCell menuCellHit
-	for _, c := range m.ensureHits().menuCells {
+	for _, c := range m.mustHits().menuCells {
 		if c.ID == MenuFilter {
 			filterCell = c
 		}
@@ -182,7 +182,7 @@ func TestHover_MenuBarNoOpWhenClosed(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	_ = m.View()
-	cell := m.ensureHits().menuCells[0]
+	cell := m.mustHits().menuCells[0]
 
 	m = clientUpdate(m, motionAt(cell.Rect.X, cell.Rect.Y))
 	assert.False(t, m.menuOpen())
@@ -205,7 +205,7 @@ func TestHover_DragIgnored(t *testing.T) {
 	m = clientUpdate(m, keyRune('v'))
 	require.True(t, m.menuOpen())
 	_ = m.View()
-	filterCell := m.ensureHits().menuCells[1]
+	filterCell := m.mustHits().menuCells[1]
 
 	m = clientUpdate(m, dragAt(filterCell.Rect.X, filterCell.Rect.Y))
 	assert.Equal(t, int(MenuView), m.openMenu, "drag does not slide sibling menu")
@@ -231,7 +231,7 @@ func TestHover_TrackerHygieneMenuPress(t *testing.T) {
 
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	_ = m.View()
-	cell := m.ensureHits().menuCells[0]
+	cell := m.mustHits().menuCells[0]
 
 	m = clientUpdate(m, clickAt(cell.Rect.X, cell.Rect.Y))
 	assert.Equal(t, -1, m.lastRequestClickIdx)
@@ -265,7 +265,7 @@ func TestHover_FreeMotionPreservesDoubleClick(t *testing.T) {
 	require.Equal(t, row, m.lastRequestClickIdx)
 
 	_ = m.View()
-	cell := m.ensureHits().menuCells[0]
+	cell := m.mustHits().menuCells[0]
 	m = clientUpdate(m, motionAt(cell.Rect.X, cell.Rect.Y))
 
 	nowFunc = func() time.Time { return t0.Add(200 * time.Millisecond) }
@@ -280,7 +280,7 @@ func TestHover_TextInputModeMotionDoesNotBlur(t *testing.T) {
 	m = clientUpdate(m, keyRune('s'))
 	require.Equal(t, ModeStringFilter, m.mode)
 	_ = m.View()
-	cell := m.ensureHits().menuCells[0]
+	cell := m.mustHits().menuCells[0]
 
 	m = clientUpdate(m, motionAt(cell.Rect.X, cell.Rect.Y))
 	assert.Equal(t, ModeStringFilter, m.mode)

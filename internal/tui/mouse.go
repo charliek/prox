@@ -126,12 +126,16 @@ func (b *BaseModel) processPanelRowY() (int, bool) {
 
 // processPanelHit returns the process index under (x,y), or -1. Solo toggles
 // mirror the 1-9 keys (logs view only). Rects are recorded per frame in
-// processPanel (mainView clears hits.chips before each render).
+// processPanel; the ProcessPanel gate is belt-and-braces with resetFrame
+// (plan 023 A1 / B1 — stale chips after `p` hid the panel).
 func (b *BaseModel) processPanelHit(x, y int) int {
+	if !b.settings.ProcessPanel {
+		return -1
+	}
 	if b.viewMode != ViewModeLogs {
 		return -1
 	}
-	for _, h := range b.ensureHits().chips {
+	for _, h := range b.mustHits().chips {
 		if h.Rect.Contains(x, y) {
 			return h.Index
 		}

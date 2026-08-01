@@ -82,16 +82,11 @@ func (b *BaseModel) closeMenu() {
 	b.openMenu = -1
 	b.menuHighlight = 0
 	b.menuWindow = 0
-	b.ensureHits().hasDropdown = false
-}
-
-func (b *BaseModel) clearMenuHitRects() {
-	h := b.ensureHits()
-	h.menuCells = h.menuCells[:0]
-	// Stale dropdown hits must never match after close (strix app.rs:1152).
-	if !b.menuOpen() {
-		h.hasDropdown = false
-	}
+	// Immediate invalidation: a menu can close in Update before the next
+	// render, so frame-top resetFrame alone is not enough (plan 023 A1).
+	h := b.mustHits()
+	h.dropdown = menuDropdownHit{}
+	h.hasDropdown = false
 }
 
 // openMenuFirst opens menu with its first activatable row highlighted.
@@ -505,7 +500,7 @@ func (b *BaseModel) renderMenuBar() string {
 
 	x := leftW + gap
 	y := 0 // menu bar is always row 0 when visible; caller places it first
-	hits := b.ensureHits()
+	hits := b.mustHits()
 	for _, c := range cells {
 		w := ansi.StringWidth(c.text)
 		style := rowBG
@@ -576,7 +571,7 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 
 	// Anchor under the cell; clamp so the box stays on-screen.
 	boxX = 0
-	for _, h := range b.ensureHits().menuCells {
+	for _, h := range b.mustHits().menuCells {
 		if h.ID == id {
 			boxX = h.Rect.X
 			break
@@ -593,7 +588,9 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	avail := b.menuAvail()
 	if avail < 1 || n == 0 {
 		// Degenerate: menu state open, no rows / no hits (plan 022 WS3).
-		b.ensureHits().hasDropdown = false
+		h := b.mustHits()
+		h.dropdown = menuDropdownHit{}
+		h.hasDropdown = false
 		return nil, boxX, boxW
 	}
 
@@ -673,7 +670,7 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 		renderInd(n - visEnd)
 	}
 
-	hits := b.ensureHits()
+	hits := b.mustHits()
 	hits.dropdown = menuDropdownHit{
 		Menu:   id,
 		Bounds: HitRect{X: boxX, Y: boxTop, W: boxW, H: len(rows)},
@@ -741,7 +738,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 	x, y := msg.X, msg.Y
-	hits := b.ensureHits()
+	hits := b.mustHits()
 
 	// Mouse-open while a textinput mode is active: blur → ModeNormal first (Codex #4).
 	blurTextMode := func() {
@@ -802,7 +799,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 // no-op motion leaves an identical frame for the renderer's tty-write skip.
 func (b *BaseModel) handleMenuMotion(msg tea.MouseMsg) bool {
 	x, y := msg.X, msg.Y
-	hits := b.ensureHits()
+	hits := b.mustHits()
 	consumed := false
 
 	if b.settings.MenuBar {

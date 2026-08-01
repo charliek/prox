@@ -40,8 +40,8 @@ var (
 )
 
 func init() {
-	// Install the default so no style is ever nil: tests construct &BaseModel{}
-	// directly (panel S5) without any theme install.
+	// Install the default so no style is ever nil: tests construct models via
+	// newTestBaseModel / newTestModel (panel S5) without any theme install.
 	SetThemeByName("tokyo-night")
 }
 

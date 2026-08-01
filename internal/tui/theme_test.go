@@ -227,9 +227,9 @@ func TestSetTheme_RebuildsStyles(t *testing.T) {
 }
 
 func TestDirectBaseModel_StylesNonNil(t *testing.T) {
-	// Package init installed tokyo-night; constructing &BaseModel{} must not
-	// see nil/zero styles (panel S5).
-	_ = &BaseModel{}
+	// Package init installed tokyo-night; constructing via newTestBaseModel
+	// must not see nil/zero styles (panel S5).
+	_ = newTestBaseModel()
 	assert.NotEmpty(t, colorStr(s.Running.GetForeground()))
 	assert.NotEmpty(t, s.ProcessColors)
 }

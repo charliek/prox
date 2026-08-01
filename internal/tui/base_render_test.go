@@ -302,23 +302,22 @@ func TestRenderBodySection_Unavailable(t *testing.T) {
 // formatRequestDetail (shared by Model and ClientModel via BaseModel) wires
 // renderBodySection in for both request and response bodies.
 func TestFormatRequestDetail_BodySections(t *testing.T) {
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID:         "req-1",
-			Timestamp:  "2026-07-18 00:00:00.000",
-			Method:     "POST",
-			URL:        "/api/v1/things",
-			StatusCode: 200,
-			RequestBody: &BodyData{
-				Size:        18,
-				ContentType: "application/json",
-				Data:        `{"key":"value"}`,
-			},
-			ResponseBody: &BodyData{
-				Size:              10,
-				Unavailable:       true,
-				UnavailableReason: "evicted",
-			},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID:         "req-1",
+		Timestamp:  "2026-07-18 00:00:00.000",
+		Method:     "POST",
+		URL:        "/api/v1/things",
+		StatusCode: 200,
+		RequestBody: &BodyData{
+			Size:        18,
+			ContentType: "application/json",
+			Data:        `{"key":"value"}`,
+		},
+		ResponseBody: &BodyData{
+			Size:              10,
+			Unavailable:       true,
+			UnavailableReason: "evicted",
 		},
 	}
 
@@ -334,15 +333,14 @@ func TestFormatRequestDetail_BodySections(t *testing.T) {
 // line reads "(in flight)" instead of a bogus "0ms" for a still-streaming
 // request (D10).
 func TestFormatRequestDetail_InFlight_ShowsDurationNote(t *testing.T) {
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID:         "req-1",
-			Timestamp:  "2026-07-18 00:00:00.000",
-			Method:     "GET",
-			URL:        "/api/v1/stream",
-			StatusCode: 200,
-			InFlight:   true,
-		},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID:         "req-1",
+		Timestamp:  "2026-07-18 00:00:00.000",
+		Method:     "GET",
+		URL:        "/api/v1/stream",
+		StatusCode: 200,
+		InFlight:   true,
 	}
 
 	out := strings.Join(b.formatRequestDetail(), "\n")
@@ -355,15 +353,14 @@ func TestFormatRequestDetail_InFlight_ShowsDurationNote(t *testing.T) {
 // no headers/bodies section (which would otherwise be indistinguishable from
 // "capture not enabled").
 func TestFormatRequestDetail_InFlight_NoDetailsNote(t *testing.T) {
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID:         "req-1",
-			Timestamp:  "2026-07-18 00:00:00.000",
-			Method:     "GET",
-			URL:        "/api/v1/stream",
-			StatusCode: 200,
-			InFlight:   true,
-		},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID:         "req-1",
+		Timestamp:  "2026-07-18 00:00:00.000",
+		Method:     "GET",
+		URL:        "/api/v1/stream",
+		StatusCode: 200,
+		InFlight:   true,
 	}
 
 	out := strings.Join(b.formatRequestDetail(), "\n")
@@ -374,16 +371,15 @@ func TestFormatRequestDetail_InFlight_NoDetailsNote(t *testing.T) {
 // in-flight record (D8, #53) renders "stale?" on both the Duration line and
 // the in-flight note, distinct from an ordinary (fresh) in-flight record.
 func TestFormatRequestDetail_Stale_ShowsStaleDurationAndNote(t *testing.T) {
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID:         "req-1",
-			Timestamp:  "2026-07-18 00:00:00.000",
-			Method:     "GET",
-			URL:        "/api/v1/stream",
-			StatusCode: 200,
-			InFlight:   true,
-			Stale:      true,
-		},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID:         "req-1",
+		Timestamp:  "2026-07-18 00:00:00.000",
+		Method:     "GET",
+		URL:        "/api/v1/stream",
+		StatusCode: 200,
+		InFlight:   true,
+		Stale:      true,
 	}
 
 	out := strings.Join(b.formatRequestDetail(), "\n")
@@ -396,15 +392,14 @@ func TestFormatRequestDetail_Stale_ShowsStaleDurationAndNote(t *testing.T) {
 // record with no captured Details (capture disabled) does NOT get the
 // in-flight note.
 func TestFormatRequestDetail_Completed_NoInFlightNote(t *testing.T) {
-	b := &BaseModel{
-		requestDetail: &RequestDetailData{
-			ID:         "req-1",
-			Timestamp:  "2026-07-18 00:00:00.000",
-			Method:     "GET",
-			URL:        "/api/v1/stream",
-			StatusCode: 200,
-			DurationMs: 42,
-		},
+	b := newTestBaseModel()
+	b.requestDetail = &RequestDetailData{
+		ID:         "req-1",
+		Timestamp:  "2026-07-18 00:00:00.000",
+		Method:     "GET",
+		URL:        "/api/v1/stream",
+		StatusCode: 200,
+		DurationMs: 42,
 	}
 
 	out := strings.Join(b.formatRequestDetail(), "\n")
@@ -422,11 +417,10 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 	defer lipgloss.SetColorProfile(prev)
 
 	t.Run("healthy renders a green dot as a separate segment", func(t *testing.T) {
-		b := &BaseModel{
-			viewMode: ViewModeRequests,
-			processes: []domain.ProcessInfo{
-				{Name: "web", State: domain.ProcessStateRunning, Health: domain.HealthStatusHealthy},
-			},
+		b := newTestBaseModel()
+		b.viewMode = ViewModeRequests
+		b.processes = []domain.ProcessInfo{
+			{Name: "web", State: domain.ProcessStateRunning, Health: domain.HealthStatusHealthy},
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("web")
@@ -436,11 +430,10 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 	})
 
 	t.Run("unhealthy renders a red dot as a separate segment", func(t *testing.T) {
-		b := &BaseModel{
-			viewMode: ViewModeRequests,
-			processes: []domain.ProcessInfo{
-				{Name: "api", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnhealthy},
-			},
+		b := newTestBaseModel()
+		b.viewMode = ViewModeRequests
+		b.processes = []domain.ProcessInfo{
+			{Name: "api", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnhealthy},
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("api")
@@ -449,11 +442,10 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 	})
 
 	t.Run("unknown renders no dot", func(t *testing.T) {
-		b := &BaseModel{
-			viewMode: ViewModeRequests,
-			processes: []domain.ProcessInfo{
-				{Name: "worker", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnknown},
-			},
+		b := newTestBaseModel()
+		b.viewMode = ViewModeRequests
+		b.processes = []domain.ProcessInfo{
+			{Name: "worker", State: domain.ProcessStateRunning, Health: domain.HealthStatusUnknown},
 		}
 		out := b.processPanel()
 		assert.NotContains(t, out, "●")
@@ -461,11 +453,10 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 	})
 
 	t.Run("empty/unset health renders no dot", func(t *testing.T) {
-		b := &BaseModel{
-			viewMode: ViewModeRequests,
-			processes: []domain.ProcessInfo{
-				{Name: "cron", State: domain.ProcessStateRunning},
-			},
+		b := newTestBaseModel()
+		b.viewMode = ViewModeRequests
+		b.processes = []domain.ProcessInfo{
+			{Name: "cron", State: domain.ProcessStateRunning},
 		}
 		out := b.processPanel()
 		assert.NotContains(t, out, "●")
@@ -473,12 +464,11 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 	})
 
 	t.Run("no-healthcheck process renders byte-identical to the pre-dot output", func(t *testing.T) {
-		b := &BaseModel{
-			viewMode: ViewModeLogs,
-			processes: []domain.ProcessInfo{
-				{Name: "web", State: domain.ProcessStateRunning},
-				{Name: "worker", State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres"}},
-			},
+		b := newTestBaseModel()
+		b.viewMode = ViewModeLogs
+		b.processes = []domain.ProcessInfo{
+			{Name: "web", State: domain.ProcessStateRunning},
+			{Name: "worker", State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres"}},
 		}
 		// Constructed the same way processPanel built its output before the
 		// health dot existed: styled "key:name[+gated detail]" segments,

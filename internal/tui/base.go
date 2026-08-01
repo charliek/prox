@@ -274,6 +274,9 @@ func applyTextInputTheme(ti *textinput.Model) {
 
 // handleWindowSize handles window resize messages.
 func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
+	// Invalidate hit-rects on the real model before relayout — resize can
+	// leave stale coordinates until the next View (plan 023 A1 / T3).
+	b.mustHits().resetFrame()
 	b.width = msg.Width
 	b.height = msg.Height
 	b.relayout()
@@ -2443,7 +2446,7 @@ func (b *BaseModel) processPanel() string {
 			items = append(items, segment)
 			if panelRowOK {
 				w := ansi.StringWidth(segment)
-				hits := b.ensureHits()
+				hits := b.mustHits()
 				hits.chips = append(hits.chips, processChipHit{
 					Index: i,
 					Rect:  HitRect{X: chipCol, Y: rowY, W: w, H: 1},
@@ -2632,10 +2635,9 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 
 // mainView renders the main TUI layout. Chrome rows are derived from settings
 // (relayout / Codex #8); the open dropdown is spliced over the composed frame
-// (overlay.go / Codex #1).
+// (overlay.go / Codex #1). Hit-rects are cleared by hitRegistry.resetFrame at
+// the top of ClientModel.View — renderers here only re-record.
 func (b *BaseModel) mainView(extraStatusInfo string) string {
-	b.clearMenuHitRects()
-
 	var lines []string
 
 	if b.settings.MenuBar {
@@ -2643,8 +2645,6 @@ func (b *BaseModel) mainView(extraStatusInfo string) string {
 	}
 
 	if b.settings.ProcessPanel {
-		h := b.ensureHits()
-		h.chips = h.chips[:0]
 		panel := b.processPanel()
 		for _, line := range strings.Split(panel, "\n") {
 			lines = append(lines, padFrameRow(line, b.width))

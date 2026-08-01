@@ -173,8 +173,8 @@ func TestMouse_ClickProcessPanelSoloToggle(t *testing.T) {
 		{Name: "api", State: domain.ProcessStateRunning},
 	}
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
-	_ = m.mainView("")
-	require.Len(t, m.ensureHits().chips, 2)
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 2)
 
 	rowY, ok := m.processPanelRowY()
 	require.True(t, ok)
@@ -191,12 +191,12 @@ func TestMouse_ProcessChipHitsRefreshPerFrame(t *testing.T) {
 		{Name: "web", State: domain.ProcessStateRunning},
 	}
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
-	_ = m.mainView("")
-	require.Len(t, m.ensureHits().chips, 1)
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 1)
 
 	m.processes = append(m.processes, domain.ProcessInfo{Name: "api", State: domain.ProcessStateRunning})
-	_ = m.mainView("")
-	require.Len(t, m.ensureHits().chips, 2, "chip rects are re-recorded each frame")
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 2, "chip rects are re-recorded each frame")
 }
 
 func TestMouse_ClickLogLineParksCursorAndDisengagesFollow(t *testing.T) {
@@ -280,8 +280,8 @@ func TestMouse_ClickAfterMenuCloseIgnoresStaleRects(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
-	_ = m.mainView("")
-	hits := m.ensureHits()
+	_ = m.View()
+	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 
 	stale := hits.dropdown.Rows[0]
@@ -291,7 +291,7 @@ func TestMouse_ClickAfterMenuCloseIgnoresStaleRects(t *testing.T) {
 		Button: tea.MouseButtonLeft,
 	})
 	require.False(t, m.menuOpen())
-	require.False(t, m.ensureHits().hasDropdown)
+	require.False(t, m.mustHits().hasDropdown)
 
 	m = clientUpdate(m, tea.MouseMsg{
 		X: stale.Rect.X, Y: stale.Rect.Y,
@@ -378,7 +378,7 @@ func TestHelpMouse_ModalFirstRouting(t *testing.T) {
 	m = clientUpdate(m, keyRune('v'))
 	require.True(t, m.menuOpen())
 	_ = m.View()
-	cell := m.ensureHits().menuCells[0]
+	cell := m.mustHits().menuCells[0]
 	m = clientUpdate(m, keyRune('?'))
 	require.Equal(t, ModeHelp, m.mode)
 	require.False(t, m.menuOpen())
