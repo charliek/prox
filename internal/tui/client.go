@@ -131,7 +131,7 @@ func restartResultClearCmd() tea.Cmd {
 // are per-caller, so this stays deliberately small rather than growing into a
 // general settings bag.
 type ClientOptions struct {
-	// Help supplies the help overlay's title suffix and quit wording. The two
+	// Help supplies the help modal's title suffix and quit wording. The two
 	// callers must word quit differently: leaving attach abandons a daemon that
 	// keeps running, leaving `up --tui` takes the processes down with it.
 	Help HelpConfig
@@ -310,11 +310,17 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
+		// Modal first, then menu, then content (plan 022 WS4 — invert of the
+		// pre-modal order where menu ran before the ModeHelp short-circuit).
+		if m.mode == ModeHelp {
+			m.handleHelpMouse(msg)
+			return m, nil
+		}
 		if handled, cmd := m.handleMenuMouse(msg); handled {
 			return m, cmd
 		}
-		// Non-menu mouse in text/help modes is ignored (menu blur handled above).
-		if m.mode == ModeSearch || m.mode == ModeStringFilter || m.mode == ModeHelp {
+		// Non-menu mouse in text modes is ignored (menu blur handled above).
+		if m.mode == ModeSearch || m.mode == ModeStringFilter {
 			return m, nil
 		}
 		if handled, navCmd := m.handleContentMouse(msg); handled {
@@ -460,8 +466,9 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleKey processes keyboard input.
-// Key routing order (Codex #4, pinned): open-menu capture → text/help modes →
-// client actions (q/r/Enter) → menu openers (m/v/f) + normal navigation.
+// Key routing order (plan 022 WS4, pinned): open-menu capture (with ?→help
+// special case) → text/help modes → client actions (q/r/Enter) → menu openers
+// + normal navigation. Text modes consume ? as text; ModeHelp captures all keys.
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 1. Open-menu capture: every key consumed, never re-dispatched.
 	if m.menuOpen() {
@@ -608,40 +615,40 @@ func clientBodyToBodyData(body *api.CapturedBodyResponse) *BodyData {
 	}
 }
 
-// View renders the TUI
+// View renders the TUI. ModeHelp returns the live main frame with the help
+// modal spliced on top (plan 022 WS4) — log streams keep updating behind it.
 func (m ClientModel) View() string {
 	if !m.ready {
 		return "Connecting to prox..."
 	}
 
-	switch m.mode {
-	case ModeHelp:
-		return m.helpView()
-	default:
-		statusInfo := m.opts.ConnectedStatus
-		if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
-			// The old-daemon park is not an outage and never self-heals by
-			// waiting, so "retrying..." would be a lie — render the actionable
-			// hint instead.
-			statusInfo = truncateError(m.connectionError, maxErrorDisplayLen)
-		} else if m.connectionError != nil && m.streamHealth[StreamProcesses].State == stream.StateClosed {
-			// Terminal: the loop is gone (auth failure classified terminal, or
-			// quit teardown) and no retry will ever happen — promising one
-			// would be a lie too (codex C12 finding).
-			statusInfo = "Connection lost: " + truncateError(m.connectionError, maxErrorDisplayLen)
-		} else if m.connectionError != nil {
-			// One wording for every transient degraded processes-stream state:
-			// the per-stream detail lives in the status bar's health segments.
-			statusInfo = "Connection error (retrying...)"
-		} else if m.statusFlash != "" {
-			statusInfo = m.statusFlash
-		} else if m.lastRestartProcess != "" {
-			if m.lastRestartError != nil {
-				statusInfo = "Restart failed: " + truncateError(m.lastRestartError, maxErrorDisplayLen)
-			} else {
-				statusInfo = "Restarted: " + m.lastRestartProcess
-			}
+	statusInfo := m.opts.ConnectedStatus
+	if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
+		// The old-daemon park is not an outage and never self-heals by
+		// waiting, so "retrying..." would be a lie — render the actionable
+		// hint instead.
+		statusInfo = truncateError(m.connectionError, maxErrorDisplayLen)
+	} else if m.connectionError != nil && m.streamHealth[StreamProcesses].State == stream.StateClosed {
+		// Terminal: the loop is gone (auth failure classified terminal, or
+		// quit teardown) and no retry will ever happen — promising one
+		// would be a lie too (codex C12 finding).
+		statusInfo = "Connection lost: " + truncateError(m.connectionError, maxErrorDisplayLen)
+	} else if m.connectionError != nil {
+		// One wording for every transient degraded processes-stream state:
+		// the per-stream detail lives in the status bar's health segments.
+		statusInfo = "Connection error (retrying...)"
+	} else if m.statusFlash != "" {
+		statusInfo = m.statusFlash
+	} else if m.lastRestartProcess != "" {
+		if m.lastRestartError != nil {
+			statusInfo = "Restart failed: " + truncateError(m.lastRestartError, maxErrorDisplayLen)
+		} else {
+			statusInfo = "Restarted: " + m.lastRestartProcess
 		}
-		return m.mainView(statusInfo)
 	}
+	frame := m.mainView(statusInfo)
+	if m.mode == ModeHelp {
+		return m.spliceHelpModal(frame)
+	}
+	return frame
 }

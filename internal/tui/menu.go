@@ -363,7 +363,9 @@ func (b *BaseModel) openMenuSibling(next bool) {
 }
 
 // handleMenuKey routes keys while a dropdown is open (strix on_key_menu exactly).
-// Every key is consumed; non-nav keys close without re-dispatch (Codex #4).
+// Every key is consumed; non-nav keys close without re-dispatch (Codex #4),
+// except "?" which closes the menu AND opens help atomically (plan 022 WS4 /
+// panel correction 2 — closing help does NOT restore the menu).
 // Returns a command from an activated item (e.g. settings-save flash clear).
 func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) tea.Cmd {
 	if !b.menuOpen() {
@@ -387,6 +389,9 @@ func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) tea.Cmd {
 		cmd := b.activateMenuItem(id, b.menuHighlight)
 		b.closeMenu()
 		return cmd
+	case "?":
+		b.enterHelp()
+		return nil
 	default:
 		// Esc and every other key: close, consumed, never re-dispatched.
 		b.closeMenu()

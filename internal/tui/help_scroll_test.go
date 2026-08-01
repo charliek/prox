@@ -3,38 +3,45 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/charliek/prox/internal/domain"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// The help box is the whole frame; before renderHelp windowed it, an
-// over-tall box scrolled its top sections (title, navigation, query cheat
-// sheet) off-screen at small terminal heights (Phase 5 verification find).
-func TestHelp_WindowsToTerminalHeight(t *testing.T) {
+// Help is a centred modal over the live frame (plan 022 WS4). Offset math
+// derives from the modal inner height — not the full-frame height.
+
+func TestHelp_WindowsToModalInnerHeight(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
-	m.mode = ModeHelp
+	m = clientUpdate(m, keyRune('?'))
 
-	view := m.helpView()
+	view := m.View()
 	assert.LessOrEqual(t, len(strings.Split(view, "\n")), 20,
-		"help box must not exceed the frame height")
-	assert.Contains(t, view, "Prox - Process Manager", "title must stay visible")
-	assert.Contains(t, view, "j/k scroll")
+		"frame must not exceed terminal height")
+	assert.Contains(t, view, "Prox - Process Manager", "title stays visible")
+	assert.Contains(t, view, helpModalFooter)
+	// Live chrome behind the modal.
+	assert.Contains(t, view, "m menu")
+	box := m.helpModalGeometry()
+	assert.LessOrEqual(t, box.H, 16, "modal height clamped to frameH-4")
+	assert.Greater(t, m.helpMaxOffset(), 0, "body exceeds modal budget at H=20")
 }
 
 func TestHelp_ScrollKeysMoveWindow(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
-	m.mode = ModeHelp
+	m = clientUpdate(m, keyRune('?'))
 
-	require.Contains(t, m.helpView(), "Prox - Process Manager")
+	require.Contains(t, m.View(), "Prox - Process Manager")
+	require.Greater(t, m.helpMaxOffset(), 0)
 
 	m.handleHelpKey(keyRune('j'))
 	assert.Equal(t, 1, m.helpOffset)
-	scrolled := m.helpView()
-	assert.NotContains(t, scrolled, "Prox - Process Manager", "top scrolled off")
+	scrolled := m.View()
 	assert.Contains(t, scrolled, "lines 2-")
 
 	m.handleHelpKey(keyRune('k'))
@@ -44,20 +51,17 @@ func TestHelp_ScrollKeysMoveWindow(t *testing.T) {
 	assert.Equal(t, m.helpPageStep(), m.helpOffset)
 
 	m.handleHelpKey(tea.KeyMsg{Type: tea.KeyEnd})
-	assert.Greater(t, m.helpOffset, 0, "sentinel; render clamps")
-	endView := m.helpView()
-	assert.Contains(t, endView, "closes help", "footer visible at bottom")
-	assert.NotContains(t, endView, "Prox - Process Manager")
+	assert.Equal(t, m.helpMaxOffset(), m.helpOffset)
+	endView := m.View()
+	assert.Contains(t, endView, helpModalFooter)
 }
 
-// k after G must visibly scroll UP immediately. The offset clamp used to
-// live in renderHelp — which runs on View()'s value copy — so G's offset
-// never persisted the clamp and k had to walk the sentinel back down one
-// press at a time (CodeRabbit PR #102).
+// k after G must scroll UP immediately. Clamp lives on the real model
+// (CodeRabbit PR #102 / plan 022 WS4).
 func TestHelp_KAfterGScrollsUpImmediately(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
-	m.mode = ModeHelp
+	m = clientUpdate(m, keyRune('?'))
 
 	m.handleHelpKey(tea.KeyMsg{Type: tea.KeyEnd})
 	bottom := m.helpOffset
@@ -70,7 +74,7 @@ func TestHelp_KAfterGScrollsUpImmediately(t *testing.T) {
 func TestHelp_CloseResetsOffset(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
-	m.mode = ModeHelp
+	m = clientUpdate(m, keyRune('?'))
 	m.helpOffset = 3
 
 	m.handleHelpKey(tea.KeyMsg{Type: tea.KeyEsc})
@@ -81,10 +85,102 @@ func TestHelp_CloseResetsOffset(t *testing.T) {
 func TestHelp_FitsWithoutWindowing(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 60})
-	m.mode = ModeHelp
+	m = clientUpdate(m, keyRune('?'))
 
-	view := m.helpView()
+	view := m.View()
 	assert.Contains(t, view, "Prox - Process Manager")
-	assert.Contains(t, view, "closes help")
+	assert.Contains(t, view, helpModalFooter)
+	assert.Equal(t, 0, m.helpMaxOffset())
 	assert.NotContains(t, view, "lines 1-", "no scroll indicator when it fits")
+}
+
+func TestHelp_ResizeShrinkClampsOffsetImmediately(t *testing.T) {
+	// Short frame → high maxOffset at bottom. Growing the frame drops
+	// maxOffset; without model-side clamp the first k looks dead (PR #102 /
+	// plan 022 WS4). "Shrink" in the acceptance text is the scroll-range
+	// shrink that follows a taller frame.
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 14})
+	m = clientUpdate(m, keyRune('?'))
+	m.handleHelpKey(tea.KeyMsg{Type: tea.KeyEnd})
+	bottom := m.helpOffset
+	require.Greater(t, bottom, 0)
+
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 40})
+	assert.Equal(t, ModeHelp, m.mode)
+	assert.Equal(t, m.helpMaxOffset(), m.helpOffset, "resize clamps immediately")
+	assert.Less(t, m.helpOffset, bottom)
+
+	before := m.helpOffset
+	m.handleHelpKey(keyRune('k'))
+	if before == 0 {
+		assert.Equal(t, 0, m.helpOffset)
+	} else {
+		assert.Equal(t, before-1, m.helpOffset, "first k after resize must move")
+	}
+}
+
+func TestHelp_QuestionWithOpenMenuOpensHelp(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = clientUpdate(m, keyRune('v'))
+	require.True(t, m.menuOpen())
+
+	m = clientUpdate(m, keyRune('?'))
+	assert.Equal(t, ModeHelp, m.mode)
+	assert.False(t, m.menuOpen(), "menu closed permanently")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEsc})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.False(t, m.menuOpen(), "closing help does not restore the menu")
+}
+
+func TestHelp_StreamingBehindModal(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	// No timestamp prefix → process column starts at column 0, left of the
+	// centred modal. Process names truncate to 10 cols in the log renderer.
+	m.settings.Timestamps = false
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   "STREAMBEH1", // exactly 10 cols — fully visible beside the modal
+		Line:      "live-update",
+	}))
+	view := m.View()
+	assert.Contains(t, view, "STREAMBEH1")
+	assert.Contains(t, view, helpModalFooter)
+	assert.Contains(t, view, "Prox - Process Manager")
+	assert.Contains(t, view, "1/1 lines")
+}
+
+func TestHelpModalRect_NarrowAndTinyFrames(t *testing.T) {
+	x, y, w, h := helpModalRect(50, 24, 20)
+	assert.Equal(t, 46, w, "width capped at frameW-4")
+	assert.Equal(t, 20, h)
+	assert.GreaterOrEqual(t, x, 0)
+	assert.GreaterOrEqual(t, y, 0)
+
+	// Tiny frame: no panic, clamps to fit.
+	assert.NotPanics(t, func() {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 20, Height: 8})
+		m = clientUpdate(m, keyRune('?'))
+		_ = m.View()
+		box := m.helpModalGeometry()
+		assert.LessOrEqual(t, box.W, 20)
+		assert.LessOrEqual(t, box.H, 8)
+		assert.GreaterOrEqual(t, box.W, 1)
+		assert.GreaterOrEqual(t, box.H, 1)
+	})
+}
+
+func TestHelpModalRect_WidthClamp(t *testing.T) {
+	_, _, w80, _ := helpModalRect(80, 24, 10)
+	assert.Equal(t, 60, w80, "70% of 80 is 56 → clamped up to min(60,76)")
+
+	_, _, w150, _ := helpModalRect(150, 40, 10)
+	assert.Equal(t, 100, w150, "70% of 150 is 105 → clamped down to 100")
 }

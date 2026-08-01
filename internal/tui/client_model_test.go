@@ -809,22 +809,27 @@ func TestClientModel_EmptyConnectedStatusRendersNothing(t *testing.T) {
 	assert.NotContains(t, m.View(), "Connected via API")
 }
 
-// TestClientModel_HelpConfigFromOptions pins the help overlay's two per-caller
-// strings threading through ClientOptions into BaseModel.
+// TestClientModel_HelpConfigFromOptions pins the help modal's two per-caller
+// strings threading through ClientOptions into BaseModel. View() shows BOTH
+// live chrome and the help box (plan 022 WS4).
 func TestClientModel_HelpConfigFromOptions(t *testing.T) {
 	opts := ClientOptions{Help: HelpConfig{
 		TitleSuffix: "(Local Mode)",
 		QuitMessage: "Quit (stops all processes)",
 	}}
 	m := NewClientModel(&stubTUIClient{}, opts)
-	// Tall frame: renderHelp windows over-tall content (WS11 scrollable help).
 	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 80})
 	m = nm.(ClientModel)
-	m.mode = ModeHelp
+	nm, _ = m.Update(keyRune('?')) // open via the real entry path
+	m = nm.(ClientModel)
+	require.True(t, m.mode == ModeHelp)
 
 	help := m.View()
 	assert.Contains(t, help, "(Local Mode)")
 	assert.Contains(t, help, "Quit (stops all processes)")
 	assert.NotContains(t, help, "(Client Mode)")
 	assert.NotContains(t, help, "daemon continues running")
+	// Live chrome behind the modal.
+	assert.Contains(t, help, "m menu")
+	assert.Contains(t, help, helpModalFooter)
 }

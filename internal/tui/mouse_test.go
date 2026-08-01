@@ -319,9 +319,9 @@ func TestMouse_IgnoredInTextInputModes(t *testing.T) {
 
 func TestHelpView_NoDeadBindings(t *testing.T) {
 	m := newTestModel()
-	// Large frame so renderHelp shows every section without windowing.
+	// Large frame so the modal shows every section without windowing.
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 80})
-	logs := m.logsHelpView()
+	logs := m.logsHelpText()
 	assert.Contains(t, logs, "Copy")
 	assert.Contains(t, logs, "  y            Copy")
 	assert.Contains(t, logs, "  m            Toggle menu bar")
@@ -330,16 +330,105 @@ func TestHelpView_NoDeadBindings(t *testing.T) {
 	assert.NotContains(t, logs, "Filter mode")
 	assert.NotContains(t, logs, "Select all")
 
-	reqs := m.requestsHelpView()
+	reqs := m.requestsHelpText()
 	assert.Contains(t, reqs, "method:GET")
 	assert.Contains(t, reqs, "double-click")
 	assert.Contains(t, reqs, "  c            Copy as curl")
 	assert.NotContains(t, reqs, "ModeFilter")
 
 	m.viewMode = ViewModeRequestDetail
-	detail := m.detailHelpView()
+	detail := m.detailHelpText()
 	assert.Contains(t, detail, "Copy wire JSON")
 	assert.Contains(t, detail, "scroll wheel")
+}
+
+func TestHelpMouse_ModalFirstRouting(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	require.Greater(t, m.helpMaxOffset(), 0)
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	// Wheel over the box scrolls help.
+	before := m.helpOffset
+	m = clientUpdate(m, tea.MouseMsg{
+		X: box.X + box.W/2, Y: box.Y + box.H/2,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	assert.Equal(t, before+1, m.helpOffset)
+	assert.Equal(t, ModeHelp, m.mode)
+
+	// Wheel outside is consumed — no help scroll, viewport untouched.
+	before = m.helpOffset
+	vpBefore := m.viewport.YOffset
+	m = clientUpdate(m, tea.MouseMsg{
+		X: 0, Y: 0,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	assert.Equal(t, before, m.helpOffset)
+	assert.Equal(t, vpBefore, m.viewport.YOffset)
+	assert.Equal(t, ModeHelp, m.mode)
+
+	// Outside press on a menu-cell coord closes help and does NOT open a menu.
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEsc})
+	m = clientUpdate(m, keyRune('v'))
+	require.True(t, m.menuOpen())
+	_ = m.View()
+	cell := m.ensureHits().menuCells[0]
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	require.False(t, m.menuOpen())
+
+	m = clientUpdate(m, clickAt(cell.Rect.X, cell.Rect.Y))
+	assert.Equal(t, ModeNormal, m.mode, "outside press closes help")
+	assert.False(t, m.menuOpen(), "outside press must not open/activate a menu")
+}
+
+func TestHelpMouse_OutsidePressClosesAndSwallows(t *testing.T) {
+	m := newRequestsModel(8, 8)
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	// Arm a double-click tracker, then open help (clears it), then re-arm
+	// is impossible while help is open — outside press must clear + swallow.
+	y := m.chromeAbove()
+	m = clientUpdate(m, clickAt(10, y))
+	require.NotEqual(t, -1, m.lastRequestClickIdx)
+
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	assert.Equal(t, -1, m.lastRequestClickIdx)
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	// Outside press closes, clears tracker, does not arm a request click.
+	outsideX, outsideY := 0, 0
+	if box.Contains(outsideX, outsideY) {
+		outsideX = box.X + box.W + 1
+		outsideY = 0
+	}
+	m = clientUpdate(m, clickAt(outsideX, outsideY))
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Equal(t, -1, m.lastRequestClickIdx, "outside press cleared tracker and did not arm")
+
+	// A follow-up click can arm normally — proving the outside press was
+	// swallowed (never completed a double-click path through help dismiss).
+	m = clientUpdate(m, clickAt(10, y))
+	assert.NotEqual(t, -1, m.lastRequestClickIdx)
+}
+
+func TestHelpMouse_InsidePressNoOp(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = clientUpdate(m, keyRune('?'))
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	m = clientUpdate(m, clickAt(box.X+1, box.Y+1))
+	assert.Equal(t, ModeHelp, m.mode)
+	assert.Equal(t, 0, m.helpOffset)
 }
 
 func TestRenderKeyHints_FitsFrame(t *testing.T) {

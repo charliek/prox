@@ -227,8 +227,8 @@ type BaseModel struct {
 	lastRequestClickIdx int
 	lastRequestClickAt  time.Time
 
-	// helpOffset scrolls the help overlay when its content exceeds the
-	// terminal height (renderHelp clamps; reset on open/close).
+	// helpOffset scrolls the help modal body when it exceeds the modal inner
+	// height (clampHelpOffset on the real model; reset on open/close).
 	helpOffset int
 }
 
@@ -278,6 +278,11 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	b.height = msg.Height
 	b.relayout()
 	b.clampMenuWindow()
+	// Clamp help on resize so the first k after a shrink works immediately
+	// (plan 022 WS4 / PR #102 lesson — never clamp only in View).
+	if b.mode == ModeHelp {
+		b.clampHelpOffset()
+	}
 }
 
 // chromeAbove is the number of rows above the viewport (menu bar + process
@@ -779,13 +784,13 @@ func (b *BaseModel) setRequestsFilterQuery(q string) {
 	}
 }
 
-// handleHelpKey handles keys in help mode
+// handleHelpKey handles keys in help mode. ModeHelp captures ALL keys: scroll
+// keys scroll; esc/?/q/enter close; anything else is swallowed (plan 022 WS4).
+// Intentional divergence from strix (dismiss-on-any-key): ours stays scrollable.
 func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "esc", "?", "q", "enter":
-		b.mode = ModeNormal
-		b.helpOffset = 0
-		b.clearRequestClickTracker()
+		b.exitHelp()
 		return true
 	case "j", "down":
 		b.helpOffset++
@@ -800,48 +805,8 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 	case "G", "end":
 		b.helpOffset = b.helpMaxOffset()
 	}
-	// Clamp HERE, on the real model — renderHelp runs on View()'s value copy,
-	// so a render-time clamp never persists (CodeRabbit PR #102: k after G
-	// appeared unresponsive while the offset walked back into range).
-	if b.helpOffset < 0 {
-		b.helpOffset = 0
-	}
-	if max := b.helpMaxOffset(); b.helpOffset > max {
-		b.helpOffset = max
-	}
+	b.clampHelpOffset()
 	return true
-}
-
-// helpMaxOffset is the largest helpOffset for the current view's help text at
-// the current terminal height (0 when the content fits without windowing).
-func (b *BaseModel) helpMaxOffset() int {
-	var raw string
-	switch b.viewMode {
-	case ViewModeRequests:
-		raw = b.requestsHelpText()
-	case ViewModeRequestDetail:
-		raw = b.detailHelpText()
-	default:
-		raw = b.logsHelpText()
-	}
-	lines := strings.Split(raw, "\n")
-	budget := b.height - 4 // s.Help border (2) + padding (2)
-	if budget < 6 {
-		budget = 6
-	}
-	if len(lines) <= budget {
-		return 0
-	}
-	return len(lines) - (budget - 1) // one row reserved for the indicator
-}
-
-// helpPageStep is the scroll step for pgup/pgdn in the help overlay.
-func (b *BaseModel) helpPageStep() int {
-	step := (b.height - 4) / 2
-	if step < 1 {
-		return 1
-	}
-	return step
 }
 
 // cycleTheme advances the active theme via the same path as the Theme menu
@@ -1037,9 +1002,9 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, nil
 
 	case "?":
-		b.mode = ModeHelp
-		b.helpOffset = 0
-		b.clearRequestClickTracker()
+		// Text modes never reach here (consume ? as text). Opens help from
+		// Normal only; menu-open ? is special-cased in handleMenuKey (WS4).
+		b.enterHelp()
 		return true, nil
 
 	case "/":
@@ -2709,54 +2674,6 @@ func singleFrameLine(s string) string {
 	return s
 }
 
-// helpView renders the help overlay based on current view mode (plan 021 WS11).
-func (b *BaseModel) helpView() string {
-	switch b.viewMode {
-	case ViewModeRequests:
-		return b.requestsHelpView()
-	case ViewModeRequestDetail:
-		return b.detailHelpView()
-	default:
-		return b.logsHelpView()
-	}
-}
-
-// renderHelp renders help text inside the s.Help box, windowing the content
-// to the terminal height when it would overflow (the box is the whole frame,
-// so an over-tall box used to scroll its top sections off-screen — Phase 5
-// verification). One content row is reserved for a scroll indicator when
-// windowing. PURE with respect to b.helpOffset: the clamp lives in
-// handleHelpKey on the real model (View has a value receiver — a render-time
-// clamp would never persist; CodeRabbit PR #102). The local clamp here is a
-// display-only safety net for a stale offset between resize and next key.
-func (b *BaseModel) renderHelp(raw string) string {
-	lines := strings.Split(raw, "\n")
-	budget := b.height - 4 // s.Help border (2) + padding (2)
-	if budget < 6 {
-		budget = 6
-	}
-	if len(lines) <= budget {
-		return s.Help.Render(raw)
-	}
-	contentRows := budget - 1 // last row: scroll indicator
-	maxOffset := len(lines) - contentRows
-	offset := b.helpOffset
-	if offset > maxOffset {
-		offset = maxOffset
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	end := offset + contentRows
-	if end > len(lines) {
-		end = len(lines)
-	}
-	windowed := append([]string{}, lines[offset:end]...)
-	windowed = append(windowed, s.Dim.Render(fmt.Sprintf("… lines %d-%d of %d (j/k scroll, esc closes) …",
-		offset+1, end, len(lines))))
-	return s.Help.Render(strings.Join(windowed, "\n"))
-}
-
 func (b *BaseModel) helpTitle(suffix string) string {
 	title := "Prox - Process Manager"
 	if b.helpConfig.TitleSuffix != "" {
@@ -2773,11 +2690,6 @@ func (b *BaseModel) helpQuit() string {
 		return b.helpConfig.QuitMessage
 	}
 	return "Quit"
-}
-
-// logsHelpView renders the help overlay for logs view.
-func (b *BaseModel) logsHelpView() string {
-	return b.renderHelp(b.logsHelpText())
 }
 
 // logsHelpText is the full (unwindowed) logs help content.
@@ -2832,11 +2744,6 @@ esc/?/q closes help (j/k scroll when taller than the screen)`,
 	return help
 }
 
-// requestsHelpView renders the help overlay for requests view.
-func (b *BaseModel) requestsHelpView() string {
-	return b.renderHelp(b.requestsHelpText())
-}
-
 // requestsHelpText is the full (unwindowed) requests help content.
 func (b *BaseModel) requestsHelpText() string {
 	help := fmt.Sprintf(`%s
@@ -2883,11 +2790,6 @@ esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Requests View]"), b.helpQuit())
 
 	return help
-}
-
-// detailHelpView renders the help overlay for request detail view.
-func (b *BaseModel) detailHelpView() string {
-	return b.renderHelp(b.detailHelpText())
 }
 
 // detailHelpText is the full (unwindowed) detail help content.
