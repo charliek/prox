@@ -324,9 +324,10 @@ func TestFormatRequestDetail_BodySections(t *testing.T) {
 
 	out := strings.Join(b.formatRequestDetail(), "\n")
 	assert.Contains(t, out, "Request Body (18 bytes, application/json)")
-	assert.Contains(t, out, `"key": "value"`)
+	assert.Contains(t, stripANSI(out), `"key": "value"`)
 	assert.Contains(t, out, "Response Body (10 bytes)")
 	assert.Contains(t, out, "(body no longer available)")
+	assert.Contains(t, out, s.Bold.Render("POST")+" /api/v1/things")
 }
 
 // TestFormatRequestDetail_InFlight_ShowsDurationNote verifies the Duration

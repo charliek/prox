@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1674,12 +1675,11 @@ func (b *BaseModel) formatRequestDetail() []string {
 
 	d := b.requestDetail
 
-	// Header info
+	// Header: bold method + full URL (curl-ish first line, plan 021 C9).
 	lines = append(lines, s.Header.Render(fmt.Sprintf("Request: %s", d.ID)))
 	lines = append(lines, "")
+	lines = append(lines, s.Bold.Render(d.Method)+" "+d.URL)
 	lines = append(lines, fmt.Sprintf("  Time:     %s", d.Timestamp))
-	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
-	lines = append(lines, fmt.Sprintf("  URL:      %s", d.URL))
 	lines = append(lines, fmt.Sprintf("  Status:   %d", d.StatusCode))
 	switch {
 	case d.InFlight && d.Stale:
@@ -1714,26 +1714,18 @@ func (b *BaseModel) formatRequestDetail() []string {
 		}
 	}
 
-	// Request headers
+	// Request headers (key Dim, value default — C9)
 	if len(d.RequestHeaders) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, s.Header.Render("Request Headers"))
-		for name, values := range d.RequestHeaders {
-			for _, value := range values {
-				lines = append(lines, fmt.Sprintf("  %s: %s", s.Dim.Render(name), value))
-			}
-		}
+		lines = append(lines, formatHeaderTable(d.RequestHeaders)...)
 	}
 
 	// Response headers
 	if len(d.ResponseHeaders) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, s.Header.Render("Response Headers"))
-		for name, values := range d.ResponseHeaders {
-			for _, value := range values {
-				lines = append(lines, fmt.Sprintf("  %s: %s", s.Dim.Render(name), value))
-			}
-		}
+		lines = append(lines, formatHeaderTable(d.ResponseHeaders)...)
 	}
 
 	// Request body
@@ -1746,6 +1738,28 @@ func (b *BaseModel) formatRequestDetail() []string {
 	lines = append(lines, "")
 	lines = append(lines, s.Dim.Render("Press ESC to go back"))
 
+	return lines
+}
+
+// formatHeaderTable renders headers as an aligned key/value table with Dim
+// keys (plan 021 C9). Keys are sorted for stable output.
+func formatHeaderTable(headers map[string][]string) []string {
+	keys := make([]string, 0, len(headers))
+	maxKey := 0
+	for name := range headers {
+		keys = append(keys, name)
+		if len(name) > maxKey {
+			maxKey = len(name)
+		}
+	}
+	sort.Strings(keys)
+	var lines []string
+	for _, name := range keys {
+		for _, value := range headers[name] {
+			padded := name + strings.Repeat(" ", maxKey-len(name))
+			lines = append(lines, fmt.Sprintf("  %s  %s", s.Dim.Render(padded), value))
+		}
+	}
 	return lines
 }
 
@@ -1804,16 +1818,24 @@ func renderBodyLines(body *BodyData) []string {
 	}
 
 	text := body.Data
+	prettyJSON := false
 	if shouldPrettyPrintJSON(body) {
 		var buf bytes.Buffer
 		if err := json.Indent(&buf, []byte(body.Data), "", "  "); err == nil {
 			text = buf.String()
+			prettyJSON = true
 		}
 	}
 
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {
-		lines = append(lines, "  "+sanitizeControlChars(line))
+		// Sanitize before highlighting so ESC from the JSON highlighter is
+		// not mistaken for a body control byte (C9).
+		safe := sanitizeControlChars(line)
+		if prettyJSON {
+			safe = highlightJSONText(safe)
+		}
+		lines = append(lines, "  "+safe)
 	}
 	return lines
 }
@@ -2018,52 +2040,75 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	// Format subdomain with padding
 	subdomain := fmt.Sprintf("%-10s", req.Subdomain)
 
-	// Format method with padding (7 chars to accommodate DELETE/OPTIONS)
-	method := fmt.Sprintf("%-7s", req.Method)
+	// Method token coloured by verb (C9); pad inside the styled segment so
+	// ANSI resets don't sit between the verb and its column padding.
+	method := httpMethodStyle(req.Method).Render(fmt.Sprintf("%-7s", req.Method))
 
-	// Format status with color based on status code
-	codeStyle := s.HTTPSuccess
+	// Status token by class (C9): 2xx→Status2xx, 3xx→FG (unstyled), 4xx/5xx
+	// themed, 0/in-flight→Dim. 1xx also Dim.
+	statusTok := fmt.Sprintf("%3d", req.StatusCode)
 	switch {
-	case req.StatusCode < 100:
-		codeStyle = s.Dim // Gray for unknown/error (status 0)
-	case req.StatusCode < 200:
-		codeStyle = s.Dim // Gray for informational 1xx
+	case req.InFlight || req.StatusCode < 200:
+		statusTok = s.Dim.Render(statusTok)
 	case req.StatusCode >= 500:
-		codeStyle = s.HTTPError
+		statusTok = s.Status5xx.Render(statusTok)
 	case req.StatusCode >= 400:
-		codeStyle = s.HTTPWarning
+		statusTok = s.Status4xx.Render(statusTok)
 	case req.StatusCode >= 300:
-		codeStyle = s.HTTPRedirect
+		// 3xx: default FG (plan/brief) — leave unstyled.
+	case req.StatusCode >= 200:
+		statusTok = s.Status2xx.Render(statusTok)
 	}
-	status := codeStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
 
-	// Format the duration column, including its "ms" unit, in one piece: the
-	// normal/in-flight/overflow cases share a digits-or-filler value plus
-	// "ms". A stale in-flight row (D8, #53: the completion event may have
-	// been lost, true outcome unknown — not necessarily broken, long-lived
-	// streams/transfers can legitimately still be live here) renders
-	// "stale?" instead, which isn't a duration so it carries no "ms" suffix.
+	// Duration column (C9): colour scale from plan WS9 — <100ms OK,
+	// 100–499 default FG, 500–1999 Warn, ≥2000 Err. In-flight/stale keep
+	// their glyphs (…ms / stale?) but Dim-styled (brief's "pulse" is
+	// style-only; the …ms glyph is kept over a ● so row shape stays).
 	durationMs := req.Duration.Milliseconds()
 	var duration string
 	switch {
 	case b.requestIsStale(req):
-		duration = "stale?"
+		duration = s.Dim.Render("stale?")
 	case req.InFlight:
-		duration = "  ...ms"
+		duration = s.Dim.Render("  ...ms")
 	case durationMs > 9999:
-		duration = "9999+ms"
+		duration = s.HTTPError.Render("9999+ms")
+	case durationMs >= 2000:
+		duration = s.HTTPError.Render(fmt.Sprintf("%5dms", durationMs))
+	case durationMs >= 500:
+		duration = s.Warn.Render(fmt.Sprintf("%5dms", durationMs))
+	case durationMs >= 100:
+		duration = fmt.Sprintf("%5dms", durationMs) // default FG
 	default:
-		duration = fmt.Sprintf("%5dms", durationMs)
+		duration = s.HTTPSuccess.Render(fmt.Sprintf("%5dms", durationMs))
 	}
 
 	return fmt.Sprintf("%s  %s  %s %s %s  %s",
 		s.Dim.Render(ts),
 		s.Dim.Render(subdomain),
 		method,
-		status,
-		s.Dim.Render(duration),
+		statusTok,
+		duration,
 		req.URL,
 	)
+}
+
+// httpMethodStyle returns the C9 method colour; unknown verbs stay unstyled FG.
+func httpMethodStyle(method string) lipgloss.Style {
+	switch strings.ToUpper(method) {
+	case "GET":
+		return s.HTTPGet
+	case "POST":
+		return s.HTTPPost
+	case "PUT":
+		return s.HTTPPut
+	case "DELETE":
+		return s.HTTPDelete
+	case "PATCH":
+		return s.HTTPPatch
+	default:
+		return lipgloss.NewStyle()
+	}
 }
 
 // getProcessStyle returns the style for a process name
@@ -2094,15 +2139,106 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 		streamIndicator = s.Err.Render(" ERR ")
 	}
 
-	line := b.highlightLogLine(entry.Line)
+	content := b.formatLogContent(entry)
 	// Timestamps toggle (plan 021 WS4): omitting the fixed-width `15:04:05 `
 	// prefix shifts the process-name column left — intentional, no padding
 	// compensation. Default true preserves today's always-on rendering.
 	if b.settings.Timestamps {
 		ts := s.Dim.Render(entry.Timestamp.Format("15:04:05"))
-		return fmt.Sprintf("%s %s%s %s", ts, prefix, streamIndicator, line)
+		return fmt.Sprintf("%s %s%s %s", ts, prefix, streamIndicator, content)
 	}
-	return fmt.Sprintf("%s%s %s", prefix, streamIndicator, line)
+	return fmt.Sprintf("%s%s %s", prefix, streamIndicator, content)
+}
+
+// formatLogContent builds the log-line body (after ts/process/ERR prefix):
+// JSON lines become a path=value summary (C9); level-tinted content composes
+// with / search highlight. Undetected plain lines stay byte-identical to C8.
+func (b *BaseModel) formatLogContent(entry domain.LogEntry) string {
+	meta := b.logMeta[entry.DisplaySeq]
+	line := entry.Line
+
+	if meta.isJSON {
+		// Width budget for no-wrap truncation: viewport minus the chrome
+		// prefix this entry will carry. Wrap-on leaves overflow to Wordwrap.
+		width := 0
+		if !b.settings.Wrap && b.viewport.Width > 0 {
+			width = b.logContentWidth(entry)
+		}
+		if summary, ok := summarizeJSONLog(line, width); ok {
+			line = summary
+		}
+	}
+
+	levelStyle, tint := logLevelStyle(meta)
+	return b.styleLogContent(line, levelStyle, tint)
+}
+
+// logContentWidth is the columns available for the log body once the
+// timestamp / process / ERR prefix are accounted for (ANSI-aware).
+func (b *BaseModel) logContentWidth(entry domain.LogEntry) int {
+	w := b.viewport.Width
+	if w <= 0 {
+		return 0
+	}
+	// Mirror formatLogEntry's prefix geometry with unstyled stand-ins so
+	// StringWidth matches the visible columns (styled prefix has same width).
+	used := 0
+	if b.settings.Timestamps {
+		used += len("15:04:05") + 1 // ts + space
+	}
+	used += 10 // process column
+	if entry.Stream == domain.StreamStderr {
+		used += len(" ERR ")
+	}
+	used += 1 // space before content
+	remain := w - used
+	if remain < 0 {
+		return 0
+	}
+	return remain
+}
+
+// logLevelStyle picks the C9 content tint for a cached meta. Info uses
+// LogInfo; trace stays default FG (no tint) so only debug is dim among the
+// low-severity levels. Unknown / !hasLevel → no tint.
+func logLevelStyle(meta logMeta) (lipgloss.Style, bool) {
+	if !meta.hasLevel {
+		return lipgloss.Style{}, false
+	}
+	switch meta.level {
+	case LogLevelError:
+		return s.LogError, true
+	case LogLevelWarn:
+		return s.LogWarn, true
+	case LogLevelDebug:
+		return s.LogDebug, true
+	case LogLevelInfo:
+		return s.LogInfo, true
+	default: // trace / unknown
+		return lipgloss.Style{}, false
+	}
+}
+
+// styleLogContent applies level tint then / search highlight. Highlight is
+// resolved on the PLAIN content so byte offsets stay valid; level colour wraps
+// the non-match spans so SearchHighlight's reset does not leak the level tint
+// past the match (C9). When no tint, this is highlightLogLine alone.
+func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style, tint bool) string {
+	if !tint {
+		return b.highlightLogLine(line)
+	}
+	q := b.logSearchQuery
+	if q == "" || !isASCIINoESC(q) || !isASCIINoESC(line) {
+		return levelStyle.Render(line)
+	}
+	idx := strings.Index(strings.ToLower(line), strings.ToLower(q))
+	if idx < 0 {
+		return levelStyle.Render(line)
+	}
+	end := idx + len(q)
+	return levelStyle.Render(line[:idx]) +
+		s.SearchHighlight.Render(line[idx:end]) +
+		levelStyle.Render(line[end:])
 }
 
 // highlightLogLine wraps the first case-insensitive match of the active
