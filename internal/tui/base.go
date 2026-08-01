@@ -163,6 +163,10 @@ type BaseModel struct {
 	menuCellHits  []menuCellHit
 	menuDropdown  *menuDropdownHit
 
+	// processChipHits records per-frame clickable rects for process panel chips
+	// (logs view). Cleared in mainView before processPanel renders (WS11).
+	processChipHits []processChipHit
+
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
 	// content. Rebuilt every updateViewport (plan 021 WS4 / Codex #2): when wrap
 	// is off the span is identity (entry i → {i,i} in filtered order); when wrap
@@ -217,6 +221,10 @@ type BaseModel struct {
 
 	// Help configuration
 	helpConfig HelpConfig
+
+	// Mouse double-click on a requests row (plan 021 WS11 / Codex #5).
+	lastRequestClickIdx int
+	lastRequestClickAt  time.Time
 }
 
 // newBaseModel creates a new BaseModel with the given help configuration
@@ -227,21 +235,24 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 	ti.Width = 40
 	applyTextInputTheme(&ti)
 
-	return BaseModel{
-		processes:     make([]domain.ProcessInfo, 0),
-		logEntries:    make([]domain.LogEntry, 0),
-		proxyRequests: make([]proxy.RequestRecord, 0),
-		textInput:     ti,
-		mode:          ModeNormal,
-		viewMode:      ViewModeLogs,
-		streamHealth:  make(map[StreamID]stream.Status),
-		streamDropped: make(map[StreamID]bool),
-		followMode:    true,
-		logCursorIdx:  -1, // no-cursor sentinel (pairs with logCursorSeq 0)
-		helpConfig:    helpConfig,
-		settings:      DefaultSettings(),
-		openMenu:      -1, // closed
+	b := BaseModel{
+		processes:           make([]domain.ProcessInfo, 0),
+		logEntries:          make([]domain.LogEntry, 0),
+		proxyRequests:       make([]proxy.RequestRecord, 0),
+		textInput:           ti,
+		mode:                ModeNormal,
+		viewMode:            ViewModeLogs,
+		streamHealth:        make(map[StreamID]stream.Status),
+		streamDropped:       make(map[StreamID]bool),
+		followMode:          true,
+		logCursorIdx:        -1, // no-cursor sentinel (pairs with logCursorSeq 0)
+		lastRequestClickIdx: -1,
+		helpConfig:          helpConfig,
+		settings:            DefaultSettings(),
+		openMenu:            -1, // closed
 	}
+	b.viewport.MouseWheelEnabled = false // TUI owns all wheel routing (Codex #5)
+	return b
 }
 
 // applyTextInputTheme sets prompt/cursor/text styles from the active theme.
@@ -321,6 +332,7 @@ func (b *BaseModel) relayout() {
 		b.viewport.Height = vpH
 		b.viewport.YPosition = headerH
 	}
+	b.viewport.MouseWheelEnabled = false // TUI owns wheel routing (Codex #5)
 }
 
 // handleLogEntry handles a new log entry message: one append followed by one
@@ -2345,6 +2357,10 @@ func healthDot(status domain.HealthStatus) string {
 // (Codex #8).
 func (b *BaseModel) processPanel() string {
 	var items []string
+	rowY, panelRowOK := b.processPanelRowY()
+	const chipSep = "  "
+	chipSepW := ansi.StringWidth(chipSep)
+	chipCol := 1 // Header Padding(0,1) left gutter
 
 	// Show processes panel in both views
 	for i, proc := range b.processes {
@@ -2371,7 +2387,16 @@ func (b *BaseModel) processPanel() string {
 		// Show number key (only in logs view where 1-9 keys work)
 		if b.viewMode == ViewModeLogs {
 			key := fmt.Sprintf("%d:", i+1)
-			items = append(items, style.Render(key+name)+dot)
+			segment := style.Render(key+name) + dot
+			items = append(items, segment)
+			if panelRowOK {
+				w := ansi.StringWidth(segment)
+				b.processChipHits = append(b.processChipHits, processChipHit{
+					Index: i,
+					Rect:  HitRect{X: chipCol, Y: rowY, W: w, H: 1},
+				})
+				chipCol += w + chipSepW
+			}
 		} else {
 			items = append(items, style.Render(name)+dot)
 		}
@@ -2565,6 +2590,7 @@ func (b *BaseModel) mainView(extraStatusInfo string) string {
 	}
 
 	if b.settings.ProcessPanel {
+		b.processChipHits = nil
 		panel := b.processPanel()
 		for _, line := range strings.Split(panel, "\n") {
 			lines = append(lines, padFrameRow(line, b.width))
@@ -2594,107 +2620,157 @@ func singleFrameLine(s string) string {
 	return s
 }
 
-// helpView renders the help overlay based on current view mode
+// helpView renders the help overlay based on current view mode (plan 021 WS11).
 func (b *BaseModel) helpView() string {
-	if b.viewMode == ViewModeRequests {
+	switch b.viewMode {
+	case ViewModeRequests:
 		return b.requestsHelpView()
+	case ViewModeRequestDetail:
+		return b.detailHelpView()
+	default:
+		return b.logsHelpView()
 	}
-	return b.logsHelpView()
 }
 
-// logsHelpView renders the help overlay for logs view
-func (b *BaseModel) logsHelpView() string {
+func (b *BaseModel) helpTitle(suffix string) string {
 	title := "Prox - Process Manager"
 	if b.helpConfig.TitleSuffix != "" {
 		title += " " + b.helpConfig.TitleSuffix
 	}
-	title += " [Logs View]"
-
-	quitMsg := "Quit"
-	if b.helpConfig.QuitMessage != "" {
-		quitMsg = b.helpConfig.QuitMessage
+	if suffix != "" {
+		title += " " + suffix
 	}
+	return title
+}
 
-	help := fmt.Sprintf(`
-%s
+func (b *BaseModel) helpQuit() string {
+	if b.helpConfig.QuitMessage != "" {
+		return b.helpConfig.QuitMessage
+	}
+	return "Quit"
+}
 
-Views:
-  Tab        Switch to Requests view
+// logsHelpView renders the help overlay for logs view.
+func (b *BaseModel) logsHelpView() string {
+	help := fmt.Sprintf(`%s
 
 Navigation:
-  j/↓        Scroll down
-  k/↑        Scroll up (pauses auto-follow)
-  g/Home     Go to top (pauses auto-follow)
-  G/End      Go to bottom (resumes auto-follow)
-  PgUp/PgDn  Page up/down
-  F          Toggle auto-follow mode
+  j/k, ↑/↓     Scroll (up pauses auto-follow)
+  PgUp/PgDn    Half-page scroll
+  g/Home       Jump to top (pauses follow)
+  G/End        Jump to bottom (resumes follow)
+  F            Toggle auto-follow
+  Tab          Switch to Requests view
+  scroll wheel Scroll (3 lines per notch; up pauses follow)
 
-Search (jumps the cursor, does NOT filter):
-  /          Search lines (jump to match at/after the current position)
-  n/N        Jump to next/previous match (wraps)
+Filter & search:
+  s            Filter bar (query language, live)
+               e.g. proc:api level:error -health
+  f            Filter menu (process + level checks)
+  /            Search — jump cursor to match (does not hide lines)
+  n/N          Next/previous search match
+  Esc          Clear filters, search, and solo
 
-Filtering:
-  1-9        Solo process (toggle)
-  f          Filter mode (process selection)
-  s          Substring filter (hide non-matching, applied live)
-  ESC        Clear filters and search
+Processes:
+  1-9          Solo a process (toggle); click panel chip too
 
-Other:
-  r          Restart selected process (1-9 to select)
-  ?          Toggle help
-  q/Ctrl+C   %s
+View & chrome:
+  p            Toggle process panel
+  T            Toggle timestamps in log lines
+  w            Toggle soft-wrap
+  m            Toggle menu bar
+  v            Open View menu (bar visible)
+  t            Cycle theme
+  ?            This help
 
-Press any key to close help...
-`, title, quitMsg)
+Copy (grab-for-agent):
+  y            Copy parked search line (when cursor set)
+
+Actions:
+  r            Restart soloed process
+  q/Ctrl+C     %s
+
+Mouse:
+  wheel        Scroll logs (3 lines/notch)
+  click line   Park cursor on that entry (disengages follow)
+  click chip   Solo/unsolo process
+  menu bar     Click cells or use v/f; ←/→ switch open menus
+
+Press any key to close help...`,
+		b.helpTitle("[Logs View]"), b.helpQuit())
 
 	return s.Help.Render(help)
 }
 
-// requestsHelpView renders the help overlay for requests view
+// requestsHelpView renders the help overlay for requests view.
 func (b *BaseModel) requestsHelpView() string {
-	title := "Prox - Process Manager"
-	if b.helpConfig.TitleSuffix != "" {
-		title += " " + b.helpConfig.TitleSuffix
-	}
-	title += " [Requests View]"
+	help := fmt.Sprintf(`%s
 
-	quitMsg := "Quit"
-	if b.helpConfig.QuitMessage != "" {
-		quitMsg = b.helpConfig.QuitMessage
-	}
+Navigation (cursor row ❯):
+  j/k, ↑/↓     Move cursor (up pauses follow; onto newest resumes)
+  PgUp/PgDn    Move cursor half a page
+  g/Home       Cursor to top (pauses follow)
+  G/End        Cursor to bottom (resumes follow)
+  F            Toggle auto-follow
+  Tab          Switch to Logs view
+  scroll wheel Move cursor (3 rows/notch; follow rules match j/k)
 
-	help := fmt.Sprintf(`
-%s
+Filter & search:
+  s            Filter bar (query language, live)
+               e.g. method:GET status:5xx host:api url:/orders
+  f            Filter menu (status class, methods)
+  /            Search URL/method/subdomain (navigate, not filter)
+  n/N          Next/previous search match
+  Esc          Back from detail, or clear filters/search
 
-Views:
-  Tab        Switch to Logs view
+Requests:
+  Enter        Open detail for cursor row
+  click row    Move cursor; double-click opens detail
 
-Navigation (moves the cursor row; reaching the oldest row loads older requests):
-  j/↓        Move cursor down (onto newest row resumes auto-follow)
-  k/↑        Move cursor up (pauses auto-follow)
-  g/Home     Move cursor to top (pauses auto-follow)
-  G/End      Move cursor to bottom (resumes auto-follow)
-  PgUp/PgDn  Move cursor half a page
-  F          Toggle auto-follow mode
+View & chrome:
+  p/T/w/m/v/t  Same as Logs view (panel, timestamps, wrap, menu, theme)
+  ?            This help
 
-Search (jumps the cursor, does NOT filter):
-  /          Search URL/method/subdomain (jump to match at/after cursor)
-  n/N        Jump to next/previous match (wraps)
+Copy (grab-for-agent):
+  y            Copy full request ID (cursor row)
+  c            Copy as curl
+  Y            Copy detail JSON (detail view)
 
-Request Details:
-  Enter      View details for the cursor row
-  ESC        Return to request list (or clear filters/search)
+Actions:
+  q/Ctrl+C     %s
 
-Filtering:
-  s          String filter (URL/method/subdomain)
-  ESC        Clear filters and search
+Mouse:
+  wheel        Move cursor (3 rows/notch)
+  click        Select row; double-click opens detail
+  menu bar     Click cells or v/f; ←/→ between menus
 
-Other:
-  ?          Toggle help
-  q/Ctrl+C   %s
+Press any key to close help...`,
+		b.helpTitle("[Requests View]"), b.helpQuit())
 
-Press any key to close help...
-`, title, quitMsg)
+	return s.Help.Render(help)
+}
+
+// detailHelpView renders the help overlay for request detail view.
+func (b *BaseModel) detailHelpView() string {
+	help := fmt.Sprintf(`%s
+
+Navigation:
+  j/k, ↑/↓     Scroll detail content
+  PgUp/PgDn    Page scroll
+  scroll wheel Scroll (3 lines per notch)
+  Esc          Back to requests list
+
+Copy (grab-for-agent):
+  y            Copy full request ID
+  c            Copy as curl
+  Y            Copy wire JSON (exact API payload)
+
+View & chrome:
+  ?            This help
+  q/Ctrl+C     %s
+
+Press any key to close help...`,
+		b.helpTitle("[Request Detail]"), b.helpQuit())
 
 	return s.Help.Render(help)
 }

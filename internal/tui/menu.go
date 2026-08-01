@@ -381,9 +381,9 @@ func (b *BaseModel) renderMenuBar() string {
 	return padFrameRow(line, b.width)
 }
 
-// renderKeyHints is the dim footer under the status bar (C11 rewrites copy).
+// renderKeyHints is the dim footer under the status bar (plan 021 WS11).
 func (b *BaseModel) renderKeyHints() string {
-	return padFrameRow(s.Dim.Render("m menu · ? help · tab switch · q quit"), b.width)
+	return padFrameRow(s.Dim.Render("m menu · / search · s filter · ? help · q quit"), b.width)
 }
 
 // dropdownBoxRows builds the opaque themed dropdown rows (uniform width) and

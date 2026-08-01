@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **TUI redesign** (plan 021): menu bar with View, Filter, and Theme dropdowns;
+  truecolor themes (six presets plus user TOML in `~/.prox/tui/themes/`); filter
+  query language on the `s` bar with a matching Filter menu; view toggles for
+  process panel, timestamps, and soft-wrap; styled log/request/detail rendering;
+  grab-for-agent copy keys (`y` / `c` / `Y`); and full mouse routing (wheel,
+  row/chip clicks, double-click to open request detail). Settings persist in
+  `~/.prox/tui/config.toml`.
+
 TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
 TUI. The owner's TUI is the same API-client TUI attach has always run, so
 every feature, key binding, and fix lands in both at once.

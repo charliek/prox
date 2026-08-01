@@ -16,67 +16,74 @@ prox up --tui web api
 
 ## Views
 
-The TUI has two views you can switch between with `Tab`:
+The TUI has two main views you can switch between with `Tab` (or the View menu):
 
-- **Logs View** - Real-time process logs with filtering
-- **Requests View** - Real-time HTTP proxy requests (when proxy is enabled)
+- **Logs View** — Real-time process logs with filtering
+- **Requests View** — Real-time HTTP proxy requests (when proxy is enabled)
 
-## Logs View Layout
+Press `Enter` on a request row (or double-click it) to open **Request Detail**.
+
+## Layout
+
+With the default chrome (menu bar and process panel visible):
 
 ```text
+ prox  myproject                    View ▾  Filter ▾  Theme ▾
 ┌─ processes ──────────────────────────────────────────────┐
-│ [1] ● web     running   [2] ● api    running             │
-│ [3] ● worker  starting  [4] ○ cron   stopped             │
-├─ logs (showing: all) ────────────────────────────────────┤
+│ 1: ● web     running   2: ● api    running               │
+├─ logs ───────────────────────────────────────────────────┤
 │ 10:32:01 web    │ GET /api/users 200 12ms                │
-│ 10:32:01 api    │ connected to database                  │
-│ 10:32:02 worker │ processing job 123                     │
-│ 10:32:02 web    │ GET /api/posts 200 8ms                 │
-│ 10:32:03 api    │ WARN: connection pool running low      │
+│ 10:32:02 api    │ connected to database                  │
 │ ...                                                      │
 ├──────────────────────────────────────────────────────────┤
-│ Tab: switch view | ? for help  [Logs] [FOLLOW] 45 lines  │
+│ [Logs] [FOLLOW] 45 lines                                 │
+│ ? help · m menu · / search · s filter · q quit           │
 └──────────────────────────────────────────────────────────┘
 ```
 
-## Requests View Layout
+Toggle the menu bar with `m`, the process panel with `p`. View preferences persist in `~/.prox/tui/config.toml`.
 
-```text
-┌─ processes ──────────────────────────────────────────────┐
-│ ● web     running   ● api    running                     │
-├─ requests ───────────────────────────────────────────────┤
-│ 15:04:05  api        GET  200   45ms  /api/v1/users      │
-│ 15:04:05  app        POST 201  120ms  /api/v1/posts      │
-│ 15:04:06  api        GET  404   12ms  /api/v1/missing    │
-│ 15:04:07  web        GET  200   23ms  /assets/main.js    │
-│ ...                                                      │
-├──────────────────────────────────────────────────────────┤
-│ Tab: switch view | ? for help  [Requests] [FOLLOW] 12    │
-└──────────────────────────────────────────────────────────┘
+## Themes
+
+Six built-in presets ship with prox: `tokyo-night` (default), `dark`, `light`, `catppuccin`, `gruvbox`, and `legacy` (approximates the pre-redesign ANSI look).
+
+- Press `t` to cycle presets and any user themes (sorted by filename).
+- Open the **Theme** menu from the menu bar (click `Theme ▾`, or `v` then `→`/`Tab` to sibling-switch) to pick a theme by name.
+- Set a default in config: `theme = "catppuccin"` in `~/.prox/tui/config.toml`.
+- Add custom themes as TOML files in `~/.prox/tui/themes/<name>.toml`:
+
+```toml
+base = "tokyo-night"
+
+[colors]
+bg = "#1a1b26"
+fg = "#a9b1d6"
+
+[palette]
+# optional 9-entry process colour list (hex)
 ```
 
-Status codes are color-coded: green (2xx), cyan (3xx), yellow (4xx), red (5xx), gray (0/unknown).
+Each file names a `base` preset and may override `[colors]` (snake_case hex) and `[palette]`. Malformed files fall back to the default with a warning in the log pane.
 
-## Process State Colors
+HTTP status colours, log level tints, and JSON syntax highlighting all follow the active theme.
 
-The processes panel color-codes each process name by its state, including the states introduced by [dependencies and tasks](../guides/dependencies.md):
+## Process State Colours
 
-| State | Color |
-| ----- | ----- |
-| `running` | green |
-| `stopped` | gray |
-| `crashed` | red |
-| `starting` | yellow |
-| `stopping` | yellow |
-| `waiting` | amber (distinct from the starting yellow) |
-| `blocked` | red, bold (a launch failure, same family as crashed) |
-| `completed` | gray (a finished task rests like a stopped process) |
+The processes panel colour-codes each process name by its state, including the states introduced by [dependencies and tasks](../guides/dependencies.md). Colours are theme-defined (not fixed ANSI indices); the mapping is semantic:
 
-A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on, appended directly to its name in the panel: `web (waiting on: postgres, redis)` or `web (blocked on: postgres)`, in declaration order. There's no separate detail area for this in the compact processes panel — it's shown inline because that's all the space there is.
+| State | Typical colour role |
+| ----- | ------------------- |
+| `running` | success / OK |
+| `stopped` | dim |
+| `crashed` | error |
+| `starting` / `stopping` | warning |
+| `waiting` | amber (distinct from starting) |
+| `blocked` | error, bold |
+| `completed` | dim |
 
-A process with a [healthcheck](configuration.md#health-check-fields) configured shows a health dot right after its name: green `●` while healthy, red `✗` while unhealthy (distinct glyphs, so the states stay distinguishable without color). It's styled separately from the name's state color, so it stays visible regardless of process state. A process still reporting `unknown` health, or with no healthcheck configured at all, shows no dot.
+A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on. A process with a [healthcheck](configuration.md#health-check-fields) shows a health dot after its name: green `●` while healthy, red `✗` while unhealthy.
 
-A request whose response is still streaming shows its real header-time status but `...` in place of the duration until it completes; the row then updates in place (same position, no duplicate) rather than adding a new line.
+Click a process chip in the panel (logs view) to solo that process — the same as pressing its `1`–`9` key. Click again to clear solo.
 
 ## Keybindings
 
@@ -84,156 +91,135 @@ A request whose response is still streaming shows its real header-time status bu
 
 | Key | Action |
 | --- | ------ |
-| `Tab` | Switch between Logs and Requests views |
-| `↑` / `↓` / `j` / `k` | Scroll |
-| `PgUp` / `PgDn` | Scroll page |
-| `scroll wheel` | Scroll |
-| `Home` / `End` / `g` / `G` | Jump to start/end |
-| `F` | Toggle auto-follow mode |
-| `Esc` | Clear filter/search, exit mode |
-| `?` | Show help overlay |
+| `Tab` | Switch between Logs and Requests |
+| `↑` / `↓` / `j` / `k` | Scroll (logs) or move cursor (requests) |
+| `PgUp` / `PgDn` | Page scroll / half-page cursor step |
+| Scroll wheel | Scroll logs or move requests cursor (3 lines per notch) |
+| `Home` / `End` / `g` / `G` | Jump to start/end (or cursor top/bottom in requests) |
+| `F` | Toggle auto-follow |
+| `?` | Help overlay |
+| `m` | Toggle menu bar |
+| `v` | Open View menu (when bar visible) |
+| `f` | Open Filter menu (when bar visible) |
+| `t` | Cycle theme |
+| `p` | Toggle process panel |
+| `T` | Toggle timestamps in log lines |
+| `w` | Toggle soft-wrap in logs |
+| `Esc` | Clear filters/search/solo; back from detail |
 | `q` | Quit |
+
+### Menu bar
+
+When the menu bar is visible:
+
+- Click `View ▾`, `Filter ▾`, or `Theme ▾` to open a dropdown.
+- With a menu open: `←`/`→`/`Tab` switch between menus; `↑`/`↓`/`j`/`k` navigate rows (separators skipped); `Enter`/`Space` activate; any other key closes the menu.
+- Opening a menu by mouse while typing in a filter/search bar blurs the input first.
+
+Menu choices persist view toggles and theme to `~/.prox/tui/config.toml` (`theme` plus `[view]` keys: `process_panel`, `timestamps`, `wrap`, `menu_bar`).
 
 ### Logs View
 
 | Key | Action |
 | --- | ------ |
-| `1-9` | Solo process (press again for all) |
-| `f` | Open process filter (multi-select) |
-| `/` | Search lines — jumps the cursor to a match (does not filter) |
-| `n` / `N` | Jump the cursor to the next/previous match (wraps) |
-| `s` | Substring filter, applied live (hides non-matching) |
-| `r` | Restart the soloed process (select with `1`-`9` first) |
+| `1-9` | Solo process (toggle) |
+| `s` | Filter bar — query language, applied live |
+| `f` | Filter menu — process checks + log levels |
+| `/` | Search — jumps cursor to match (does not filter) |
+| `n` / `N` | Next/previous search match |
+| `y` | Copy parked line (after click or `/` search cursor) |
+| `r` | Restart the soloed process |
+| Mouse click line | Park cursor on that entry (disengages follow) |
+
+**Filter query language (logs):** space-separated tokens. Examples:
+
+```text
+proc:api level:error -health
+proc:web proc:worker level:warn
+re:timeout
+```
+
+Fields: `proc:` (repeatable), `level:error|warn|info|debug|trace` (repeatable), `re:<regex>` (≤256 chars). Bare words are case-insensitive AND substring matches on the line. `-` negates any token. Invalid syntax keeps the last good filter and shows a hint in the status bar.
+
+The **Filter menu** edits the same state as the `s` bar; menu changes rewrite the bar text canonically.
 
 ### Requests View
 
-The requests view has an explicit **cursor row** (marked with `❯`). The
-navigation keys move that cursor rather than scrolling raw lines, and the
-viewport scrolls the minimum needed to keep the cursor on screen.
+The requests view has an explicit **cursor row** (marked with `❯`). Navigation moves that cursor; the viewport scrolls to keep it visible.
 
 | Key | Action |
 | --- | ------ |
-| `j` / `↓` | Move cursor down (onto the newest row resumes auto-follow) |
-| `k` / `↑` | Move cursor up (pauses auto-follow) |
-| `g` / `Home` | Move cursor to the top (pauses auto-follow) |
-| `G` / `End` | Move cursor to the bottom (resumes auto-follow) |
-| `PgUp` / `PgDn` | Move cursor half a page |
-| `F` | Toggle auto-follow (on pins the cursor to the newest row) |
-| `/` | Search URL/method/subdomain — jumps the cursor to a match (does not filter) |
-| `n` / `N` | Jump the cursor to the next/previous match (wraps) |
-| `s` | String filter (on URL/method/subdomain) — hides non-matching rows |
-| `Enter` | Open detail view for the cursor row |
-| `Esc` | Return from detail, or clear the filter and search |
+| `j` / `↓` | Move cursor down (onto newest resumes follow) |
+| `k` / `↑` | Move cursor up (pauses follow) |
+| `g` / `Home` | Cursor to top |
+| `G` / `End` | Cursor to bottom (resumes follow) |
+| `s` | Filter bar — query language |
+| `f` | Filter menu — status class + methods |
+| `/` | Search URL/method/subdomain (navigate only) |
+| `n` / `N` | Next/previous match |
+| `Enter` | Open detail for cursor row |
+| `y` | Copy full request ID |
+| `c` | Copy as curl |
+| Mouse click | Select row; double-click opens detail |
 
-**Auto-follow** pins the cursor to the newest row and keeps the list scrolled
-to the bottom as requests arrive. Moving the cursor up (`k`, `PgUp`, `g`)
-pauses follow; moving it back onto the newest row (`j`/`PgDn`), or pressing
-`G`/`End`/`F`, resumes it. While follow is paused, arriving requests never move
-the cursor off the row you selected.
-
-**Scroll-back.** The TUI loads the newest 1000 requests when it connects.
-Moving the cursor onto the oldest row loads the next older page automatically
-(1000 at a time, up to the 5000 the server retains). The status bar reports
-`loading older…` while a page is in flight, `start of history` once the oldest
-retained request is loaded, and `⚠ older: …` if a page could not be fetched —
-move up again to retry. Filters and searches never reach the fetch: they apply
-to what is displayed, not to what is loaded. Reconnecting re-syncs against the
-server's current window and discards pages older than it, so a scrolled-back
-list can never show a gap; page back down again after a reconnect.
-
-**Search vs. filter.** `/` in the requests view *navigates* — it jumps the
-cursor to matching rows and leaves every row visible — so it composes with an
-active `s` filter (matches are computed over the filtered list) instead of
-replacing it. `s` still *filters*, hiding non-matching rows. The status bar
-shows the search indicator as `/<query> (i/k)` (cursor on match _i_ of _k_) or
-`/<query> (k matches)` when the cursor is not on a match.
-
-## Request Detail View
-
-Press `Enter` on a request to see headers and captured bodies:
+**Filter query language (requests):** examples:
 
 ```text
-Request Body (35 bytes, application/json)
-  {
-    "user": "alice"
-  }
+method:GET status:5xx host:api url:/orders
+sub:web method:POST
 ```
 
-- The body section title shows the byte count, Content-Type, and (when the
-  body was transfer-encoded, e.g. gzip) Content-Encoding — omitted when not
-  present.
-- Bodies are pretty-printed 2-space indented JSON when the Content-Type
-  contains `json`, or when the raw body is itself valid JSON. Any other text
-  renders unchanged except that ASCII control characters (other than tab and
-  newline) and DEL are sanitized to the Unicode replacement character, so a
-  captured body cannot emit ESC/BEL/OSC sequences that manipulate the terminal.
-  Binary bodies show `[binary data]`; bodies that could no longer be loaded
-  (e.g. evicted from disk) show `(body no longer available)`.
-- A request still streaming its response shows `Duration: (in flight)` and,
-  since headers/bodies haven't been captured yet, `(request in flight —
-  details arrive on completion)` instead of the usual body sections.
-- Detail views live-update: when the open request completes, the view
-  re-fetches the request in the background and refreshes in place with its
-  final duration, headers, and bodies — no loading flicker, and your scroll
-  position is preserved. If that background re-fetch fails, the last snapshot
-  stays on screen and the note changes to `(live refresh failed — press esc
-  and re-enter to reload)`.
+Fields: `sub:`, `method:` (repeatable), `status:` (`500`, `5xx`, `>=400`, `200-299`, …), `url:` (repeatable). Bare terms OR-match URL, method, and subdomain (back-compat with the old substring filter).
 
-## Process Filter Mode
+**Auto-follow** pins the cursor to the newest row. Scrolling or moving up pauses follow; `G`/`End`/`F`, or moving onto the newest row, resumes it.
 
-Press `f` to open the multi-select process filter:
+**Scroll-back.** The TUI loads the newest 1000 requests on connect. Moving the cursor to the oldest visible row fetches older pages (1000 at a time). Filters apply client-side to loaded data only.
 
-```text
-┌─ filter processes ───────────────────┐
-│ [x] web                              │
-│ [x] api                              │
-│ [ ] worker                           │
-│ [x] cron                             │
-├──────────────────────────────────────┤
-│ [space] toggle  [a]ll  [n]one        │
-│ [enter] apply   [esc] cancel         │
-└──────────────────────────────────────┘
-```
+### Request Detail View
 
 | Key | Action |
 | --- | ------ |
-| `↑` / `↓` | Navigate list |
-| `Space` | Toggle selection |
-| `a` | Select all |
-| `n` | Select none |
-| `Enter` | Apply filter |
-| `Esc` | Cancel |
+| `Esc` | Back to requests list |
+| `y` | Copy request ID |
+| `c` | Copy as curl (`https://<host>[:port]<path>`; port included in `up --tui`, omitted in attach) |
+| `Y` | Copy wire JSON (exact API payload) |
+| Scroll wheel | Scroll detail content |
 
-## Search Mode
+Detail views live-update when the open request completes.
 
-Press `/` to enter search mode. An input field appears at the bottom; the
-behavior depends on the active view:
+## Search vs. Filter
 
-- **Logs view:** `/` is case-insensitive substring *navigation* over the log
-  line text. On `Enter` the cursor jumps to the first match at-or-after its
-  current position (wrapping); `n`/`N` then jump to the next and previous
-  matches (wrapping). No lines are hidden, so search composes with an active
-  `s` filter — the cursor row is marked with `❯` and the matched substring is
-  highlighted, and the status bar shows the match indicator (`/<query> (i/k)`
-  or `/<query> (k matches)`). Use `s` — not `/` — to hide non-matching lines.
-- **Requests view:** `/` is case-insensitive substring *navigation* over
-  URL/method/subdomain. On `Enter` the cursor jumps to the first match
-  at-or-after its current row (wrapping); `n`/`N` then jump to the next and
-  previous matches (wrapping). No rows are hidden, so search composes with an
-  active `s` filter.
-- `Esc` cancels the input; in normal mode `Esc` clears the committed
-  filter/search.
+- **`/`** navigates: jumps the cursor to matches without hiding rows/lines. Composes with an active `s` filter.
+- **`s`** filters: hides non-matching entries using the query language above. Each view keeps its own filter across `Tab` switches.
+- Status bar shows committed search as `/<query> (i/k)` or filter as `Filter: <query>`.
 
-## String Filter Mode
+## Copy (grab-for-agent)
 
-Press `s` to enter string filter mode:
+Copy keys write to the system clipboard (with a status flash on success or failure):
 
-- Input field appears at bottom
-- Only lines matching the filter are shown
-- Non-matching lines are hidden
-- Header shows active filter: `logs (filter: "ERROR")`
-- `Esc` clears the filter
+| Context | Key | Copies |
+| ------- | --- | ------ |
+| Requests list | `y` | Full request ID |
+| Requests list | `c` | curl command |
+| Detail | `y` / `c` / `Y` | ID / curl / wire JSON |
+| Logs (parked cursor) | `y` | Raw log line |
+
+## Mouse
+
+Mouse support requires a terminal that reports cell motion (`tea.WithMouseCellMotion`).
+
+| Action | Effect |
+| ------ | ------ |
+| Wheel | 3 lines per notch — scroll logs, move requests cursor, or scroll detail |
+| Click process chip | Solo/unsolo (logs view) |
+| Click log line | Park cursor; disengages follow |
+| Click request row | Move cursor |
+| Double-click request row | Open detail (~500 ms window) |
+| Click menu cells / rows | Open menus and activate items |
+| Click while typing filter/search | Ignored (except menu bar, which blurs input) |
+
+Wheel events are handled entirely by the TUI (the bubbles viewport wheel handler is disabled) so scrolling does not double-fire.
 
 ## Help Overlay
 
-Press `?` to show all keybindings in a modal overlay. Press any key to dismiss.
+Press `?` for context-sensitive help (logs, requests, or detail). Press any key to dismiss.

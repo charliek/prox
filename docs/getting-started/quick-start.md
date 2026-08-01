@@ -87,9 +87,11 @@ Note: The `--tui` flag works in foreground mode only, is mutually exclusive with
 The TUI provides:
 
 - Real-time log viewing with scrollback
-- Process filtering with number keys (1-9)
-- Search with `/` and filter with `s`
+- Menu bar (View / Filter / Theme), theme cycling (`t`), and view toggles
+- Process filtering via `1-9`, process chips, and `proc:` filter clauses
+- Search with `/` and filter query language with `s` (Filter menu via `f`)
 - Process restart with `r`
+- Mouse: wheel scroll, row/chip clicks, double-click request rows for detail
 - Press `?` for help, `q` to quit
 
 ## Background Mode

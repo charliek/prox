@@ -311,11 +311,16 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
-		// Menu clicks only in C3. Wheel / viewport forwarding stay on the
-		// bubbles default until C11 owns full mouse routing
-		// (viewport.MouseWheelEnabled=false + handled-flag).
 		if handled, cmd := m.handleMenuMouse(msg); handled {
 			return m, cmd
+		}
+		// Non-menu mouse in text/help modes is ignored (menu blur handled above).
+		if m.mode == ModeSearch || m.mode == ModeStringFilter || m.mode == ModeHelp {
+			return m, nil
+		}
+		if handled, navCmd := m.handleContentMouse(msg); handled {
+			cmd := m.maybeFetchOlderRequests()
+			return m, tea.Batch(navCmd, cmd)
 		}
 
 	case ExternalShutdownMsg:
@@ -440,7 +445,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Handle viewport updates
+	// Handle viewport updates for unhandled messages (wheel disabled — TUI routes scroll).
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
 
@@ -496,16 +501,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.viewMode == ViewModeRequests {
 			requestID := m.getSelectedRequest()
 			if requestID != "" {
-				m.selectedRequestID = requestID
-				m.viewMode = ViewModeRequestDetail
-				m.detailLoading = true
-				m.requestDetail = nil
-				m.requestDetailRaw = nil
-				m.detailError = nil
-				m.detailRefreshFailed = false
-				m.renderDetailFromTop()
-				m.detailFetchSeq++
-				return m, m.fetchRequestDetail(requestID, m.detailFetchSeq)
+				return m, m.beginRequestDetail(requestID)
 			}
 		}
 		return m, nil
@@ -535,6 +531,20 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// beginRequestDetail opens the request detail view and starts a fetch.
+func (m *ClientModel) beginRequestDetail(requestID string) tea.Cmd {
+	m.selectedRequestID = requestID
+	m.viewMode = ViewModeRequestDetail
+	m.detailLoading = true
+	m.requestDetail = nil
+	m.requestDetailRaw = nil
+	m.detailError = nil
+	m.detailRefreshFailed = false
+	m.renderDetailFromTop()
+	m.detailFetchSeq++
+	return m.fetchRequestDetail(requestID, m.detailFetchSeq)
 }
 
 // fetchRequestDetail returns a command to fetch request details from the API,

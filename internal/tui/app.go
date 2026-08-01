@@ -61,10 +61,10 @@ type TUIClient interface {
 // RunClient starts the TUI application in client mode (connected via API).
 //
 // opts carries the caller's wording and, for a caller that supervises processes,
-// its shutdown channel. Unlike Run above, RunClient starts no goroutine of its
-// own to quit the program: the wait on opts.ShutdownCh is a command the model
-// returns from Init (see ClientOptions.ShutdownCh), so every quit — user
-// keypress or out-of-band request — arrives as a message through Update.
+// its shutdown channel. RunClient starts no goroutine of its own to quit the
+// program: the wait on opts.ShutdownCh is a command the model returns from Init
+// (see ClientOptions.ShutdownCh), so every quit — user keypress or out-of-band
+// request — arrives as a message through Update.
 func RunClient(client TUIClient, opts ClientOptions) error {
 	settings, warnings := LoadSettings()
 	if settings.Theme != "" {
@@ -79,9 +79,9 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 		model.projectName = resolveProjectName(opts.ProjectName)
 	}
 
-	// WithMouseCellMotion enables menu-cell clicks (WS3). C11 owns full mouse
-	// routing (disabling bubbles viewport wheel to avoid the double-scroll
-	// trap); until then the viewport keeps its default wheel handling.
+	// WithMouseCellMotion enables menu and content mouse routing (WS11).
+	// viewport.MouseWheelEnabled is false on the model so bubbles does not
+	// double-scroll wheel events (Codex #5).
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	ctx, cancel := context.WithCancel(context.Background())
