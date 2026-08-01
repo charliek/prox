@@ -181,6 +181,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 	ti.Placeholder = "Type to filter..."
 	ti.CharLimit = 100
 	ti.Width = 40
+	applyTextInputTheme(&ti)
 
 	return BaseModel{
 		processes:       make([]domain.ProcessInfo, 0),
@@ -196,6 +197,17 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
 	}
+}
+
+// applyTextInputTheme sets prompt/cursor/text styles from the active theme.
+func applyTextInputTheme(ti *textinput.Model) {
+	th := CurrentTheme()
+	if th == nil {
+		return
+	}
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(th.FooterKey)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(th.FG)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Cursor)
 }
 
 // handleWindowSize handles window resize messages
@@ -1226,7 +1238,7 @@ func (b *BaseModel) updateViewport() {
 			// with two spaces so columns stay aligned (D10).
 			marker := "  "
 			if i == b.cursorIdx {
-				marker = cursorStyle.Render("❯ ")
+				marker = s.Cursor.Render("❯ ")
 			}
 			lines = append(lines, marker+b.formatProxyRequest(req))
 		}
@@ -1246,7 +1258,7 @@ func (b *BaseModel) updateViewport() {
 			if searching {
 				marker := "  "
 				if i == b.logCursorIdx {
-					marker = cursorStyle.Render("❯ ")
+					marker = s.Cursor.Render("❯ ")
 				}
 				line = marker + line
 			}
@@ -1291,7 +1303,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 	}
 
 	if b.detailError != nil {
-		lines = append(lines, errorStyle.Render("Error: "+b.detailError.Error()))
+		lines = append(lines, s.Err.Render("Error: "+b.detailError.Error()))
 		return lines
 	}
 
@@ -1303,7 +1315,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 	d := b.requestDetail
 
 	// Header info
-	lines = append(lines, headerStyle.Render(fmt.Sprintf("Request: %s", d.ID)))
+	lines = append(lines, s.Header.Render(fmt.Sprintf("Request: %s", d.ID)))
 	lines = append(lines, "")
 	lines = append(lines, fmt.Sprintf("  Time:     %s", d.Timestamp))
 	lines = append(lines, fmt.Sprintf("  Method:   %s", d.Method))
@@ -1331,24 +1343,24 @@ func (b *BaseModel) formatRequestDetail() []string {
 			// A live-refresh attempt (attach mode — D16) failed while this
 			// in-flight snapshot was on screen: say so instead of silently
 			// re-promising details that may never arrive automatically.
-			lines = append(lines, dimStyle.Render("(live refresh failed — press esc and re-enter to reload)"))
+			lines = append(lines, s.Dim.Render("(live refresh failed — press esc and re-enter to reload)"))
 		case d.Stale:
 			// D8, #53: the completion event may have been lost — the true
 			// outcome is unknown, not necessarily broken (long-lived
 			// streams/transfers can legitimately still be live here).
-			lines = append(lines, dimStyle.Render("(request in flight, stale? — the completion event may have been lost; true outcome unknown)"))
+			lines = append(lines, s.Dim.Render("(request in flight, stale? — the completion event may have been lost; true outcome unknown)"))
 		default:
-			lines = append(lines, dimStyle.Render("(request in flight — details arrive on completion)"))
+			lines = append(lines, s.Dim.Render("(request in flight — details arrive on completion)"))
 		}
 	}
 
 	// Request headers
 	if len(d.RequestHeaders) > 0 {
 		lines = append(lines, "")
-		lines = append(lines, headerStyle.Render("Request Headers"))
+		lines = append(lines, s.Header.Render("Request Headers"))
 		for name, values := range d.RequestHeaders {
 			for _, value := range values {
-				lines = append(lines, fmt.Sprintf("  %s: %s", dimStyle.Render(name), value))
+				lines = append(lines, fmt.Sprintf("  %s: %s", s.Dim.Render(name), value))
 			}
 		}
 	}
@@ -1356,10 +1368,10 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// Response headers
 	if len(d.ResponseHeaders) > 0 {
 		lines = append(lines, "")
-		lines = append(lines, headerStyle.Render("Response Headers"))
+		lines = append(lines, s.Header.Render("Response Headers"))
 		for name, values := range d.ResponseHeaders {
 			for _, value := range values {
-				lines = append(lines, fmt.Sprintf("  %s: %s", dimStyle.Render(name), value))
+				lines = append(lines, fmt.Sprintf("  %s: %s", s.Dim.Render(name), value))
 			}
 		}
 	}
@@ -1372,7 +1384,7 @@ func (b *BaseModel) formatRequestDetail() []string {
 
 	// Footer hint
 	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("Press ESC to go back"))
+	lines = append(lines, s.Dim.Render("Press ESC to go back"))
 
 	return lines
 }
@@ -1386,7 +1398,7 @@ func renderBodySection(title string, b *BodyData) []string {
 	if b == nil || b.Size == 0 {
 		return nil
 	}
-	lines := []string{"", headerStyle.Render(bodySectionTitle(title, b))}
+	lines := []string{"", s.Header.Render(bodySectionTitle(title, b))}
 	return append(lines, renderBodyLines(b)...)
 }
 
@@ -1422,7 +1434,7 @@ func bodySectionTitle(title string, b *BodyData) string {
 // this is a cheap defense.)
 func renderBodyLines(body *BodyData) []string {
 	if body.Unavailable {
-		return []string{dimStyle.Render("(body no longer available)")}
+		return []string{s.Dim.Render("(body no longer available)")}
 	}
 	if body.IsBinary {
 		return renderBinaryPreview(body.Data, body.DataBase64)
@@ -1488,12 +1500,12 @@ func renderBinaryPreview(data string, dataBase64 bool) []string {
 		}
 	}
 	if len(raw) == 0 {
-		return []string{dimStyle.Render("[binary data]")}
+		return []string{s.Dim.Render("[binary data]")}
 	}
 
 	lines := hexPreviewLines(raw, hexPreviewMaxBytes)
 	if len(raw) > hexPreviewMaxBytes && len(lines) > 0 {
-		lines[len(lines)-1] = dimStyle.Render(lines[len(lines)-1])
+		lines[len(lines)-1] = s.Dim.Render(lines[len(lines)-1])
 	}
 	return lines
 }
@@ -1655,20 +1667,20 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	method := fmt.Sprintf("%-7s", req.Method)
 
 	// Format status with color based on status code
-	statusStyle := httpSuccessStyle
+	codeStyle := s.HTTPSuccess
 	switch {
 	case req.StatusCode < 100:
-		statusStyle = dimStyle // Gray for unknown/error (status 0)
+		codeStyle = s.Dim // Gray for unknown/error (status 0)
 	case req.StatusCode < 200:
-		statusStyle = dimStyle // Gray for informational 1xx
+		codeStyle = s.Dim // Gray for informational 1xx
 	case req.StatusCode >= 500:
-		statusStyle = httpErrorStyle
+		codeStyle = s.HTTPError
 	case req.StatusCode >= 400:
-		statusStyle = httpWarningStyle
+		codeStyle = s.HTTPWarning
 	case req.StatusCode >= 300:
-		statusStyle = httpRedirectStyle
+		codeStyle = s.HTTPRedirect
 	}
-	status := statusStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
+	status := codeStyle.Render(fmt.Sprintf("%3d", req.StatusCode))
 
 	// Format the duration column, including its "ms" unit, in one piece: the
 	// normal/in-flight/overflow cases share a digits-or-filler value plus
@@ -1690,11 +1702,11 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	}
 
 	return fmt.Sprintf("%s  %s  %s %s %s  %s",
-		dimStyle.Render(ts),
-		dimStyle.Render(subdomain),
+		s.Dim.Render(ts),
+		s.Dim.Render(subdomain),
 		method,
 		status,
-		dimStyle.Render(duration),
+		s.Dim.Render(duration),
 		req.URL,
 	)
 }
@@ -1704,10 +1716,10 @@ func getProcessStyle(name string, processes []domain.ProcessInfo) lipgloss.Style
 	// Find process index for color
 	for i, p := range processes {
 		if p.Name == name {
-			return processColors[i%len(processColors)]
+			return s.ProcessColors[i%len(s.ProcessColors)]
 		}
 	}
-	return defaultProcessStyle
+	return s.DefaultProcess
 }
 
 // formatLogEntry formats a single log entry for display
@@ -1723,19 +1735,19 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 
 	// Build line
 	prefix := procStyle.Render(procName)
-	timestamp := dimStyle.Render(ts)
+	timestamp := s.Dim.Render(ts)
 
 	// Stream indicator
 	streamIndicator := ""
 	if entry.Stream == domain.StreamStderr {
-		streamIndicator = errorStyle.Render(" ERR ")
+		streamIndicator = s.Err.Render(" ERR ")
 	}
 
 	return fmt.Sprintf("%s %s%s %s", timestamp, prefix, streamIndicator, b.highlightLogLine(entry.Line))
 }
 
 // highlightLogLine wraps the first case-insensitive match of the active
-// logSearchQuery in line with searchHighlightStyle (D9). It highlights only
+// logSearchQuery in line with s.SearchHighlight (D9). It highlights only
 // when BOTH the query and the WHOLE line are plain ASCII with no ESC byte:
 // case-folding an ASCII line preserves byte offsets (so the styled run lands
 // exactly on the match), and excluding ESC keeps a digit query from matching
@@ -1758,7 +1770,7 @@ func (b *BaseModel) highlightLogLine(line string) string {
 		return line
 	}
 	end := idx + len(q)
-	return line[:idx] + searchHighlightStyle.Render(line[idx:end]) + line[end:]
+	return line[:idx] + s.SearchHighlight.Render(line[idx:end]) + line[end:]
 }
 
 // isASCIINoESC reports whether s is pure ASCII (every byte < 0x80) and contains
@@ -1778,23 +1790,23 @@ func isASCIINoESC(s string) bool {
 func processStyle(state domain.ProcessState) lipgloss.Style {
 	switch state {
 	case domain.ProcessStateRunning:
-		return runningStyle
+		return s.Running
 	case domain.ProcessStateStopped:
-		return stoppedStyle
+		return s.Stopped
 	case domain.ProcessStateCrashed:
-		return crashedStyle
+		return s.Crashed
 	case domain.ProcessStateStarting:
-		return startingStyle
+		return s.Starting
 	case domain.ProcessStateStopping:
-		return stoppingStyle
+		return s.Stopping
 	case domain.ProcessStateWaiting:
-		return waitingStyle
+		return s.Waiting
 	case domain.ProcessStateBlocked:
-		return blockedStyle
+		return s.Blocked
 	case domain.ProcessStateCompleted:
-		return completedStyle
+		return s.Completed
 	default:
-		return defaultProcessStyle
+		return s.DefaultProcess
 	}
 }
 
@@ -1825,9 +1837,9 @@ func gatedDetail(p domain.ProcessInfo) string {
 func healthDot(status domain.HealthStatus) string {
 	switch status {
 	case domain.HealthStatusHealthy:
-		return healthyDotStyle.Render(" ●")
+		return s.HealthyDot.Render(" ●")
 	case domain.HealthStatusUnhealthy:
-		return unhealthyDotStyle.Render(" ✗")
+		return s.UnhealthyDot.Render(" ✗")
 	default:
 		return ""
 	}
@@ -1869,7 +1881,7 @@ func (b *BaseModel) processPanel() string {
 	}
 
 	header := lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(items, "  "))
-	return headerStyle.Render(header)
+	return s.Header.Render(header)
 }
 
 // statusLeftDefault builds the left status-bar text for normal mode (no input
@@ -1996,8 +2008,8 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		leftWidth = 0
 	}
 
-	leftPart := statusStyle.Width(leftWidth).Render(left)
-	rightPart := statusStyle.Render(right)
+	leftPart := s.Status.Width(leftWidth).Render(left)
+	rightPart := s.Status.Render(right)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftPart, "  ", rightPart)
 }
@@ -2073,7 +2085,7 @@ Other:
 Press any key to close help...
 `, title, quitMsg)
 
-	return helpStyle.Render(help)
+	return s.Help.Render(help)
 }
 
 // requestsHelpView renders the help overlay for requests view
@@ -2122,7 +2134,7 @@ Other:
 Press any key to close help...
 `, title, quitMsg)
 
-	return helpStyle.Render(help)
+	return s.Help.Render(help)
 }
 
 // containsIgnoreCase performs a case-insensitive substring search

@@ -429,7 +429,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("web")
-		wantDot := healthyDotStyle.Render(" ●")
+		wantDot := s.HealthyDot.Render(" ●")
 		assert.Contains(t, out, wantName+wantDot, "the dot follows the name as its own styled segment")
 		assert.NotContains(t, out, wantName+" ●", "the dot must be styled, not plain text")
 	})
@@ -443,7 +443,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("api")
-		wantDot := unhealthyDotStyle.Render(" ✗")
+		wantDot := s.UnhealthyDot.Render(" ✗")
 		assert.Contains(t, out, wantName+wantDot)
 	})
 
@@ -481,8 +481,8 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		// Constructed the same way processPanel built its output before the
 		// health dot existed: styled "key:name[+gated detail]" segments,
-		// joined by two spaces, wrapped in headerStyle — no dot anywhere.
-		want := headerStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
+		// joined by two spaces, wrapped in s.Header — no dot anywhere.
+		want := s.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
 			processStyle(domain.ProcessStateRunning).Render("1:web"),
 			processStyle(domain.ProcessStateWaiting).Render("2:worker (waiting on: postgres)"),
 		}, "  ")))
