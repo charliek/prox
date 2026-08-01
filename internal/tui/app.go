@@ -75,8 +75,14 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 	model := NewClientModel(client, opts)
 	model.settings = settings
 	model.startupWarnings = warnings
+	if model.projectName == "" {
+		model.projectName = resolveProjectName(opts.ProjectName)
+	}
 
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	// WithMouseCellMotion enables menu-cell clicks (WS3). C11 owns full mouse
+	// routing (disabling bubbles viewport wheel to avoid the double-scroll
+	// trap); until then the viewport keeps its default wheel handling.
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	ctx, cancel := context.WithCancel(context.Background())
 

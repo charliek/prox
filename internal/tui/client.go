@@ -138,6 +138,11 @@ type ClientOptions struct {
 	// result — outranks it; see View.
 	ConnectedStatus string
 
+	// ProjectName is shown in the menu bar (WS3). Empty → RunClient resolves
+	// the cwd base. CLI wiring of an explicit name lands with a later commit;
+	// C3 only adds the field + cwd fallback.
+	ProjectName string
+
 	// ShutdownCh, when non-nil, quits the program on close. This is how an
 	// out-of-band shutdown request (POST /shutdown, via the coordinator's
 	// trigger channel) reaches a --tui daemon, which otherwise blocks in
@@ -194,11 +199,13 @@ type ClientModel struct {
 
 // NewClientModel creates a new TUI model for client mode
 func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
-	return ClientModel{
+	m := ClientModel{
 		BaseModel: newBaseModel(opts.Help),
 		client:    client,
 		opts:      opts,
 	}
+	m.projectName = resolveProjectName(opts.ProjectName)
+	return m
 }
 
 // Init starts the external-shutdown wait, and nothing else. Client mode has no
@@ -288,6 +295,14 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		// Menu clicks only in C3. Wheel / viewport forwarding stay on the
+		// bubbles default until C11 owns full mouse routing
+		// (viewport.MouseWheelEnabled=false + handled-flag).
+		if m.handleMenuMouse(msg) {
+			return m, nil
+		}
 
 	case ExternalShutdownMsg:
 		// Same exit as q/Ctrl-C: RunClient returns and the caller runs its
@@ -429,9 +444,17 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// handleKey processes keyboard input
+// handleKey processes keyboard input.
+// Key routing order (Codex #4, pinned): open-menu capture → text/help modes →
+// client actions (q/r/Enter) → menu openers (m/v) + normal navigation.
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Handle mode-specific keys first
+	// 1. Open-menu capture: every key consumed, never re-dispatched.
+	if m.menuOpen() {
+		m.handleMenuKey(msg)
+		return m, nil
+	}
+
+	// 2. Mode-specific keys (textinput / help).
 	switch m.mode {
 	case ModeFilter:
 		_, cmd := m.handleFilterKey(msg)
@@ -447,7 +470,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Normal mode keys
+	// 3. Client actions.
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -482,10 +505,7 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle common navigation keys. A handled key may have moved the requests
-	// cursor onto the oldest visible row, which is scroll-back's trigger (D11):
-	// the check has to run HERE rather than inside handleNavigationKey, which
-	// returns a bool and cannot dispatch a command.
+	// 4. Menu openers (m/v) + common navigation. `f` stays ModeFilter until C8.
 	handled, navCmd := m.handleNavigationKey(msg)
 	if handled {
 		// maybeFetchOlderRequests is evaluated BEFORE m is copied into the

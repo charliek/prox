@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
@@ -137,6 +138,19 @@ type BaseModel struct {
 	// round-tripped here; C4 applies them to rendering.
 	settings Settings
 
+	// projectName is shown in the menu bar (WS3). Set from ClientOptions or
+	// resolved to the cwd base in RunClient.
+	projectName string
+
+	// Menu bar open state (WS3). openMenu is -1 when closed, otherwise a MenuID.
+	// menuHighlight is the full-list index of the highlighted dropdown row.
+	// Hit-rects are recorded per render and cleared on close (strix stale-rect
+	// discipline / Codex #1).
+	openMenu      int
+	menuHighlight int
+	menuCellHits  []menuCellHit
+	menuDropdown  *menuDropdownHit
+
 	// Request detail view
 	selectedRequestID string
 	requestDetail     *RequestDetailData
@@ -204,6 +218,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		logCursorIdx:    -1, // no-cursor sentinel (pairs with logCursorSeq 0)
 		helpConfig:      helpConfig,
 		settings:        DefaultSettings(),
+		openMenu:        -1, // closed
 	}
 }
 
@@ -218,27 +233,71 @@ func applyTextInputTheme(ti *textinput.Model) {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Cursor)
 }
 
-// handleWindowSize handles window resize messages
+// handleWindowSize handles window resize messages.
 func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	b.width = msg.Width
 	b.height = msg.Height
+	b.relayout()
+}
 
-	headerHeight := 4 // Process panel
-	footerHeight := 2 // Status bar
-	verticalMargins := headerHeight + footerHeight
-
-	viewportHeight := msg.Height - verticalMargins
-	if viewportHeight < 1 {
-		viewportHeight = 1
+// chromeAbove is the number of rows above the viewport (menu bar + process
+// panel). Derived from ACTUAL enabled chrome — not fixed reservations (Codex #8).
+func (b *BaseModel) chromeAbove() int {
+	h := 0
+	if b.settings.MenuBar {
+		h++ // menu bar row
 	}
+	if b.settings.ProcessPanel {
+		h += 2 // content line + Header MarginBottom
+	}
+	return h
+}
 
+// chromeBelow is status bar + key-hint footer.
+func (b *BaseModel) chromeBelow() int {
+	return 2
+}
+
+// chromeHeight is the total non-viewport chrome.
+func (b *BaseModel) chromeHeight() int {
+	return b.chromeAbove() + b.chromeBelow()
+}
+
+// defaultChromeHeight is chrome under DefaultSettings (menu+panel on).
+// Test helpers that size a WindowSizeMsg for a target viewport height use this.
+func defaultChromeHeight() int {
+	s := DefaultSettings()
+	h := 2 // status + hint
+	if s.MenuBar {
+		h++
+	}
+	if s.ProcessPanel {
+		h += 2
+	}
+	return h
+}
+
+// relayout derives viewport geometry from enabled chrome rows. Called on
+// WindowSizeMsg AND every visibility toggle (a toggle emits no resize, so
+// without this the viewport keeps stale geometry — Codex #8). C4 flips
+// ProcessPanel and calls relayout the same way.
+func (b *BaseModel) relayout() {
+	if b.width <= 0 || b.height <= 0 {
+		return
+	}
+	vpH := b.height - b.chromeHeight()
+	if vpH < 1 {
+		vpH = 1
+	}
+	headerH := b.chromeAbove()
 	if !b.ready {
-		b.viewport = viewport.New(msg.Width, viewportHeight)
-		b.viewport.YPosition = headerHeight
+		b.viewport = viewport.New(b.width, vpH)
+		b.viewport.YPosition = headerH
 		b.ready = true
 	} else {
-		b.viewport.Width = msg.Width
-		b.viewport.Height = viewportHeight
+		b.viewport.Width = b.width
+		b.viewport.Height = vpH
+		b.viewport.YPosition = headerH
 	}
 }
 
@@ -650,22 +709,75 @@ func (b *BaseModel) cycleTheme() tea.Cmd {
 	return statusFlashClearCmd()
 }
 
+// setViewMode switches the active view and tears down detail state when leaving
+// detail (Codex #4 — that cleanup lived only in the Esc branch before). Tab,
+// menu radios, and Esc all route through here.
+func (b *BaseModel) setViewMode(mode ViewMode) {
+	if b.viewMode == mode {
+		return
+	}
+	if b.viewMode == ViewModeRequestDetail && mode != ViewModeRequestDetail {
+		b.selectedRequestID = ""
+		b.requestDetail = nil
+		b.detailError = nil
+		b.detailRefreshFailed = false
+		b.detailLoading = false
+	}
+	b.viewMode = mode
+	b.updateViewport()
+}
+
+// toggleFollow is the shared Follow toggle used by the F key and the View menu
+// check (WS3 — no behavior duplication).
+func (b *BaseModel) toggleFollow() {
+	if b.viewMode == ViewModeRequests {
+		b.followMode = !b.followMode
+		if b.followMode {
+			requests := b.filteredProxyRequests()
+			b.setRequestCursor(requests, len(requests)-1)
+		}
+		b.updateViewport()
+		return
+	}
+	b.followMode = !b.followMode
+	if b.followMode {
+		b.viewport.GotoBottom()
+	}
+}
+
 // handleNavigationKey handles common navigation keys.
 // Returns whether the key was handled and an optional command.
 func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
 	case "t":
 		return true, b.cycleTheme()
+
+	case "m":
+		// Toggle menu bar visibility and persist (WS3).
+		return true, b.toggleMenuBar()
+
+	case "v":
+		// Open the View menu when the bar is visible. `v` was free; Theme has
+		// no mnemonic (`t` stays cycle — panel B1). Keyboard path to Theme:
+		// open View then Right/Tab sibling-switch.
+		//
+		// NOTE: `f` is NOT a Filter-menu mnemonic yet — it still opens
+		// ModeFilter (C8 rebinds `f` to the Filter dropdown). Until then the
+		// Filter cell is click/sibling-only (pinned C3 resolution).
+		if b.settings.MenuBar {
+			b.openMenuFirst(MenuView)
+		}
+		return true, nil
+
 	case "tab":
 		// Toggle between Logs and Requests views (only if not in detail view)
 		switch b.viewMode {
 		case ViewModeLogs:
-			b.viewMode = ViewModeRequests
+			b.setViewMode(ViewModeRequests)
 		case ViewModeRequests:
-			b.viewMode = ViewModeLogs
+			b.setViewMode(ViewModeLogs)
 		}
 		// In detail view, tab does nothing
-		b.updateViewport()
 		return true, nil
 
 	case "?":
@@ -737,14 +849,10 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, nil
 
 	case "esc":
-		// In detail view, go back to requests list
+		// In detail view, go back to requests list (via setViewMode so detail
+		// teardown lives in one place — Codex #4).
 		if b.viewMode == ViewModeRequestDetail {
-			b.viewMode = ViewModeRequests
-			b.selectedRequestID = ""
-			b.requestDetail = nil
-			b.detailError = nil
-			b.detailRefreshFailed = false
-			b.updateViewport()
+			b.setViewMode(ViewModeRequests)
 			return true, nil
 		}
 		// Clear filters and both views' search queries (D13/D8). Resetting the
@@ -818,20 +926,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, nil
 
 	case "F":
-		if b.viewMode == ViewModeRequests {
-			b.followMode = !b.followMode
-			if b.followMode {
-				// Toggling follow on pins the cursor to the newest row.
-				requests := b.filteredProxyRequests()
-				b.setRequestCursor(requests, len(requests)-1)
-			}
-			b.updateViewport()
-			return true, nil
-		}
-		b.followMode = !b.followMode
-		if b.followMode {
-			b.viewport.GotoBottom()
-		}
+		b.toggleFollow()
 		return true, nil
 	}
 
@@ -1874,7 +1969,9 @@ func healthDot(status domain.HealthStatus) string {
 	}
 }
 
-// processPanel renders the process status header
+// processPanel renders the process status header. Content is constrained to
+// frame width with an ANSI-aware cut so it cannot terminal-wrap unpredictably
+// (Codex #8).
 func (b *BaseModel) processPanel() string {
 	var items []string
 
@@ -1910,6 +2007,17 @@ func (b *BaseModel) processPanel() string {
 	}
 
 	header := lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(items, "  "))
+	if b.width > 0 {
+		// Header Padding(0,1) consumes 2 columns; cut so Render fits the frame.
+		inner := b.width - 2
+		if inner < 0 {
+			inner = 0
+		}
+		if ansi.StringWidth(header) > inner {
+			header = ansi.Cut(header, 0, inner)
+		}
+		return s.Header.Width(b.width).MaxWidth(b.width).Render(header)
+	}
 	return s.Header.Render(header)
 }
 
@@ -2037,28 +2145,54 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		leftWidth = 0
 	}
 
-	leftPart := s.Status.Width(leftWidth).Render(left)
-	rightPart := s.Status.Render(right)
+	// Force a single row: lipgloss wraps by default when Width is set, which
+	// would blow the chrome height budget (relayout / Codex #8).
+	leftPart := s.Status.Width(leftWidth).MaxHeight(1).Render(left)
+	rightPart := s.Status.MaxHeight(1).Render(right)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftPart, "  ", rightPart)
 }
 
-// mainView renders the main TUI layout
+// mainView renders the main TUI layout. Chrome rows are derived from settings
+// (relayout / Codex #8); the open dropdown is spliced over the composed frame
+// (overlay.go / Codex #1).
 func (b *BaseModel) mainView(extraStatusInfo string) string {
-	var sb strings.Builder
+	b.clearMenuHitRects()
 
-	// Process panel at top
-	sb.WriteString(b.processPanel())
-	sb.WriteString("\n")
+	var lines []string
 
-	// Main log viewport
-	sb.WriteString(b.viewport.View())
-	sb.WriteString("\n")
+	if b.settings.MenuBar {
+		lines = append(lines, b.renderMenuBar())
+	}
 
-	// Status bar at bottom
-	sb.WriteString(b.statusBar(extraStatusInfo))
+	if b.settings.ProcessPanel {
+		panel := b.processPanel()
+		for _, line := range strings.Split(panel, "\n") {
+			lines = append(lines, padFrameRow(line, b.width))
+		}
+	}
 
-	return sb.String()
+	for _, line := range strings.Split(b.viewport.View(), "\n") {
+		lines = append(lines, padFrameRow(line, b.width))
+	}
+
+	lines = append(lines, padFrameRow(singleFrameLine(b.statusBar(extraStatusInfo)), b.width))
+	lines = append(lines, b.renderKeyHints())
+
+	if b.menuOpen() {
+		lines = b.applyMenuOverlay(lines)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// singleFrameLine keeps the first visual row of s (defensive against a chrome
+// helper that still wraps at pathological widths).
+func singleFrameLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // helpView renders the help overlay based on current view mode

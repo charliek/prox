@@ -629,8 +629,8 @@ func keyRune(r rune) tea.KeyMsg {
 
 // newRequestsModel builds a ClientModel in the requests view holding n requests
 // (IDs req-000..req-{n-1}, URLs /path/000..), with the viewport sized so its
-// content Height is viewportHeight (handleWindowSize subtracts the 6-row
-// header+footer margin). followMode starts true, so the cursor begins pinned
+// content Height is viewportHeight (handleWindowSize/relayout subtracts
+// defaultChromeHeight). followMode starts true, so the cursor begins pinned
 // to the newest row.
 func newRequestsModel(n, viewportHeight int) ClientModel {
 	return newSearchModel(viewportHeight, makeTestRequests(n))
@@ -730,7 +730,7 @@ func TestRequestsCursor_VisibilityKeyboardJumps(t *testing.T) {
 // requests branch of updateViewport must scroll it so the cursor is visible.
 func TestRequestsCursor_VisibilityTabIn(t *testing.T) {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight()}) // viewport height 5
 
 	// Fill logs and requests while in the logs view.
 	for i := 0; i < 30; i++ {
@@ -763,14 +763,14 @@ func TestRequestsCursor_VisibilityResize(t *testing.T) {
 	assert.True(t, cursorVisible(m))
 
 	// Shrink the window: cursor must stay visible.
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
 	// Grow it back: still visible, and the viewport must not be left scrolled
 	// past the true bottom (a grown window shrinks the valid max YOffset —
 	// blank overscroll would report the cursor "visible" while showing gaps).
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + defaultChromeHeight()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
@@ -1001,7 +1001,7 @@ func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) ClientModel 
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = reqs
-	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight()})
 }
 
 // commitSearch drives the `/`-search flow: enter search mode, set the query,
@@ -1178,14 +1178,14 @@ func TestRequestsSearch_EscClearsQuery(t *testing.T) {
 // --- Logs-view search navigation tests (C4 / D6-D10) ---
 
 // newLogsModel builds a ClientModel in the (default) logs view, viewport sized so its
-// content height is viewportHeight (handleWindowSize subtracts the 6-row
-// margin), then streams the given lines through handleLogEntry so each entry is
+// content height is viewportHeight (handleWindowSize/relayout subtracts
+// defaultChromeHeight), then streams the given lines through handleLogEntry so each entry is
 // stamped with a unique non-zero Seq — the logs search cursor anchors by Seq, so
 // a zero Seq would break the anchor. followMode starts true (default), pinning
 // the cursor to the newest line until a jump or scroll disengages it.
 func newLogsModel(viewportHeight int, lines []string) ClientModel {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight()})
 	base := time.Unix(0, 0)
 	for i, line := range lines {
 		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
@@ -1384,7 +1384,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 
 func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight()}) // viewport height 5
 	feed := func(line string) {
 		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
 	}
