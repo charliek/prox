@@ -145,6 +145,9 @@ type BaseModel struct {
 
 	// statusFlash is a short-lived status-bar message (theme cycle, save errors).
 	statusFlash string
+	// statusFlashSeq is the flash generation: incremented by setStatusFlash
+	// so a stale clear timer can't erase a newer flash (CodeRabbit PR #102).
+	statusFlashSeq int
 
 	// settings are persisted at ~/.prox/tui/config.toml (WS2). View bools drive
 	// chrome (ProcessPanel/MenuBar) and log rendering (Timestamps/Wrap) — C4.
@@ -784,24 +787,51 @@ func (b *BaseModel) handleHelpKey(msg tea.KeyMsg) bool {
 		b.helpOffset = 0
 		return true
 	case "j", "down":
-		b.helpOffset++ // upper bound clamped in renderHelp
+		b.helpOffset++
 	case "k", "up":
-		if b.helpOffset > 0 {
-			b.helpOffset--
-		}
+		b.helpOffset--
 	case "pgdown":
 		b.helpOffset += b.helpPageStep()
 	case "pgup":
 		b.helpOffset -= b.helpPageStep()
-		if b.helpOffset < 0 {
-			b.helpOffset = 0
-		}
 	case "g", "home":
 		b.helpOffset = 0
 	case "G", "end":
-		b.helpOffset = 1 << 30 // clamped to the last page in renderHelp
+		b.helpOffset = b.helpMaxOffset()
+	}
+	// Clamp HERE, on the real model — renderHelp runs on View()'s value copy,
+	// so a render-time clamp never persists (CodeRabbit PR #102: k after G
+	// appeared unresponsive while the offset walked back into range).
+	if b.helpOffset < 0 {
+		b.helpOffset = 0
+	}
+	if max := b.helpMaxOffset(); b.helpOffset > max {
+		b.helpOffset = max
 	}
 	return true
+}
+
+// helpMaxOffset is the largest helpOffset for the current view's help text at
+// the current terminal height (0 when the content fits without windowing).
+func (b *BaseModel) helpMaxOffset() int {
+	var raw string
+	switch b.viewMode {
+	case ViewModeRequests:
+		raw = b.requestsHelpText()
+	case ViewModeRequestDetail:
+		raw = b.detailHelpText()
+	default:
+		raw = b.logsHelpText()
+	}
+	lines := strings.Split(raw, "\n")
+	budget := b.height - 4 // s.Help border (2) + padding (2)
+	if budget < 6 {
+		budget = 6
+	}
+	if len(lines) <= budget {
+		return 0
+	}
+	return len(lines) - (budget - 1) // one row reserved for the indicator
 }
 
 // helpPageStep is the scroll step for pgup/pgdn in the help overlay.
@@ -821,19 +851,32 @@ func (b *BaseModel) cycleTheme() tea.Cmd {
 
 // setThemeByName resolves name, installs the theme, persists, flashes, and
 // re-renders. Canonical name and ResolveTheme warnings are surfaced in the
+// setStatusFlash shows msg in the status bar and returns the clear command
+// tagged with the NEW flash generation (StatusFlashClearMsg.Seq — stale
+// timers from earlier flashes must not clear this one; CodeRabbit PR #102).
+func (b *BaseModel) setStatusFlash(msg string, delay time.Duration) tea.Cmd {
+	b.statusFlash = msg
+	b.statusFlashSeq++
+	seq := b.statusFlashSeq
+	return tea.Tick(delay, func(t time.Time) tea.Msg {
+		return StatusFlashClearMsg{Seq: seq}
+	})
+}
+
 // status flash (WS2/WS5).
 func (b *BaseModel) setThemeByName(name string) tea.Cmd {
 	canonical, warnings := SetThemeByName(name)
 	b.settings.Theme = canonical
 
+	var msg string
 	if err := SaveSettings(b.settings); err != nil {
-		b.statusFlash = "settings not saved: " + err.Error()
+		msg = "settings not saved: " + err.Error()
 	} else {
-		b.statusFlash = themeFlashMessage(canonical, warnings)
+		msg = themeFlashMessage(canonical, warnings)
 	}
 	applyTextInputTheme(&b.textInput)
 	b.updateViewport()
-	return statusFlashClearCmd()
+	return b.setStatusFlash(msg, statusFlashClearDelay)
 }
 
 func themeFlashMessage(canonical string, warnings []string) string {
@@ -886,8 +929,7 @@ func (b *BaseModel) toggleProcessPanel() tea.Cmd {
 	b.settings.ProcessPanel = !b.settings.ProcessPanel
 	b.relayout()
 	if err := SaveSettings(b.settings); err != nil {
-		b.statusFlash = "settings not saved: " + err.Error()
-		return statusFlashClearCmd()
+		return b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
 	}
 	return nil
 }
@@ -898,8 +940,7 @@ func (b *BaseModel) toggleTimestamps() tea.Cmd {
 	b.settings.Timestamps = !b.settings.Timestamps
 	var cmd tea.Cmd
 	if err := SaveSettings(b.settings); err != nil {
-		b.statusFlash = "settings not saved: " + err.Error()
-		cmd = statusFlashClearCmd()
+		cmd = b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
 	}
 	b.updateViewport()
 	return cmd
@@ -915,8 +956,7 @@ func (b *BaseModel) toggleWrap() tea.Cmd {
 	b.settings.Wrap = !b.settings.Wrap
 	var cmd tea.Cmd
 	if err := SaveSettings(b.settings); err != nil {
-		b.statusFlash = "settings not saved: " + err.Error()
-		cmd = statusFlashClearCmd()
+		cmd = b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
 	}
 	b.updateViewport()
 	if b.viewMode == ViewModeLogs {
@@ -1469,7 +1509,14 @@ func (b *BaseModel) ensureLogCursorVisible() {
 	if sp.Last < b.viewport.YOffset {
 		b.viewport.SetYOffset(sp.First)
 	} else if sp.First >= b.viewport.YOffset+b.viewport.Height {
-		b.viewport.SetYOffset(sp.Last - b.viewport.Height + 1)
+		// A wrapped entry taller than the viewport must anchor at its START
+		// (the match/cursor row) — aligning the tail would scroll the cursor
+		// itself off-screen (CodeRabbit PR #102).
+		if sp.Last-sp.First+1 >= b.viewport.Height {
+			b.viewport.SetYOffset(sp.First)
+		} else {
+			b.viewport.SetYOffset(sp.Last - b.viewport.Height + 1)
+		}
 	}
 }
 
@@ -1644,7 +1691,11 @@ func (b *BaseModel) updateViewport() {
 			if wrapOn && wrapWidth > 0 {
 				// Highlight before wrap — offsets stay valid on the unwrapped
 				// string (plan 021 WS4). Requests never take this branch.
-				wrapped := ansi.Wordwrap(line, wrapWidth, "")
+				// ansi.Wrap, not Wordwrap: an unbroken token longer than the
+				// width must be SPLIT — Wordwrap leaves it over-wide, the
+				// terminal hard-wraps it visually, and the entry↔display-row
+				// span mapping below drifts by one row (CodeRabbit PR #102).
+				wrapped := ansi.Wrap(line, wrapWidth, "")
 				parts := strings.Split(wrapped, "\n")
 				if len(parts) == 0 {
 					parts = []string{""}
@@ -2081,8 +2132,9 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	// Format timestamp
 	ts := req.Timestamp.Format("15:04:05")
 
-	// Format subdomain with padding
-	subdomain := fmt.Sprintf("%-10s", req.Subdomain)
+	// Format subdomain with padding; truncate over-long names so columns
+	// don't drift (CodeRabbit PR #102).
+	subdomain := ansi.Truncate(fmt.Sprintf("%-10s", req.Subdomain), 10, "")
 
 	// Method token coloured by verb (C9); pad inside the styled segment so
 	// ANSI resets don't sit between the verb and its column padding.
@@ -2171,8 +2223,9 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 	// Get process color
 	procStyle := getProcessStyle(entry.Process, b.processes)
 
-	// Format process name with padding
-	procName := fmt.Sprintf("%-10s", entry.Process)
+	// Format process name with padding; truncate over-long names so columns
+	// don't drift (CodeRabbit PR #102).
+	procName := ansi.Truncate(fmt.Sprintf("%-10s", entry.Process), 10, "")
 
 	// Build line
 	prefix := procStyle.Render(procName)
@@ -2668,7 +2721,10 @@ func (b *BaseModel) helpView() string {
 // to the terminal height when it would overflow (the box is the whole frame,
 // so an over-tall box used to scroll its top sections off-screen — Phase 5
 // verification). One content row is reserved for a scroll indicator when
-// windowing; helpOffset is clamped here so height changes self-heal.
+// windowing. PURE with respect to b.helpOffset: the clamp lives in
+// handleHelpKey on the real model (View has a value receiver — a render-time
+// clamp would never persist; CodeRabbit PR #102). The local clamp here is a
+// display-only safety net for a stale offset between resize and next key.
 func (b *BaseModel) renderHelp(raw string) string {
 	lines := strings.Split(raw, "\n")
 	budget := b.height - 4 // s.Help border (2) + padding (2)
@@ -2676,21 +2732,24 @@ func (b *BaseModel) renderHelp(raw string) string {
 		budget = 6
 	}
 	if len(lines) <= budget {
-		b.helpOffset = 0
 		return s.Help.Render(raw)
 	}
 	contentRows := budget - 1 // last row: scroll indicator
 	maxOffset := len(lines) - contentRows
-	if b.helpOffset > maxOffset {
-		b.helpOffset = maxOffset
+	offset := b.helpOffset
+	if offset > maxOffset {
+		offset = maxOffset
 	}
-	end := b.helpOffset + contentRows
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + contentRows
 	if end > len(lines) {
 		end = len(lines)
 	}
-	windowed := append([]string{}, lines[b.helpOffset:end]...)
+	windowed := append([]string{}, lines[offset:end]...)
 	windowed = append(windowed, s.Dim.Render(fmt.Sprintf("… lines %d-%d of %d (j/k scroll, esc closes) …",
-		b.helpOffset+1, end, len(lines))))
+		offset+1, end, len(lines))))
 	return s.Help.Render(strings.Join(windowed, "\n"))
 }
 
@@ -2714,6 +2773,11 @@ func (b *BaseModel) helpQuit() string {
 
 // logsHelpView renders the help overlay for logs view.
 func (b *BaseModel) logsHelpView() string {
+	return b.renderHelp(b.logsHelpText())
+}
+
+// logsHelpText is the full (unwindowed) logs help content.
+func (b *BaseModel) logsHelpText() string {
 	help := fmt.Sprintf(`%s
 
 Navigation:
@@ -2761,11 +2825,16 @@ Mouse:
 esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Logs View]"), b.helpQuit())
 
-	return b.renderHelp(help)
+	return help
 }
 
 // requestsHelpView renders the help overlay for requests view.
 func (b *BaseModel) requestsHelpView() string {
+	return b.renderHelp(b.requestsHelpText())
+}
+
+// requestsHelpText is the full (unwindowed) requests help content.
+func (b *BaseModel) requestsHelpText() string {
 	help := fmt.Sprintf(`%s
 
 Navigation (cursor row ❯):
@@ -2809,11 +2878,16 @@ Mouse:
 esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Requests View]"), b.helpQuit())
 
-	return b.renderHelp(help)
+	return help
 }
 
 // detailHelpView renders the help overlay for request detail view.
 func (b *BaseModel) detailHelpView() string {
+	return b.renderHelp(b.detailHelpText())
+}
+
+// detailHelpText is the full (unwindowed) detail help content.
+func (b *BaseModel) detailHelpText() string {
 	help := fmt.Sprintf(`%s
 
 Navigation:
@@ -2834,7 +2908,7 @@ View & chrome:
 esc/?/q closes help (j/k scroll when taller than the screen)`,
 		b.helpTitle("[Request Detail]"), b.helpQuit())
 
-	return b.renderHelp(help)
+	return help
 }
 
 // containsIgnoreCase performs a case-insensitive substring search

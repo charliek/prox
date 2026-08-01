@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// withTestTheme installs name and restores tokyo-night on cleanup.
+// withTestTheme installs name and restores the PREVIOUS theme on cleanup.
 // Theme-mutating tests must NOT call t.Parallel — the style set is a
 // package-global singleton (Codex #7).
 func withTestTheme(t *testing.T, name string) {

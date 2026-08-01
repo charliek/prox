@@ -298,8 +298,7 @@ func (b *BaseModel) toggleMenuBar() tea.Cmd {
 	}
 	b.relayout()
 	if err := SaveSettings(b.settings); err != nil {
-		b.statusFlash = "settings not saved: " + err.Error()
-		return statusFlashClearCmd()
+		return b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
 	}
 	return nil
 }

@@ -50,6 +50,23 @@ func TestHelp_ScrollKeysMoveWindow(t *testing.T) {
 	assert.NotContains(t, endView, "Prox - Process Manager")
 }
 
+// k after G must visibly scroll UP immediately. The offset clamp used to
+// live in renderHelp — which runs on View()'s value copy — so G's offset
+// never persisted the clamp and k had to walk the sentinel back down one
+// press at a time (CodeRabbit PR #102).
+func TestHelp_KAfterGScrollsUpImmediately(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
+	m.mode = ModeHelp
+
+	m.handleHelpKey(tea.KeyMsg{Type: tea.KeyEnd})
+	bottom := m.helpOffset
+	require.Greater(t, bottom, 0)
+
+	m.handleHelpKey(keyRune('k'))
+	assert.Equal(t, bottom-1, m.helpOffset, "k must move one row up from the clamped bottom")
+}
+
 func TestHelp_CloseResetsOffset(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})

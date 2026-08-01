@@ -203,7 +203,9 @@ func TestSaveSettings_AtomicWrite(t *testing.T) {
 
 	dirInfo, err := os.Stat(dir)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o755), dirInfo.Mode().Perm())
+	// MkdirAll's 0o755 is masked by the process umask (077 → 0700): assert
+	// owner access rather than the exact mode (CodeRabbit PR #102).
+	assert.Equal(t, os.FileMode(0o700), dirInfo.Mode().Perm()&0o700)
 
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -299,8 +301,31 @@ func TestStartupWarningsMsg(t *testing.T) {
 
 func TestStatusFlashClearMsg(t *testing.T) {
 	m := newTestModel()
-	m.statusFlash = "theme: dark"
+	cmd := m.setStatusFlash("theme: dark", statusFlashClearDelay)
+	require.NotNil(t, cmd)
+	require.Equal(t, 1, m.statusFlashSeq)
 
-	newModel, _ := m.Update(StatusFlashClearMsg{})
+	newModel, _ := m.Update(StatusFlashClearMsg{Seq: 1})
 	assert.Empty(t, newModel.(ClientModel).statusFlash)
+}
+
+// A stale clear timer must not erase a NEWER flash: copy flash (2s) racing a
+// theme flash (3s) was the reported case (CodeRabbit PR #102).
+func TestStatusFlash_StaleTimerKeepsNewerFlash(t *testing.T) {
+	m := newTestModel()
+	m.setStatusFlash("theme: dark", statusFlashClearDelay) // seq 1, 3s timer
+	m.setStatusFlash("copied curl", copyFlashClearDelay)   // seq 2, 2s timer
+
+	// The 2s copy timer fires first with seq 2 — clears the copy flash.
+	after, _ := m.Update(StatusFlashClearMsg{Seq: 2})
+	m = after.(ClientModel)
+	m.setStatusFlash("theme: light", statusFlashClearDelay) // seq 3
+
+	// Now the ORIGINAL 3s timer (seq 1) fires — must NOT clear seq 3's flash.
+	after, _ = m.Update(StatusFlashClearMsg{Seq: 1})
+	m = after.(ClientModel)
+	assert.Equal(t, "theme: light", m.statusFlash)
+
+	after, _ = m.Update(StatusFlashClearMsg{Seq: 3})
+	assert.Empty(t, after.(ClientModel).statusFlash)
 }

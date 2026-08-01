@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
@@ -114,6 +115,13 @@ type filterToken struct {
 	body string // raw without leading '-'
 }
 
+// isFilterSpace reports ASCII whitespace only. Bytes are decoded one at a
+// time during the scan; a UTF-8 continuation byte (0x80-0xBF) cast to rune
+// must never be treated as a separator (CodeRabbit PR #102).
+func isFilterSpace(b byte) bool {
+	return b < utf8.RuneSelf && unicode.IsSpace(rune(b))
+}
+
 // tokenizeFilter splits query into tokens, honouring field:"quoted value".
 // Empty/whitespace-only input yields a nil token slice (valid empty query).
 func tokenizeFilter(query string) ([]filterToken, error) {
@@ -121,7 +129,7 @@ func tokenizeFilter(query string) ([]filterToken, error) {
 	i := 0
 	n := len(query)
 	for i < n {
-		for i < n && unicode.IsSpace(rune(query[i])) {
+		for i < n && isFilterSpace(query[i]) {
 			i++
 		}
 		if i >= n {
@@ -132,14 +140,17 @@ func tokenizeFilter(query string) ([]filterToken, error) {
 		if query[i] == '-' {
 			neg = true
 			i++
-			if i >= n || unicode.IsSpace(rune(query[i])) {
+			if i >= n || isFilterSpace(query[i]) {
 				return nil, &FilterQueryError{Pos: start, Msg: "lonely negation"}
 			}
 		}
 		bodyStart := i
 		// field:"quoted" — scan to closing quote after the first colon+quote.
-		if colon := strings.IndexByte(query[i:], ':'); colon >= 0 {
-			afterColon := i + colon + 1
+		// The colon lookahead is bounded to the CURRENT token: searching the
+		// whole remainder would glue `foo bar:"x y"` into one token and hide
+		// the bar field (CodeRabbit PR #102).
+		if colon := indexByteWithinToken(query, i, ':'); colon >= 0 {
+			afterColon := colon + 1
 			if afterColon < n && query[afterColon] == '"' {
 				j := afterColon + 1
 				for j < n && query[j] != '"' {
@@ -155,13 +166,27 @@ func tokenizeFilter(query string) ([]filterToken, error) {
 			}
 		}
 		// Unquoted token: run to next whitespace.
-		for i < n && !unicode.IsSpace(rune(query[i])) {
+		for i < n && !isFilterSpace(query[i]) {
 			i++
 		}
 		body := query[bodyStart:i]
 		toks = append(toks, filterToken{raw: query[start:i], pos: start, neg: neg, body: body})
 	}
 	return toks, nil
+}
+
+// indexByteWithinToken finds c starting at i, stopping at the end of the
+// current token (next ASCII whitespace). Returns the absolute index or -1.
+func indexByteWithinToken(query string, i int, c byte) int {
+	for j := i; j < len(query); j++ {
+		if isFilterSpace(query[j]) {
+			return -1
+		}
+		if query[j] == c {
+			return j
+		}
+	}
+	return -1
 }
 
 // splitFieldValue splits "field:value" / `field:"quoted"`. ok is false when

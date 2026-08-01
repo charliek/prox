@@ -72,30 +72,55 @@ func LoadSettings() (Settings, []string) {
 		return s, []string{fmt.Sprintf("settings file unparseable: %v", err)}
 	}
 
-	applySettingsFromMap(&s, root)
-	return s, nil
+	return s, applySettingsFromMap(&s, root)
 }
 
-func applySettingsFromMap(s *Settings, root map[string]any) {
-	if theme, ok := root["theme"].(string); ok {
-		s.Theme = theme
+// TOML key names, shared by the load and merge paths (CodeRabbit PR #102).
+const (
+	keyTheme        = "theme"
+	keyView         = "view"
+	keyProcessPanel = "process_panel"
+	keyTimestamps   = "timestamps"
+	keyWrap         = "wrap"
+	keyMenuBar      = "menu_bar"
+)
+
+// applySettingsFromMap overlays known keys onto s. Values with the wrong
+// TOML type are ignored AND reported (silently dropping `theme = 3` leaves
+// the user wondering why their edit does nothing — CodeRabbit PR #102).
+func applySettingsFromMap(s *Settings, root map[string]any) []string {
+	var warnings []string
+	if raw, present := root[keyTheme]; present {
+		if theme, ok := raw.(string); ok {
+			s.Theme = theme
+		} else {
+			warnings = append(warnings, "theme: expected string, ignored")
+		}
 	}
-	view, ok := root["view"].(map[string]any)
+	rawView, present := root[keyView]
+	if !present {
+		return warnings
+	}
+	view, ok := rawView.(map[string]any)
 	if !ok {
-		return
+		return append(warnings, "view: expected table, ignored")
 	}
-	if v, ok := view["process_panel"].(bool); ok {
-		s.ProcessPanel = v
+	boolKey := func(key string, dst *bool) {
+		raw, present := view[key]
+		if !present {
+			return
+		}
+		if v, ok := raw.(bool); ok {
+			*dst = v
+		} else {
+			warnings = append(warnings, key+": expected boolean, ignored")
+		}
 	}
-	if v, ok := view["timestamps"].(bool); ok {
-		s.Timestamps = v
-	}
-	if v, ok := view["wrap"].(bool); ok {
-		s.Wrap = v
-	}
-	if v, ok := view["menu_bar"].(bool); ok {
-		s.MenuBar = v
-	}
+	boolKey(keyProcessPanel, &s.ProcessPanel)
+	boolKey(keyTimestamps, &s.Timestamps)
+	boolKey(keyWrap, &s.Wrap)
+	boolKey(keyMenuBar, &s.MenuBar)
+	return warnings
 }
 
 // SaveSettings merges s into the on-disk file, preserving unknown keys.
@@ -136,17 +161,17 @@ func SaveSettings(s Settings) error {
 
 func mergeSettingsIntoMap(root map[string]any, s Settings) {
 	if s.Theme != "" {
-		root["theme"] = s.Theme
+		root[keyTheme] = s.Theme
 	}
-	view, _ := root["view"].(map[string]any)
+	view, _ := root[keyView].(map[string]any)
 	if view == nil {
 		view = make(map[string]any)
 	}
-	view["process_panel"] = s.ProcessPanel
-	view["timestamps"] = s.Timestamps
-	view["wrap"] = s.Wrap
-	view["menu_bar"] = s.MenuBar
-	root["view"] = view
+	view[keyProcessPanel] = s.ProcessPanel
+	view[keyTimestamps] = s.Timestamps
+	view[keyWrap] = s.Wrap
+	view[keyMenuBar] = s.MenuBar
+	root[keyView] = view
 }
 
 // atomicWriteFile writes data to path via a unique temp file in the same

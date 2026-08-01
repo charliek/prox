@@ -196,6 +196,22 @@ func TestWrap_LongLineProducesMultipleDisplayRows(t *testing.T) {
 	assert.Equal(t, sp.Last-sp.First+1, m.viewport.TotalLineCount())
 }
 
+// An UNBROKEN token longer than the width must still split into multiple
+// rows: Wordwrap leaves it over-wide, the terminal hard-wraps it visually,
+// and logRowSpans drifts a row behind reality (CodeRabbit PR #102).
+func TestWrap_UnbrokenTokenSplitsAcrossRows(t *testing.T) {
+	m := newLogsModelNarrow(70, 10, []string{
+		strings.Repeat("x", 300),
+	})
+	m.settings.Wrap = true
+	m.updateViewport()
+
+	require.Len(t, m.logEntries, 1)
+	sp := m.logRowSpans[m.logEntries[0].DisplaySeq]
+	assert.Greater(t, sp.Last-sp.First, 0, "unbroken token spans multiple rows")
+	assert.Equal(t, sp.Last-sp.First+1, m.viewport.TotalLineCount())
+}
+
 func TestWrap_NoWrapByteIdenticalToPreC4(t *testing.T) {
 	lines := []string{"short", "another line", strings.Repeat("x", 200)}
 	m := newLogsModelNarrow(70, 20, lines)

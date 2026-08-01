@@ -30,8 +30,14 @@ type RestartResultMsg struct {
 // RestartResultClearMsg is sent to clear the restart result after a delay
 type RestartResultClearMsg struct{}
 
-// StatusFlashClearMsg clears a short-lived status-bar flash (theme cycle, etc.).
-type StatusFlashClearMsg struct{}
+// StatusFlashClearMsg clears a short-lived status-bar flash (theme cycle,
+// copy, etc.). Seq is the flash generation captured when the timer was
+// scheduled: two delays (2s copy, 3s general) share the statusFlash field,
+// and without a generation a stale timer clears a NEWER flash early
+// (CodeRabbit PR #102). Clears only when Seq matches the current generation.
+type StatusFlashClearMsg struct {
+	Seq int
+}
 
 // StartupWarningsMsg delivers non-fatal settings/theme load warnings to the log pane.
 type StartupWarningsMsg struct {
@@ -115,13 +121,6 @@ const statusFlashClearDelay = 3 * time.Second
 func restartResultClearCmd() tea.Cmd {
 	return tea.Tick(restartResultClearDelay, func(t time.Time) tea.Msg {
 		return RestartResultClearMsg{}
-	})
-}
-
-// statusFlashClearCmd returns a command that clears the status flash after a delay.
-func statusFlashClearCmd() tea.Cmd {
-	return tea.Tick(statusFlashClearDelay, func(t time.Time) tea.Msg {
-		return StatusFlashClearMsg{}
 	})
 }
 
@@ -398,7 +397,9 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastRestartError = nil
 
 	case StatusFlashClearMsg:
-		m.statusFlash = ""
+		if msg.Seq == m.statusFlashSeq {
+			m.statusFlash = ""
+		}
 
 	case StartupWarningsMsg:
 		for _, w := range msg.Warnings {

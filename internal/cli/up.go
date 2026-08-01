@@ -566,7 +566,9 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			Help:       tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
 			ShutdownCh: coordinator.TriggerCh(),
 		}
-		if cfg.Proxy != nil {
+		// Ports feed curl-copy only; pass them when a proxy is actually
+		// listening (disabled/--no-proxy → port-less https://<host><url>).
+		if cfg.Proxy != nil && cfg.Proxy.Enabled {
 			tuiOpts.ProxyHTTPSPort = cfg.Proxy.HTTPSPort
 			tuiOpts.ProxyHTTPPort = cfg.Proxy.HTTPPort
 		}

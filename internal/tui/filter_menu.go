@@ -71,7 +71,9 @@ func (b *BaseModel) logsFilterMenuItems() []MenuItem {
 			Cmd:     MenuCommand(menuCmdToggleProcPrefix + name),
 		})
 	}
-	items = append(items, MenuItem{Separator: true})
+	if len(items) > 0 { // no leading separator when there are no processes
+		items = append(items, MenuItem{Separator: true})
+	}
 
 	for _, lv := range logsFilterLevels {
 		checked := logsLevelChecked(expr, lv.level)

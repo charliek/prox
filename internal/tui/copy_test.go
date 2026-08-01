@@ -22,7 +22,7 @@ func TestCurlCopyPayload_WithPort(t *testing.T) {
 		URL:      "/orders?id=1",
 	}
 	assert.Equal(t,
-		"curl -X POST 'https://api.local.dev:6789/orders?id=1'",
+		"curl -X 'POST' 'https://api.local.dev:6789/orders?id=1'",
 		curlCopyPayload(req, 6789),
 	)
 }
@@ -34,7 +34,7 @@ func TestCurlCopyPayload_PortlessAttach(t *testing.T) {
 		URL:      "/health",
 	}
 	assert.Equal(t,
-		"curl -X get 'https://api.local.dev/health'",
+		"curl -X 'get' 'https://api.local.dev/health'",
 		curlCopyPayload(req, 0),
 	)
 }
@@ -46,7 +46,7 @@ func TestCurlCopyPayload_SubdomainFallback(t *testing.T) {
 		URL:       "/v1/x",
 	}
 	assert.Equal(t,
-		"curl -X PUT 'https://api:8443/v1/x'",
+		"curl -X 'PUT' 'https://api:8443/v1/x'",
 		curlCopyPayload(req, 8443),
 	)
 }
@@ -59,13 +59,32 @@ func TestCurlCopyPayload_PrefersHostnameOverSubdomain(t *testing.T) {
 		URL:       "/z",
 	}
 	assert.Equal(t,
-		"curl -X DELETE 'https://full.host.dev/z'",
+		"curl -X 'DELETE' 'https://full.host.dev/z'",
 		curlCopyPayload(req, 0),
 	)
 }
 
 func TestRequestIDCopyPayload(t *testing.T) {
 	assert.Equal(t, "abc123def456", requestIDCopyPayload("abc123def456"))
+}
+
+// The payload is pasted into shells by users AND agents; method/URL are
+// attacker-influenceable, so apostrophes must not break quoting (CodeRabbit
+// PR #102, critical).
+func TestCurlCopyPayload_ShellEscapes(t *testing.T) {
+	req := proxy.RequestRecord{
+		Method:    "GET",
+		Subdomain: "api",
+		URL:       "/search?q=';rm -rf ~;'",
+	}
+	got := curlCopyPayload(req, 0)
+	assert.Equal(t,
+		`curl -X 'GET' 'https://api/search?q='\'';rm -rf ~;'\'''`,
+		got)
+
+	req.Method = "G'ET"
+	got = curlCopyPayload(req, 0)
+	assert.Contains(t, got, `'G'\''ET'`)
 }
 
 func TestDetailJSONCopyPayload_ByteExact(t *testing.T) {
@@ -132,7 +151,7 @@ func TestCopyKeys_RequestList_CurlAndID(t *testing.T) {
 	assert.Equal(t, "copied request id req-002", m.statusFlash)
 
 	m = clientUpdate(m, keyRune('c'))
-	assert.Equal(t, "curl -X POST 'https://shop.local.dev:6789/orders'", clipboard)
+	assert.Equal(t, "curl -X 'POST' 'https://shop.local.dev:6789/orders'", clipboard)
 }
 
 func TestCopyKeys_DetailView(t *testing.T) {
@@ -173,7 +192,7 @@ func TestCopyKeys_DetailView(t *testing.T) {
 	assert.Equal(t, "req-detail", clipboard)
 
 	m = clientUpdate(m, keyRune('c'))
-	assert.Equal(t, "curl -X GET 'https://h.local.dev:443/z'", clipboard)
+	assert.Equal(t, "curl -X 'GET' 'https://h.local.dev:443/z'", clipboard)
 
 	wantJSON, err := json.Marshal(raw)
 	require.NoError(t, err)

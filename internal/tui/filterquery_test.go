@@ -34,6 +34,17 @@ func TestParseLogsFilter(t *testing.T) {
 			},
 		},
 		{
+			// The quoted-field colon lookahead must stop at the token
+			// boundary — searching the whole remainder glued the bare word,
+			// the field, and its value into one bare term (CodeRabbit #102).
+			name:  "bare word before quoted field",
+			query: `foo proc:"my app"`,
+			check: func(t *testing.T, e LogsFilterExpr) {
+				assert.Equal(t, []string{"my app"}, e.procs)
+				assert.Equal(t, []string{"foo"}, e.terms)
+			},
+		},
+		{
 			name:  "proc single",
 			query: "proc:api",
 			check: func(t *testing.T, e LogsFilterExpr) {

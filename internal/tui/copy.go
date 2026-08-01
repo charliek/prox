@@ -19,12 +19,6 @@ const copyFlashClearDelay = 2 * time.Second
 // clipboardWriteString is a test seam over atotto/clipboard.
 var clipboardWriteString = clipboard.WriteAll
 
-func copyFlashClearCmd() tea.Cmd {
-	return tea.Tick(copyFlashClearDelay, func(t time.Time) tea.Msg {
-		return StatusFlashClearMsg{}
-	})
-}
-
 // requestIDCopyPayload returns the full request ID for clipboard (WS10).
 func requestIDCopyPayload(id string) string {
 	return id
@@ -39,9 +33,18 @@ func curlCopyHost(req proxy.RequestRecord) string {
 	return req.Subdomain
 }
 
+// shellSingleQuote wraps s in single quotes with '\” escapes. The curl
+// payload is pasted into shells (by users AND agents), and request method/URL
+// are attacker-influenceable — an apostrophe in a proxied path must not be
+// able to break out of quoting (CodeRabbit PR #102, critical).
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // curlCopyPayload builds `curl -X <METHOD> 'https://<host>[:port]<URL>'` per
 // plan 021 WS10 / panel B2. ProxyHTTPSPort != 0 includes :port (up --tui);
-// 0 omits the port (attach / shared-daemon-on-443).
+// 0 omits the port (attach / shared-daemon-on-443). Method and target are
+// shellSingleQuote'd.
 func curlCopyPayload(req proxy.RequestRecord, proxyHTTPSPort int) string {
 	host := curlCopyHost(req)
 	url := req.URL
@@ -54,7 +57,7 @@ func curlCopyPayload(req proxy.RequestRecord, proxyHTTPSPort int) string {
 	} else {
 		authority = host
 	}
-	return fmt.Sprintf("curl -X %s 'https://%s%s'", req.Method, authority, url)
+	return fmt.Sprintf("curl -X %s %s", shellSingleQuote(req.Method), shellSingleQuote("https://"+authority+url))
 }
 
 // detailJSONCopyPayload re-marshals the retained wire response byte-for-byte
@@ -146,20 +149,17 @@ func (m *ClientModel) handleCopyDetailJSON() (bool, tea.Cmd) {
 	}
 	payload, err := detailJSONCopyPayload(m.requestDetailRaw)
 	if err != nil {
-		m.statusFlash = err.Error()
-		return true, copyFlashClearCmd()
+		return true, m.setStatusFlash(err.Error(), copyFlashClearDelay)
 	}
 	return true, m.writeClipboard(string(payload), "copied JSON")
 }
 
 func (m *ClientModel) writeClipboard(text, successFlash string) tea.Cmd {
 	if err := clipboardWriteString(text); err != nil {
-		m.statusFlash = "clipboard unavailable: " + err.Error()
-		return copyFlashClearCmd()
+		return m.setStatusFlash("clipboard unavailable: "+err.Error(), copyFlashClearDelay)
 	}
 	if successFlash != "" {
-		m.statusFlash = successFlash
-		return copyFlashClearCmd()
+		return m.setStatusFlash(successFlash, copyFlashClearDelay)
 	}
 	return nil
 }
