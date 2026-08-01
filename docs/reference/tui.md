@@ -144,6 +144,8 @@ re:timeout
 
 Fields: `proc:` (repeatable), `level:error|warn|info|debug|trace` (repeatable), `re:<regex>` (≤256 chars). Bare words are case-insensitive AND substring matches on the line. `-` negates any token. Invalid syntax keeps the last good filter and shows a hint in the status bar.
 
+A line's level is detected at ingest from (first match wins): a JSON `level`/`lvl`/`severity` key (string, or pino/bunyan numeric), a logfmt `level=`/`lvl=` token, or a standalone UPPERCASE level token early in the line — the shape python logging, tracing's text format, pino-pretty, and uvicorn emit in local dev. `warning` maps to warn; `fatal`/`critical` map to error. Lines with no detectable level are excluded from positive `level:` filters (and untinted).
+
 The **Filter menu** edits the same state as the `s` bar; menu changes rewrite the bar text canonically.
 
 ### Requests View

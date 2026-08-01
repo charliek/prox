@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ func TestNormalizeLevel(t *testing.T) {
 		{"WARNING", LogLevelWarn, true},
 		{"fatal", LogLevelError, true},
 		{"FATAL", LogLevelError, true},
+		{"critical", LogLevelError, true},
+		{"CRITICAL", LogLevelError, true},
 		{"notice", LogLevelUnknown, false},
 	}
 	for _, tc := range cases {
@@ -44,14 +47,38 @@ func TestClassifyLevel_Corpus(t *testing.T) {
 	}{
 		{"json level error", `{"level":"error","msg":"x"}`, LogLevelError, true},
 		{"json lvl warning", `{"lvl":"warning"}`, LogLevelWarn, true},
+		{"json severity (gcp/python)", `{"severity":"WARNING","message":"x"}`, LogLevelWarn, true},
+		{"json severity critical", `{"severity":"CRITICAL","message":"x"}`, LogLevelError, true},
+		{"json pino numeric info", `{"level":30,"msg":"x"}`, LogLevelInfo, true},
+		{"json pino numeric error", `{"level":50,"msg":"x"}`, LogLevelError, true},
+		{"json numeric out of range", `{"level":123}`, LogLevelUnknown, false},
 		{"logfmt info", "level=INFO msg=x", LogLevelInfo, true},
 		{"logfmt fatal", "level=fatal", LogLevelError, true},
 		{"plain text", "something happened", LogLevelUnknown, false},
 		{"mid-line logfmt", "retry level=info weird", LogLevelInfo, true},
-		{"json non-string level", `{"level":123}`, LogLevelUnknown, false},
 		{"uppercase logfmt", "LEVEL=ERROR", LogLevelError, true},
 		{"unsupported level name", "level=notice", LogLevelUnknown, false},
 		{"empty", "", LogLevelUnknown, false},
+
+		// Bare-token path: real dev-format bytes per stack.
+		{"python dev info", "2026-08-01 11:39:29,582 INFO demo.app: server starting", LogLevelInfo, true},
+		{"python dev warning", "2026-08-01 11:39:29,582 WARNING demo.app: careful now", LogLevelWarn, true},
+		{"uvicorn access", `INFO:     127.0.0.1:51234 - "GET / HTTP/1.1" 200 OK`, LogLevelInfo, true},
+		{"rust tracing text", "2026-08-01T16:14:05.604587Z  INFO tower_http::trace::on_request: started processing request", LogLevelInfo, true},
+		{"rust tracing ansi", "2026-08-01T16:14:05.604587Z \x1b[32m INFO\x1b[0m tower_http::trace: x", LogLevelInfo, true},
+		{"rust tracing warn ansi", "2026-08-01T16:14:05.604587Z \x1b[33m WARN\x1b[0m sqlx::query: slow", LogLevelWarn, true},
+		{"pino-pretty ansi", "[16:39:31] \x1b[32mINFO\x1b[39m: \x1b[36mserver starting\x1b[39m", LogLevelInfo, true},
+		{"pino-pretty error", "[16:39:31] \x1b[31mERROR\x1b[39m: \x1b[36mfailed\x1b[39m", LogLevelError, true},
+		{"bracketed token", "[INFO] starting", LogLevelInfo, true},
+		{"critical bare", "2026-08-01 11:39:29,582 CRITICAL demo.app: boom", LogLevelError, true},
+
+		// False-positive guards.
+		{"lowercase prose", "error handling started ok", LogLevelUnknown, false},
+		{"lowercase bare info", "2026-08-01 info lowercase token", LogLevelUnknown, false},
+		{"token beyond scan limit", strings.Repeat("x", 90) + " INFO y", LogLevelUnknown, false},
+		{"token prefix of word", "INFORMATIONAL notice", LogLevelUnknown, false},
+		{"token in url path", "GET /INFO/health HTTP/1.1", LogLevelUnknown, false},
+		{"sqlx continuation", `    err: {`, LogLevelUnknown, false},
 	}
 	for _, tc := range cases {
 		tc := tc

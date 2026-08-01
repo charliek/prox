@@ -31,6 +31,14 @@ All notable changes to this project will be documented in this file.
 - **Free-motion menu hover** (plan 022). Hovering the menu bar slides an open
   menu across sibling cells; hovering dropdown rows moves the highlight (requires
   all-motion mouse reporting).
+- **Broader log-level detection** for `level:` filters and level tints. Beyond
+  JSON `level`/`lvl` and logfmt `level=`, the classifier now reads JSON
+  `severity` keys (Cloud Logging / stridelabs-python deployed format),
+  pino/bunyan numeric levels (`{"level":30}`), `critical` as error, and a
+  standalone UPPERCASE level token early in the line — covering python
+  logging's dev format, tracing's text layer, pino-pretty, and uvicorn access
+  lines, ANSI colors included. Previously these lines had no detected level,
+  so `level:info` filtered them all out.
 
 ### Changed
 
