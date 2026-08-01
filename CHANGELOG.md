@@ -14,6 +14,31 @@ All notable changes to this project will be documented in this file.
   row/chip clicks, double-click to open request detail). Settings persist in
   `~/.prox/tui/config.toml`.
 
+### Fixed
+
+- **TUI menu bar, dropdown, and process-chip mouse clicks** (plan 022). Hit
+  rectangles were recorded during render but discarded because `View` uses a
+  value receiver — the live model never saw them, so menu and chip clicks were
+  dead in the real app. Clicks now use a shared hit registry that survives the
+  render copy.
+
+### Added
+
+- **Dropdown height clamping with scroll indicators** (plan 022). Long menus
+  (for example the Theme list on short terminals) window to the available frame
+  height with “… N more …” indicators; the mouse wheel scrolls an open dropdown
+  and is consumed so the viewport underneath does not move.
+- **Free-motion menu hover** (plan 022). Hovering the menu bar slides an open
+  menu across sibling cells; hovering dropdown rows moves the highlight (requires
+  all-motion mouse reporting).
+
+### Changed
+
+- **`?` help is now a centered modal** over the live TUI (plan 022). Logs and
+  requests keep updating behind it; the wheel scrolls the modal when content is
+  taller than the box; Esc, `?`, `q`, Enter, or a click outside the box closes
+  it (replacing the old full-screen help view).
+
 TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
 TUI. The owner's TUI is the same API-client TUI attach has always run, so
 every feature, key binding, and fix lands in both at once.

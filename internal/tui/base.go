@@ -2733,12 +2733,11 @@ Actions:
   q/Ctrl+C     %s
 
 Mouse:
-  wheel        Scroll logs (3 lines/notch)
+  wheel        Scroll logs; scroll open dropdown (not viewport) when menu open
   click line   Park cursor on that entry (disengages follow)
   click chip   Solo/unsolo process
-  menu bar     Click cells or use v/f; ←/→ switch open menus
-
-esc/?/q closes help (j/k scroll when taller than the screen)`,
+  menu bar     Click or hover cells; click dropdown rows; ←/→ switch open menus
+  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
 		b.helpTitle("[Logs View]"), b.helpQuit())
 
 	return help
@@ -2782,11 +2781,11 @@ Actions:
   q/Ctrl+C     %s
 
 Mouse:
-  wheel        Move cursor (3 rows/notch)
-  click        Select row; double-click opens detail
-  menu bar     Click cells or v/f; ←/→ between menus
-
-esc/?/q closes help (j/k scroll when taller than the screen)`,
+  wheel        Move cursor; scroll open dropdown (not viewport) when menu open
+  click row    Move cursor; double-click opens detail
+  click chip   Solo/unsolo process
+  menu bar     Click or hover cells; click dropdown rows; ←/→ between menus
+  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
 		b.helpTitle("[Requests View]"), b.helpQuit())
 
 	return help
@@ -2811,7 +2810,10 @@ View & chrome:
   ?            This help
   q/Ctrl+C     %s
 
-esc/?/q closes help (j/k scroll when taller than the screen)`,
+Mouse:
+  wheel        Scroll detail; scroll open dropdown when menu open
+  menu bar     Click or hover cells; click dropdown rows
+  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
 		b.helpTitle("[Request Detail]"), b.helpQuit())
 
 	return help

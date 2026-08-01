@@ -97,7 +97,7 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 | Scroll wheel | Scroll logs or move requests cursor (3 lines per notch) |
 | `Home` / `End` / `g` / `G` | Jump to start/end (or cursor top/bottom in requests) |
 | `F` | Toggle auto-follow |
-| `?` | Help overlay |
+| `?` | Help modal |
 | `m` | Toggle menu bar |
 | `v` | Open View menu (when bar visible) |
 | `f` | Open Filter menu (when bar visible) |
@@ -113,7 +113,10 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 When the menu bar is visible:
 
 - Click `View ▾`, `Filter ▾`, or `Theme ▾` to open a dropdown.
-- With a menu open: `←`/`→`/`Tab` switch between menus; `↑`/`↓`/`j`/`k` navigate rows (separators skipped); `Enter`/`Space` activate; any other key closes the menu.
+- Hover a sibling menu cell while a dropdown is open to slide the menu across
+  the bar; hover dropdown rows to move the highlight.
+- With a menu open: `←`/`→`/`Tab` switch between menus; `↑`/`↓`/`j`/`k` navigate rows (separators skipped); the scroll wheel moves the highlight; `Enter`/`Space` activate; any other key closes the menu (except `?`, which closes the menu and opens help).
+- Long menus clamp to the frame with “… N more …” indicator rows; wheel scrolls the visible window.
 - Opening a menu by mouse while typing in a filter/search bar blurs the input first.
 
 Menu choices persist view toggles and theme to `~/.prox/tui/config.toml` (`theme` plus `[view]` keys: `process_panel`, `timestamps`, `wrap`, `menu_bar`).
@@ -206,20 +209,31 @@ Copy keys write to the system clipboard (with a status flash on success or failu
 
 ## Mouse
 
-Mouse support requires a terminal that reports cell motion (`tea.WithMouseCellMotion`).
+Mouse support requires a terminal that reports all motion (`tea.WithMouseAllMotion`,
+SGR `?1003` + `?1006`).
 
 | Action | Effect |
 | ------ | ------ |
-| Wheel | 3 lines per notch — scroll logs, move requests cursor, or scroll detail |
+| Wheel (no menu open) | 3 lines per notch — scroll logs, move requests cursor, or scroll detail |
+| Wheel (menu open) | Move dropdown highlight; viewport does not scroll |
 | Click process chip | Solo/unsolo (logs view) |
 | Click log line | Park cursor; disengages follow |
 | Click request row | Move cursor |
 | Double-click request row | Open detail (~500 ms window) |
-| Click menu cells / rows | Open menus and activate items |
+| Click / hover menu bar | Open menus; hover slides an open menu across siblings |
+| Click dropdown row | Activate item |
 | Click while typing filter/search | Ignored (except menu bar, which blurs input) |
 
 Wheel events are handled entirely by the TUI (the bubbles viewport wheel handler is disabled) so scrolling does not double-fire.
 
-## Help Overlay
+**Text selection:** the TUI owns the pointer for mouse reporting. To select text in
+the terminal, use your terminal’s override modifier (commonly **Shift**-click or
+**Option**-click on macOS — the exact key is terminal-specific).
 
-Press `?` for context-sensitive help (logs, requests, or detail). Press any key to dismiss.
+## Help modal
+
+Press `?` in Normal or Help mode for context-sensitive help (logs, requests, or
+detail). Help appears as a centered modal over the live UI (the menu bar, status
+bar, and streaming content stay visible behind it). Scroll with `j`/`k`, PgUp/PgDn,
+`g`/`G`, or the wheel over the box when content is taller than the modal. Close
+with Esc, `?`, `q`, Enter, or a click outside the box.
