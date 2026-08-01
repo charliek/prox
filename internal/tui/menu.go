@@ -209,8 +209,8 @@ func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
 	return idx
 }
 
-// menuReservedBottom is status + hints — dropdowns never cover them (plan 022 WS3).
-const menuReservedBottom = 2
+// menuReservedBottom is the footer band — dropdowns never cover it (plan 023 B2).
+const menuReservedBottom = 1
 
 func (b *BaseModel) menuBoxTop() int {
 	if b.settings.MenuBar {
@@ -438,7 +438,7 @@ func (b *BaseModel) toggleMenuBar() tea.Cmd {
 	}
 	b.relayout()
 	if err := SaveSettings(b.settings); err != nil {
-		return b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
+		return b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
 	}
 	return nil
 }
@@ -519,11 +519,6 @@ func (b *BaseModel) renderMenuBar() string {
 
 	line := bld.String()
 	return padFrameRow(line, b.width)
-}
-
-// renderKeyHints is the dim footer under the status bar (plan 021 WS11).
-func (b *BaseModel) renderKeyHints() string {
-	return padFrameRow(s.Dim.Render("m menu · / search · s filter · ? help · q quit"), b.width)
 }
 
 // dropdownBoxRows builds the windowed dropdown rows (indicators + visible

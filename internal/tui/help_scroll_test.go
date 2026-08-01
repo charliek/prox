@@ -25,8 +25,9 @@ func TestHelp_WindowsToModalInnerHeight(t *testing.T) {
 		"frame must not exceed terminal height")
 	assert.Contains(t, view, "Prox - Process Manager", "title stays visible")
 	assert.Contains(t, view, helpModalFooter)
-	// Live chrome behind the modal.
-	assert.Contains(t, view, "m menu")
+	// Live chrome behind the modal (merged footer; sticky ? help survives at 90).
+	assert.Contains(t, ansi.Strip(view), "? help")
+	assert.Contains(t, ansi.Strip(view), "[FOLLOW]")
 	box := m.helpModalGeometry()
 	assert.LessOrEqual(t, box.H, 16, "modal height clamped to frameH-4")
 	assert.Greater(t, m.helpMaxOffset(), 0, "body exceeds modal budget at H=20")

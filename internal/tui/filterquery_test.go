@@ -889,14 +889,14 @@ func TestStringFilter_InvalidKeepsLastGood(t *testing.T) {
 	assert.Equal(t, "hello", m.logsFilter.LastGood.Serialize())
 	assert.Len(t, m.filteredEntries(), 1, "LastGood keeps filtering")
 
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "Filter: hello level:chatty")
 	assert.Contains(t, bar, "invalid filter")
 
 	// Same hint while the s-bar is open.
 	m.mode = ModeStringFilter
 	m.textInput.SetValue(m.logsFilter.RawQuery)
-	bar = m.statusBar("")
+	bar = m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "invalid filter")
 }
 
@@ -963,7 +963,7 @@ func TestStringFilter_StatusShowsRawBothViews(t *testing.T) {
 	m.height = 30
 
 	m.setLogsFilterQuery("hello")
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "Filter: hello")
 
 	// With / search active, filter is still shown (Codex #3 unification).
@@ -972,14 +972,14 @@ func TestStringFilter_StatusShowsRawBothViews(t *testing.T) {
 	m.logMeta = map[int64]logMeta{1: {}}
 	m.logCursorIdx = 0
 	m.logCursorSeq = 1
-	bar = m.statusBar("")
+	bar = m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/needle")
 	assert.Contains(t, bar, "filter: hello")
 
 	m.viewMode = ViewModeRequests
 	m.setRequestsFilterQuery("status:4xx")
 	m.requestSearchQuery = ""
-	bar = m.statusBar("")
+	bar = m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "Filter: status:4xx")
 }
 

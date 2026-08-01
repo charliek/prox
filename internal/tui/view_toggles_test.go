@@ -96,7 +96,7 @@ func TestViewToggles_FlashOnSaveError(t *testing.T) {
 			m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 			m = clientUpdate(m, keyRune(tc.key))
 			assert.True(t, tc.check(m), "toggle still applied in-session")
-			assert.Contains(t, m.statusFlash, "settings not saved")
+			assert.Contains(t, m.statusFlash.text, "settings not saved")
 		})
 	}
 }

@@ -1228,7 +1228,7 @@ func TestRequestsSearch_NoMatch(t *testing.T) {
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 1, m.cursorIdx)
 
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/zzz-nomatch (0 matches)", "status shows the 0-match form")
 }
 
@@ -1366,7 +1366,7 @@ func TestLogsSearch_NoMatch(t *testing.T) {
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, -1, m.logCursorIdx)
 
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/zzz (0 matches)", "status shows the 0-match form")
 }
 
@@ -1382,7 +1382,7 @@ func TestLogsSearch_NoMatchAfterPriorMatchClearsCursor(t *testing.T) {
 	assert.Equal(t, "zzz", m.logSearchQuery)
 	assert.Equal(t, -1, m.logCursorIdx, "a no-match search clears the prior cursor index")
 	assert.Equal(t, int64(0), m.logCursorSeq, "and its Seq anchor")
-	assert.Contains(t, m.statusBar(""), "/zzz (0 matches)")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/zzz (0 matches)")
 }
 
 func TestLogsSearch_EscClears(t *testing.T) {
@@ -1404,9 +1404,9 @@ func TestLogsSearch_StatusIndicator(t *testing.T) {
 	m = commitSearch(m, "needle")
 	require.Equal(t, 0, m.logCursorIdx)
 
-	assert.Contains(t, m.statusBar(""), "/needle (1/2)", "shows the cursor's match position of the total")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/needle (1/2)", "shows the cursor's match position of the total")
 	m = clientUpdate(m, keyRune('n'))
-	assert.Contains(t, m.statusBar(""), "/needle (2/2)", "advancing updates the position")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/needle (2/2)", "advancing updates the position")
 }
 
 func TestLogsSearch_FollowPreservedOnNewestRowMatch(t *testing.T) {
@@ -1436,7 +1436,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 	m = commitSearch(m, "hit")
 	require.Equal(t, "hit mid", logCursorLine(t, m))
 	require.False(t, m.followMode)
-	require.Contains(t, m.statusBar(""), "/hit (1/1)")
+	require.Contains(t, m.statusBar(footerMsg{}), "/hit (1/1)")
 
 	// A new log line arrives while the search is parked off-newest.
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
@@ -1447,7 +1447,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 
 	assert.False(t, m.followMode, "a streaming arrival must not re-engage follow while a search is parked")
 	assert.Equal(t, "hit mid", logCursorLine(t, m), "the cursor stays on the match, not yanked to the new newest row")
-	assert.Contains(t, m.statusBar(""), "/hit (1/1)", "match position is preserved across the arrival")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/hit (1/1)", "match position is preserved across the arrival")
 }
 
 func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
@@ -1583,7 +1583,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	m = clientUpdate(m, keyRune('g'))
 
 	m = commitSearch(m, "needle")
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/needle (1/1)", "search indicator wins, with the cursor's match position")
 	assert.Contains(t, bar, "filter: path", "the active `s` filter is appended")
 	assert.NotContains(t, bar, "Showing:", "solo is never shown in the requests view")
@@ -1591,7 +1591,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	// Prompt precedence: while typing a search, the input prompt wins over the
 	// committed indicator.
 	m2 := clientUpdate(m, keyRune('/'))
-	assert.Contains(t, m2.statusBar(""), "Search:", "the mode prompt takes precedence")
+	assert.Contains(t, m2.statusBar(footerMsg{}), "Search:", "the mode prompt takes precedence")
 }
 
 func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
@@ -1599,7 +1599,7 @@ func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
 	m.width = 120
 
 	m.requestSearchQuery = "日本語テスト"
-	unicodeBar := m.statusBar("")
+	unicodeBar := m.statusBar(footerMsg{})
 
 	// The layout is measured in display columns, not bytes: an ASCII query of
 	// the same DISPLAY width must produce a bar of the same rendered width.
@@ -1608,7 +1608,7 @@ func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
 	// right side's lipgloss.Width back to len — the right side is
 	// structurally ASCII, so no assertion can distinguish them there.
 	m.requestSearchQuery = strings.Repeat("x", lipgloss.Width("日本語テスト"))
-	asciiBar := m.statusBar("")
+	asciiBar := m.statusBar(footerMsg{})
 	assert.Equal(t, lipgloss.Width(asciiBar), lipgloss.Width(unicodeBar),
 		"a Unicode query must not change the status-bar layout width")
 }

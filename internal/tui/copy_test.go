@@ -148,7 +148,7 @@ func TestCopyKeys_RequestList_CurlAndID(t *testing.T) {
 
 	m = clientUpdate(m, keyRune('y'))
 	assert.Equal(t, "req-002", clipboard)
-	assert.Equal(t, "copied request id req-002", m.statusFlash)
+	assert.Equal(t, "copied request id req-002", m.statusFlash.text)
 
 	m = clientUpdate(m, keyRune('c'))
 	assert.Equal(t, "curl -X 'POST' 'https://shop.local.dev:6789/orders'", clipboard)
@@ -198,7 +198,7 @@ func TestCopyKeys_DetailView(t *testing.T) {
 	require.NoError(t, err)
 	m = clientUpdate(m, keyRune('Y'))
 	assert.Equal(t, string(wantJSON), clipboard)
-	assert.Equal(t, "copied JSON", m.statusFlash)
+	assert.Equal(t, "copied JSON", m.statusFlash.text)
 }
 
 func TestCopyKeys_YNoOpInRequestList(t *testing.T) {
@@ -262,7 +262,7 @@ func TestCopyKeys_ClipboardFailure(t *testing.T) {
 
 	m := newClientRequestsModel(&stubTUIClient{}, 1, 10)
 	m = clientUpdate(m, keyRune('y'))
-	assert.Equal(t, "clipboard unavailable: no display", m.statusFlash)
+	assert.Equal(t, "clipboard unavailable: no display", m.statusFlash.text)
 }
 
 func TestCopyKeys_NoOpInTextinputModes(t *testing.T) {

@@ -36,7 +36,7 @@ func openThemeAtHeight(t *testing.T, height int, userThemes int) ClientModel {
 }
 
 func TestMenuWindow_ClampWithIndicators(t *testing.T) {
-	// Height=12 → avail = 12 - 1 - 2 = 9. 6 presets + 6 user = 12 > 9 → clamp.
+	// Height=12 → avail = 12 - 1 - 1 = 10. 6 presets + 6 user = 12 > 10 → clamp.
 	m := openThemeAtHeight(t, 12, 6)
 	items := m.menuItems(MenuTheme)
 	require.GreaterOrEqual(t, len(items), 12)
@@ -45,7 +45,7 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	avail := m.menuAvail()
-	require.Equal(t, 9, avail)
+	require.Equal(t, 10, avail)
 	assert.Equal(t, avail, hits.dropdown.Bounds.H, "rendered rows == avail when clamped with bottom indicator")
 	assert.Equal(t, 0, m.menuWindow)
 
@@ -89,13 +89,13 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 }
 
 func TestMenuWindow_NoIndicatorsWhenAvailSmall(t *testing.T) {
-	// Height=5 → avail = 2. Indicators only when avail >= 4.
+	// Height=5 → avail = 5 - 1 - 1 = 3. Indicators only when avail >= 4.
 	m := openThemeAtHeight(t, 5, 6)
-	require.Equal(t, 2, m.menuAvail())
+	require.Equal(t, 3, m.menuAvail())
 	_ = m.View()
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
-	assert.Equal(t, 2, hits.dropdown.Bounds.H)
+	assert.Equal(t, 3, hits.dropdown.Bounds.H)
 	for _, r := range hits.dropdown.Rows {
 		assert.NotEqual(t, -1, r.Index, "no indicator rows when avail < 4")
 		assert.NotEqual(t, MenuCommand(""), r.Cmd)
@@ -141,7 +141,8 @@ func TestMenuWindow_FollowsHighlightKeyboard(t *testing.T) {
 
 func TestMenuWindow_SiblingSlideResetsOffset(t *testing.T) {
 	m := openThemeAtHeight(t, 12, 6)
-	for range 8 {
+	items := m.menuItems(MenuTheme)
+	for m.menuHighlight < len(items)-1 {
 		m = clientUpdate(m, keyRune('j'))
 	}
 	require.Greater(t, m.menuWindow, 0)
@@ -238,7 +239,7 @@ func assertDropdownRectGeometry(t *testing.T, m ClientModel) {
 	for _, r := range hits.dropdown.Rows {
 		assert.GreaterOrEqual(t, r.Rect.Y, 1)
 		assert.Less(t, r.Rect.Y, frameH-menuReservedBottom,
-			"row Y=%d must stay above status+hints", r.Rect.Y)
+			"row Y=%d must stay above footer", r.Rect.Y)
 		assert.Less(t, r.Rect.Y+r.Rect.H, frameH)
 		assert.Equal(t, hits.dropdown.Bounds.X, r.Rect.X, "row X matches bounds")
 		assert.Equal(t, hits.dropdown.Bounds.W, r.Rect.W, "row W matches bounds")
@@ -256,7 +257,7 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 		{80, 24},
 		{120, 40},
 		{60, 16},
-		{80, 12}, // Theme overflows here (12 items > avail 9): exercises indicators
+		{80, 12}, // Theme overflows here (12 items > avail 10): exercises indicators
 	}
 	menus := []struct {
 		name MenuID
@@ -409,8 +410,8 @@ func assertMenuRectHonestyActivate(t *testing.T, m ClientModel, id MenuID) {
 }
 
 func TestMenuWindow_DegenerateAvailZero(t *testing.T) {
-	// avail = height - boxTop - 2 < 1 → height < 4 with menu bar.
-	m := openThemeAtHeight(t, 3, 6)
+	// avail = height - boxTop - 1 < 1 → height < 3 with menu bar.
+	m := openThemeAtHeight(t, 2, 6)
 	require.Less(t, m.menuAvail(), 1)
 	require.True(t, m.menuOpen())
 

@@ -149,17 +149,17 @@ func (m *ClientModel) handleCopyDetailJSON() (bool, tea.Cmd) {
 	}
 	payload, err := detailJSONCopyPayload(m.requestDetailRaw)
 	if err != nil {
-		return true, m.setStatusFlash(err.Error(), copyFlashClearDelay)
+		return true, m.setStatusFlash(footerError(err.Error()), flashTransient, copyFlashClearDelay)
 	}
 	return true, m.writeClipboard(string(payload), "copied JSON")
 }
 
 func (m *ClientModel) writeClipboard(text, successFlash string) tea.Cmd {
 	if err := clipboardWriteString(text); err != nil {
-		return m.setStatusFlash("clipboard unavailable: "+err.Error(), copyFlashClearDelay)
+		return m.setStatusFlash(footerError("clipboard unavailable: "+err.Error()), flashTransient, copyFlashClearDelay)
 	}
 	if successFlash != "" {
-		return m.setStatusFlash(successFlash, copyFlashClearDelay)
+		return m.setStatusFlash(footerInfo(successFlash), flashTransient, copyFlashClearDelay)
 	}
 	return nil
 }

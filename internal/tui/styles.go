@@ -22,6 +22,8 @@ type styleSet struct {
 	HealthyDot, UnhealthyDot    lipgloss.Style
 	Header, Status, Help        lipgloss.Style
 	Err, Dim                    lipgloss.Style
+	FooterKey, FooterLabel      lipgloss.Style // two-tone footer hints (plan 023 B2)
+	FooterError                 lipgloss.Style // ✗ error flash: Err-bold on FooterBG
 	HTTPSuccess, HTTPRedirect   lipgloss.Style
 	HTTPWarning, HTTPError      lipgloss.Style
 	// Method / status class styles (plan 021 C9). Mapped from existing Theme
@@ -147,7 +149,8 @@ func buildStyleSet(t *Theme) styleSet {
 		UnhealthyDot: fillBG(lipgloss.NewStyle().Foreground(t.Err), t),
 
 		// Header/Status match pre-theme construction (BG + padding only — no
-		// FG) so the legacy preset's escape codes stay byte-identical.
+		// FG) so the legacy preset's escape codes stay byte-identical. Footer
+		// text FG is applied per-segment in the footer renderer (plan 023 B2).
 		Header: header,
 		Status: lipgloss.NewStyle().
 			Background(t.FooterBG).
@@ -159,6 +162,18 @@ func buildStyleSet(t *Theme) styleSet {
 			Background(t.ErrBadgeBG).
 			Bold(true),
 		Dim: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
+
+		FooterKey: lipgloss.NewStyle().
+			Foreground(t.FooterKey).
+			Background(t.FooterBG).
+			Bold(true),
+		FooterLabel: lipgloss.NewStyle().
+			Foreground(t.FooterFG).
+			Background(t.FooterBG),
+		FooterError: lipgloss.NewStyle().
+			Foreground(t.Err).
+			Background(t.FooterBG).
+			Bold(true),
 
 		HTTPSuccess:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
 		HTTPRedirect: fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t),

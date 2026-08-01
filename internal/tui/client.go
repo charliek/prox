@@ -404,7 +404,8 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StatusFlashClearMsg:
 		if msg.Seq == m.statusFlashSeq {
-			m.statusFlash = ""
+			m.statusFlash = footerMsg{}
+			m.statusFlashClass = flashTransient
 		}
 
 	case StartupWarningsMsg:
@@ -633,30 +634,7 @@ func (m ClientModel) View() string {
 		return "Connecting to prox..."
 	}
 
-	statusInfo := m.opts.ConnectedStatus
-	if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
-		// The old-daemon park is not an outage and never self-heals by
-		// waiting, so "retrying..." would be a lie — render the actionable
-		// hint instead.
-		statusInfo = truncateError(m.connectionError, maxErrorDisplayLen)
-	} else if m.connectionError != nil && m.streamHealth[StreamProcesses].State == stream.StateClosed {
-		// Terminal: the loop is gone (auth failure classified terminal, or
-		// quit teardown) and no retry will ever happen — promising one
-		// would be a lie too (codex C12 finding).
-		statusInfo = "Connection lost: " + truncateError(m.connectionError, maxErrorDisplayLen)
-	} else if m.connectionError != nil {
-		// One wording for every transient degraded processes-stream state:
-		// the per-stream detail lives in the status bar's health segments.
-		statusInfo = "Connection error (retrying...)"
-	} else if m.statusFlash != "" {
-		statusInfo = m.statusFlash
-	} else if m.lastRestartProcess != "" {
-		if m.lastRestartError != nil {
-			statusInfo = "Restart failed: " + truncateError(m.lastRestartError, maxErrorDisplayLen)
-		} else {
-			statusInfo = "Restarted: " + m.lastRestartProcess
-		}
-	}
+	statusInfo := m.resolveFooterMsg()
 	frame := m.mainView(statusInfo)
 	if m.mode == ModeHelp {
 		return m.spliceHelpModal(frame)

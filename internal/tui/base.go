@@ -143,8 +143,11 @@ type BaseModel struct {
 	lastRestartProcess string
 	lastRestartError   error
 
-	// statusFlash is a short-lived status-bar message (theme cycle, save errors).
-	statusFlash string
+	// statusFlash is a short-lived typed footer message (theme cycle, copy,
+	// settings-save failures). Class separates settings-save from transient
+	// flashes for B2 precedence (plan 023).
+	statusFlash      footerMsg
+	statusFlashClass flashClass
 	// statusFlashSeq is the flash generation: incremented by setStatusFlash
 	// so a stale clear timer can't erase a newer flash (CodeRabbit PR #102).
 	statusFlashSeq int
@@ -301,9 +304,9 @@ func (b *BaseModel) chromeAbove() int {
 	return h
 }
 
-// chromeBelow is status bar + key-hint footer.
+// chromeBelow is the merged footer row (status + hints — plan 023 B2).
 func (b *BaseModel) chromeBelow() int {
-	return 2
+	return 1
 }
 
 // chromeHeight is the total non-viewport chrome.
@@ -315,7 +318,7 @@ func (b *BaseModel) chromeHeight() int {
 // Test helpers that size a WindowSizeMsg for a target viewport height use this.
 func defaultChromeHeight() int {
 	s := DefaultSettings()
-	h := 2 // status + hint
+	h := 1 // merged footer
 	if s.MenuBar {
 		h++
 	}
@@ -323,6 +326,37 @@ func defaultChromeHeight() int {
 		h += 2
 	}
 	return h
+}
+
+// contentRect is the viewport content region between chromeAbove and
+// chromeBelow (plan 023 B2). C7/C11 extend this — no scattered +1s.
+func (b *BaseModel) contentRect() HitRect {
+	y := b.chromeAbove()
+	h := b.height - b.chromeHeight()
+	if h < 1 {
+		h = 1 // match relayout's minimum viewport
+	}
+	w := b.width
+	if w < 0 {
+		w = 0
+	}
+	return HitRect{X: 0, Y: y, W: w, H: h}
+}
+
+// viewportOrigin is the top-left of contentRect (frame coordinates).
+func (b *BaseModel) viewportOrigin() (x, y int) {
+	r := b.contentRect()
+	return r.X, r.Y
+}
+
+// footerRowY is the frame Y of the merged footer band.
+func (b *BaseModel) footerRowY() int {
+	return b.height - b.chromeBelow()
+}
+
+// isFooterY reports whether frame Y falls on the footer band.
+func (b *BaseModel) isFooterY(y int) bool {
+	return y >= b.footerRowY() && y < b.height
 }
 
 // relayout derives viewport geometry from enabled chrome rows. Called on
@@ -822,32 +856,23 @@ func (b *BaseModel) cycleTheme() tea.Cmd {
 
 // setThemeByName resolves name, installs the theme, persists, flashes, and
 // re-renders. Canonical name and ResolveTheme warnings are surfaced in the
-// setStatusFlash shows msg in the status bar and returns the clear command
-// tagged with the NEW flash generation (StatusFlashClearMsg.Seq — stale
-// timers from earlier flashes must not clear this one; CodeRabbit PR #102).
-func (b *BaseModel) setStatusFlash(msg string, delay time.Duration) tea.Cmd {
-	b.statusFlash = msg
-	b.statusFlashSeq++
-	seq := b.statusFlashSeq
-	return tea.Tick(delay, func(t time.Time) tea.Msg {
-		return StatusFlashClearMsg{Seq: seq}
-	})
-}
-
 // status flash (WS2/WS5).
 func (b *BaseModel) setThemeByName(name string) tea.Cmd {
 	canonical, warnings := SetThemeByName(name)
 	b.settings.Theme = canonical
 
-	var msg string
+	var msg footerMsg
+	var class flashClass
 	if err := SaveSettings(b.settings); err != nil {
-		msg = "settings not saved: " + err.Error()
+		msg = footerError("settings not saved: " + err.Error())
+		class = flashSettingsSave
 	} else {
-		msg = themeFlashMessage(canonical, warnings)
+		msg = footerInfo(themeFlashMessage(canonical, warnings))
+		class = flashTransient
 	}
 	applyTextInputTheme(&b.textInput)
 	b.updateViewport()
-	return b.setStatusFlash(msg, statusFlashClearDelay)
+	return b.setStatusFlash(msg, class, statusFlashClearDelay)
 }
 
 func themeFlashMessage(canonical string, warnings []string) string {
@@ -900,7 +925,7 @@ func (b *BaseModel) toggleProcessPanel() tea.Cmd {
 	b.settings.ProcessPanel = !b.settings.ProcessPanel
 	b.relayout()
 	if err := SaveSettings(b.settings); err != nil {
-		return b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
+		return b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
 	}
 	return nil
 }
@@ -911,7 +936,7 @@ func (b *BaseModel) toggleTimestamps() tea.Cmd {
 	b.settings.Timestamps = !b.settings.Timestamps
 	var cmd tea.Cmd
 	if err := SaveSettings(b.settings); err != nil {
-		cmd = b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
+		cmd = b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
 	}
 	b.updateViewport()
 	return cmd
@@ -927,7 +952,7 @@ func (b *BaseModel) toggleWrap() tea.Cmd {
 	b.settings.Wrap = !b.settings.Wrap
 	var cmd tea.Cmd
 	if err := SaveSettings(b.settings); err != nil {
-		cmd = b.setStatusFlash("settings not saved: "+err.Error(), statusFlashClearDelay)
+		cmd = b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
 	}
 	b.updateViewport()
 	if b.viewMode == ViewModeLogs {
@@ -2562,22 +2587,11 @@ func (b *BaseModel) statusDefaultHint(extraInfo string) string {
 	return hint
 }
 
-// statusBar renders the bottom status bar
-func (b *BaseModel) statusBar(extraInfo string) string {
-	var left, right string
-
-	// View mode indicator
-	viewIndicator := "[Logs]"
-	switch b.viewMode {
-	case ViewModeRequests:
-		viewIndicator = "[Requests]"
-	case ViewModeRequestDetail:
-		viewIndicator = "[Request Detail]"
-	}
-
-	// Filtered lists, each computed once and shared below between the left-side
-	// search indicator and the right-side visible count so a single render never
-	// rescans the underlying slice twice. Only the active view's list is built.
+// statusBar renders the merged footer row: left status (typed message) +
+// right [View] [FOLLOW] count + two-tone key hints (plan 023 B2).
+func (b *BaseModel) statusBar(msg footerMsg) string {
+	// Filtered lists feed the right-side visible count and the left-side
+	// empty-msg fallback below. Only the active view's list is built.
 	var requests []proxy.RequestRecord
 	var entries []domain.LogEntry
 	if b.viewMode == ViewModeRequests {
@@ -2586,28 +2600,32 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		entries = b.filteredEntries()
 	}
 
-	// Left side: mode/filter info
+	// Left side: mode prompts win over the resolved footer message; otherwise
+	// style the typed msg (or fall back to filter/idle when msg is empty —
+	// direct statusBar test call sites).
+	var leftStyled string
 	switch b.mode {
 	case ModeSearch:
-		left = "Search: " + b.textInput.View()
+		leftStyled = s.FooterLabel.Render("Search: ") + b.textInput.View()
 	case ModeStringFilter:
-		left = "Filter: " + b.textInput.View()
+		leftStyled = s.FooterLabel.Render("Filter: ") + b.textInput.View()
 		if b.activeFilterParseErr() != nil {
-			left += " [invalid filter]"
+			leftStyled += s.FooterLabel.Render(" [invalid filter]")
 		}
 	default:
-		left = b.statusLeftDefault(extraInfo, requests, entries)
+		if msg.empty() {
+			msg = footerInfo(b.statusLeftDefault("", requests, entries))
+		}
+		leftStyled = styleFooterMsg(msg)
 	}
 
-	// Per-stream health and scroll-back state ride on the end of the left side in
-	// every mode: a degraded stream (or a page still loading) is worth showing
-	// even while a filter prompt is open, and both are orthogonal to the
-	// overall-connection text attach mode owns.
+	// Per-stream health and scroll-back state ride on the end of the left side.
 	if segs := append(b.streamHealthSegments(), b.requestsPagingSegments()...); len(segs) > 0 {
-		left += " | " + strings.Join(segs, " | ")
+		sep := s.FooterLabel.Render(" | ")
+		leftStyled += sep + strings.Join(segs, sep)
 	}
 
-	// Right side: follow mode and count
+	// Right side: follow mode and count (PRESERVED) + key hints.
 	var visible, total int
 	var label string
 	if b.viewMode == ViewModeRequests {
@@ -2619,33 +2637,35 @@ func (b *BaseModel) statusBar(extraInfo string) string {
 		total = len(b.logEntries)
 		label = "lines"
 	}
+	viewIndicator := "[Logs]"
+	switch b.viewMode {
+	case ViewModeRequests:
+		viewIndicator = "[Requests]"
+	case ViewModeRequestDetail:
+		viewIndicator = "[Request Detail]"
+	}
 	followIndicator := "[FOLLOW]"
 	if !b.followMode {
 		followIndicator = "[PAUSED]"
 	}
-	right = fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
+	countPlain := fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
+	countStyled := s.FooterLabel.Render(countPlain)
 
-	// Calculate widths. Use display width (lipgloss.Width), never byte len: a
-	// Unicode search query in `left` would misplace the right-aligned counts if
-	// the layout math counted bytes (D13).
-	leftWidth := b.width - lipgloss.Width(right) - 4
-	if leftWidth < 0 {
-		leftWidth = 0
-	}
-
-	// Force a single row: lipgloss wraps by default when Width is set, which
-	// would blow the chrome height budget (relayout / Codex #8).
-	leftPart := s.Status.Width(leftWidth).MaxHeight(1).Render(left)
-	rightPart := s.Status.MaxHeight(1).Render(right)
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftPart, s.StatusSep.Render("  "), rightPart)
+	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints())
+	pad := s.FooterLabel.Render(" ")
+	gap := s.FooterLabel.Render("  ")
+	row := pad + left + gap + right
+	// padFrameRow fills any remaining columns with theme Base (FooterBG under
+	// the Status band is applied per-segment above — trailing pad uses Base
+	// which is theme BG; prefer Status-colored fill for the footer band).
+	return singleFrameLine(padFooterRow(row, b.width))
 }
 
 // mainView renders the main TUI layout. Chrome rows are derived from settings
 // (relayout / Codex #8); the open dropdown is spliced over the composed frame
 // (overlay.go / Codex #1). Hit-rects are cleared by hitRegistry.resetFrame at
 // the top of ClientModel.View — renderers here only re-record.
-func (b *BaseModel) mainView(extraStatusInfo string) string {
+func (b *BaseModel) mainView(msg footerMsg) string {
 	var lines []string
 
 	if b.settings.MenuBar {
@@ -2675,8 +2695,7 @@ func (b *BaseModel) mainView(extraStatusInfo string) string {
 		lines = append(lines, padFrameRow(line, b.width))
 	}
 
-	lines = append(lines, padFrameRow(singleFrameLine(b.statusBar(extraStatusInfo)), b.width))
-	lines = append(lines, b.renderKeyHints())
+	lines = append(lines, padFooterRow(singleFrameLine(b.statusBar(msg)), b.width))
 
 	if b.menuOpen() {
 		lines = b.applyMenuOverlay(lines)

@@ -243,7 +243,7 @@ func TestThemeCycleKey(t *testing.T) {
 
 	// Cycles to the next preset in canonical order.
 	assert.Equal(t, "dark", CurrentThemeName())
-	assert.Equal(t, "theme: dark", updated.statusFlash)
+	assert.Equal(t, "theme: dark", updated.statusFlash.text)
 
 	styledAfter := updated.formatLogEntry(updated.logEntries[0])
 	assert.NotEqual(t, styledBefore, styledAfter, "formatLogEntry should use new theme styles after updateViewport")
@@ -285,7 +285,7 @@ func TestThemeCycleKey_AdvancesThroughPresetOrder(t *testing.T) {
 		newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 		m = newModel.(ClientModel)
 		assert.Equal(t, expected, CurrentThemeName())
-		assert.Equal(t, "theme: "+expected, m.statusFlash)
+		assert.Equal(t, "theme: "+expected, m.statusFlash.text)
 	}
 }
 
@@ -301,31 +301,31 @@ func TestStartupWarningsMsg(t *testing.T) {
 
 func TestStatusFlashClearMsg(t *testing.T) {
 	m := newTestModel()
-	cmd := m.setStatusFlash("theme: dark", statusFlashClearDelay)
+	cmd := m.setStatusFlash(footerInfo("theme: dark"), flashTransient, statusFlashClearDelay)
 	require.NotNil(t, cmd)
 	require.Equal(t, 1, m.statusFlashSeq)
 
 	newModel, _ := m.Update(StatusFlashClearMsg{Seq: 1})
-	assert.Empty(t, newModel.(ClientModel).statusFlash)
+	assert.Empty(t, newModel.(ClientModel).statusFlash.text)
 }
 
 // A stale clear timer must not erase a NEWER flash: copy flash (2s) racing a
 // theme flash (3s) was the reported case (CodeRabbit PR #102).
 func TestStatusFlash_StaleTimerKeepsNewerFlash(t *testing.T) {
 	m := newTestModel()
-	m.setStatusFlash("theme: dark", statusFlashClearDelay) // seq 1, 3s timer
-	m.setStatusFlash("copied curl", copyFlashClearDelay)   // seq 2, 2s timer
+	m.setStatusFlash(footerInfo("theme: dark"), flashTransient, statusFlashClearDelay) // seq 1, 3s timer
+	m.setStatusFlash(footerInfo("copied curl"), flashTransient, copyFlashClearDelay)   // seq 2, 2s timer
 
 	// The 2s copy timer fires first with seq 2 — clears the copy flash.
 	after, _ := m.Update(StatusFlashClearMsg{Seq: 2})
 	m = after.(ClientModel)
-	m.setStatusFlash("theme: light", statusFlashClearDelay) // seq 3
+	m.setStatusFlash(footerInfo("theme: light"), flashTransient, statusFlashClearDelay) // seq 3
 
 	// Now the ORIGINAL 3s timer (seq 1) fires — must NOT clear seq 3's flash.
 	after, _ = m.Update(StatusFlashClearMsg{Seq: 1})
 	m = after.(ClientModel)
-	assert.Equal(t, "theme: light", m.statusFlash)
+	assert.Equal(t, "theme: light", m.statusFlash.text)
 
 	after, _ = m.Update(StatusFlashClearMsg{Seq: 3})
-	assert.Empty(t, after.(ClientModel).statusFlash)
+	assert.Empty(t, after.(ClientModel).statusFlash.text)
 }

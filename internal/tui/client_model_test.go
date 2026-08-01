@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -829,7 +830,8 @@ func TestClientModel_HelpConfigFromOptions(t *testing.T) {
 	assert.Contains(t, help, "Quit (stops all processes)")
 	assert.NotContains(t, help, "(Client Mode)")
 	assert.NotContains(t, help, "daemon continues running")
-	// Live chrome behind the modal.
-	assert.Contains(t, help, "m menu")
+	// Live chrome behind the modal (merged footer).
+	assert.Contains(t, ansi.Strip(help), "? help")
+	assert.Contains(t, ansi.Strip(help), "[FOLLOW]")
 	assert.Contains(t, help, helpModalFooter)
 }

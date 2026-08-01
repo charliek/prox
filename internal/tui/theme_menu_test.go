@@ -85,7 +85,7 @@ func TestThemeMenu_ActivatePreset(t *testing.T) {
 
 	assert.False(t, m.menuOpen())
 	assert.Equal(t, "dark", CurrentThemeName())
-	assert.Equal(t, "theme: dark", m.statusFlash)
+	assert.Equal(t, "theme: dark", m.statusFlash.text)
 
 	styledAfter := m.formatLogEntry(m.logEntries[0])
 	assert.NotEqual(t, styledBefore, styledAfter, "viewport should re-render with new theme")
@@ -116,8 +116,8 @@ func TestThemeMenu_ActivateMalformedUserTheme(t *testing.T) {
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
 
 	assert.Equal(t, "tokyo-night", CurrentThemeName())
-	assert.Contains(t, m.statusFlash, "theme: tokyo-night")
-	assert.Contains(t, m.statusFlash, "theme TOML parse error")
+	assert.Contains(t, m.statusFlash.text, "theme: tokyo-night")
+	assert.Contains(t, m.statusFlash.text, "theme TOML parse error")
 
 	loaded, warnings := LoadSettings()
 	require.Empty(t, warnings)
@@ -140,8 +140,8 @@ func TestThemeCycleKey_FlashesResolveWarning(t *testing.T) {
 	updated := newModel.(ClientModel)
 
 	assert.Equal(t, "tokyo-night", CurrentThemeName())
-	assert.Contains(t, updated.statusFlash, "theme: tokyo-night")
-	assert.Contains(t, updated.statusFlash, "theme TOML parse error")
+	assert.Contains(t, updated.statusFlash.text, "theme: tokyo-night")
+	assert.Contains(t, updated.statusFlash.text, "theme TOML parse error")
 
 	loaded, warnings := LoadSettings()
 	require.Empty(t, warnings)
@@ -157,7 +157,7 @@ func TestThemeMenu_MouseActivate(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = openThemeMenu(m)
-	_ = m.mainView("")
+	_ = m.mainView(footerMsg{})
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 
@@ -172,5 +172,5 @@ func TestThemeMenu_MouseActivate(t *testing.T) {
 	})
 	assert.False(t, m.menuOpen())
 	assert.Equal(t, "light", CurrentThemeName())
-	assert.Equal(t, "theme: light", m.statusFlash)
+	assert.Equal(t, "theme: light", m.statusFlash.text)
 }

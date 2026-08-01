@@ -6,7 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -433,11 +433,12 @@ func TestHelpMouse_InsidePressNoOp(t *testing.T) {
 
 func TestRenderKeyHints_FitsFrame(t *testing.T) {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 60, Height: 24})
-	hint := m.renderKeyHints()
-	assert.Contains(t, hint, "m menu")
-	assert.Contains(t, hint, "? help")
-	assert.LessOrEqual(t, lipgloss.Width(hint), 60)
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
+	bar := ansi.Strip(m.statusBar(footerMsg{}))
+	assert.Contains(t, bar, "m menu")
+	assert.Contains(t, bar, "? help")
+	assert.Contains(t, bar, "q quit")
+	assert.LessOrEqual(t, ansi.StringWidth(m.statusBar(footerMsg{})), 120)
 }
 
 func TestMouse_ProcessPanelNoOpInRequestsView(t *testing.T) {

@@ -44,6 +44,13 @@ func (m *ClientModel) handleContentMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 
+	// Footer band: consumed no-op — never opens menus or moves the cursor
+	// (plan 023 B2). Menu-open outside clicks are handled above in
+	// handleMenuMouse before this runs.
+	if m.isFooterY(msg.Y) {
+		return true, nil
+	}
+
 	if idx := m.processPanelHit(msg.X, msg.Y); idx >= 0 {
 		m.toggleSoloProcess(idx)
 		m.updateViewport()
@@ -105,11 +112,11 @@ func (m *ClientModel) handleMouseWheel(delta int) (bool, tea.Cmd) {
 // viewportLocalRow maps a frame Y coordinate to a 0-based row within the
 // viewport window. ok is false when Y is outside the viewport chrome.
 func (b *BaseModel) viewportLocalRow(y int) (local int, ok bool) {
-	top := b.chromeAbove()
-	if y < top || y >= top+b.viewport.Height {
+	r := b.contentRect()
+	if y < r.Y || y >= r.Y+r.H {
 		return 0, false
 	}
-	return y - top, true
+	return y - r.Y, true
 }
 
 // processPanelRowY is the frame Y of the process-panel content row.
