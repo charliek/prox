@@ -228,156 +228,137 @@ func CycleTheme(current string) (string, *Theme) {
 
 // --- presets ----------------------------------------------------------------
 
-func tokyoNightTheme() *Theme {
-	ok := rgb(158, 206, 106)
-	// Warn (starting) is a bright yellow; Waiting is the warmer amber — must
-	// stay distinct (panel S5). Amber matches strix unstaged / user brief.
-	warn := rgb(230, 194, 72)
-	waiting := rgb(224, 175, 104)
-	errc := rgb(247, 118, 142)
-	info := rgb(122, 162, 247)
-	dim := rgb(86, 95, 137)
-	cyan := rgb(125, 207, 255)
-	purple := rgb(187, 154, 247)
+// paletteSpec holds the per-preset hues and chrome anchors; deriveTheme()
+// fills the remaining Theme slots from shared formulas.
+type paletteSpec struct {
+	bg, fg, dim                   lipgloss.Color
+	border, headerBG, selectionBG lipgloss.Color
+	accent                        lipgloss.Color // BorderFocused, Title, FooterKey
+
+	// Optional overrides (empty → derived; see deriveTheme).
+	headerFG   lipgloss.Color
+	errBadgeFG lipgloss.Color
+	logInfo    lipgloss.Color
+	procFirst  lipgloss.Color
+	procFifth  lipgloss.Color
+
+	ok, warn, waiting, err lipgloss.Color
+	cyan, purple           lipgloss.Color
+
+	procExtra [2]lipgloss.Color
+}
+
+func deriveTheme(p paletteSpec) *Theme {
+	headerFG := p.headerFG
+	if headerFG == "" {
+		headerFG = p.fg
+	}
+	errBadgeFG := p.errBadgeFG
+	if errBadgeFG == "" {
+		errBadgeFG = headerFG
+	}
+	logInfo := p.logInfo
+	if logInfo == "" {
+		logInfo = p.accent
+	}
+	procFirst := p.procFirst
+	if procFirst == "" {
+		procFirst = p.accent
+	}
+	procFifth := p.procFifth
+	if procFifth == "" {
+		procFifth = p.cyan
+	}
 	return &Theme{
-		BG: rgb(26, 27, 38), FG: rgb(169, 177, 214), Dim: dim,
-		Border: rgb(41, 46, 66), BorderFocused: info, Title: info,
-		HeaderBG: rgb(22, 22, 30), HeaderFG: rgb(192, 202, 245),
-		FooterBG: rgb(22, 22, 30), FooterFG: dim, FooterKey: info,
-		SelectionBG: rgb(40, 52, 87), SelectionFG: rgb(192, 202, 245),
-		Cursor: purple,
-		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
-		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
-		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
-		SearchHitBG: warn, SearchHitFG: rgb(26, 27, 38),
-		ErrBadgeFG: rgb(192, 202, 245), ErrBadgeBG: errc,
+		BG: p.bg, FG: p.fg, Dim: p.dim,
+		Border: p.border, BorderFocused: p.accent, Title: p.accent,
+		HeaderBG: p.headerBG, HeaderFG: headerFG,
+		FooterBG: p.headerBG, FooterFG: p.dim, FooterKey: p.accent,
+		SelectionBG: p.selectionBG, SelectionFG: headerFG,
+		Cursor: p.purple,
+		OK:     p.ok, Warn: p.warn, Err: p.err, Waiting: p.waiting,
+		HTTPSuccess: p.ok, HTTPRedirect: p.cyan, HTTPWarning: p.warn, HTTPError: p.err,
+		LogError: p.err, LogWarn: p.waiting, LogInfo: logInfo, LogDebug: p.dim,
+		JSONKey: p.purple, JSONString: p.ok, JSONNumber: p.waiting, JSONBool: p.cyan,
+		SearchHitBG: p.warn, SearchHitFG: p.bg,
+		ErrBadgeFG: errBadgeFG, ErrBadgeBG: p.err,
 		ProcPalette: []lipgloss.Color{
-			info, ok, waiting, purple, cyan, errc,
-			rgb(115, 218, 202), rgb(255, 158, 100), rgb(192, 202, 245),
+			procFirst, p.ok, p.waiting, p.purple, procFifth, p.err,
+			p.procExtra[0], p.procExtra[1], headerFG,
 		},
 		FullFill: true,
 	}
+}
+
+func tokyoNightTheme() *Theme {
+	return deriveTheme(paletteSpec{
+		bg: rgb(26, 27, 38), fg: rgb(169, 177, 214), dim: rgb(86, 95, 137),
+		border: rgb(41, 46, 66), headerBG: rgb(22, 22, 30), selectionBG: rgb(40, 52, 87),
+		accent:   rgb(122, 162, 247),
+		headerFG: rgb(192, 202, 245),
+		ok:       rgb(158, 206, 106), warn: rgb(230, 194, 72), waiting: rgb(224, 175, 104),
+		err: rgb(247, 118, 142), cyan: rgb(125, 207, 255), purple: rgb(187, 154, 247),
+		procExtra: [2]lipgloss.Color{
+			rgb(115, 218, 202), rgb(255, 158, 100),
+		},
+	})
 }
 
 func darkTheme() *Theme {
-	ok := rgb(135, 175, 95)
-	warn := rgb(230, 200, 80)
-	waiting := rgb(215, 175, 95) // strix unstaged amber
-	errc := rgb(215, 95, 95)
-	info := rgb(95, 135, 215)
-	dim := rgb(128, 128, 128)
-	cyan := rgb(95, 175, 215)
-	purple := rgb(175, 135, 215)
-	return &Theme{
-		BG: rgb(28, 28, 28), FG: rgb(208, 208, 208), Dim: dim,
-		Border: rgb(58, 58, 58), BorderFocused: info, Title: info,
-		HeaderBG: rgb(18, 18, 18), HeaderFG: rgb(228, 228, 228),
-		FooterBG: rgb(18, 18, 18), FooterFG: dim, FooterKey: info,
-		SelectionBG: rgb(48, 48, 48), SelectionFG: rgb(228, 228, 228),
-		Cursor: purple,
-		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
-		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
-		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
-		SearchHitBG: warn, SearchHitFG: rgb(28, 28, 28),
-		ErrBadgeFG: rgb(228, 228, 228), ErrBadgeBG: errc,
-		ProcPalette: []lipgloss.Color{
-			info, ok, waiting, purple, cyan, errc,
-			rgb(95, 215, 175), rgb(215, 135, 95), rgb(228, 228, 228),
+	return deriveTheme(paletteSpec{
+		bg: rgb(28, 28, 28), fg: rgb(208, 208, 208), dim: rgb(128, 128, 128),
+		border: rgb(58, 58, 58), headerBG: rgb(18, 18, 18), selectionBG: rgb(48, 48, 48),
+		accent:   rgb(95, 135, 215),
+		headerFG: rgb(228, 228, 228),
+		ok:       rgb(135, 175, 95), warn: rgb(230, 200, 80), waiting: rgb(215, 175, 95),
+		err: rgb(215, 95, 95), cyan: rgb(95, 175, 215), purple: rgb(175, 135, 215),
+		procExtra: [2]lipgloss.Color{
+			rgb(95, 215, 175), rgb(215, 135, 95),
 		},
-		FullFill: true,
-	}
+	})
 }
 
 func lightTheme() *Theme {
-	ok := rgb(80, 161, 79)
-	warn := rgb(200, 150, 20)
-	waiting := rgb(193, 132, 1) // strix unstaged
-	errc := rgb(228, 86, 73)
-	info := rgb(64, 120, 242)
-	dim := rgb(160, 161, 167)
-	cyan := rgb(1, 132, 188)
-	purple := rgb(166, 38, 164)
-	return &Theme{
-		BG: rgb(250, 250, 250), FG: rgb(56, 58, 66), Dim: dim,
-		Border: rgb(212, 212, 212), BorderFocused: info, Title: info,
-		HeaderBG: rgb(234, 234, 235), HeaderFG: rgb(56, 58, 66),
-		FooterBG: rgb(234, 234, 235), FooterFG: dim, FooterKey: info,
-		SelectionBG: rgb(208, 215, 230), SelectionFG: rgb(56, 58, 66),
-		Cursor: purple,
-		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
-		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
-		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
-		SearchHitBG: warn, SearchHitFG: rgb(250, 250, 250),
-		ErrBadgeFG: rgb(250, 250, 250), ErrBadgeBG: errc,
-		ProcPalette: []lipgloss.Color{
-			info, ok, waiting, purple, cyan, errc,
-			rgb(8, 151, 156), rgb(210, 105, 30), rgb(56, 58, 66),
+	return deriveTheme(paletteSpec{
+		bg: rgb(250, 250, 250), fg: rgb(56, 58, 66), dim: rgb(160, 161, 167),
+		border: rgb(212, 212, 212), headerBG: rgb(234, 234, 235), selectionBG: rgb(208, 215, 230),
+		accent:     rgb(64, 120, 242),
+		errBadgeFG: rgb(250, 250, 250),
+		ok:         rgb(80, 161, 79), warn: rgb(200, 150, 20), waiting: rgb(193, 132, 1),
+		err: rgb(228, 86, 73), cyan: rgb(1, 132, 188), purple: rgb(166, 38, 164),
+		procExtra: [2]lipgloss.Color{
+			rgb(8, 151, 156), rgb(210, 105, 30),
 		},
-		FullFill: true,
-	}
+	})
 }
 
 func catppuccinTheme() *Theme {
-	ok := rgb(166, 227, 161)
-	warn := rgb(249, 226, 175)    // bright yellow (strix unstaged)
-	waiting := rgb(245, 194, 131) // peach — distinct from starting yellow
-	errc := rgb(243, 139, 168)
-	info := rgb(137, 180, 250)
-	dim := rgb(108, 112, 134)
-	cyan := rgb(137, 220, 235)
-	purple := rgb(203, 166, 247)
-	return &Theme{
-		BG: rgb(30, 30, 46), FG: rgb(205, 214, 244), Dim: dim,
-		Border: rgb(49, 50, 68), BorderFocused: info, Title: info,
-		HeaderBG: rgb(24, 24, 37), HeaderFG: rgb(205, 214, 244),
-		FooterBG: rgb(24, 24, 37), FooterFG: dim, FooterKey: info,
-		SelectionBG: rgb(49, 50, 68), SelectionFG: rgb(205, 214, 244),
-		Cursor: purple,
-		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
-		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
-		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
-		SearchHitBG: warn, SearchHitFG: rgb(30, 30, 46),
-		ErrBadgeFG: rgb(205, 214, 244), ErrBadgeBG: errc,
-		ProcPalette: []lipgloss.Color{
-			info, ok, waiting, purple, cyan, errc,
-			rgb(148, 226, 213), rgb(250, 179, 135), rgb(205, 214, 244),
+	return deriveTheme(paletteSpec{
+		bg: rgb(30, 30, 46), fg: rgb(205, 214, 244), dim: rgb(108, 112, 134),
+		border: rgb(49, 50, 68), headerBG: rgb(24, 24, 37), selectionBG: rgb(49, 50, 68),
+		accent: rgb(137, 180, 250),
+		ok:     rgb(166, 227, 161), warn: rgb(249, 226, 175), waiting: rgb(245, 194, 131),
+		err: rgb(243, 139, 168), cyan: rgb(137, 220, 235), purple: rgb(203, 166, 247),
+		procExtra: [2]lipgloss.Color{
+			rgb(148, 226, 213), rgb(250, 179, 135),
 		},
-		FullFill: true,
-	}
+	})
 }
 
 func gruvboxTheme() *Theme {
-	ok := rgb(184, 187, 38)
-	warn := rgb(250, 189, 47)    // bright gold (starting)
-	waiting := rgb(254, 128, 25) // orange — distinct from starting gold
-	errc := rgb(251, 73, 52)
-	dim := rgb(146, 131, 116)
 	aqua := rgb(131, 165, 152)
-	purple := rgb(211, 134, 155)
 	green := rgb(142, 192, 124)
-	return &Theme{
-		BG: rgb(40, 40, 40), FG: rgb(235, 219, 178), Dim: dim,
-		Border: rgb(60, 56, 54), BorderFocused: warn, Title: warn,
-		HeaderBG: rgb(29, 32, 33), HeaderFG: rgb(235, 219, 178),
-		FooterBG: rgb(29, 32, 33), FooterFG: dim, FooterKey: warn,
-		SelectionBG: rgb(60, 56, 54), SelectionFG: rgb(235, 219, 178),
-		Cursor: purple,
-		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
-		HTTPSuccess: ok, HTTPRedirect: aqua, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: aqua, LogDebug: dim,
-		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: aqua,
-		SearchHitBG: warn, SearchHitFG: rgb(40, 40, 40),
-		ErrBadgeFG: rgb(235, 219, 178), ErrBadgeBG: errc,
-		ProcPalette: []lipgloss.Color{
-			aqua, ok, waiting, purple, green, errc,
-			rgb(69, 133, 136), rgb(214, 93, 14), rgb(235, 219, 178),
+	return deriveTheme(paletteSpec{
+		bg: rgb(40, 40, 40), fg: rgb(235, 219, 178), dim: rgb(146, 131, 116),
+		border: rgb(60, 56, 54), headerBG: rgb(29, 32, 33), selectionBG: rgb(60, 56, 54),
+		accent:  rgb(250, 189, 47),
+		logInfo: aqua, procFirst: aqua, procFifth: green,
+		ok: rgb(184, 187, 38), warn: rgb(250, 189, 47), waiting: rgb(254, 128, 25),
+		err: rgb(251, 73, 52), cyan: aqua, purple: rgb(211, 134, 155),
+		procExtra: [2]lipgloss.Color{
+			rgb(69, 133, 136), rgb(214, 93, 14),
 		},
-		FullFill: true,
-	}
+	})
 }
 
 // legacyTheme approximates the pre-theme ANSI-256 look from styles.go so
@@ -441,13 +422,6 @@ func themeFromTOML(text string) (theme *Theme, warnings []string, ok bool) {
 	if base == nil {
 		warnings = append(warnings, fmt.Sprintf("unknown base %q; using tokyo-night", baseName))
 		base = tokyoNightTheme()
-	} else {
-		// Copy so overrides don't mutate the shared preset.
-		cp := *base
-		base = &cp
-		if base.ProcPalette != nil {
-			base.ProcPalette = append([]lipgloss.Color(nil), base.ProcPalette...)
-		}
 	}
 
 	for key, val := range file.Colors {
