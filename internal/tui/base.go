@@ -1760,12 +1760,18 @@ func (b *BaseModel) updateViewport() {
 		} else {
 			for i, req := range requests {
 				// Prefix the cursor row with a styled marker and every other row
-				// with two spaces so columns stay aligned (D10).
-				marker := s.Base.Render("  ")
-				if i == b.cursorIdx {
-					marker = s.Cursor.Render("❯ ")
-				}
-				lines = append(lines, marker+b.formatProxyRequest(req))
+				// with two spaces so columns stay aligned (D10). FullFill
+				// cursor rows rebuild segments with SelectionBG (plan 023 E1).
+				selected := i == b.cursorIdx
+				var line string
+				withSelectionStyles(selected, func() {
+					marker := s.Base.Render("  ")
+					if selected {
+						marker = s.Cursor.Render("❯ ")
+					}
+					line = marker + b.formatProxyRequest(req)
+				})
+				lines = append(lines, line)
 			}
 		}
 	default: // ViewModeLogs
@@ -1795,14 +1801,18 @@ func (b *BaseModel) updateViewport() {
 		wrapOn := b.settings.Wrap
 		wrapWidth := b.viewport.Width
 		for i, entry := range entries {
-			line := b.formatLogEntry(entry)
-			if searching {
-				marker := s.Base.Render("  ")
-				if i == b.logCursorIdx {
-					marker = s.Cursor.Render("❯ ")
+			selected := searching && i == b.logCursorIdx
+			var line string
+			withSelectionStyles(selected, func() {
+				line = b.formatLogEntry(entry)
+				if searching {
+					marker := s.Base.Render("  ")
+					if selected {
+						marker = s.Cursor.Render("❯ ")
+					}
+					line = marker + line
 				}
-				line = marker + line
-			}
+			})
 			if wrapOn && wrapWidth > 0 {
 				// Highlight before wrap — offsets stay valid on the unwrapped
 				// string (plan 021 WS4). Requests never take this branch.
@@ -2522,6 +2532,8 @@ func logLevelStyle(meta logMeta) (lipgloss.Style, bool) {
 // resolved on the PLAIN content so byte offsets stay valid; level colour wraps
 // the non-match spans so SearchHighlight's reset does not leak the level tint
 // past the match (C9). When no tint, this is highlightLogLine alone.
+// Under the selection band (selectionRowActive), non-match spans use the
+// active Base (SelectionBG) so SearchHitBG wins only on the hit cells.
 func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style, tint bool) string {
 	if !tint {
 		return b.highlightLogLine(line)
@@ -2548,23 +2560,37 @@ func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style, tint
 // inside an ANSI escape sequence. Any other line (unicode, or one already
 // carrying escape codes) falls back to the unstyled text — the row marker alone
 // signals the match. Returns line unchanged when no search is active or nothing
-// matches.
+// matches (except under the selection band, where raw content is Base-wrapped
+// so the band has no default-BG holes).
 func (b *BaseModel) highlightLogLine(line string) string {
 	q := b.logSearchQuery
 	if q == "" {
+		if selectionRowActive {
+			return s.Base.Render(line)
+		}
 		return line
 	}
 	if !isASCIINoESC(q) || !isASCIINoESC(line) {
+		if selectionRowActive {
+			return s.Base.Render(line)
+		}
 		return line
 	}
 	// Both sides are ASCII, so ToLower does not shift byte offsets: the index
 	// found in the lowered line is valid in the original.
 	idx := strings.Index(strings.ToLower(line), strings.ToLower(q))
 	if idx < 0 {
+		if selectionRowActive {
+			return s.Base.Render(line)
+		}
 		return line
 	}
 	end := idx + len(q)
-	return line[:idx] + s.SearchHighlight.Render(line[idx:end]) + line[end:]
+	pre, mid, post := line[:idx], line[idx:end], line[end:]
+	if selectionRowActive {
+		return s.Base.Render(pre) + s.SearchHighlight.Render(mid) + s.Base.Render(post)
+	}
+	return pre + s.SearchHighlight.Render(mid) + post
 }
 
 // isASCIINoESC reports whether s is pure ASCII (every byte < 0x80) and contains
@@ -2904,14 +2930,22 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		}
 	}
 
-	for _, line := range strings.Split(b.viewport.View(), "\n") {
+	vpLines := strings.Split(b.viewport.View(), "\n")
+	for i, line := range vpLines {
 		// Under FullFill, viewport rows pad to Width with raw spaces; trim and
 		// re-pad with Base-styled fill so no default-BG holes remain. Legacy
 		// skips the trim entirely (padFrameRow is already byte-identical).
+		// Cursor-band rows pad with SelectionBG so the band is full-width
+		// (plan 023 E1) — including every wrapped display row of the entry.
 		if CurrentTheme().FullFill {
 			line = trimTrailingSpacesANSI(line)
 		}
-		line = padFrameRow(line, b.viewport.Width)
+		contentRow := b.viewport.YOffset + i
+		if b.inSelectionBand(contentRow) {
+			line = padSelectionRow(line, b.viewport.Width)
+		} else {
+			line = padFrameRow(line, b.viewport.Width)
+		}
 		if drawPanel {
 			lines = append(lines, wrapPanelContentRow(line))
 		} else {

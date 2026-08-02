@@ -48,7 +48,11 @@ type styleSet struct {
 	JSONBool, JSONNull                   lipgloss.Style
 	Bold                                 lipgloss.Style // detail request line
 	Cursor, SearchHighlight              lipgloss.Style
-	ProcessColors                        []lipgloss.Style
+	// Selection paints FullFill cursor-row padding (plan 023 E1). Segment BGs
+	// on the band come from sel (SelectionBG fill); SearchHighlight keeps
+	// SearchHitBG so search hits win over the band.
+	Selection     lipgloss.Style
+	ProcessColors []lipgloss.Style
 }
 
 // Package-global styles. The process hosts one TUI model (Codex #7), so a
@@ -56,9 +60,11 @@ type styleSet struct {
 // assignment — never mutate fields in place. The TUI is single-goroutine;
 // theme-mutating tests must not run in parallel (see withTestTheme).
 var (
-	s                styleSet
-	currentTheme     *Theme
-	currentThemeName string
+	s                  styleSet
+	sel                styleSet // FullFill cursor-row styles (SelectionBG fill)
+	selectionRowActive bool     // true while formatters run under sel
+	currentTheme       *Theme
+	currentThemeName   string
 )
 
 func init() {
@@ -76,6 +82,25 @@ func SetTheme(t *Theme) {
 	}
 	currentTheme = t
 	s = buildStyleSet(t)
+	if t.FullFill {
+		sel = buildSelectionStyleSet(t)
+	} else {
+		sel = styleSet{} // legacy: band off; marker-only cursor (C5 byte-identity)
+	}
+}
+
+// withSelectionStyles runs fn with s swapped to the SelectionBG fill set when
+// selected under a FullFill theme. Legacy and non-selected rows keep s as-is
+// so escape output stays byte-identical to pre-band rendering.
+func withSelectionStyles(selected bool, fn func()) {
+	if !selected || currentTheme == nil || !currentTheme.FullFill {
+		fn()
+		return
+	}
+	prev, prevFlag := s, selectionRowActive
+	s, selectionRowActive = sel, true
+	fn()
+	s, selectionRowActive = prev, prevFlag
 }
 
 // SetThemeByName resolves name and installs it. Returns the canonical name and
@@ -93,19 +118,30 @@ func CurrentTheme() *Theme { return currentTheme }
 // CurrentThemeName returns the canonical name of the active theme.
 func CurrentThemeName() string { return currentThemeName }
 
-// fillBG adds Background(t.BG) when t.FullFill so FG-only segments still paint
-// the theme surface (SGR-reset law). Styles with their own chrome BG skip this.
-func fillBG(st lipgloss.Style, t *Theme) lipgloss.Style {
+// fillBG adds Background(surface) when t.FullFill so FG-only segments still
+// paint a theme surface (SGR-reset law). Styles with their own chrome BG skip
+// this. surface is t.BG for normal rows and t.SelectionBG for the cursor band.
+func fillBG(st lipgloss.Style, t *Theme, surface lipgloss.Color) lipgloss.Style {
 	if t.FullFill {
-		return st.Background(t.BG)
+		return st.Background(surface)
 	}
 	return st
 }
 
 func buildStyleSet(t *Theme) styleSet {
+	return buildStyleSetFill(t, t.BG, false)
+}
+
+// buildSelectionStyleSet rebuilds row styles with SelectionBG fill so cursor
+// rows paint a full-width band (plan 023 E1). SearchHighlight keeps SearchHitBG.
+func buildSelectionStyleSet(t *Theme) styleSet {
+	return buildStyleSetFill(t, t.SelectionBG, true)
+}
+
+func buildStyleSetFill(t *Theme, surface lipgloss.Color, selectionBand bool) styleSet {
 	base := lipgloss.NewStyle()
 	if t.FullFill {
-		base = lipgloss.NewStyle().Foreground(t.FG).Background(t.BG)
+		base = lipgloss.NewStyle().Foreground(t.FG).Background(surface)
 	}
 
 	header := lipgloss.NewStyle().
@@ -134,30 +170,35 @@ func buildStyleSet(t *Theme) styleSet {
 		statusSep = statusSep.Background(t.FooterBG)
 	}
 
+	errBG := t.ErrBadgeBG
+	if selectionBand {
+		errBG = t.SelectionBG
+	}
+
 	ss := styleSet{
 		Base:      base,
 		HeaderSep: headerSep,
 		StatusSep: statusSep,
 
-		Running:  fillBG(lipgloss.NewStyle().Foreground(t.OK).Bold(true), t),
-		Stopped:  fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
-		Crashed:  fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t),
-		Starting: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
-		Stopping: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
+		Running:  fillBG(lipgloss.NewStyle().Foreground(t.OK).Bold(true), t, surface),
+		Stopped:  fillBG(lipgloss.NewStyle().Foreground(t.Dim), t, surface),
+		Crashed:  fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t, surface),
+		Starting: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t, surface),
+		Stopping: fillBG(lipgloss.NewStyle().Foreground(t.Warn), t, surface),
 		// Gated-launch + task terminal states (plan 013 D5). Waiting is a
 		// distinct amber; blocked shares the crashed red (bold); completed
 		// rests gray like stopped.
-		Waiting:   fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t),
-		Blocked:   fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t),
-		Completed: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
+		Waiting:   fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t, surface),
+		Blocked:   fillBG(lipgloss.NewStyle().Foreground(t.Err).Bold(true), t, surface),
+		Completed: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t, surface),
 
 		DefaultProcess: base,
-		Warn:           fillBG(lipgloss.NewStyle().Foreground(t.Warn), t),
+		Warn:           fillBG(lipgloss.NewStyle().Foreground(t.Warn), t, surface),
 
 		// Health dots reuse OK/Err (plan 018 D13) so they stay consistent with
 		// process-state colouring.
-		HealthyDot:   fillBG(lipgloss.NewStyle().Foreground(t.OK), t),
-		UnhealthyDot: fillBG(lipgloss.NewStyle().Foreground(t.Err), t),
+		HealthyDot:   fillBG(lipgloss.NewStyle().Foreground(t.OK), t, surface),
+		UnhealthyDot: fillBG(lipgloss.NewStyle().Foreground(t.Err), t, surface),
 
 		// Header/Status match pre-theme construction (BG + padding only — no
 		// FG) so the legacy preset's escape codes stay byte-identical. Footer
@@ -166,23 +207,23 @@ func buildStyleSet(t *Theme) styleSet {
 		Status: lipgloss.NewStyle().
 			Background(t.FooterBG).
 			Padding(0, 1),
-		DetailTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
+		DetailTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t, surface),
 		Help:        help,
-		HelpBorder:  fillBG(lipgloss.NewStyle().Foreground(t.BorderFocused), t),
-		HelpTitle:   fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
-		HelpSection: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
-		HelpKey:     fillBG(lipgloss.NewStyle().Foreground(t.FooterKey).Bold(true), t),
+		HelpBorder:  fillBG(lipgloss.NewStyle().Foreground(t.BorderFocused), t, surface),
+		HelpTitle:   fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t, surface),
+		HelpSection: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t, surface),
+		HelpKey:     fillBG(lipgloss.NewStyle().Foreground(t.FooterKey).Bold(true), t, surface),
 
 		// Panel border chars (manual rounded frame around the viewport).
 		// Not a lipgloss.Border style — renderers paint ╭─╮│╰╯ directly.
-		Panel:      fillBG(lipgloss.NewStyle().Foreground(t.Border), t),
-		PanelTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
+		Panel:      fillBG(lipgloss.NewStyle().Foreground(t.Border), t, surface),
+		PanelTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t, surface),
 
 		Err: lipgloss.NewStyle().
 			Foreground(t.ErrBadgeFG).
-			Background(t.ErrBadgeBG).
+			Background(errBG).
 			Bold(true),
-		Dim: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t),
+		Dim: fillBG(lipgloss.NewStyle().Foreground(t.Dim), t, surface),
 
 		FooterKey: lipgloss.NewStyle().
 			Foreground(t.FooterKey).
@@ -196,52 +237,56 @@ func buildStyleSet(t *Theme) styleSet {
 			Background(t.FooterBG).
 			Bold(true),
 
-		HTTPSuccess: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
-		HTTPError:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
+		HTTPSuccess: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t, surface),
+		HTTPError:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t, surface),
 
 		// Method colors (C9): GET=info-ish redirect cyan, POST=OK, PUT=waiting,
 		// DELETE=err, PATCH=warn. Unknown methods stay default FG.
-		HTTPGet:    fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t),
-		HTTPPost:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
-		HTTPPut:    fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t),
-		HTTPDelete: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
-		HTTPPatch:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
+		HTTPGet:    fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t, surface),
+		HTTPPost:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t, surface),
+		HTTPPut:    fillBG(lipgloss.NewStyle().Foreground(t.Waiting), t, surface),
+		HTTPDelete: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t, surface),
+		HTTPPatch:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t, surface),
 
-		Status2xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
-		Status4xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
-		Status5xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
+		Status2xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t, surface),
+		Status4xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t, surface),
+		Status5xx: fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t, surface),
 
-		LogError: fillBG(lipgloss.NewStyle().Foreground(t.LogError), t),
-		LogWarn:  fillBG(lipgloss.NewStyle().Foreground(t.LogWarn), t),
-		LogInfo:  fillBG(lipgloss.NewStyle().Foreground(t.LogInfo), t),
-		LogDebug: fillBG(lipgloss.NewStyle().Foreground(t.LogDebug), t),
+		LogError: fillBG(lipgloss.NewStyle().Foreground(t.LogError), t, surface),
+		LogWarn:  fillBG(lipgloss.NewStyle().Foreground(t.LogWarn), t, surface),
+		LogInfo:  fillBG(lipgloss.NewStyle().Foreground(t.LogInfo), t, surface),
+		LogDebug: fillBG(lipgloss.NewStyle().Foreground(t.LogDebug), t, surface),
 
-		JSONKey:    fillBG(lipgloss.NewStyle().Foreground(t.JSONKey), t),
-		JSONString: fillBG(lipgloss.NewStyle().Foreground(t.JSONString), t),
-		JSONNumber: fillBG(lipgloss.NewStyle().Foreground(t.JSONNumber), t),
-		JSONBool:   fillBG(lipgloss.NewStyle().Foreground(t.JSONBool), t),
-		JSONNull:   fillBG(lipgloss.NewStyle().Foreground(t.Dim), t), // Theme has no JSONNull slot
+		JSONKey:    fillBG(lipgloss.NewStyle().Foreground(t.JSONKey), t, surface),
+		JSONString: fillBG(lipgloss.NewStyle().Foreground(t.JSONString), t, surface),
+		JSONNumber: fillBG(lipgloss.NewStyle().Foreground(t.JSONNumber), t, surface),
+		JSONBool:   fillBG(lipgloss.NewStyle().Foreground(t.JSONBool), t, surface),
+		JSONNull:   fillBG(lipgloss.NewStyle().Foreground(t.Dim), t, surface), // Theme has no JSONNull slot
 
-		Bold: fillBG(lipgloss.NewStyle().Foreground(t.FG).Bold(true), t),
+		Bold: fillBG(lipgloss.NewStyle().Foreground(t.FG).Bold(true), t, surface),
 
-		// Cursor styles only the "❯ " marker, never the whole row: each row is a
-		// concatenation of individually styled segments whose ANSI resets would
-		// terminate an outer attribute mid-line (D10).
-		Cursor: fillBG(lipgloss.NewStyle().Foreground(t.Cursor).Bold(true), t),
+		// Cursor styles the "❯ " marker as its own segment (D10). Under the
+		// selection band it also carries SelectionBG so the marker cell is
+		// part of the full-width band (plan 023 E1).
+		Cursor: fillBG(lipgloss.NewStyle().Foreground(t.Cursor).Bold(true), t, surface),
 		// SearchHighlight applies only to the exact matched run of a `/`-search
 		// hit, and only when query and line are plain ASCII with no ESC byte —
 		// otherwise case-folding could shift byte offsets or the run could land
 		// inside an ANSI escape, so formatLogEntry falls back to the row marker
-		// alone (isASCIINoESC, D9).
+		// alone (isASCIINoESC, D9). Always SearchHitBG — wins over SelectionBG.
 		SearchHighlight: lipgloss.NewStyle().
 			Foreground(t.SearchHitFG).
 			Background(t.SearchHitBG).
 			Bold(true),
+
+		Selection: lipgloss.NewStyle().
+			Foreground(t.SelectionFG).
+			Background(t.SelectionBG),
 	}
 
 	ss.ProcessColors = make([]lipgloss.Style, 0, len(t.ProcPalette))
 	for _, c := range t.ProcPalette {
-		ss.ProcessColors = append(ss.ProcessColors, fillBG(lipgloss.NewStyle().Foreground(c), t))
+		ss.ProcessColors = append(ss.ProcessColors, fillBG(lipgloss.NewStyle().Foreground(c), t, surface))
 	}
 	return ss
 }

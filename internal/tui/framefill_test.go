@@ -358,3 +358,184 @@ func TestLegacy_ProcessPanelByteIdentity(t *testing.T) {
 		processStyle(domain.ProcessStateRunning).Render("1:web")))
 	assert.Equal(t, want, out)
 }
+
+// --- plan 023 E1 / C16: selection-band SGR scanner assertions ---
+
+// assertBandRowBG checks every viewport content cell on frame row frameRow
+// carries wantBG (SelectionBG or a mix checked by the caller per-col).
+func assertViewportRowBG(t *testing.T, frame string, m ClientModel, contentRow int, wantBG string, allowHit string) {
+	t.Helper()
+	ox, oy := m.viewportOrigin()
+	local := contentRow - m.viewport.YOffset
+	require.GreaterOrEqual(t, local, 0)
+	require.Less(t, local, m.viewport.Height)
+	frameRow := oy + local
+	rows := scanFrameCellBGs(frame)
+	require.Greater(t, len(rows), frameRow)
+	row := rows[frameRow]
+	require.GreaterOrEqual(t, len(row), ox+m.viewport.Width,
+		"frame row %d too short for viewport (len=%d need %d)", frameRow, len(row), ox+m.viewport.Width)
+	var bad []string
+	for col := ox; col < ox+m.viewport.Width; col++ {
+		bg := row[col].BG
+		if bg == wantBG || (allowHit != "" && bg == allowHit) {
+			continue
+		}
+		bad = append(bad, fmt.Sprintf("c%d=%s", col, bg))
+		if len(bad) >= 8 {
+			break
+		}
+	}
+	if len(bad) > 0 {
+		t.Fatalf("contentRow %d (frame r%d) cells missing band BG %s (hit ok=%q): %s",
+			contentRow, frameRow, wantBG, allowHit, strings.Join(bad, ", "))
+	}
+}
+
+func TestSelectionBand_SingleLineLogRow(t *testing.T) {
+	pinTrueColorProfile(t)
+	withTestTheme(t, "tokyo-night")
+	th := CurrentTheme()
+	require.True(t, th.FullFill)
+	selKey := lipglossColorBGKey(th.SelectionBG)
+	hitKey := lipglossColorBGKey(th.SearchHitBG)
+
+	m := newLogsModel(20, []string{"alpha line", "beta target here", "gamma"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "target")
+	require.Equal(t, 1, m.logCursorIdx)
+	require.True(t, m.inSelectionBand(m.logCursorIdx))
+
+	frame := m.View()
+	assertFrameContract(t, m)
+	assertViewportRowBG(t, frame, m, m.logCursorIdx, selKey, hitKey)
+	// ❯ marker retained on the band row.
+	assert.Contains(t, m.viewport.View(), "❯")
+}
+
+func TestSelectionBand_WrappedLogEntry(t *testing.T) {
+	pinTrueColorProfile(t)
+	withTestTheme(t, "tokyo-night")
+	th := CurrentTheme()
+	selKey := lipglossColorBGKey(th.SelectionBG)
+	hitKey := lipglossColorBGKey(th.SearchHitBG)
+
+	long := "WRAPNEEDLE " + strings.Repeat("abcd ", 40)
+	m := newLogsModel(20, []string{"short", long, "tail"})
+	m.settings.Wrap = true
+	m.settings.Timestamps = true
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 60, Height: 24})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "WRAPNEEDLE")
+	require.Equal(t, 1, m.logCursorIdx)
+	sp := m.logRowSpans[m.logCursorSeq]
+	require.Greater(t, sp.Last-sp.First, 0, "selected entry must wrap across display rows")
+
+	frame := m.View()
+	assertFrameContract(t, m)
+	for r := sp.First; r <= sp.Last; r++ {
+		if r < m.viewport.YOffset || r >= m.viewport.YOffset+m.viewport.Height {
+			continue
+		}
+		assertViewportRowBG(t, frame, m, r, selKey, hitKey)
+	}
+}
+
+func TestSelectionBand_SearchHitPrecedence(t *testing.T) {
+	pinTrueColorProfile(t)
+	withTestTheme(t, "tokyo-night")
+	th := CurrentTheme()
+	selKey := lipglossColorBGKey(th.SelectionBG)
+	hitKey := lipglossColorBGKey(th.SearchHitBG)
+	require.NotEqual(t, selKey, hitKey)
+
+	m := newLogsModel(20, []string{"nope", "find HITHERE please", "other"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "HITHERE")
+	require.Equal(t, 1, m.logCursorIdx)
+
+	frame := m.View()
+	assertFrameContract(t, m)
+	assertViewportRowBG(t, frame, m, m.logCursorIdx, selKey, hitKey)
+
+	// At least one cell on the band carries SearchHitBG.
+	ox, oy := m.viewportOrigin()
+	rows := scanFrameCellBGs(frame)
+	frameRow := rows[oy+(m.logCursorIdx-m.viewport.YOffset)]
+	hitCount := 0
+	selCount := 0
+	for col := ox; col < ox+m.viewport.Width; col++ {
+		switch frameRow[col].BG {
+		case hitKey:
+			hitCount++
+		case selKey:
+			selCount++
+		}
+	}
+	assert.Greater(t, hitCount, 0, "search hit cells must keep SearchHitBG inside the band")
+	assert.Greater(t, selCount, 0, "non-hit band cells must carry SelectionBG")
+}
+
+func TestSelectionBand_RequestsCursorRow(t *testing.T) {
+	pinTrueColorProfile(t)
+	withTestTheme(t, "tokyo-night")
+	th := CurrentTheme()
+	selKey := lipglossColorBGKey(th.SelectionBG)
+
+	m := newTestModel()
+	m.settings = DefaultSettings()
+	dir := t.TempDir()
+	withTestSettingsPath(t, dir+"/config.toml")
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.processes = []domain.ProcessInfo{{Name: "web", State: domain.ProcessStateRunning}}
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		m = clientUpdate(m, ProxyRequestMsg(proxy.RequestRecord{
+			ID: fmt.Sprintf("r%d", i), Method: "GET", URL: fmt.Sprintf("/p/%d", i),
+			StatusCode: 200, Subdomain: "api", Timestamp: now,
+			Duration: 10 * time.Millisecond,
+		}))
+	}
+	m.setViewMode(ViewModeRequests)
+	m.followMode = false
+	m.setRequestCursor(m.filteredProxyRequests(), 1)
+	m.updateViewport()
+	require.Equal(t, 1, m.cursorIdx)
+	require.True(t, m.inSelectionBand(1))
+
+	frame := m.View()
+	assertFrameContract(t, m)
+	assertViewportRowBG(t, frame, m, 1, selKey, "")
+	assert.Contains(t, m.viewport.View(), "❯")
+}
+
+func TestLegacy_SelectionBandDisabled(t *testing.T) {
+	// C5 byte-identity: legacy keeps marker-only cursor rendering — no
+	// SelectionBG band on cursor rows (FullFill=false).
+	pinTrueColorProfile(t)
+	withTestTheme(t, "legacy")
+	th := CurrentTheme()
+	require.False(t, th.FullFill)
+	selKey := lipglossColorBGKey(th.SelectionBG)
+
+	m := newLogsModel(20, []string{"alpha", "beta target", "gamma"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "target")
+	require.Equal(t, 1, m.logCursorIdx)
+	assert.False(t, m.inSelectionBand(m.logCursorIdx), "legacy must not activate the band")
+
+	frame := m.View()
+	ox, oy := m.viewportOrigin()
+	rows := scanFrameCellBGs(frame)
+	frameRow := rows[oy+(m.logCursorIdx-m.viewport.YOffset)]
+	for col := ox; col < ox+m.viewport.Width; col++ {
+		assert.NotEqual(t, selKey, frameRow[col].BG,
+			"legacy cursor row must not paint SelectionBG at c%d", col)
+	}
+	// Marker still present (old behavior).
+	assert.Contains(t, m.viewport.View(), "❯")
+
+	// Cursor style itself must remain FG-only under legacy (C5 pin).
+	_, no := s.Cursor.GetBackground().(lipgloss.NoColor)
+	assert.True(t, no, "legacy Cursor must not gain FullFill/Selection Background")
+}

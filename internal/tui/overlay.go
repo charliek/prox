@@ -85,6 +85,23 @@ func padFrameRow(row string, width int) string {
 	}
 }
 
+// padSelectionRow is padFrameRow for FullFill cursor-band rows: trailing fill
+// uses s.Selection (SelectionBG) so the band spans the full viewport width.
+func padSelectionRow(row string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := ansi.StringWidth(row)
+	switch {
+	case w > width:
+		return ansi.Cut(row, 0, width)
+	case w < width:
+		return row + s.Selection.Render(strings.Repeat(" ", width-w))
+	default:
+		return row
+	}
+}
+
 // overlayRow splices box into base at column x. base must already be padded to
 // frameWidth. boxW is the display width of box. Returns a single frame row.
 func overlayRow(base string, x, frameWidth int, box string) string {
