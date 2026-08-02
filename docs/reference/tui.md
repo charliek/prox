@@ -29,19 +29,32 @@ With the default chrome (menu bar and process panel visible):
 
 ```text
  prox  myproject                    View ▾  Filter ▾  Theme ▾
-┌─ processes ──────────────────────────────────────────────┐
-│ 1: ● web     running   2: ● api    running               │
-├─ logs ───────────────────────────────────────────────────┤
-│ 10:32:01 web    │ GET /api/users 200 12ms                │
-│ 10:32:02 api    │ connected to database                  │
+ 1: ● web     running   2: ● api    running
+╭─ Logs ───────────────────────────────────────────────────╮
+│ 10:32:01 web    connected to database                    │
+│ 10:32:02 api    │ GET /api/users 200 12ms                 │
 │ ...                                                      │
-├──────────────────────────────────────────────────────────┤
-│ [Logs] [FOLLOW] 45 lines                                 │
-│ ? help · m menu · / search · s filter · q quit           │
-└──────────────────────────────────────────────────────────┘
+╰──────────────────────────────────────────────────────────╯
+ Tab: switch view | ? for help   [Logs] [FOLLOW] 45/120 lines   ? help · m menu · / search · s filter · q quit
 ```
 
+The **process panel** sits above the main content. The **viewport** (logs, requests list, or detail body) is wrapped in a rounded border with a title spliced into the top edge (`─ Logs ─`, `─ Requests ─`, or `─ Request <id> ─`). On very small terminals the panel may render borderless rather than corrupt the frame.
+
 Toggle the menu bar with `m`, the process panel with `p`. View preferences persist in `~/.prox/tui/config.toml`.
+
+### Merged footer
+
+A single footer row carries everything that used to split across status and hint rows:
+
+- **Left:** typed status — mode prompts (`Search:` / `Filter:` while typing), committed search/filter/solo text, connection or restart messages, or the idle hint. Errors render as `✗ …` on the footer background.
+- **Right:** `[Logs]` / `[Requests]` / `[Request Detail]`, `[FOLLOW]` / `[PAUSED]`, visible/total count, then two-tone key hints (`? help · m menu · / search · s filter · q quit`).
+
+On narrow terminals hints drop right-to-left (non-sticky pairs first; `? help` and `q quit` last), then the count, then the status text truncates. Clicks on the footer are consumed and do nothing.
+
+### Bordered chrome
+
+- **Dropdown menus** use rounded borders. Each row shows a right-aligned **hint** column (keyboard shortcut) when space allows; long menus clamp with “… N more …” rows.
+- **Help modal** is a centred rounded box with a **focused** border colour and the view name spliced into the top border (`─ Help — Logs ─`). On very narrow frames side padding and then the border degrade before content.
 
 ## Themes
 
@@ -66,6 +79,8 @@ fg = "#a9b1d6"
 Each file names a `base` preset and may override `[colors]` (snake_case hex) and `[palette]`. Malformed files fall back to the default with a warning in the log pane.
 
 HTTP status colours, log level tints, and JSON syntax highlighting all follow the active theme.
+
+On **FullFill** presets (all except `legacy`), the active cursor row paints a full-width **selection band** across every wrapped display row of that entry. `/` search hits inside the band keep their search-highlight colour on top of the band.
 
 ## Process State Colours
 
@@ -97,7 +112,7 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 | Scroll wheel | Scroll logs or move requests cursor (3 lines per notch) |
 | `Home` / `End` / `g` / `G` | Jump to start/end (or cursor top/bottom in requests) |
 | `F` | Toggle auto-follow |
-| `?` | Help modal |
+| `?` | Help modal (Normal mode; see Help modal for menu-open `?`) |
 | `m` | Toggle menu bar |
 | `v` | Open View menu (when bar visible) |
 | `f` | Open Filter menu (when bar visible) |
@@ -106,20 +121,20 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 | `T` | Toggle timestamps in log lines |
 | `w` | Toggle soft-wrap in logs |
 | `Esc` | Clear filters/search/solo; back from detail |
-| `q` | Quit |
+| `q` | Quit (Normal mode); close help without quitting (Help mode); typed into search/filter bars while editing |
+| `ctrl+c` | Quit from any mode (including help and text entry) |
 
 ### Menu bar
 
 When the menu bar is visible:
 
 - Click `View ▾`, `Filter ▾`, or `Theme ▾` to open a dropdown.
-- Hover a sibling menu cell while a dropdown is open to slide the menu across
-  the bar; hover dropdown rows to move the highlight.
+- Hover a sibling menu cell while a dropdown is open to slide the menu across the bar; hover dropdown rows to move the highlight.
 - With a menu open: `←`/`→`/`Tab` switch between menus; `↑`/`↓`/`j`/`k` navigate rows (separators skipped); the scroll wheel moves the highlight; `Enter`/`Space` activate; any other key closes the menu (except `?`, which closes the menu and opens help).
 - Long menus clamp to the frame with “… N more …” indicator rows; wheel scrolls the visible window.
 - Opening a menu by mouse while typing in a filter/search bar blurs the input first.
 
-Menu choices persist view toggles and theme to `~/.prox/tui/config.toml` (`theme` plus `[view]` keys: `process_panel`, `timestamps`, `wrap`, `menu_bar`).
+Menu choices persist view toggles, theme, and (in Requests view) column visibility to `~/.prox/tui/config.toml` (`theme`, `[view]` keys: `process_panel`, `timestamps`, `wrap`, `menu_bar`, plus `[requests]` column booleans).
 
 ### Logs View
 
@@ -152,15 +167,17 @@ Fields:
 
 `-` negates any token. Invalid syntax (including bad `re:` compile) keeps the last good filter and shows a hint in the status bar. Values with whitespace use `field:"quoted"` form; there are no escapes — a value containing both whitespace and `"` is unrepresentable.
 
-JSON object log lines may *display* as a compact `path=value` summary, but filter/`/` search still match the raw line.
+JSON object log lines may *display* as a compact `path=value` summary (parsed once at ingest and cached; wrap-on keeps summary plus compact raw), but filter/`/` search still match the raw line.
 
-A line's level is detected at ingest from (first match wins): a JSON `level`/`lvl`/`severity` key (string, or pino/bunyan numeric), a logfmt `level=`/`lvl=` token, or a standalone UPPERCASE level token early in the line — the shape python logging, tracing's text format, pino-pretty, and uvicorn emit in local dev. Lines with no detectable level are excluded from positive `level:` filters (and untinted).
+A line's level is detected at ingest from (first match wins): a JSON `level`/`lvl`/`severity` key (string, or pino/bunyan numeric), a logfmt `level=`/`lvl=` token at line start or after whitespace, or a standalone UPPERCASE level token early in the line — the shape python logging, tracing's text format, pino-pretty, and uvicorn emit in local dev. Lines with no detectable level are excluded from positive `level:` filters (and untinted).
 
 The **Filter menu** edits the same state as the `s` bar; menu changes rewrite the bar text canonically.
 
 ### Requests View
 
 The requests view has an explicit **cursor row** (marked with `❯`). Navigation moves that cursor; the viewport scrolls to keep it visible.
+
+Open the **View** menu (`v`) for a **Columns** checkbox section (Requests and Request Detail views): toggle Time, Host, Method, Status, Duration, and ID. **URL is always shown.** Defaults are all on; choices persist under `[requests]` in config. `/` search matches only visible columns; copy keys (`y`, `c`) are unaffected.
 
 | Key | Action |
 | --- | ------ |
@@ -170,7 +187,7 @@ The requests view has an explicit **cursor row** (marked with `❯`). Navigation
 | `G` / `End` | Cursor to bottom (resumes follow) |
 | `s` | Filter bar — query language |
 | `f` | Filter menu — status class + methods |
-| `/` | Search URL/method/subdomain (navigate only) |
+| `/` | Search visible columns (navigate only) |
 | `n` / `N` | Next/previous match |
 | `Enter` | Open detail for cursor row |
 | `y` | Copy full request ID |
@@ -215,7 +232,7 @@ Detail views live-update when the open request completes.
 
 - **`/`** navigates: jumps the cursor to matches without hiding rows/lines. Composes with an active `s` filter.
 - **`s`** filters: hides non-matching entries using the query language above. Each view keeps its own filter across `Tab` switches.
-- Status bar shows committed search as `/<query> (i/k)` or filter as `Filter: <query>`.
+- The merged footer left side shows committed search as `/<query> (i/n)` (cursor on match *i* of *n*) or `/<query> (n matches)`, filter as `Filter: <query>`, or the idle hint. While typing, `Search:` / `Filter:` prompts take precedence.
 
 ## Copy (grab-for-agent)
 
@@ -230,31 +247,30 @@ Copy keys write to the system clipboard (with a status flash on success or failu
 
 ## Mouse
 
-Mouse support requires a terminal that reports all motion (`tea.WithMouseAllMotion`,
-SGR `?1003` + `?1006`).
+Mouse support requires a terminal that reports all motion (`tea.WithMouseAllMotion`, SGR `?1003` + `?1006`).
+
+On terminals that support **OSC 22** (kitty, WezTerm, Alacritty, Ghostty, …), the pointer switches to a hand over activatable targets: menu-bar cells, dropdown rows (not separators or overflow indicators), and process chips in Normal mode. Content rows, the footer, panel borders, and the help box keep the default pointer.
 
 | Action | Effect |
 | ------ | ------ |
 | Wheel (no menu open) | 3 lines per notch — scroll logs, move requests cursor, or scroll detail |
 | Wheel (menu open) | Move dropdown highlight; viewport does not scroll |
+| Wheel (help open) | Scroll help body when the pointer is over the box |
 | Click process chip | Solo/unsolo (logs view) |
 | Click log line | Park cursor; disengages follow |
 | Click request row | Move cursor |
 | Double-click request row | Open detail (~500 ms window) |
+| Click panel border or requests header | Consumed no-op |
+| Click footer | Consumed no-op |
 | Click / hover menu bar | Open menus; hover slides an open menu across siblings |
 | Click dropdown row | Activate item |
 | Click while typing filter/search | Ignored (except menu bar, which blurs input) |
+| Click outside help box | Close help |
 
 Wheel events are handled entirely by the TUI (the bubbles viewport wheel handler is disabled) so scrolling does not double-fire.
 
-**Text selection:** the TUI owns the pointer for mouse reporting. To select text in
-the terminal, use your terminal’s override modifier (commonly **Shift**-click or
-**Option**-click on macOS — the exact key is terminal-specific).
+**Text selection:** the TUI owns the pointer for mouse reporting. To select text in the terminal, use your terminal’s override modifier (commonly **Shift**-click or **Option**-click on macOS — the exact key is terminal-specific).
 
 ## Help modal
 
-Press `?` in Normal or Help mode for context-sensitive help (logs, requests, or
-detail). Help appears as a centered modal over the live UI (the menu bar, status
-bar, and streaming content stay visible behind it). Scroll with `j`/`k`, PgUp/PgDn,
-`g`/`G`, or the wheel over the box when content is taller than the modal. Close
-with Esc, `?`, `q`, Enter, or a click outside the box.
+Press `?` in Normal mode for context-sensitive help (logs, requests, or detail). With a menu open, `?` closes the menu and opens help. Help appears as a centred modal over the live UI (the menu bar, footer, and streaming content stay visible behind it). Scroll with `j`/`k`, PgUp/PgDn, `g`/`G`, or the wheel over the box when content is taller than the modal. Close with Esc, `?`, `q`, Enter, or a click outside the box. `ctrl+c` quits the TUI from help as well.
