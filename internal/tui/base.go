@@ -1279,12 +1279,46 @@ func (b *BaseModel) halfPageStep() int {
 }
 
 // requestMatchesSearch reports whether a request matches the requests-view `/`
-// query: a case-insensitive substring over URL, Method, and Subdomain — the
-// same fields the `s` filter matches (D12).
-func requestMatchesSearch(req proxy.RequestRecord, query string) bool {
-	return containsIgnoreCase(req.URL, query) ||
-		containsIgnoreCase(req.Method, query) ||
-		containsIgnoreCase(req.Subdomain, query)
+// query: a case-insensitive substring over the text of currently visible
+// columns only (plan 023 B7). URL is always searchable; copy keys are
+// unaffected by column visibility.
+func (b *BaseModel) requestMatchesSearch(req proxy.RequestRecord, query string) bool {
+	cols := b.settings.RequestsColumns
+	if cols.Time && containsIgnoreCase(req.Timestamp.Format("15:04:05"), query) {
+		return true
+	}
+	if cols.Host && containsIgnoreCase(req.Subdomain, query) {
+		return true
+	}
+	if cols.Method && containsIgnoreCase(req.Method, query) {
+		return true
+	}
+	if cols.Status && containsIgnoreCase(fmt.Sprintf("%d", req.StatusCode), query) {
+		return true
+	}
+	if cols.Duration && containsIgnoreCase(requestDurationSearchText(req, b.requestIsStale(req)), query) {
+		return true
+	}
+	if cols.ID && containsIgnoreCase(strings.TrimSpace(shortRequestID(req.ID)), query) {
+		return true
+	}
+	return containsIgnoreCase(req.URL, query)
+}
+
+// requestDurationSearchText is the plain duration-column text used by `/`
+// search (mirrors formatProxyRequest glyphs without padding/styles).
+func requestDurationSearchText(req proxy.RequestRecord, stale bool) string {
+	durationMs := req.Duration.Milliseconds()
+	switch {
+	case stale:
+		return "stale?"
+	case req.InFlight:
+		return "...ms"
+	case durationMs > 9999:
+		return "9999+ms"
+	default:
+		return fmt.Sprintf("%dms", durationMs)
+	}
 }
 
 // jumpToRequestSearchMatch moves the cursor to the first row matching
@@ -1325,7 +1359,7 @@ func (b *BaseModel) seekRequestSearchMatch(dir int) {
 		// At-or-after: offsets 0..n-1 forward, cursor row first.
 		for i := 0; i < n; i++ {
 			idx := (start + i) % n
-			if requestMatchesSearch(requests[idx], b.requestSearchQuery) {
+			if b.requestMatchesSearch(requests[idx], b.requestSearchQuery) {
 				b.landSearchJump(requests, idx, n)
 				return
 			}
@@ -1336,7 +1370,7 @@ func (b *BaseModel) seekRequestSearchMatch(dir int) {
 	// own row is never revisited, so n/N are no-ops when it is the sole match.
 	for i := 1; i < n; i++ {
 		idx := ((start+dir*i)%n + n) % n
-		if requestMatchesSearch(requests[idx], b.requestSearchQuery) {
+		if b.requestMatchesSearch(requests[idx], b.requestSearchQuery) {
 			b.landSearchJump(requests, idx, n)
 			return
 		}
@@ -1366,7 +1400,7 @@ func (b *BaseModel) requestSearchMatchInfo(requests []proxy.RequestRecord) (posi
 		return 0, 0
 	}
 	for i, req := range requests {
-		if requestMatchesSearch(req, b.requestSearchQuery) {
+		if b.requestMatchesSearch(req, b.requestSearchQuery) {
 			total++
 			if i == b.cursorIdx {
 				position = total
@@ -2214,82 +2248,137 @@ func (b *BaseModel) getSelectedRequest() string {
 }
 
 // formatRequestsHeaderRow builds the fixed column-label row for the requests
-// view (plan 023 B6). Widths match formatProxyRequest; a two-space indent
+// view (plan 023 B6/B7). Widths match formatProxyRequest; a two-space indent
 // mirrors the cursor-marker column on data rows so labels stay aligned.
+// Hidden columns contribute nothing (no separator, no padding).
 func (b *BaseModel) formatRequestsHeaderRow() string {
+	cols := b.settings.RequestsColumns
 	sep2 := s.Base.Render("  ")
 	sep1 := s.Base.Render(" ")
 	indent := s.Base.Render("  ")
-	return indent +
-		s.Dim.Render(fmt.Sprintf("%-8s", "Time")) + sep2 +
-		s.Dim.Render(fmt.Sprintf("%-10s", "Host")) + sep2 +
-		s.Dim.Render(fmt.Sprintf("%-7s", "Method")) + sep1 +
-		s.Dim.Render(fmt.Sprintf("%3s", "Sta")) + sep1 +
-		s.Dim.Render(fmt.Sprintf("%-7s", "Duration")) + sep2 +
-		s.Dim.Render("URL")
+
+	var parts []string
+	appendCell := func(cell, leadingSep string) {
+		if len(parts) == 0 {
+			parts = append(parts, cell)
+			return
+		}
+		parts = append(parts, leadingSep, cell)
+	}
+	if cols.Time {
+		appendCell(s.Dim.Render(fmt.Sprintf("%-8s", "Time")), sep2)
+	}
+	if cols.Host {
+		appendCell(s.Dim.Render(fmt.Sprintf("%-10s", "Host")), sep2)
+	}
+	if cols.Method {
+		appendCell(s.Dim.Render(fmt.Sprintf("%-7s", "Method")), sep2)
+	}
+	if cols.Status {
+		appendCell(s.Dim.Render(fmt.Sprintf("%3s", "Sta")), sep1)
+	}
+	if cols.Duration {
+		appendCell(s.Dim.Render(fmt.Sprintf("%-7s", "Duration")), sep1)
+	}
+	if cols.ID {
+		appendCell(s.Dim.Render(fmt.Sprintf("%-8s", "ID")), sep2)
+	}
+	appendCell(s.Dim.Render("URL"), sep2)
+	return indent + strings.Join(parts, "")
 }
 
-// formatProxyRequest formats a single proxy request for display
+// shortRequestID returns the 8-char ID column text: empty → 8 spaces;
+// len≤8 → left-aligned padded (not truncated); len>8 → first 8 bytes.
+func shortRequestID(id string) string {
+	if id == "" {
+		return "        "
+	}
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return fmt.Sprintf("%-8s", id)
+}
+
+// formatProxyRequest formats a single proxy request for display. Hidden
+// columns contribute nothing (plan 023 B7); URL is always present.
 func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
-	// Format timestamp
-	ts := req.Timestamp.Format("15:04:05")
-
-	// Format subdomain with padding; truncate over-long names so columns
-	// don't drift (CodeRabbit PR #102).
-	subdomain := ansi.Truncate(fmt.Sprintf("%-10s", req.Subdomain), 10, "")
-
-	// Method token coloured by verb (C9); pad inside the styled segment so
-	// ANSI resets don't sit between the verb and its column padding.
-	method := httpMethodStyle(req.Method).Render(fmt.Sprintf("%-7s", req.Method))
-
-	// Status token by class (C9): 2xx→Status2xx, 3xx→FG (unstyled), 4xx/5xx
-	// themed, 0/in-flight→Dim. 1xx also Dim.
-	statusTok := fmt.Sprintf("%3d", req.StatusCode)
-	switch {
-	case req.InFlight || req.StatusCode < 200:
-		statusTok = s.Dim.Render(statusTok)
-	case req.StatusCode >= 500:
-		statusTok = s.Status5xx.Render(statusTok)
-	case req.StatusCode >= 400:
-		statusTok = s.Status4xx.Render(statusTok)
-	case req.StatusCode >= 300:
-		// 3xx: default FG (plan/brief) — Base so FullFill paints theme BG.
-		statusTok = s.Base.Render(statusTok)
-	case req.StatusCode >= 200:
-		statusTok = s.Status2xx.Render(statusTok)
-	}
-
-	// Duration column (C9): colour scale from plan WS9 — <100ms OK,
-	// 100–499 default FG, 500–1999 Warn, ≥2000 Err. In-flight/stale keep
-	// their glyphs (…ms / stale?) but Dim-styled (brief's "pulse" is
-	// style-only; the …ms glyph is kept over a ● so row shape stays).
-	durationMs := req.Duration.Milliseconds()
-	var duration string
-	switch {
-	case b.requestIsStale(req):
-		duration = s.Dim.Render("stale?")
-	case req.InFlight:
-		duration = s.Dim.Render("  ...ms")
-	case durationMs > 9999:
-		duration = s.HTTPError.Render("9999+ms")
-	case durationMs >= 2000:
-		duration = s.HTTPError.Render(fmt.Sprintf("%5dms", durationMs))
-	case durationMs >= 500:
-		duration = s.Warn.Render(fmt.Sprintf("%5dms", durationMs))
-	case durationMs >= 100:
-		duration = s.Base.Render(fmt.Sprintf("%5dms", durationMs)) // default FG
-	default:
-		duration = s.HTTPSuccess.Render(fmt.Sprintf("%5dms", durationMs))
-	}
-
+	cols := b.settings.RequestsColumns
 	sep2 := s.Base.Render("  ")
 	sep1 := s.Base.Render(" ")
-	return s.Dim.Render(ts) + sep2 +
-		s.Dim.Render(subdomain) + sep2 +
-		method + sep1 +
-		statusTok + sep1 +
-		duration + sep2 +
-		s.Base.Render(req.URL)
+
+	var parts []string
+	appendCell := func(cell, leadingSep string) {
+		if len(parts) == 0 {
+			parts = append(parts, cell)
+			return
+		}
+		parts = append(parts, leadingSep, cell)
+	}
+
+	if cols.Time {
+		ts := req.Timestamp.Format("15:04:05")
+		appendCell(s.Dim.Render(ts), sep2)
+	}
+	if cols.Host {
+		// Truncate over-long names so columns don't drift (CodeRabbit PR #102).
+		subdomain := ansi.Truncate(fmt.Sprintf("%-10s", req.Subdomain), 10, "")
+		appendCell(s.Dim.Render(subdomain), sep2)
+	}
+	if cols.Method {
+		// Method token coloured by verb (C9); pad inside the styled segment so
+		// ANSI resets don't sit between the verb and its column padding.
+		method := httpMethodStyle(req.Method).Render(fmt.Sprintf("%-7s", req.Method))
+		appendCell(method, sep2)
+	}
+	if cols.Status {
+		// Status token by class (C9): 2xx→Status2xx, 3xx→FG (unstyled), 4xx/5xx
+		// themed, 0/in-flight→Dim. 1xx also Dim.
+		statusTok := fmt.Sprintf("%3d", req.StatusCode)
+		switch {
+		case req.InFlight || req.StatusCode < 200:
+			statusTok = s.Dim.Render(statusTok)
+		case req.StatusCode >= 500:
+			statusTok = s.Status5xx.Render(statusTok)
+		case req.StatusCode >= 400:
+			statusTok = s.Status4xx.Render(statusTok)
+		case req.StatusCode >= 300:
+			// 3xx: default FG (plan/brief) — Base so FullFill paints theme BG.
+			statusTok = s.Base.Render(statusTok)
+		case req.StatusCode >= 200:
+			statusTok = s.Status2xx.Render(statusTok)
+		}
+		appendCell(statusTok, sep1)
+	}
+	if cols.Duration {
+		// Duration column (C9): colour scale from plan WS9 — <100ms OK,
+		// 100–499 default FG, 500–1999 Warn, ≥2000 Err. In-flight/stale keep
+		// their glyphs (…ms / stale?) but Dim-styled (brief's "pulse" is
+		// style-only; the …ms glyph is kept over a ● so row shape stays).
+		durationMs := req.Duration.Milliseconds()
+		var duration string
+		switch {
+		case b.requestIsStale(req):
+			duration = s.Dim.Render("stale?")
+		case req.InFlight:
+			duration = s.Dim.Render("  ...ms")
+		case durationMs > 9999:
+			duration = s.HTTPError.Render("9999+ms")
+		case durationMs >= 2000:
+			duration = s.HTTPError.Render(fmt.Sprintf("%5dms", durationMs))
+		case durationMs >= 500:
+			duration = s.Warn.Render(fmt.Sprintf("%5dms", durationMs))
+		case durationMs >= 100:
+			duration = s.Base.Render(fmt.Sprintf("%5dms", durationMs)) // default FG
+		default:
+			duration = s.HTTPSuccess.Render(fmt.Sprintf("%5dms", durationMs))
+		}
+		appendCell(duration, sep1)
+	}
+	if cols.ID {
+		appendCell(s.Dim.Render(shortRequestID(req.ID)), sep2)
+	}
+	appendCell(s.Base.Render(req.URL), sep2)
+	return strings.Join(parts, "")
 }
 
 // httpMethodStyle returns the C9 method colour; unknown verbs stay unstyled FG.

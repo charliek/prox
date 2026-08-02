@@ -140,6 +140,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		Timestamps:   true,
 		Wrap:         true,
 		MenuBar:      false,
+		RequestsColumns: RequestsColumns{
+			Time: true, Host: false, Method: true,
+			Status: true, Duration: false, ID: true,
+		},
 	}
 	require.NoError(t, SaveSettings(original))
 

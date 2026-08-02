@@ -51,6 +51,13 @@ const (
 	MenuCmdToggleTimestamps   MenuCommand = "toggle-timestamps"
 	MenuCmdToggleWrap         MenuCommand = "toggle-wrap"
 
+	MenuCmdToggleColTime     MenuCommand = "toggle-col-time"
+	MenuCmdToggleColHost     MenuCommand = "toggle-col-host"
+	MenuCmdToggleColMethod   MenuCommand = "toggle-col-method"
+	MenuCmdToggleColStatus   MenuCommand = "toggle-col-status"
+	MenuCmdToggleColDuration MenuCommand = "toggle-col-duration"
+	MenuCmdToggleColID       MenuCommand = "toggle-col-id"
+
 	menuCmdSetThemePrefix = "set-theme:"
 )
 
@@ -103,7 +110,7 @@ func (b *BaseModel) openMenuFirst(id MenuID) {
 func (b *BaseModel) menuFirstSelectable(id MenuID) int {
 	items := b.menuItems(id)
 	for i, it := range items {
-		if !it.Separator {
+		if menuItemSelectable(it) {
 			return i
 		}
 	}
@@ -124,8 +131,9 @@ func parseSetThemeCmd(cmd MenuCommand) (name string, ok bool) {
 
 // menuItems builds rows live from state so markers never drift (WS3).
 // View menu (WS4): Logs/Requests radios, sep, Process panel / Timestamps /
-// Wrap lines / Follow checks. Filter menu (WS8): per-view check/radio rows.
-// Theme menu (WS5): preset radios then user stems.
+// Wrap lines / Follow checks; in Requests view, a Columns checkbox section
+// (plan 023 B7). Filter menu (WS8): per-view check/radio rows. Theme menu
+// (WS5): preset radios then user stems.
 func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	switch id {
 	case MenuView:
@@ -135,7 +143,7 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 		timestamps := b.settings.Timestamps
 		wrap := b.settings.Wrap
 		follow := b.followMode
-		return []MenuItem{
+		items := []MenuItem{
 			{Label: "Logs", Hint: "Tab", Selected: &logsOn, Cmd: MenuCmdSetLogs},
 			{Label: "Requests", Hint: "Tab", Selected: &reqsOn, Cmd: MenuCmdSetRequests},
 			{Separator: true},
@@ -144,6 +152,26 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 			{Label: "Wrap lines", Hint: "w", Checked: &wrap, Cmd: MenuCmdToggleWrap},
 			{Label: "Follow", Hint: "F", Checked: &follow, Cmd: MenuCmdToggleFollow},
 		}
+		if reqsOn {
+			cols := b.settings.RequestsColumns
+			timeOn := cols.Time
+			hostOn := cols.Host
+			methodOn := cols.Method
+			statusOn := cols.Status
+			durationOn := cols.Duration
+			idOn := cols.ID
+			items = append(items,
+				MenuItem{Separator: true},
+				MenuItem{Label: "Columns", Cmd: ""}, // section header (non-activatable)
+				MenuItem{Label: "Time", Checked: &timeOn, Cmd: MenuCmdToggleColTime},
+				MenuItem{Label: "Host", Checked: &hostOn, Cmd: MenuCmdToggleColHost},
+				MenuItem{Label: "Method", Checked: &methodOn, Cmd: MenuCmdToggleColMethod},
+				MenuItem{Label: "Status", Checked: &statusOn, Cmd: MenuCmdToggleColStatus},
+				MenuItem{Label: "Duration", Checked: &durationOn, Cmd: MenuCmdToggleColDuration},
+				MenuItem{Label: "ID", Checked: &idOn, Cmd: MenuCmdToggleColID},
+			)
+		}
+		return items
 	case MenuTheme:
 		names := AvailableThemes()
 		current := CurrentThemeName()
@@ -195,7 +223,7 @@ func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
 			step = 1
 		}
 		for j := idx + step; j >= 0 && j < n; j += step {
-			if !items[j].Separator {
+			if menuItemSelectable(items[j]) {
 				return j
 			}
 		}
@@ -207,11 +235,17 @@ func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
 		} else {
 			idx = (idx + n - 1) % n
 		}
-		if !items[idx].Separator {
+		if menuItemSelectable(items[idx]) {
 			break
 		}
 	}
 	return idx
+}
+
+// menuItemSelectable reports whether a dropdown row can take highlight / activate
+// (skips separators and section headers with empty Cmd).
+func menuItemSelectable(it MenuItem) bool {
+	return !it.Separator && it.Cmd != ""
 }
 
 // menuReservedBottom is the footer band — dropdowns never cover it (plan 023 B2).
@@ -433,9 +467,33 @@ func (b *BaseModel) activateMenuCommand(cmd MenuCommand) tea.Cmd {
 		return b.toggleTimestamps()
 	case MenuCmdToggleWrap:
 		return b.toggleWrap()
+	case MenuCmdToggleColTime:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.Time = !c.Time })
+	case MenuCmdToggleColHost:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.Host = !c.Host })
+	case MenuCmdToggleColMethod:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.Method = !c.Method })
+	case MenuCmdToggleColStatus:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.Status = !c.Status })
+	case MenuCmdToggleColDuration:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.Duration = !c.Duration })
+	case MenuCmdToggleColID:
+		return b.toggleRequestsColumn(func(c *RequestsColumns) { c.ID = !c.ID })
 	}
 	if b.activateFilterMenuCommand(cmd) {
 		return nil
+	}
+	return nil
+}
+
+// toggleRequestsColumn flips one RequestsColumns field, relayouts (row width
+// changes), re-renders, and persists the whole [requests] table (plan 023 B7).
+func (b *BaseModel) toggleRequestsColumn(flip func(*RequestsColumns)) tea.Cmd {
+	flip(&b.settings.RequestsColumns)
+	b.relayout()
+	b.updateViewport()
+	if err := SaveSettingsChanged(b.settings, settingRequestsColumns); err != nil {
+		return b.setStatusFlash(footerError(formatSettingsSaveError(err)), flashSettingsSave, statusFlashClearDelay)
 	}
 	return nil
 }

@@ -13,11 +13,24 @@ import (
 
 // Settings holds TUI preferences persisted at ~/.prox/tui/config.toml.
 type Settings struct {
-	Theme        string
-	ProcessPanel bool
-	Timestamps   bool
-	Wrap         bool
-	MenuBar      bool
+	Theme           string
+	ProcessPanel    bool
+	Timestamps      bool
+	Wrap            bool
+	MenuBar         bool
+	RequestsColumns RequestsColumns
+}
+
+// RequestsColumns controls which optional columns appear in the requests
+// list (plan 023 B7 / C13). URL is always shown and is not a field here.
+// Defaults are all-on (see DefaultSettings / defaultRequestsColumns).
+type RequestsColumns struct {
+	Time     bool
+	Host     bool
+	Method   bool
+	Status   bool
+	Duration bool
+	ID       bool
 }
 
 // settingKey identifies a single persisted settings field for typed partial
@@ -31,6 +44,7 @@ const (
 	settingViewTimestamps
 	settingViewWrap
 	settingViewMenuBar
+	settingRequestsColumns // [requests] table of six booleans (plan 023 C13)
 )
 
 // allSettingKeys is every currently persisted key (full-save / SaveSettings).
@@ -40,6 +54,7 @@ var allSettingKeys = []settingKey{
 	settingViewTimestamps,
 	settingViewWrap,
 	settingViewMenuBar,
+	settingRequestsColumns,
 }
 
 // ErrConfigUnparseable is returned by SaveSettings when the on-disk file exists
@@ -73,14 +88,28 @@ func defaultSettingsPath() string {
 	return filepath.Join(home, ".prox", "tui", "config.toml")
 }
 
+// defaultRequestsColumns returns all-on column visibility (plan 023 B7).
+func defaultRequestsColumns() RequestsColumns {
+	return RequestsColumns{
+		Time:     true,
+		Host:     true,
+		Method:   true,
+		Status:   true,
+		Duration: true,
+		ID:       true,
+	}
+}
+
 // DefaultSettings returns schema defaults. Defaults preserve today's behavior:
-// the process panel shows, timestamps render, no soft-wrap, menu bar on.
+// the process panel shows, timestamps render, no soft-wrap, menu bar on,
+// all optional request columns visible.
 func DefaultSettings() Settings {
 	return Settings{
-		ProcessPanel: true,
-		Timestamps:   true,
-		Wrap:         false,
-		MenuBar:      true,
+		ProcessPanel:    true,
+		Timestamps:      true,
+		Wrap:            false,
+		MenuBar:         true,
+		RequestsColumns: defaultRequestsColumns(),
 	}
 }
 
@@ -119,11 +148,19 @@ const (
 	keyTimestamps   = "timestamps"
 	keyWrap         = "wrap"
 	keyMenuBar      = "menu_bar"
+	keyRequests     = "requests"
+	keyReqTime      = "time"
+	keyReqHost      = "host"
+	keyReqMethod    = "method"
+	keyReqStatus    = "status"
+	keyReqDuration  = "duration"
+	keyReqID        = "id"
 )
 
 // applySettingsFromMap overlays known keys onto s. Values with the wrong
 // TOML type are ignored AND reported (silently dropping `theme = 3` leaves
 // the user wondering why their edit does nothing — CodeRabbit PR #102).
+// A missing [requests] table leaves RequestsColumns at their all-on defaults.
 func applySettingsFromMap(s *Settings, root map[string]any) []string {
 	var warnings []string
 	if raw, present := root[keyTheme]; present {
@@ -133,29 +170,52 @@ func applySettingsFromMap(s *Settings, root map[string]any) []string {
 			warnings = append(warnings, "theme: expected string, ignored")
 		}
 	}
-	rawView, present := root[keyView]
-	if !present {
-		return warnings
-	}
-	view, ok := rawView.(map[string]any)
-	if !ok {
-		return append(warnings, "view: expected table, ignored")
-	}
-	boolKey := func(key string, dst *bool) {
-		raw, present := view[key]
-		if !present {
-			return
-		}
-		if v, ok := raw.(bool); ok {
-			*dst = v
+	if rawView, present := root[keyView]; present {
+		view, ok := rawView.(map[string]any)
+		if !ok {
+			warnings = append(warnings, "view: expected table, ignored")
 		} else {
-			warnings = append(warnings, key+": expected boolean, ignored")
+			boolKey := func(key string, dst *bool) {
+				raw, present := view[key]
+				if !present {
+					return
+				}
+				if v, ok := raw.(bool); ok {
+					*dst = v
+				} else {
+					warnings = append(warnings, key+": expected boolean, ignored")
+				}
+			}
+			boolKey(keyProcessPanel, &s.ProcessPanel)
+			boolKey(keyTimestamps, &s.Timestamps)
+			boolKey(keyWrap, &s.Wrap)
+			boolKey(keyMenuBar, &s.MenuBar)
 		}
 	}
-	boolKey(keyProcessPanel, &s.ProcessPanel)
-	boolKey(keyTimestamps, &s.Timestamps)
-	boolKey(keyWrap, &s.Wrap)
-	boolKey(keyMenuBar, &s.MenuBar)
+	if rawReqs, present := root[keyRequests]; present {
+		reqs, ok := rawReqs.(map[string]any)
+		if !ok {
+			warnings = append(warnings, "requests: expected table, ignored")
+		} else {
+			boolKey := func(key string, dst *bool) {
+				raw, present := reqs[key]
+				if !present {
+					return
+				}
+				if v, ok := raw.(bool); ok {
+					*dst = v
+				} else {
+					warnings = append(warnings, "requests."+key+": expected boolean, ignored")
+				}
+			}
+			boolKey(keyReqTime, &s.RequestsColumns.Time)
+			boolKey(keyReqHost, &s.RequestsColumns.Host)
+			boolKey(keyReqMethod, &s.RequestsColumns.Method)
+			boolKey(keyReqStatus, &s.RequestsColumns.Status)
+			boolKey(keyReqDuration, &s.RequestsColumns.Duration)
+			boolKey(keyReqID, &s.RequestsColumns.ID)
+		}
+	}
 	return warnings
 }
 
@@ -266,6 +326,15 @@ func mergeChangedSettingsIntoMap(root map[string]any, s Settings, changed []sett
 		case settingViewMenuBar:
 			ensureView()[keyMenuBar] = s.MenuBar
 			viewTouched = true
+		case settingRequestsColumns:
+			root[keyRequests] = map[string]any{
+				keyReqTime:     s.RequestsColumns.Time,
+				keyReqHost:     s.RequestsColumns.Host,
+				keyReqMethod:   s.RequestsColumns.Method,
+				keyReqStatus:   s.RequestsColumns.Status,
+				keyReqDuration: s.RequestsColumns.Duration,
+				keyReqID:       s.RequestsColumns.ID,
+			}
 		}
 	}
 	if viewTouched {
