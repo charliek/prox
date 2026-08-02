@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -24,10 +25,14 @@ const (
 
 // logMeta caches ingest-time classification keyed by DisplaySeq (plan 021 WS7).
 // Eviction prunes keys in lockstep with the log ring (Codex #11).
+// pairs is a width-independent JSON path=value list filled at ingest from the
+// same Unmarshal that feeds level detection (plan 023 C14); render formats
+// from pairs without re-unmarshalling.
 type logMeta struct {
 	level    LogLevel
 	hasLevel bool
 	isJSON   bool
+	pairs    []jsonPair
 }
 
 // logfmtLevelRE matches level= / lvl= tokens on the raw line (case-insensitive).
@@ -84,45 +89,35 @@ func pinoLevel(n int) (LogLevel, bool) {
 	}
 }
 
-// classifyLevel detects a log level from the unstyled entry line (appendLogEntry
-// receives pre-render text). Returns (level, true) when a level token is found.
-func classifyLevel(raw string) (LogLevel, bool) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return LogLevelUnknown, false
-	}
-
-	// JSON path: leading object with "level"/"lvl"/"severity" (string, or
-	// pino/bunyan numeric). A present-but-unusable key is authoritative:
-	// no fall-through to the heuristic paths.
-	if strings.HasPrefix(trimmed, "{") {
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
-			for _, key := range []string{"level", "lvl", "severity"} {
-				v, ok := obj[key]
-				if !ok {
-					continue
-				}
-				switch v := v.(type) {
-				case string:
-					return normalizeLevel(v)
-				case float64:
-					return pinoLevel(int(v))
-				default:
-					return LogLevelUnknown, false
-				}
-			}
+// classifyJSONObjectLevel reads level/lvl/severity from a parsed JSON object.
+// ok is true when a usable level was found. authoritative is true when any of
+// those keys is present (even if unusable) — callers must not fall through to
+// heuristics in that case.
+func classifyJSONObjectLevel(obj map[string]any) (level LogLevel, ok bool, authoritative bool) {
+	for _, key := range []string{"level", "lvl", "severity"} {
+		v, present := obj[key]
+		if !present {
+			continue
+		}
+		switch v := v.(type) {
+		case string:
+			level, ok = normalizeLevel(v)
+			return level, ok, true
+		case float64:
+			level, ok = pinoLevel(int(v))
+			return level, ok, true
+		default:
+			return LogLevelUnknown, false, true
 		}
 	}
+	return LogLevelUnknown, false, false
+}
 
-	// logfmt path: scan the raw line (not trimmed) so mid-line tokens match.
+// classifyLevelHeuristics applies logfmt then bare-token detection (non-JSON).
+func classifyLevelHeuristics(raw string) (LogLevel, bool) {
 	if m := logfmtLevelRE.FindStringSubmatch(raw); len(m) >= 2 {
 		return normalizeLevel(m[1])
 	}
-
-	// Bare-token path: uppercase level word early in the line, on an
-	// ANSI-stripped copy so child-emitted colors (tracing, pino-pretty)
-	// don't break the delimiters. Display keeps the raw line.
 	scan := ansi.Strip(raw)
 	if len(scan) > bareLevelScanLimit {
 		scan = scan[:bareLevelScanLimit]
@@ -130,8 +125,41 @@ func classifyLevel(raw string) (LogLevel, bool) {
 	if m := bareLevelRE.FindStringSubmatch(scan); len(m) >= 2 {
 		return normalizeLevel(m[1])
 	}
-
 	return LogLevelUnknown, false
+}
+
+// ingestLogMeta classifies a line at append time. JSON objects pay one
+// Unmarshal that feeds both level detection and a cached path=value pair list
+// for render (plan 023 C14). Eviction of the containing logMeta map entry is
+// unchanged (keyed by DisplaySeq, pruned with the ring).
+func ingestLogMeta(raw string) logMeta {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return logMeta{}
+	}
+
+	if strings.HasPrefix(trimmed, "{") {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+			pairs := flattenJSONPairs(obj, "", 0)
+			sort.Slice(pairs, func(i, j int) bool { return pairs[i].path < pairs[j].path })
+			meta := logMeta{isJSON: true, pairs: pairs}
+			if level, ok, auth := classifyJSONObjectLevel(obj); auth {
+				meta.level = level
+				meta.hasLevel = ok
+				return meta
+			}
+			// Valid JSON object without a level key: still cache pairs; fall
+			// through so logfmt/bare can tint the line.
+			level, has := classifyLevelHeuristics(raw)
+			meta.level = level
+			meta.hasLevel = has
+			return meta
+		}
+	}
+
+	level, has := classifyLevelHeuristics(raw)
+	return logMeta{level: level, hasLevel: has}
 }
 
 // isJSONObject reports whether raw is a JSON object (trimmed leading `{` and

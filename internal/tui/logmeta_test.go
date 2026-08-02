@@ -52,6 +52,8 @@ func TestClassifyLevel_Corpus(t *testing.T) {
 		{"json pino numeric info", `{"level":30,"msg":"x"}`, LogLevelInfo, true},
 		{"json pino numeric error", `{"level":50,"msg":"x"}`, LogLevelError, true},
 		{"json numeric out of range", `{"level":123}`, LogLevelUnknown, false},
+		{"json no level key, logfmt in value", `{"msg":"level=info x"}`, LogLevelInfo, true},
+		{"json no level, no heuristic", `{"msg":"hi"}`, LogLevelUnknown, false},
 		{"logfmt info", "level=INFO msg=x", LogLevelInfo, true},
 		{"logfmt fatal", "level=fatal", LogLevelError, true},
 		{"plain text", "something happened", LogLevelUnknown, false},
@@ -111,6 +113,13 @@ func TestLogMeta_AppendLogEntry(t *testing.T) {
 	assert.True(t, meta.hasLevel)
 	assert.Equal(t, LogLevelError, meta.level)
 	assert.True(t, meta.isJSON)
+	require.NotEmpty(t, meta.pairs, "ingest caches JSON pairs (C14)")
+	paths := make([]string, len(meta.pairs))
+	for i, p := range meta.pairs {
+		paths[i] = p.path
+	}
+	assert.Contains(t, paths, "level")
+	assert.Contains(t, paths, "msg")
 }
 
 func TestLogMeta_AppendLogEntry_PlainLine(t *testing.T) {
@@ -173,4 +182,10 @@ func TestLogMeta_EvictionSyncBatch(t *testing.T) {
 	assert.True(t, meta.hasLevel)
 	assert.Equal(t, LogLevelDebug, meta.level)
 	assert.True(t, meta.isJSON)
+}
+
+// classifyLevel is the test-only wrapper matching the old classifier signature.
+func classifyLevel(raw string) (LogLevel, bool) {
+	meta := ingestLogMeta(raw)
+	return meta.level, meta.hasLevel
 }

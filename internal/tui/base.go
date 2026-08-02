@@ -169,10 +169,13 @@ type BaseModel struct {
 	// bar hide, resize, and help capture (plan 023 B3).
 	// Hit-rects live in hits (shared across View value-copies — plan 022 WS0)
 	// and are cleared on close (strix stale-rect discipline / Codex #1).
+	// themeMenuNames caches AvailableThemes for the lifetime of an open Theme
+	// dropdown (plan 023 C14); refreshed on every Theme open path.
 	openMenu        int
 	menuHighlight   int
 	menuWindow      int
 	hoveredMenuCell int
+	themeMenuNames  []string
 	hits            *hitRegistry
 
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
@@ -466,12 +469,8 @@ func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
 	if b.logMeta == nil {
 		b.logMeta = make(map[int64]logMeta)
 	}
-	level, hasLevel := classifyLevel(entry.Line)
-	b.logMeta[entry.DisplaySeq] = logMeta{
-		level:    level,
-		hasLevel: hasLevel,
-		isJSON:   isJSONObject(entry.Line),
-	}
+	// One Unmarshal feeds level + cached JSON pairs (plan 023 C14).
+	b.logMeta[entry.DisplaySeq] = ingestLogMeta(entry.Line)
 
 	b.logEntries = append(b.logEntries, entry)
 	// Keep only last entries - create new slice to release memory from old entries
@@ -2191,8 +2190,9 @@ func shouldPrettyPrintJSON(body *BodyData) bool {
 // filteredEntries returns log entries after applying filters. The s-bar query
 // is evaluated via logsFilter.LastGood (plan 021 WS6); process inclusion is
 // expressed with proc:/-proc: clauses (WS8 retired ModeFilter/filterProcesses).
+// Preallocates like filteredProxyRequests (plan 023 C14).
 func (b *BaseModel) filteredEntries() []domain.LogEntry {
-	var result []domain.LogEntry
+	result := make([]domain.LogEntry, 0, len(b.logEntries))
 	expr := b.logsFilter.LastGood
 	useExpr := !expr.IsEmpty()
 
@@ -2443,20 +2443,19 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 // formatLogContent builds the log-line body (after ts/process/ERR prefix):
 // JSON lines become a path=value summary (C9); level-tinted content composes
 // with / search highlight. Undetected plain lines stay byte-identical to C8.
+// JSON formatting uses ingest-cached pairs — no re-Unmarshal (plan 023 C14).
 func (b *BaseModel) formatLogContent(entry domain.LogEntry) string {
 	meta := b.logMeta[entry.DisplaySeq]
 	line := entry.Line
 
 	if meta.isJSON {
 		// Width budget for no-wrap truncation: viewport minus the chrome
-		// prefix this entry will carry. Wrap-on leaves overflow to Wordwrap.
+		// prefix this entry will carry. Wrap-on (width 0) keeps summary+raw.
 		width := 0
 		if !b.settings.Wrap && b.viewport.Width > 0 {
 			width = b.logContentWidth(entry)
 		}
-		if summary, ok := summarizeJSONLog(line, width); ok {
-			line = summary
-		}
+		line = formatJSONSummary(meta.pairs, strings.TrimSpace(entry.Line), width)
 	}
 
 	levelStyle, tint := logLevelStyle(meta)
@@ -2475,6 +2474,11 @@ func (b *BaseModel) logContentWidth(entry domain.LogEntry) int {
 	// Mirror formatLogEntry's prefix geometry with unstyled stand-ins so
 	// StringWidth matches the visible columns (styled prefix has same width).
 	used := 0
+	// Search marker ("❯ " / "  ") is prepended in updateViewport when a
+	// logs / search is active — 2 columns (plan 023 C14).
+	if b.logSearchQuery != "" {
+		used += 2
+	}
 	if b.settings.Timestamps {
 		used += len("15:04:05") + 1 // ts + space
 	}

@@ -92,6 +92,7 @@ func (b *BaseModel) closeMenu() {
 	b.menuHighlight = 0
 	b.menuWindow = 0
 	b.hoveredMenuCell = -1
+	b.themeMenuNames = nil
 	// Immediate invalidation: a menu can close in Update before the next
 	// render, so frame-top resetFrame alone is not enough (plan 023 A1).
 	h := b.mustHits()
@@ -100,8 +101,15 @@ func (b *BaseModel) closeMenu() {
 }
 
 // openMenuFirst opens menu with its first activatable row highlighted.
+// Theme open refreshes the user-theme directory listing (plan 023 C14);
+// keyboard open, hover-slide into Theme, and close/reopen all pass through here.
 func (b *BaseModel) openMenuFirst(id MenuID) {
 	b.openMenu = int(id)
+	if id == MenuTheme {
+		b.themeMenuNames = AvailableThemes()
+	} else {
+		b.themeMenuNames = nil
+	}
 	b.menuHighlight = b.menuFirstSelectable(id)
 	b.menuWindow = 0
 	b.hoveredMenuCell = -1
@@ -173,7 +181,12 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 		}
 		return items
 	case MenuTheme:
-		names := AvailableThemes()
+		names := b.themeMenuNames
+		if names == nil {
+			// Fallback for callers that build Theme items without opening
+			// (tests); the open path always populates themeMenuNames first.
+			names = AvailableThemes()
+		}
 		current := CurrentThemeName()
 		items := make([]MenuItem, len(names))
 		selected := make([]bool, len(names))

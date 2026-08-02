@@ -115,6 +115,12 @@ func TestPanel_WidthChain(t *testing.T) {
 	w := m.logContentWidth(entry)
 	assert.Equal(t, 78-8-1-10-1, w)
 
+	m.logSearchQuery = "hello"
+	wSearch := m.logContentWidth(entry)
+	assert.Equal(t, 78-2-8-1-10-1, wSearch,
+		"searchMarker (2) subtracted when log search active (C14)")
+	m.logSearchQuery = ""
+
 	m.settings.Wrap = true
 	m.logEntries = []domain.LogEntry{{
 		Process:    "api",

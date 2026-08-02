@@ -160,8 +160,8 @@ func TestFormatLogEntry_JSONSummary(t *testing.T) {
 	// (C9: raw is appended only when the remainder budget allows).
 	m.viewport.Width = 60
 	raw := `{"level":"error","msg":"fail","code":500}`
-	m.logMeta = map[int64]logMeta{1: {level: LogLevelError, hasLevel: true, isJSON: true}}
-	entry := domain.LogEntry{Process: "api", Line: raw, DisplaySeq: 1}
+	m.appendLogEntry(domain.LogEntry{Process: "api", Line: raw})
+	entry := m.logEntries[0]
 	got := m.formatLogEntry(entry)
 	plain := stripANSI(got)
 	assert.Contains(t, plain, `code=500`)
@@ -171,12 +171,41 @@ func TestFormatLogEntry_JSONSummary(t *testing.T) {
 	assert.Contains(t, got, s.LogError.Render(`code=500  level="error"  msg="fail"`))
 }
 
+func TestFormatLogEntry_JSONSummary_WrapOnOffConsistent(t *testing.T) {
+	pinANSIProfile(t)
+	withTestTheme(t, "tokyo-night")
+
+	raw := `{"a":1,"b":"hi"}`
+	// Wide viewport so wrap-off includes compact raw.
+	mk := func(wrap bool) string {
+		m := newTestModel()
+		m.settings.Timestamps = false
+		m.settings.Wrap = wrap
+		m.viewport.Width = 120
+		m.appendLogEntry(domain.LogEntry{Process: "api", Line: raw})
+		return stripANSI(m.formatLogContent(m.logEntries[0]))
+	}
+	off := mk(false)
+	on := mk(true)
+	assert.Equal(t, off, on, "wrap-on keeps summary+raw consistent with wrap-off")
+	assert.Contains(t, off, `a=1`)
+	assert.Contains(t, off, `{"a":1,"b":"hi"}`)
+}
+
 func TestSummarizeJSONLog_AppendsRawWhenFits(t *testing.T) {
 	raw := `{"a":1}`
 	sum, ok := summarizeJSONLog(raw, 80)
 	require.True(t, ok)
 	assert.Contains(t, sum, `a=1`)
 	assert.Contains(t, sum, `{"a":1}`, "compact raw included when width allows")
+}
+
+func TestSummarizeJSONLog_WidthZeroKeepsRaw(t *testing.T) {
+	raw := `{"a":1}`
+	sum, ok := summarizeJSONLog(raw, 0)
+	require.True(t, ok)
+	assert.Contains(t, sum, `a=1`)
+	assert.Contains(t, sum, `{"a":1}`, "width<=0 keeps compact raw (wrap-on path)")
 }
 
 func TestFormatLogEntry_NonJSONUntouched(t *testing.T) {
@@ -317,4 +346,15 @@ func TestHighlightJSONText_RoundTripPlain(t *testing.T) {
 	in := "{\n  \"a\": 1\n}"
 	out := highlightJSONText(in)
 	assert.Equal(t, `{"a":1}`, strings.Join(strings.Fields(stripANSI(out)), ""))
+}
+
+// summarizeJSONLog is the test-only convenience wrapper for the ingest+render
+// pair: one ingest parse, then format from the cached pairs (production render
+// does exactly this via logMeta.pairs).
+func summarizeJSONLog(raw string, width int) (string, bool) {
+	meta := ingestLogMeta(raw)
+	if !meta.isJSON {
+		return "", false
+	}
+	return formatJSONSummary(meta.pairs, strings.TrimSpace(raw), width), true
 }

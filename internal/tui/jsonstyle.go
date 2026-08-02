@@ -20,24 +20,10 @@ const jsonSummaryMaxPairs = 8
 // jsonSummaryMaxDepth is the maximum path segment count (a.b = depth 2).
 const jsonSummaryMaxDepth = 2
 
-// summarizeJSONLog builds a one-line `path=value` summary of a JSON object log
-// line (C9). Paths are depth-capped, keys sorted, at most jsonSummaryMaxPairs
-// pairs, joined with two spaces. When width > 0 the result is ANSI-truncated
-// to that many columns; compact raw JSON is appended only when it fits the
-// remaining budget. Returns ("", false) when raw is not a JSON object.
-func summarizeJSONLog(raw string, width int) (string, bool) {
-	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, "{") {
-		return "", false
-	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
-		return "", false
-	}
-
-	pairs := flattenJSONPairs(obj, "", 0)
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].path < pairs[j].path })
-
+// formatJSONSummary renders cached path=value pairs (plus optional compact raw)
+// without unmarshalling. width <= 0 keeps summary+raw (wrap-on / unlimited);
+// width > 0 truncates and only appends compact raw when it fits.
+func formatJSONSummary(pairs []jsonPair, rawTrimmed string, width int) string {
 	var b strings.Builder
 	n := len(pairs)
 	show := n
@@ -54,23 +40,33 @@ func summarizeJSONLog(raw string, width int) (string, bool) {
 		fmt.Fprintf(&b, "  …(+%d more)", n-jsonSummaryMaxPairs)
 	}
 	summary := b.String()
+	compact := strings.Join(strings.Fields(rawTrimmed), " ")
 
 	if width <= 0 {
-		return summary, true
+		// Wrap-on (and unlimited): keep summary+raw consistent with wrap-off
+		// when the raw blob would fit (plan 023 C14).
+		if summary == "" {
+			return compact
+		}
+		if compact == "" {
+			return summary
+		}
+		return summary + " " + compact
 	}
 
 	// Prefer summary alone when the raw blob won't fit after it.
 	sumW := ansi.StringWidth(summary)
 	if sumW >= width {
-		return ansi.Cut(summary, 0, width), true
+		return ansi.Cut(summary, 0, width)
 	}
-	// Compact raw (single-line trimmed) only when the remainder has room.
 	remain := width - sumW - 1 // space separator
-	compact := strings.Join(strings.Fields(trimmed), " ")
 	if remain > 0 && ansi.StringWidth(compact) <= remain {
-		return summary + " " + compact, true
+		if summary == "" {
+			return ansi.Cut(compact, 0, width)
+		}
+		return summary + " " + compact
 	}
-	return summary, true
+	return summary
 }
 
 type jsonPair struct {
