@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -155,6 +156,24 @@ func TestPanel_MouseIgnoresBorderRows(t *testing.T) {
 	idx := m.entryIndexContainingRow(entries, m.viewport.YOffset+local)
 	require.Equal(t, entries[idx].DisplaySeq, m.logCursorSeq)
 	assert.False(t, m.followMode)
+}
+
+func TestRenderBorderTitleMid_Spacing(t *testing.T) {
+	br := lipgloss.RoundedBorder()
+	mid := renderBorderTitleMid("Logs", 12, styles.Panel, styles.PanelTitle)
+	plain := ansi.Strip(mid)
+	assert.Equal(t, 12, ansi.StringWidth(plain))
+	assert.True(t, strings.HasPrefix(plain, br.Top+" Logs "+br.Top),
+		"want `─ Logs ─` prefix, got %q", plain)
+
+	helpMid := renderHelpBorderTitleMid("Help — Logs", 20)
+	helpPlain := ansi.Strip(helpMid)
+	assert.True(t, strings.HasPrefix(helpPlain, br.Top+" Help — Logs "+br.Top),
+		"help border title: %q", helpPlain)
+
+	// Too narrow: no label splice.
+	narrow := ansi.Strip(renderBorderTitleMid("Logs", 4, styles.Panel, styles.PanelTitle))
+	assert.Equal(t, strings.Repeat(br.Top, 4), narrow)
 }
 
 func TestPanel_OverlayStillComposites(t *testing.T) {

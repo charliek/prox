@@ -33,14 +33,14 @@ type styleSet struct {
 	FooterError                        lipgloss.Style // ✗ error flash: Err-bold on FooterBG
 	// Menu bar + dropdown chrome (plan 023 C18). Header-band styles use HeaderBG;
 	// dropdown styles use theme BG — neither varies with the selection band.
-	MenuBarFill, MenuBrand, MenuHint lipgloss.Style
-	MenuCell, MenuCellHover          lipgloss.Style
-	Dropdown, DropdownDim            lipgloss.Style
-	DropdownItem, DropdownItemMuted  lipgloss.Style
-	DropdownItemHint                 lipgloss.Style
-	DropdownItemSelected             lipgloss.Style
-	DropdownItemSelectedHint         lipgloss.Style
-	DropdownGap, DropdownSelectedGap lipgloss.Style
+	MenuBarFill, MenuBrand, MenuHint      lipgloss.Style
+	MenuCell, MenuCellHover, MenuCellOpen lipgloss.Style
+	Dropdown, DropdownDim                 lipgloss.Style
+	DropdownItem, DropdownItemMuted       lipgloss.Style
+	DropdownItemHint                      lipgloss.Style
+	DropdownItemSelected                  lipgloss.Style
+	DropdownItemSelectedHint              lipgloss.Style
+	DropdownGap, DropdownSelectedGap      lipgloss.Style
 	// Panel / PanelTitle paint the viewport panel border chars and the title
 	// spliced into the top border (plan 023 E2). Manual composition — lipgloss
 	// has no native border-title. FullFill gets t.BG; legacy is FG-only so
@@ -259,6 +259,9 @@ func buildStyleSetFill(t *Theme, surface lipgloss.Color, selectionBand bool) sty
 			Foreground(t.Title).
 			Background(t.HeaderBG),
 		MenuCellHover: lipgloss.NewStyle().
+			Foreground(t.Title).
+			Background(t.SelectionBG),
+		MenuCellOpen: lipgloss.NewStyle().
 			Foreground(t.SelectionFG).
 			Background(t.SelectionBG),
 

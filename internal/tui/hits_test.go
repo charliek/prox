@@ -294,7 +294,7 @@ func TestMenuItem_HintsPopulated(t *testing.T) {
 		assert.Equal(t, want[it.Label], it.Hint, "item %q", it.Label)
 	}
 	for _, it := range m.menuItems(MenuTheme) {
-		assert.Equal(t, "t", it.Hint, "theme %q", it.Label)
+		assert.Empty(t, it.Hint, "theme %q: cycle hint lives in footer/help only", it.Label)
 	}
 	for _, it := range m.menuItems(MenuFilter) {
 		if it.Separator {

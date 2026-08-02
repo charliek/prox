@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,16 +65,10 @@ func TestMenuBar_CellStylesClosedOpenHover(t *testing.T) {
 	withTestTheme(t, "tokyo-night")
 	pinTrueColorProfile(t)
 
-	th := CurrentTheme()
-	closedStyle := lipgloss.NewStyle().
-		Foreground(th.Title).
-		Background(th.HeaderBG)
-	selStyle := lipgloss.NewStyle().
-		Foreground(th.SelectionFG).
-		Background(th.SelectionBG)
-	closedView := closedStyle.Render(menuCellText(MenuView))
-	closedFilter := closedStyle.Render(menuCellText(MenuFilter))
-	selView := selStyle.Render(menuCellText(MenuView))
+	closedView := styles.MenuCell.Render(menuCellText(MenuView))
+	closedFilter := styles.MenuCell.Render(menuCellText(MenuFilter))
+	hoverView := styles.MenuCellHover.Render(menuCellText(MenuView))
+	openView := styles.MenuCellOpen.Render(menuCellText(MenuView))
 
 	m := newTestModel()
 	m.projectName = "demo"
@@ -88,14 +81,15 @@ func TestMenuBar_CellStylesClosedOpenHover(t *testing.T) {
 
 	m.hoveredMenuCell = int(MenuView)
 	bar = m.renderMenuBar()
-	assert.Contains(t, bar, selView)
+	assert.Contains(t, bar, hoverView)
 	assert.Contains(t, bar, closedFilter)
-	require.NotEqual(t, closedView, selView, "closed vs selection styles must differ")
+	require.NotEqual(t, closedView, hoverView, "closed vs hover styles must differ")
+	require.NotEqual(t, hoverView, openView, "hover vs open styles must differ")
 
 	m.hoveredMenuCell = -1
 	m.openMenuFirst(MenuView)
 	bar = m.renderMenuBar()
-	assert.Contains(t, bar, selView)
+	assert.Contains(t, bar, openView)
 }
 
 func TestMenuBar_HitRectsFollowLeftCells(t *testing.T) {

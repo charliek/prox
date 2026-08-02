@@ -3,6 +3,10 @@ package tui
 // menuReservedBottom is the footer band — dropdowns never cover it (plan 023 B2).
 const menuReservedBottom = 1
 
+// menuPanelBottomReserve keeps the dropdown bottom border at least one row
+// above the viewport panel's bottom border row (plan 024 F4).
+const menuPanelBottomReserve = 1
+
 func (b *BaseModel) menuBoxTop() int {
 	if b.settings.MenuBar {
 		return 1
@@ -11,9 +15,10 @@ func (b *BaseModel) menuBoxTop() int {
 }
 
 // menuAvail is the inner (content) row budget for the open dropdown — frame
-// height minus bar, footer, and the top+bottom border (plan 023 B4).
+// height minus bar, footer, panel-bottom inset, and the top+bottom border
+// (plan 023 B4 / plan 024 F4).
 func (b *BaseModel) menuAvail() int {
-	return b.height - b.menuBoxTop() - menuReservedBottom - menuBorderSize
+	return b.height - b.menuBoxTop() - menuReservedBottom - menuPanelBottomReserve - menuBorderSize
 }
 
 // menuWindowMaxOffset is the largest menuWindow for n item rows and avail.

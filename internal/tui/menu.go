@@ -164,7 +164,6 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 			selected[i] = name == current
 			items[i] = MenuItem{
 				Label:    name,
-				Hint:     "t", // theme-cycle key (handleNavigationKey)
 				Selected: &selected[i],
 				Cmd:      menuCmdSetTheme(name),
 			}

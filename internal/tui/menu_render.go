@@ -49,7 +49,7 @@ func (b *BaseModel) renderMenuBar() string {
 		w := ansi.StringWidth(text)
 		style := styles.MenuCell
 		if b.menuOpen() && MenuID(b.openMenu) == id {
-			style = styles.MenuCellHover
+			style = styles.MenuCellOpen
 		} else if !b.menuOpen() && b.hoveredMenuCell == int(id) {
 			style = styles.MenuCellHover
 		}

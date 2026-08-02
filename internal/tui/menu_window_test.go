@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -36,7 +39,7 @@ func openThemeAtHeight(t *testing.T, height int, userThemes int) ClientModel {
 }
 
 func TestMenuWindow_ClampWithIndicators(t *testing.T) {
-	// Height=12 → avail = 12 - 1 - 1 - 2(border) = 8. 6 presets + 6 user = 12 > 8 → clamp.
+	// Height=12 → avail = 12 - 1 - 1 - 1(panel) - 2(border) = 7. 6 presets + 6 user = 12 > 7 → clamp.
 	m := openThemeAtHeight(t, 12, 6)
 	items := m.menuItems(MenuTheme)
 	require.GreaterOrEqual(t, len(items), 12)
@@ -45,7 +48,7 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	avail := m.menuAvail()
-	require.Equal(t, 8, avail)
+	require.Equal(t, 7, avail)
 	assert.Equal(t, avail, len(hits.dropdown.Rows), "content rows == avail when clamped with bottom indicator")
 	assert.Equal(t, avail+menuBorderSize, hits.dropdown.Bounds.H, "Bounds include top+bottom border")
 	assert.Equal(t, 0, m.menuWindow)
@@ -88,14 +91,14 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 }
 
 func TestMenuWindow_NoIndicatorsWhenAvailSmall(t *testing.T) {
-	// Height=7 → avail = 7 - 1 - 1 - 2 = 3. Indicators only when avail >= 4.
+	// Height=7 → avail = 7 - 1 - 1 - 1 - 2 = 2. Indicators only when avail >= 4.
 	m := openThemeAtHeight(t, 7, 6)
-	require.Equal(t, 3, m.menuAvail())
+	require.Equal(t, 2, m.menuAvail())
 	_ = m.View()
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
-	assert.Equal(t, 3, len(hits.dropdown.Rows))
-	assert.Equal(t, 3+menuBorderSize, hits.dropdown.Bounds.H)
+	assert.Equal(t, 2, len(hits.dropdown.Rows))
+	assert.Equal(t, 2+menuBorderSize, hits.dropdown.Bounds.H)
 	for _, r := range hits.dropdown.Rows {
 		assert.NotEqual(t, -1, r.Index, "no indicator rows when avail < 4")
 	}
@@ -250,6 +253,21 @@ func assertDropdownRectGeometry(t *testing.T, m ClientModel) {
 	}
 	// Never cover the footer: outer bottom edge is strictly above footer row.
 	assert.LessOrEqual(t, bounds.Y+bounds.H, frameH-menuReservedBottom)
+	// Dropdown bottom border sits above the panel bottom border row.
+	if m.canDrawPanel() {
+		content := m.contentRect()
+		panelBottom := content.Y + content.H - 1
+		dropdownBottom := bounds.Y + bounds.H - 1
+		assert.Less(t, dropdownBottom, panelBottom,
+			"dropdown bottom row %d must be above panel bottom row %d", dropdownBottom, panelBottom)
+	}
+	// No frame row should carry two dropdown/panel bottom-left corners.
+	br := lipgloss.RoundedBorder()
+	for i, line := range strings.Split(m.View(), "\n") {
+		plain := ansi.Strip(line)
+		assert.LessOrEqual(t, strings.Count(plain, br.BottomLeft), 1,
+			"row %d must not contain two bottom-border glyph runs: %q", i, plain)
+	}
 }
 
 // TestMenuWindow_RectHonesty generalizes rect-honesty over View/Filter/Theme
@@ -261,7 +279,7 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 		{80, 24},
 		{120, 40},
 		{60, 16},
-		{80, 12}, // Theme overflows here (12 items > avail 8): exercises indicators
+		{80, 12}, // Theme overflows here (12 items > avail 7): exercises indicators
 	}
 	menus := []struct {
 		name MenuID
