@@ -110,13 +110,18 @@ func (m *ClientModel) handleMouseWheel(delta int) (bool, tea.Cmd) {
 }
 
 // viewportLocalRow maps a frame Y coordinate to a 0-based row within the
-// viewport window. ok is false when Y is outside the viewport chrome.
+// viewport window. ok is false when Y is outside the viewport content (panel
+// border rows and chrome are excluded).
 func (b *BaseModel) viewportLocalRow(y int) (local int, ok bool) {
-	r := b.contentRect()
-	if y < r.Y || y >= r.Y+r.H {
+	_, oy := b.viewportOrigin()
+	h := b.viewport.Height
+	if h < 1 {
+		h = 1
+	}
+	if y < oy || y >= oy+h {
 		return 0, false
 	}
-	return y - r.Y, true
+	return y - oy, true
 }
 
 // processPanelRowY is the frame Y of the process-panel content row.

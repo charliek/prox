@@ -315,7 +315,8 @@ func (b *BaseModel) chromeHeight() int {
 }
 
 // defaultChromeHeight is chrome under DefaultSettings (menu+panel on).
-// Test helpers that size a WindowSizeMsg for a target viewport height use this.
+// Test helpers that size a WindowSizeMsg for a target viewport height use
+// defaultChromeHeight()+defaultPanelBorder() so the panel inset is included.
 func defaultChromeHeight() int {
 	s := DefaultSettings()
 	h := 1 // merged footer
@@ -328,8 +329,15 @@ func defaultChromeHeight() int {
 	return h
 }
 
-// contentRect is the viewport content region between chromeAbove and
-// chromeBelow (plan 023 B2). C7/C11 extend this — no scattered +1s.
+// defaultPanelBorder is the viewport panel cost (2) under sizes where the
+// panel fits. Paired with defaultChromeHeight for WindowSizeMsg sizing:
+// Height = viewportHeight + defaultChromeHeight() + defaultPanelBorder().
+func defaultPanelBorder() int { return 2 }
+
+// contentRect is the outer content band between chromeAbove and chromeBelow
+// (plan 023 B2). The viewport panel (C7) draws inside this rect when it fits
+// — viewport geometry is inset by panelBorder()/2 on each edge. C11 further
+// extends chrome via viewMode-dependent rows.
 func (b *BaseModel) contentRect() HitRect {
 	y := b.chromeAbove()
 	h := b.height - b.chromeHeight()
@@ -343,10 +351,12 @@ func (b *BaseModel) contentRect() HitRect {
 	return HitRect{X: 0, Y: y, W: w, H: h}
 }
 
-// viewportOrigin is the top-left of contentRect (frame coordinates).
+// viewportOrigin is the top-left of the viewport content (frame coordinates),
+// inset by the panel border when drawn.
 func (b *BaseModel) viewportOrigin() (x, y int) {
 	r := b.contentRect()
-	return r.X, r.Y
+	inset := b.panelBorder() / 2
+	return r.X + inset, r.Y + inset
 }
 
 // footerRowY is the frame Y of the merged footer band.
@@ -362,24 +372,32 @@ func (b *BaseModel) isFooterY(y int) bool {
 // relayout derives viewport geometry from enabled chrome rows. Called on
 // WindowSizeMsg AND every visibility toggle (a toggle emits no resize, so
 // without this the viewport keeps stale geometry — Codex #8). C4 flips
-// ProcessPanel and calls relayout the same way.
+// ProcessPanel and calls relayout the same way. Panel border (C7) insets the
+// viewport by panelBorder() rows/cols when contentRect is large enough.
 func (b *BaseModel) relayout() {
 	if b.width <= 0 || b.height <= 0 {
 		return
 	}
-	vpH := b.height - b.chromeHeight()
+	r := b.contentRect()
+	border := b.panelBorder()
+	vpH := r.H - border
 	if vpH < 1 {
 		vpH = 1
 	}
-	headerH := b.chromeAbove()
+	vpW := r.W - border
+	if vpW < 1 {
+		vpW = 1
+	}
+	inset := border / 2
+	yPos := r.Y + inset
 	if !b.ready {
-		b.viewport = viewport.New(b.width, vpH)
-		b.viewport.YPosition = headerH
+		b.viewport = viewport.New(vpW, vpH)
+		b.viewport.YPosition = yPos
 		b.ready = true
 	} else {
-		b.viewport.Width = b.width
+		b.viewport.Width = vpW
 		b.viewport.Height = vpH
-		b.viewport.YPosition = headerH
+		b.viewport.YPosition = yPos
 	}
 	b.viewport.MouseWheelEnabled = false // TUI owns wheel routing (Codex #5)
 }
@@ -2275,6 +2293,8 @@ func (b *BaseModel) formatLogContent(entry domain.LogEntry) string {
 
 // logContentWidth is the columns available for the log body once the
 // timestamp / process / ERR prefix are accounted for (ANSI-aware).
+// Width chain (plan 023 WS-C): frameW − panelBorder − searchMarker(C14) −
+// prefixes. panelBorder is already subtracted via viewport.Width (relayout).
 func (b *BaseModel) logContentWidth(entry domain.LogEntry) int {
 	w := b.viewport.Width
 	if w <= 0 {
@@ -2685,6 +2705,11 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		}
 	}
 
+	drawPanel := b.canDrawPanel()
+	if drawPanel {
+		lines = append(lines, b.renderPanelTop(b.width))
+	}
+
 	for _, line := range strings.Split(b.viewport.View(), "\n") {
 		// Under FullFill, viewport rows pad to Width with raw spaces; trim and
 		// re-pad with Base-styled fill so no default-BG holes remain. Legacy
@@ -2692,7 +2717,16 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		if CurrentTheme().FullFill {
 			line = trimTrailingSpacesANSI(line)
 		}
-		lines = append(lines, padFrameRow(line, b.width))
+		line = padFrameRow(line, b.viewport.Width)
+		if drawPanel {
+			lines = append(lines, wrapPanelContentRow(line))
+		} else {
+			lines = append(lines, padFrameRow(line, b.width))
+		}
+	}
+
+	if drawPanel {
+		lines = append(lines, b.renderPanelBottom(b.width))
 	}
 
 	lines = append(lines, padFooterRow(singleFrameLine(b.statusBar(msg)), b.width))

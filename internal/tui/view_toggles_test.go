@@ -415,7 +415,7 @@ func TestMenu_ViewRowOrder(t *testing.T) {
 // tests at ~70 cols).
 func newLogsModelNarrow(width, viewportHeight int, lines []string) ClientModel {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: width, Height: viewportHeight + defaultChromeHeight()})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: width, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder()})
 	base := time.Unix(0, 0)
 	for i, line := range lines {
 		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{

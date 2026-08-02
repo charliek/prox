@@ -198,7 +198,8 @@ func TestHover_DragIgnored(t *testing.T) {
 
 	m := newRequestsModel(4, 6)
 	row := 2
-	y := m.chromeAbove() + row
+	_, oy := m.viewportOrigin()
+	y := oy + row
 	m = clientUpdate(m, clickAt(10, y))
 	require.Equal(t, row, m.lastRequestClickIdx, "arm tracker via request click")
 
@@ -215,7 +216,8 @@ func TestHover_DragIgnored(t *testing.T) {
 
 func TestHover_TrackerHygieneWheel(t *testing.T) {
 	m := newRequestsModel(6, 6)
-	y := m.chromeAbove()
+	_, oy := m.viewportOrigin()
+	y := oy
 	m = clientUpdate(m, clickAt(10, y))
 	require.NotEqual(t, -1, m.lastRequestClickIdx)
 
@@ -225,7 +227,8 @@ func TestHover_TrackerHygieneWheel(t *testing.T) {
 
 func TestHover_TrackerHygieneMenuPress(t *testing.T) {
 	m := newRequestsModel(6, 6)
-	y := m.chromeAbove()
+	_, oy := m.viewportOrigin()
+	y := oy
 	m = clientUpdate(m, clickAt(10, y))
 	require.NotEqual(t, -1, m.lastRequestClickIdx)
 
@@ -239,7 +242,8 @@ func TestHover_TrackerHygieneMenuPress(t *testing.T) {
 
 func TestHover_TrackerHygieneHelpEnterExit(t *testing.T) {
 	m := newRequestsModel(6, 6)
-	y := m.chromeAbove()
+	_, oy := m.viewportOrigin()
+	y := oy
 	m = clientUpdate(m, clickAt(10, y))
 	require.NotEqual(t, -1, m.lastRequestClickIdx)
 
@@ -259,7 +263,8 @@ func TestHover_FreeMotionPreservesDoubleClick(t *testing.T) {
 
 	m := newRequestsModel(4, 6)
 	row := 2
-	y := m.chromeAbove() + row
+	_, oy := m.viewportOrigin()
+	y := oy + row
 
 	m = clientUpdate(m, clickAt(10, y))
 	require.Equal(t, row, m.lastRequestClickIdx)

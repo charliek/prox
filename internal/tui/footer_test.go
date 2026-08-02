@@ -30,9 +30,12 @@ func TestFooter_ContentRect(t *testing.T) {
 	assert.Equal(t, m.chromeAbove(), r.Y)
 	assert.Equal(t, 80, r.W)
 	assert.Equal(t, 24-m.chromeHeight(), r.H)
+	require.True(t, m.canDrawPanel())
 	ox, oy := m.viewportOrigin()
-	assert.Equal(t, r.X, ox)
-	assert.Equal(t, r.Y, oy)
+	assert.Equal(t, r.X+1, ox, "panel insets viewport origin by 1 col")
+	assert.Equal(t, r.Y+1, oy, "panel insets viewport origin by 1 row")
+	assert.Equal(t, r.W-2, m.viewport.Width)
+	assert.Equal(t, r.H-2, m.viewport.Height)
 	assert.Equal(t, 23, m.footerRowY()) // height 24, chromeBelow 1
 }
 

@@ -240,17 +240,19 @@ func TestFrameFill_LightTheme_ChromePaddingOverlays(t *testing.T) {
 	assertFrameContract(t, m)
 
 	prefixW := logPrefixWidth()
-	vpTop := m.chromeAbove()
-	vpBot := m.height - m.chromeBelow() - 1
+	ox, oy := m.viewportOrigin()
+	vpTop := oy
+	vpBot := oy + m.viewport.Height - 1
 	exemptLog := func(row, col int) bool {
 		if row < vpTop || row > vpBot {
 			return false
 		}
-		// First viewport row holds our single log entry's content cells.
-		if row == vpTop && col >= prefixW {
+		// First viewport content row holds our single log entry's content cells
+		// (col 0 is the panel's left border when drawn).
+		if row == vpTop && col >= ox+prefixW {
 			// Trailing padFrameRow spaces are TUI-generated — not exempt.
 			contentW := ansi.StringWidth(nested)
-			return col < prefixW+contentW
+			return col < ox+prefixW+contentW
 		}
 		return false
 	}
@@ -329,6 +331,8 @@ func TestLegacy_FullFillExempt(t *testing.T) {
 	assertNoBG("HTTPGet", ss.HTTPGet)
 	assertNoBG("LogError", ss.LogError)
 	assertNoBG("Bold", ss.Bold)
+	assertNoBG("Panel", ss.Panel)
+	assertNoBG("PanelTitle", ss.PanelTitle)
 	require.NotEmpty(t, ss.ProcessColors)
 	assertNoBG("ProcessColors[0]", ss.ProcessColors[0])
 

@@ -133,7 +133,15 @@ func TestHitLifecycle_ProcessPanelOff_StaleChipClickParksLogCursor(t *testing.T)
 	_ = m.View()
 	require.Empty(t, m.mustHits().chips, "hidden panel must not re-record chips")
 
-	m = clientUpdate(m, clickAt(clickX, clickY))
+	// After ProcessPanel hide, chromeAbove shrinks: the old chip Y is now the
+	// viewport panel's top border. Click the first content row beneath it so
+	// the T1 intent (stale coords must not solo; content click parks cursor)
+	// still holds under the C7 panel inset.
+	contentY := clickY
+	if m.canDrawPanel() {
+		contentY = clickY + 1
+	}
+	m = clientUpdate(m, clickAt(clickX, contentY))
 	assert.Empty(t, m.soloProcess, "stale chip location must not solo a process")
 	assert.False(t, m.followMode, "click parks the log cursor and disengages follow")
 	entries := m.filteredEntries()

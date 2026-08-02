@@ -275,7 +275,7 @@ func newClientRequestsModel(stub *stubTUIClient, n, viewportHeight int) ClientMo
 	m := NewClientModel(stub, attachClientOptions())
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = makeTestRequests(n)
-	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight()})
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder()})
 	return nm.(ClientModel)
 }
 

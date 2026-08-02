@@ -24,8 +24,13 @@ type styleSet struct {
 	Err, Dim                    lipgloss.Style
 	FooterKey, FooterLabel      lipgloss.Style // two-tone footer hints (plan 023 B2)
 	FooterError                 lipgloss.Style // ✗ error flash: Err-bold on FooterBG
-	HTTPSuccess, HTTPRedirect   lipgloss.Style
-	HTTPWarning, HTTPError      lipgloss.Style
+	// Panel / PanelTitle paint the viewport panel border chars and the title
+	// spliced into the top border (plan 023 E2). Manual composition — lipgloss
+	// has no native border-title. FullFill gets t.BG; legacy is FG-only so
+	// C5 byte-identity pins stay green (panel is new chrome under legacy).
+	Panel, PanelTitle         lipgloss.Style
+	HTTPSuccess, HTTPRedirect lipgloss.Style
+	HTTPWarning, HTTPError    lipgloss.Style
 	// Method / status class styles (plan 021 C9). Mapped from existing Theme
 	// HTTP/OK/Warn/Err/FG slots — no new Theme TOML keys.
 	HTTPGet, HTTPPost, HTTPPut, HTTPDelete, HTTPPatch lipgloss.Style
@@ -156,6 +161,11 @@ func buildStyleSet(t *Theme) styleSet {
 			Background(t.FooterBG).
 			Padding(0, 1),
 		Help: help,
+
+		// Panel border chars (manual rounded frame around the viewport).
+		// Not a lipgloss.Border style — renderers paint ╭─╮│╰╯ directly.
+		Panel:      fillBG(lipgloss.NewStyle().Foreground(t.Border), t),
+		PanelTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
 
 		Err: lipgloss.NewStyle().
 			Foreground(t.ErrBadgeFG).

@@ -205,7 +205,8 @@ func TestMouse_ClickLogLineParksCursorAndDisengagesFollow(t *testing.T) {
 	require.True(t, m.followMode)
 
 	local := 1
-	contentY := m.chromeAbove() + local
+	_, oy := m.viewportOrigin()
+	contentY := oy + local
 	m = clientUpdate(m, clickAt(5, contentY))
 
 	entries := m.filteredEntries()
@@ -220,7 +221,8 @@ func TestMouse_ClickRequestRowMovesCursor(t *testing.T) {
 	require.Equal(t, 5, m.cursorIdx)
 
 	local := 0
-	y := m.chromeAbove() + local
+	_, oy := m.viewportOrigin()
+	y := oy + local
 	m = clientUpdate(m, clickAt(10, y))
 	assert.Equal(t, m.viewport.YOffset, m.cursorIdx)
 }
@@ -232,7 +234,8 @@ func TestMouse_DoubleClickOpensDetail(t *testing.T) {
 
 	m := newRequestsModel(4, 6)
 	row := 2
-	y := m.chromeAbove() + row
+	_, oy := m.viewportOrigin()
+	y := oy + row
 
 	m = clientUpdate(m, clickAt(10, y))
 	require.Equal(t, ViewModeRequests, m.viewMode)
@@ -252,7 +255,8 @@ func TestMouse_DoubleClickSlowDoesNotOpenDetail(t *testing.T) {
 
 	m := newRequestsModel(4, 6)
 	row := 1
-	y := m.chromeAbove() + row
+	_, oy := m.viewportOrigin()
+	y := oy + row
 
 	m = clientUpdate(m, clickAt(10, y))
 	nowFunc = func() time.Time { return t0.Add(600 * time.Millisecond) }
@@ -266,8 +270,9 @@ func TestMouse_DoubleClickDifferentRowDoesNotOpenDetail(t *testing.T) {
 	defer func() { nowFunc = time.Now }()
 
 	m := newRequestsModel(4, 6)
-	y0 := m.chromeAbove() + 0
-	y2 := m.chromeAbove() + 2
+	_, oy := m.viewportOrigin()
+	y0 := oy + 0
+	y2 := oy + 2
 
 	m = clientUpdate(m, clickAt(10, y0))
 	nowFunc = func() time.Time { return t0.Add(100 * time.Millisecond) }
@@ -311,7 +316,8 @@ func TestMouse_IgnoredInTextInputModes(t *testing.T) {
 	assert.Equal(t, before, m.viewport.YOffset)
 	assert.Equal(t, ModeStringFilter, m.mode)
 
-	contentY := m.chromeAbove() + 1
+	_, oy := m.viewportOrigin()
+	contentY := oy + 1
 	m = clientUpdate(m, clickAt(5, contentY))
 	assert.Equal(t, ModeStringFilter, m.mode)
 	assert.Equal(t, before, m.viewport.YOffset)
@@ -393,7 +399,8 @@ func TestHelpMouse_OutsidePressClosesAndSwallows(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
 	// Arm a double-click tracker, then open help (clears it), then re-arm
 	// is impossible while help is open — outside press must clear + swallow.
-	y := m.chromeAbove()
+	_, oy := m.viewportOrigin()
+	y := oy
 	m = clientUpdate(m, clickAt(10, y))
 	require.NotEqual(t, -1, m.lastRequestClickIdx)
 
