@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,8 +146,8 @@ func TestFormatProxyRequest_EmptyAndShortID(t *testing.T) {
 		URL: "/e", StatusCode: 200, Duration: time.Millisecond,
 	}
 	got := stripANSI(m.formatProxyRequest(empty))
-	// Eight spaces between duration and URL (empty ID column).
-	assert.Contains(t, got, "1ms  "+"        "+"  /e")
+	// Eight-column duration, eight-space ID column, then URL.
+	assert.Contains(t, got, "     1ms"+"  "+"        "+"  /e")
 
 	short := empty
 	short.ID = "ab"
@@ -320,6 +321,75 @@ func TestMenu_ToggleColumn_PersistsAndRelayouts(t *testing.T) {
 
 	got := stripANSI(m.formatProxyRequest(m.proxyRequests[0]))
 	assert.NotContains(t, got, "GET")
+}
+
+// allRequestsColumnCombos enumerates every visibility mask the Columns menu allows.
+func allRequestsColumnCombos() []RequestsColumns {
+	combos := make([]RequestsColumns, 0, 64)
+	for mask := 0; mask < 64; mask++ {
+		combos = append(combos, RequestsColumns{
+			Time:     mask&1 != 0,
+			Host:     mask&2 != 0,
+			Method:   mask&4 != 0,
+			Status:   mask&8 != 0,
+			Duration: mask&16 != 0,
+			ID:       mask&32 != 0,
+		})
+	}
+	return combos
+}
+
+// requestsColumnStartOffsets returns display-column start offsets for each
+// visible column in requestsColumnSpec order, skipping the 2-col row prefix
+// (header indent or data cursor marker).
+func requestsColumnStartOffsets(rendered string, cols RequestsColumns) []int {
+	const rowPrefixW = 2
+	pos := rowPrefixW
+	i := skipDisplayWidth(rendered, rowPrefixW)
+	var starts []int
+	first := true
+	for _, def := range requestsColumnSpec {
+		if !cols.columnVisible(def.key) {
+			continue
+		}
+		if !first {
+			i += skipDisplayWidth(rendered[i:], def.sepBefore)
+			pos += def.sepBefore
+		}
+		starts = append(starts, pos)
+		if def.width > 0 {
+			i += skipDisplayWidth(rendered[i:], def.width)
+			pos += def.width
+		}
+		first = false
+	}
+	return starts
+}
+
+func TestRequestsColumnHeaderDataAlignment(t *testing.T) {
+	m := newTestModel()
+	synth := proxy.RequestRecord{
+		ID:         "abcd1234",
+		Timestamp:  time.Date(2026, 1, 1, 12, 34, 56, 0, time.UTC),
+		Subdomain:  "api.example",
+		Method:     "GET",
+		URL:        "/path",
+		StatusCode: 200,
+		Duration:   50 * time.Millisecond,
+	}
+	for i, cols := range allRequestsColumnCombos() {
+		t.Run(fmt.Sprintf("mask_%02d", i), func(t *testing.T) {
+			m.settings.RequestsColumns = cols
+			hdr := m.formatRequestsHeaderRow()
+			row := styles.Base.Render("  ") + m.formatProxyRequest(synth)
+			assert.Equal(t, requestsColumnStartOffsets(hdr, cols), requestsColumnStartOffsets(row, cols))
+			if cols.Status {
+				plain := stripANSI(hdr)
+				assert.Contains(t, plain, "Status")
+				assert.NotContains(t, plain, "Sta ")
+			}
+		})
+	}
 }
 
 func TestFrameContract_RequestsColumnsOff(t *testing.T) {

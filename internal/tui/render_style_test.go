@@ -262,7 +262,7 @@ func TestFormatProxyRequest_MethodAndStatusColors(t *testing.T) {
 		}
 		got := m.formatProxyRequest(req)
 		assert.Contains(t, got, c.msty.Render(fmt.Sprintf("%-7s", c.method)), c.method)
-		tok := fmt.Sprintf("%3d", c.status)
+		tok := fmt.Sprintf("%6d", c.status)
 		switch {
 		case c.status < 200:
 			assert.Contains(t, got, styles.Dim.Render(tok))
@@ -289,11 +289,11 @@ func TestFormatProxyRequest_DurationScale(t *testing.T) {
 			StatusCode: 200, Duration: time.Duration(ms) * time.Millisecond,
 		})
 	}
-	assert.Contains(t, mk(50), styles.HTTPSuccess.Render("   50ms"))
-	assert.Contains(t, mk(300), styles.Base.Render("  300ms"))
-	assert.NotContains(t, mk(300), styles.Warn.Render("  300ms"))
-	assert.Contains(t, mk(800), styles.Warn.Render("  800ms"))
-	assert.Contains(t, mk(3000), styles.HTTPError.Render(" 3000ms"))
+	assert.Contains(t, mk(50), styles.HTTPSuccess.Render("    50ms"))
+	assert.Contains(t, mk(300), styles.Base.Render("   300ms"))
+	assert.NotContains(t, mk(300), styles.Warn.Render("   300ms"))
+	assert.Contains(t, mk(800), styles.Warn.Render("   800ms"))
+	assert.Contains(t, mk(3000), styles.HTTPError.Render("  3000ms"))
 }
 
 func TestFormatProxyRequest_InFlightDim(t *testing.T) {
@@ -305,8 +305,8 @@ func TestFormatProxyRequest_InFlightDim(t *testing.T) {
 		StatusCode: 200, InFlight: true,
 	}
 	got := m.formatProxyRequest(req)
-	assert.Contains(t, got, styles.Dim.Render("  ...ms"))
-	assert.Contains(t, got, styles.Dim.Render("200"))
+	assert.Contains(t, got, styles.Dim.Render("   ...ms"))
+	assert.Contains(t, got, styles.Dim.Render("   200"))
 }
 
 func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {

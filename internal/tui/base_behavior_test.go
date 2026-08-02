@@ -530,7 +530,7 @@ func TestFormatProxyRequest_StatusCode0(t *testing.T) {
 	assert.Contains(t, formatted, "api")
 	assert.Contains(t, formatted, "GET")
 	assert.Contains(t, formatted, "/test")
-	assert.Contains(t, formatted, "  0") // Status code 0 with 3-char right-aligned padding
+	assert.Contains(t, formatted, "     0") // Status code 0 with 6-char right-aligned padding
 
 	// Verify exact padding for subdomain (10 chars left-aligned)
 	// "api" should be followed by 7 spaces to make 10 chars total
@@ -540,8 +540,8 @@ func TestFormatProxyRequest_StatusCode0(t *testing.T) {
 	// "GET" should be followed by 4 spaces to make 7 chars total
 	assert.Contains(t, formatted, "GET    ") // 7 chars total
 
-	// Verify duration is 5 chars right-aligned (100ms = "  100")
-	assert.Contains(t, formatted, "  100")
+	// Verify duration is 8 chars right-aligned (100ms).
+	assert.Contains(t, formatted, "   100ms")
 }
 
 func TestFormatProxyRequest_DurationOverflow(t *testing.T) {
@@ -592,7 +592,7 @@ func TestFormatProxyRequest_InFlight(t *testing.T) {
 
 	formatted := model.formatProxyRequest(req)
 
-	assert.Contains(t, formatted, "  ...ms", "duration column should render dots, 5-char padded, with the ms suffix")
+	assert.Contains(t, formatted, "   ...ms", "duration column should render dots, 8-char padded, with the ms suffix")
 	assert.NotContains(t, formatted, "0ms", "in-flight rows must not render a fake zero duration")
 	assert.Contains(t, formatted, "200", "status should show the real header-time code")
 }
@@ -629,8 +629,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 		durationMs int64
 		wantSub    string // Expected subdomain with padding (10 chars)
 		wantMethod string // Expected method with padding (7 chars)
-		wantStatus string // Expected status with padding (3 chars)
-		wantDur    string // Expected duration with padding (5 chars)
+		wantStatus string // Expected status with padding (6 chars)
+		wantDur    string // Expected duration with padding (8 chars)
 	}{
 		{
 			name:       "short fields",
@@ -640,8 +640,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			durationMs: 1,
 			wantSub:    "a         ", // 1 + 9 spaces
 			wantMethod: "GET    ",    // 3 + 4 spaces
-			wantStatus: "200",        // already 3 chars
-			wantDur:    "    1",      // 4 spaces + 1
+			wantStatus: "   200",     // right-aligned in 6 cols
+			wantDur:    "     1ms",   // right-aligned in 8 cols
 		},
 		{
 			name:       "max length subdomain",
@@ -651,8 +651,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			durationMs: 9999,
 			wantSub:    "webservice", // exactly 10 chars
 			wantMethod: "DELETE ",    // 6 + 1 space
-			wantStatus: "404",
-			wantDur:    " 9999", // 1 space + 4 digits
+			wantStatus: "   404",
+			wantDur:    "  9999ms",
 		},
 		{
 			name:       "single digit status",
@@ -661,9 +661,9 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			statusCode: 0,
 			durationMs: 50,
 			wantSub:    "api       ",
-			wantMethod: "OPTIONS", // exactly 7 chars
-			wantStatus: "  0",     // 2 spaces + 0
-			wantDur:    "   50",   // 3 spaces + 50
+			wantMethod: "OPTIONS",  // exactly 7 chars
+			wantStatus: "     0",   // right-aligned in 6 cols
+			wantDur:    "    50ms", // right-aligned in 8 cols
 		},
 	}
 
