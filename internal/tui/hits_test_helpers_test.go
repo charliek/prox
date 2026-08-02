@@ -5,5 +5,11 @@ package tui
 // BaseModel is intentional. There is no lazy-alloc path — mustHits panics
 // on nil (plan 023 A1).
 func newTestBaseModel() *BaseModel {
-	return &BaseModel{hits: &hitRegistry{}, helpMemo: &helpMemoCache{}}
+	return &BaseModel{
+		hits:         &hitRegistry{},
+		helpMemo:     &helpMemoCache{},
+		pointerShape: &pointerShapeCache{},
+		lastMouseX:   -1,
+		lastMouseY:   -1,
+	}
 }

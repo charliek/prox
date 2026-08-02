@@ -310,6 +310,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
+		m.noteMousePosition(msg.X, msg.Y)
 		// Modal first, then menu, then content (plan 022 WS4 — invert of the
 		// pre-modal order where menu ran before the ModeHelp short-circuit).
 		if m.mode == ModeHelp {
@@ -640,7 +641,7 @@ func (m ClientModel) View() string {
 	statusInfo := m.resolveFooterMsg()
 	frame := m.mainView(statusInfo)
 	if m.mode == ModeHelp {
-		return m.spliceHelpModal(frame)
+		frame = m.spliceHelpModal(frame)
 	}
-	return frame
+	return m.appendCursorShape(frame)
 }

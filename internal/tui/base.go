@@ -178,6 +178,13 @@ type BaseModel struct {
 	themeMenuNames  []string
 	hits            *hitRegistry
 
+	// lastMouseX/Y are the most recent pointer cell coordinates (-1 = none).
+	// Used by desiredCursorShape in View (plan 023 C17).
+	lastMouseX int
+	lastMouseY int
+	// pointerShape caches the last emitted OSC-22 shape (shared pointer).
+	pointerShape *pointerShapeCache
+
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
 	// content. Rebuilt every updateViewport (plan 021 WS4 / Codex #2): when wrap
 	// is off the span is identity (entry i → {i,i} in filtered order); when wrap
@@ -271,6 +278,9 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		hoveredMenuCell:     -1,
 		hits:                &hitRegistry{},
 		helpMemo:            &helpMemoCache{},
+		pointerShape:        &pointerShapeCache{},
+		lastMouseX:          -1,
+		lastMouseY:          -1,
 	}
 	b.viewport.MouseWheelEnabled = false // TUI owns all wheel routing (Codex #5)
 	return b

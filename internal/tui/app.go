@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -86,12 +87,15 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 	// toggle mouse only while a menu is open, then drag-only.
 	// viewport.MouseWheelEnabled is false on the model so bubbles does not
 	// double-scroll wheel events (Codex #5).
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion(), tea.WithOutput(os.Stdout))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go runClientStreams(ctx, client, p.Send)
 
+	// Restore the terminal pointer on every exit path (plan 023 C17). The app
+	// binds no suspend key; if one is added later, reset/restore should join it.
+	defer resetTerminalPointer()
 	_, err := p.Run()
 
 	// Cleanup: cancel context to stop the stream loops
