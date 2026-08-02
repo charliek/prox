@@ -31,6 +31,16 @@ type styleSet struct {
 	Err, Dim                           lipgloss.Style
 	FooterKey, FooterLabel             lipgloss.Style // two-tone footer hints (plan 023 B2)
 	FooterError                        lipgloss.Style // ✗ error flash: Err-bold on FooterBG
+	// Menu bar + dropdown chrome (plan 023 C18). Header-band styles use HeaderBG;
+	// dropdown styles use theme BG — neither varies with the selection band.
+	MenuBarFill, MenuBrand, MenuHint lipgloss.Style
+	MenuCell, MenuCellHover          lipgloss.Style
+	Dropdown, DropdownDim            lipgloss.Style
+	DropdownItem, DropdownItemMuted  lipgloss.Style
+	DropdownItemHint                 lipgloss.Style
+	DropdownItemSelected             lipgloss.Style
+	DropdownItemSelectedHint         lipgloss.Style
+	DropdownGap, DropdownSelectedGap lipgloss.Style
 	// Panel / PanelTitle paint the viewport panel border chars and the title
 	// spliced into the top border (plan 023 E2). Manual composition — lipgloss
 	// has no native border-title. FullFill gets t.BG; legacy is FG-only so
@@ -236,6 +246,47 @@ func buildStyleSetFill(t *Theme, surface lipgloss.Color, selectionBand bool) sty
 			Foreground(t.Err).
 			Background(t.FooterBG).
 			Bold(true),
+
+		MenuBarFill: lipgloss.NewStyle().Background(t.HeaderBG),
+		MenuBrand: lipgloss.NewStyle().
+			Foreground(t.HeaderFG).
+			Background(t.HeaderBG).
+			Bold(true),
+		MenuHint: lipgloss.NewStyle().
+			Foreground(t.Dim).
+			Background(t.HeaderBG),
+		MenuCell: lipgloss.NewStyle().
+			Foreground(t.Title).
+			Background(t.HeaderBG),
+		MenuCellHover: lipgloss.NewStyle().
+			Foreground(t.SelectionFG).
+			Background(t.SelectionBG),
+
+		Dropdown: lipgloss.NewStyle().
+			Foreground(t.Border).
+			Background(t.BG),
+		DropdownDim: lipgloss.NewStyle().
+			Foreground(t.Dim).
+			Background(t.BG),
+		DropdownItem: lipgloss.NewStyle().
+			Foreground(t.FG).
+			Background(t.BG),
+		DropdownItemMuted: lipgloss.NewStyle().
+			Foreground(t.Dim).
+			Background(t.BG),
+		DropdownItemHint: lipgloss.NewStyle().
+			Foreground(t.Dim).
+			Background(t.BG),
+		DropdownItemSelected: lipgloss.NewStyle().
+			Foreground(t.SelectionFG).
+			Background(t.SelectionBG),
+		DropdownItemSelectedHint: lipgloss.NewStyle().
+			Foreground(t.Dim).
+			Background(t.SelectionBG),
+		DropdownGap: lipgloss.NewStyle().
+			Background(t.BG),
+		DropdownSelectedGap: lipgloss.NewStyle().
+			Background(t.SelectionBG),
 
 		HTTPSuccess: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t, surface),
 		HTTPError:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t, surface),

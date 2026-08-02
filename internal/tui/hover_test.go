@@ -71,7 +71,7 @@ func TestHover_DropdownRowMovesHighlight(t *testing.T) {
 			break
 		}
 	}
-	require.NotEqual(t, MenuCommand(""), reqs.Cmd)
+	require.GreaterOrEqual(t, reqs.Index, 0)
 
 	m = clientUpdate(m, motionAt(reqs.Rect.X, reqs.Rect.Y))
 	assert.Equal(t, 1, m.menuHighlight)

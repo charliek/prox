@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -71,15 +70,6 @@ type MenuItem struct {
 	Selected  *bool // radio marker
 	Separator bool
 	Cmd       MenuCommand
-}
-
-// HitRect is a mouse hit target in frame coordinates (0-based, inclusive origin).
-type HitRect struct {
-	X, Y, W, H int
-}
-
-func (r HitRect) Contains(x, y int) bool {
-	return x >= r.X && x < r.X+r.W && y >= r.Y && y < r.Y+r.H
 }
 
 // menuOpen reports whether a dropdown is open.
@@ -207,192 +197,14 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 	}
 }
 
-// menuStep moves the highlight by one selectable row. wrap=true (keyboard)
-// wraps modulo n skipping separators; wrap=false (wheel) clamps at the ends.
-func (b *BaseModel) menuStep(id MenuID, item int, down bool) int {
-	return b.menuStepDir(id, item, down, true)
-}
-
-func (b *BaseModel) menuStepClamp(id MenuID, item int, down bool) int {
-	return b.menuStepDir(id, item, down, false)
-}
-
-func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
-	items := b.menuItems(id)
-	n := len(items)
-	if n == 0 {
-		return 0
-	}
-	idx := item
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
-	if !wrap {
-		step := -1
-		if down {
-			step = 1
-		}
-		for j := idx + step; j >= 0 && j < n; j += step {
-			if menuItemSelectable(items[j]) {
-				return j
-			}
-		}
-		return idx
-	}
-	for range n {
-		if down {
-			idx = (idx + 1) % n
-		} else {
-			idx = (idx + n - 1) % n
-		}
-		if menuItemSelectable(items[idx]) {
-			break
-		}
-	}
-	return idx
-}
-
 // menuItemSelectable reports whether a dropdown row can take highlight / activate
 // (skips separators and section headers with empty Cmd).
 func menuItemSelectable(it MenuItem) bool {
 	return !it.Separator && it.Cmd != ""
 }
 
-// menuReservedBottom is the footer band — dropdowns never cover it (plan 023 B2).
-const menuReservedBottom = 1
-
 // menuBorderSize is the rounded-border cost in rows and columns (plan 023 B4).
 const menuBorderSize = 2
-
-func (b *BaseModel) menuBoxTop() int {
-	if b.settings.MenuBar {
-		return 1
-	}
-	return 0
-}
-
-// menuAvail is the inner (content) row budget for the open dropdown — frame
-// height minus bar, footer, and the top+bottom border (plan 023 B4).
-func (b *BaseModel) menuAvail() int {
-	return b.height - b.menuBoxTop() - menuReservedBottom - menuBorderSize
-}
-
-// menuWindowMaxOffset is the largest menuWindow for n item rows and avail.
-func menuWindowMaxOffset(n, avail int) int {
-	if avail < 1 || n <= avail {
-		return 0
-	}
-	if avail < 4 {
-		return n - avail
-	}
-	// End window: top indicator only → avail-1 item rows.
-	return n - (avail - 1)
-}
-
-// menuWindowLayout returns the visible item slice [visStart, visEnd) and whether
-// top/bottom "… N more …" indicator rows are shown for the given window start.
-func menuWindowLayout(n, avail, start int) (visStart, visEnd int, topInd, botInd bool) {
-	if avail < 1 || n == 0 {
-		return 0, 0, false, false
-	}
-	if n <= avail {
-		return 0, n, false, false
-	}
-	maxStart := menuWindowMaxOffset(n, avail)
-	if start < 0 {
-		start = 0
-	}
-	if start > maxStart {
-		start = maxStart
-	}
-	if avail < 4 {
-		return start, start + avail, false, false
-	}
-	topInd = start > 0
-	contentCap := avail
-	if topInd {
-		contentCap--
-	}
-	if start+contentCap < n {
-		botInd = true
-		contentCap--
-	}
-	end := start + contentCap
-	if end > n {
-		end = n
-	}
-	return start, end, topInd, botInd
-}
-
-// followMenuWindow adjusts menuWindow after a highlight move so the highlight
-// stays visible. Wrap last→first resets to 0; first→last jumps to maxOffset
-// (strix derived-window semantics — plan 022 WS3).
-func (b *BaseModel) followMenuWindow(prevHighlight int, movedDown bool) {
-	if !b.menuOpen() {
-		return
-	}
-	id := MenuID(b.openMenu)
-	items := b.menuItems(id)
-	n := len(items)
-	avail := b.menuAvail()
-	h := b.menuHighlight
-
-	if movedDown && h < prevHighlight {
-		b.menuWindow = 0
-		return
-	}
-	if !movedDown && h > prevHighlight {
-		b.menuWindow = menuWindowMaxOffset(n, avail)
-		return
-	}
-	b.menuWindow = deriveMenuWindowStart(n, avail, b.menuWindow, h)
-}
-
-// clampMenuWindow keeps menuWindow in range and showing the highlight. Call
-// after resize / highlight moves (not from View — value receiver).
-func (b *BaseModel) clampMenuWindow() {
-	if !b.menuOpen() {
-		return
-	}
-	items := b.menuItems(MenuID(b.openMenu))
-	b.menuWindow = deriveMenuWindowStart(len(items), b.menuAvail(),
-		b.menuWindow, b.menuHighlight)
-}
-
-// deriveMenuWindowStart is THE window-start algorithm (plan 022 WS3): clamp to
-// [0, maxOffset], then adjust minimally so highlight is visible. Input handlers
-// persist its result into menuWindow; dropdownBoxRows re-derives per frame so
-// View (a value receiver) never depends on the stored offset being fresh.
-func deriveMenuWindowStart(n, avail, window, highlight int) int {
-	if avail < 1 || n == 0 {
-		return 0
-	}
-	maxStart := menuWindowMaxOffset(n, avail)
-	if window > maxStart {
-		window = maxStart
-	}
-	if window < 0 {
-		window = 0
-	}
-	start, end, _, _ := menuWindowLayout(n, avail, window)
-	if highlight >= start && highlight < end {
-		return start
-	}
-	if highlight < start {
-		return highlight
-	}
-	for start < maxStart {
-		start++
-		_, end, _, _ = menuWindowLayout(n, avail, start)
-		if highlight < end {
-			return start
-		}
-	}
-	return maxStart
-}
 
 func (b *BaseModel) openMenuSibling(next bool) {
 	if !b.menuOpen() {
@@ -431,11 +243,11 @@ func (b *BaseModel) handleMenuKey(msg tea.KeyMsg) tea.Cmd {
 		b.openMenuSibling(true)
 	case "up", "k":
 		prev := b.menuHighlight
-		b.menuHighlight = b.menuStep(id, b.menuHighlight, false)
+		b.menuHighlight = b.menuStepDir(id, b.menuHighlight, false, true)
 		b.followMenuWindow(prev, false)
 	case "down", "j":
 		prev := b.menuHighlight
-		b.menuHighlight = b.menuStep(id, b.menuHighlight, true)
+		b.menuHighlight = b.menuStepDir(id, b.menuHighlight, true, true)
 		b.followMenuWindow(prev, true)
 	case "enter", " ":
 		cmd := b.activateMenuItem(id, b.menuHighlight)
@@ -524,81 +336,18 @@ func (b *BaseModel) toggleMenuBar() tea.Cmd {
 	return nil
 }
 
-// ConfigPathProjectName derives the menu-bar project label from the absolute
-// path of the resolved config file (plan 023 B3: basename of its directory).
-func ConfigPathProjectName(absConfigPath string) string {
-	if absConfigPath == "" {
-		return ""
-	}
-	return dirBaseName(filepath.Dir(absConfigPath))
-}
-
-// StatusProjectName derives the menu-bar project label from GET /status
-// project_dir (plan 023 B3). Empty project_dir returns "" so callers fall
-// back to the cwd basename via resolveProjectName.
-func StatusProjectName(projectDir string) string {
-	if projectDir == "" {
-		return ""
-	}
-	return dirBaseName(projectDir)
-}
-
-func dirBaseName(dir string) string {
-	base := filepath.Base(dir)
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		return ""
-	}
-	return base
-}
-
-// resolveProjectName returns opts.ProjectName, or the cwd base as fallback (WS3).
-func resolveProjectName(name string) string {
-	if name != "" {
-		return name
-	}
-	cwd, err := filepathAbs(".")
-	if err != nil || cwd == "" {
-		return "prox"
-	}
-	if base := dirBaseName(cwd); base != "" {
-		return base
-	}
-	return "prox"
-}
-
-// filepathAbs is os.Getwd-backed; separated for tests that want to stub later.
-var filepathAbs = func(path string) (string, error) {
-	return filepath.Abs(path)
-}
-
 // renderMenuBar draws the menu row and records cell hit-rects.
 // Layout (plan 023 B3): `prox` (bold HeaderFG) + Dim project name + cells,
 // left-aligned; the remainder of the row is HeaderBG fill.
 func (b *BaseModel) renderMenuBar() string {
-	th := CurrentTheme()
-	rowBG := lipgloss.NewStyle().Background(th.HeaderBG)
-	brandStyle := lipgloss.NewStyle().
-		Foreground(th.HeaderFG).
-		Background(th.HeaderBG).
-		Bold(true)
-	dimStyle := lipgloss.NewStyle().
-		Foreground(th.Dim).
-		Background(th.HeaderBG)
-	closedStyle := lipgloss.NewStyle().
-		Foreground(th.Title).
-		Background(th.HeaderBG)
-	selStyle := lipgloss.NewStyle().
-		Foreground(th.SelectionFG).
-		Background(th.SelectionBG)
-
 	var bld strings.Builder
-	bld.WriteString(rowBG.Render(" "))
-	bld.WriteString(brandStyle.Render("prox"))
+	bld.WriteString(s.MenuBarFill.Render(" "))
+	bld.WriteString(s.MenuBrand.Render("prox"))
 	if b.projectName != "" {
-		bld.WriteString(rowBG.Render(" "))
-		bld.WriteString(dimStyle.Render(b.projectName))
+		bld.WriteString(s.MenuBarFill.Render(" "))
+		bld.WriteString(s.MenuHint.Render(b.projectName))
 	}
-	bld.WriteString(rowBG.Render(" "))
+	bld.WriteString(s.MenuBarFill.Render(" "))
 
 	x := ansi.StringWidth(bld.String())
 	y := 0 // menu bar is always row 0 when visible; caller places it first
@@ -606,11 +355,11 @@ func (b *BaseModel) renderMenuBar() string {
 	for _, id := range menuOrder {
 		text := menuCellText(id)
 		w := ansi.StringWidth(text)
-		style := closedStyle
+		style := s.MenuCell
 		if b.menuOpen() && MenuID(b.openMenu) == id {
-			style = selStyle
+			style = s.MenuCellHover
 		} else if !b.menuOpen() && b.hoveredMenuCell == int(id) {
-			style = selStyle
+			style = s.MenuCellHover
 		}
 		bld.WriteString(style.Render(text))
 		hits.menuCells = append(hits.menuCells, menuCellHit{
@@ -624,7 +373,7 @@ func (b *BaseModel) renderMenuBar() string {
 	w := ansi.StringWidth(line)
 	switch {
 	case w < b.width:
-		line += rowBG.Render(strings.Repeat(" ", b.width-w))
+		line += s.MenuBarFill.Render(strings.Repeat(" ", b.width-w))
 	case w > b.width:
 		line = ansi.Cut(line, 0, b.width)
 	}
@@ -643,7 +392,6 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	id := MenuID(b.openMenu)
 	items := b.menuItems(id)
 
-	th := CurrentTheme()
 	const pad = 1 // leading edge pad inside the border
 	const hintGap = 1
 	n := len(items)
@@ -710,10 +458,6 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	visStart, visEnd, topInd, botInd := menuWindowLayout(n, avail,
 		deriveMenuWindowStart(n, avail, b.menuWindow, b.menuHighlight))
 
-	borderStyle := lipgloss.NewStyle().
-		Foreground(th.Border).
-		Background(th.BG)
-	dimStyle := lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
 	br := lipgloss.RoundedBorder()
 
 	hitRows := make([]menuRowHit, 0, avail)
@@ -722,16 +466,16 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	rowY := boxTop + 1
 
 	// Top border.
-	rows = append(rows, borderStyle.Render(br.TopLeft)+
-		borderStyle.Render(strings.Repeat(br.Top, innerW))+
-		borderStyle.Render(br.TopRight))
+	rows = append(rows, s.Dropdown.Render(br.TopLeft)+
+		s.Dropdown.Render(strings.Repeat(br.Top, innerW))+
+		s.Dropdown.Render(br.TopRight))
 
 	renderInd := func(hidden int) {
 		label := fmt.Sprintf("… %d more …", hidden)
 		content := strings.Repeat(" ", pad) + label
 		content = padFrameRow(content, innerW)
-		inner := dimStyle.Render(ansi.Cut(content, 0, innerW))
-		row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
+		inner := s.DropdownDim.Render(ansi.Cut(content, 0, innerW))
+		row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
 		rows = append(rows, row)
 		hitRows = append(hitRows, menuRowHit{
 			Index: -1,
@@ -751,8 +495,8 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 			content := strings.Repeat("─", max(1, innerW-pad*2))
 			content = strings.Repeat(" ", pad) + content + strings.Repeat(" ", pad)
 			content = ansi.Cut(content, 0, innerW)
-			inner := dimStyle.Render(padFrameRow(content, innerW))
-			row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
+			inner := s.DropdownDim.Render(padFrameRow(content, innerW))
+			row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
 			rows = append(rows, row)
 			hitRows = append(hitRows, menuRowHit{
 				Index: -1,
@@ -760,16 +504,14 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 			})
 		default:
 			highlighted := i == b.menuHighlight && it.Cmd != ""
-			inner := renderMenuItemInner(it, innerW, pad, hintGap, highlighted, th)
-			row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
+			inner := renderMenuItemInner(it, innerW, pad, hintGap, highlighted)
+			row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
 			rows = append(rows, row)
-			cmd := it.Cmd
 			idx := i
-			if cmd == "" {
+			if it.Cmd == "" {
 				idx = -1
 			}
 			hitRows = append(hitRows, menuRowHit{
-				Cmd:   cmd,
 				Index: idx,
 				Rect:  HitRect{X: contentX, Y: rowY, W: innerW, H: 1},
 			})
@@ -782,9 +524,9 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	}
 
 	// Bottom border.
-	rows = append(rows, borderStyle.Render(br.BottomLeft)+
-		borderStyle.Render(strings.Repeat(br.Bottom, innerW))+
-		borderStyle.Render(br.BottomRight))
+	rows = append(rows, s.Dropdown.Render(br.BottomLeft)+
+		s.Dropdown.Render(strings.Repeat(br.Bottom, innerW))+
+		s.Dropdown.Render(br.BottomRight))
 
 	hits := b.mustHits()
 	hits.dropdown = menuDropdownHit{
@@ -812,28 +554,24 @@ func menuItemInnerWidth(it MenuItem, pad, hintGap int) int {
 // renderMenuItemInner paints one dropdown content row of exactly innerW columns:
 // left-aligned marker+label, right-aligned Hint in Dim, ANSI-aware label
 // truncation when tight (plan 023 B4).
-func renderMenuItemInner(it MenuItem, innerW, pad, hintGap int, highlighted bool, th *Theme) string {
+func renderMenuItemInner(it MenuItem, innerW, pad, hintGap int, highlighted bool) string {
 	label := it.Label
 	marker := menuMarker(it)
 	hint := it.Hint
 
 	var leftStyle, hintStyle, gapStyle lipgloss.Style
 	if highlighted {
-		leftStyle = lipgloss.NewStyle().
-			Foreground(th.SelectionFG).
-			Background(th.SelectionBG)
-		gapStyle = lipgloss.NewStyle().Background(th.SelectionBG)
-		hintStyle = lipgloss.NewStyle().
-			Foreground(th.Dim).
-			Background(th.SelectionBG)
+		leftStyle = s.DropdownItemSelected
+		gapStyle = s.DropdownSelectedGap
+		hintStyle = s.DropdownItemSelectedHint
 	} else if it.Cmd == "" {
-		leftStyle = lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
-		gapStyle = lipgloss.NewStyle().Background(th.BG)
+		leftStyle = s.DropdownItemMuted
+		gapStyle = s.DropdownGap
 		hintStyle = leftStyle
 	} else {
-		leftStyle = lipgloss.NewStyle().Foreground(th.FG).Background(th.BG)
-		gapStyle = lipgloss.NewStyle().Background(th.BG)
-		hintStyle = lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+		leftStyle = s.DropdownItem
+		gapStyle = s.DropdownGap
+		hintStyle = s.DropdownItemHint
 	}
 
 	hintW := 0
@@ -928,7 +666,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		id := MenuID(b.openMenu)
 		down := msg.Button == tea.MouseButtonWheelDown
 		prev := b.menuHighlight
-		b.menuHighlight = b.menuStepClamp(id, b.menuHighlight, down)
+		b.menuHighlight = b.menuStepDir(id, b.menuHighlight, down, false)
 		b.followMenuWindow(prev, down)
 		return true, nil
 	}
@@ -982,7 +720,7 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		}
 		for _, row := range d.Rows {
 			if row.Rect.Contains(x, y) {
-				if row.Cmd != "" && row.Index >= 0 {
+				if row.Index >= 0 {
 					cmd := b.activateMenuItem(d.Menu, row.Index)
 					b.closeMenu()
 					return true, cmd

@@ -52,7 +52,6 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 
 	// At top: bottom indicator only, no top indicator.
 	botInd := hits.dropdown.Rows[len(hits.dropdown.Rows)-1]
-	assert.Equal(t, MenuCommand(""), botInd.Cmd)
 	assert.Equal(t, -1, botInd.Index)
 	assert.NotEqual(t, -1, hits.dropdown.Rows[0].Index, "first row is an item, not top indicator")
 
@@ -66,10 +65,9 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	_ = m.View()
 	hits = m.mustHits()
 	topInd := hits.dropdown.Rows[0]
-	assert.Equal(t, MenuCommand(""), topInd.Cmd)
 	assert.Equal(t, -1, topInd.Index)
 	lastRow := hits.dropdown.Rows[len(hits.dropdown.Rows)-1]
-	assert.NotEqual(t, MenuCommand(""), lastRow.Cmd, "bottom row is an item, not indicator")
+	assert.NotEqual(t, -1, lastRow.Index, "bottom row is an item, not indicator")
 	assert.Equal(t, len(items)-1, lastRow.Index)
 
 	// Middle window (offset 1..max-1): both indicators.
@@ -100,7 +98,6 @@ func TestMenuWindow_NoIndicatorsWhenAvailSmall(t *testing.T) {
 	assert.Equal(t, 3+menuBorderSize, hits.dropdown.Bounds.H)
 	for _, r := range hits.dropdown.Rows {
 		assert.NotEqual(t, -1, r.Index, "no indicator rows when avail < 4")
-		assert.NotEqual(t, MenuCommand(""), r.Cmd)
 	}
 	assert.NotContains(t, stripANSI(m.View()), "more")
 }
@@ -326,7 +323,7 @@ func assertThemeRectHonesty(t *testing.T, m ClientModel) {
 	var activatable []targetRow
 	hasInd := false
 	for _, r := range hits.dropdown.Rows {
-		if r.Cmd == "" || r.Index < 0 {
+		if r.Index < 0 {
 			hasInd = true
 			continue
 		}
@@ -390,7 +387,7 @@ func assertMenuRectHonestyActivate(t *testing.T, m ClientModel, id MenuID) {
 
 	var indexes []int
 	for _, r := range hits.dropdown.Rows {
-		if r.Cmd == "" || r.Index < 0 {
+		if r.Index < 0 {
 			continue
 		}
 		indexes = append(indexes, r.Index)
@@ -492,12 +489,10 @@ func TestMenuWindow_ViewMenuIndexOnHits(t *testing.T) {
 
 	var foundSep, foundReqs bool
 	for _, r := range hits.dropdown.Rows {
-		if r.Cmd == MenuCmdSetRequests {
-			assert.Equal(t, 1, r.Index)
+		if r.Index == 1 {
 			foundReqs = true
 		}
-		if r.Cmd == "" {
-			assert.Equal(t, -1, r.Index, "separator/non-activatable")
+		if r.Index < 0 {
 			foundSep = true
 		}
 	}

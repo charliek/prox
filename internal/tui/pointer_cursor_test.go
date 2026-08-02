@@ -85,12 +85,12 @@ func TestPointerShape_DropdownActivatableOnly(t *testing.T) {
 			sep = row
 			foundSep = true
 		}
-		if row.Index >= 0 && row.Cmd != "" {
+		if row.Index >= 0 {
 			activatable = row
 		}
 	}
 	require.True(t, foundSep, "need a non-activatable row")
-	require.NotEqual(t, MenuCommand(""), activatable.Cmd)
+	require.GreaterOrEqual(t, activatable.Index, 0)
 
 	cache := m.mustPointerShape()
 	cache.record = true

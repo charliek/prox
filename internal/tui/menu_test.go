@@ -231,7 +231,7 @@ func TestMenu_MouseClickDropdownActivates(t *testing.T) {
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 2)
 
 	reqs := hits.dropdown.Rows[1] // Requests
-	require.Equal(t, MenuCmdSetRequests, reqs.Cmd)
+	require.Equal(t, 1, reqs.Index)
 	m = clientUpdate(m, tea.MouseMsg{
 		X:      reqs.Rect.X,
 		Y:      reqs.Rect.Y,

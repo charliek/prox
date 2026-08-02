@@ -1,5 +1,14 @@
 package tui
 
+// HitRect is a mouse hit target in frame coordinates (0-based, inclusive origin).
+type HitRect struct {
+	X, Y, W, H int
+}
+
+func (r HitRect) Contains(x, y int) bool {
+	return x >= r.X && x < r.X+r.W && y >= r.Y && y < r.Y+r.H
+}
+
 // hitRegistry holds all render-recorded mouse hit geometry. It is
 // heap-allocated and SHARED across ClientModel copies: ClientModel.View is
 // a value receiver, so render-time writes to plain fields would be discarded
@@ -27,8 +36,7 @@ type menuDropdownHit struct {
 }
 
 type menuRowHit struct {
-	Cmd   MenuCommand // empty = separator / indicator / non-activatable
-	Index int         // full-list items index; -1 when non-activatable
+	Index int // full-list items index; -1 when non-activatable
 	Rect  HitRect
 }
 

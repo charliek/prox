@@ -61,7 +61,7 @@ func TestHitRegistry_DropdownRowClickActivates_ViewLevel(t *testing.T) {
 	require.True(t, hits.hasDropdown, "View() must leave dropdown hits on the stored model")
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 2)
 	reqs := hits.dropdown.Rows[1] // Requests
-	require.Equal(t, MenuCmdSetRequests, reqs.Cmd)
+	require.Equal(t, 1, reqs.Index)
 	col, row := reqs.Rect.X+1, reqs.Rect.Y
 
 	m = clientUpdate(m, clickAt(col, row))
@@ -164,7 +164,7 @@ func TestHitLifecycle_ResizeInvalidatesStaleMenuRects(t *testing.T) {
 	require.True(t, hits.hasDropdown)
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 2)
 	stale := hits.dropdown.Rows[1] // Requests
-	require.Equal(t, MenuCmdSetRequests, stale.Cmd)
+	require.Equal(t, 1, stale.Index)
 	col, row := stale.Rect.X+1, stale.Rect.Y
 
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -221,7 +221,7 @@ func TestOverlayClickThrough_DropdownAndHelp(t *testing.T) {
 	var tsRow menuRowHit
 	found := false
 	for _, r := range m.mustHits().dropdown.Rows {
-		if r.Cmd == MenuCmdToggleTimestamps {
+		if r.Index >= 0 && m.menuItems(MenuView)[r.Index].Cmd == MenuCmdToggleTimestamps {
 			tsRow = r
 			found = true
 			break
