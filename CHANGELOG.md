@@ -211,6 +211,36 @@ All notable changes to this project will be documented in this file.
 - **JSON log rendering performance** (plan 023). JSON object lines are parsed
   once at ingest (level detection and path=value summary share one unmarshal);
   wrap-on display keeps summary plus compact raw consistently.
+- **Plain log/request text now carries the theme background** (plan 024).
+  Level-less lines rendered on the terminal-default background — 62% of the
+  frame in the light theme. Every TUI-formatted line now renders through the
+  base (or level-tinted) style, and the frame-fill scanner no longer
+  blanket-exempts the log region: only cells inside a line's own child ANSI
+  spans stay exempt.
+- **Requests header/data column alignment** (plan 024). The header rendered
+  `Duration` at 8 columns while data cells were 7 (ID and URL data sat one
+  column left of their labels), and the Status header read `Sta`. Header and
+  rows now share one column-spec table; `Status` is a full label with data
+  padded to match.
+- **Footer band flush and fill** (plan 024). The key-hint group is padded
+  flush to the right edge instead of floating mid-band, and every footer
+  segment — join spaces, stream-health `n/a`, paging notices, truncation
+  ellipses, and the filter text input itself — now renders on the footer
+  background, eliminating default-background holes (including the 43-column
+  hole while editing a filter).
+- **Border and glyph details** (plan 024). Panel and help border titles
+  render `─ Label ─` (they rendered `─ Logs────`); a clamped dropdown's
+  bottom border now stops one row above the panel's bottom border instead of
+  landing on it; a hovered closed menu cell is now visually distinct from an
+  open one; and Theme dropdown rows no longer repeat the `t` hint.
+- **Wrapped-row hanging indent** (plan 024). Wrapped log continuation rows
+  keep the timestamp/process gutter instead of dedenting to column 1, and
+  wrapped help descriptions hang-indent to the description column.
+- **Selective log-filter allocation regression** (plan 024). The plan-023
+  `filteredEntries` preallocation reserved full capacity even with an active
+  filter (50152 B/op); full preallocation now applies only when no filter is
+  active, restoring selective filters to ~1000 B/op while keeping the
+  no-filter fast path.
 
 ## v0.2.4
 
