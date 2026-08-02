@@ -17,7 +17,7 @@ func TestCenteredHint_Geometry(t *testing.T) {
 	pinANSIProfile(t)
 	withTestTheme(t, "tokyo-night")
 
-	lines := centeredHint("hi", s.Dim, 10, 5)
+	lines := centeredHint("hi", styles.Dim, 10, 5)
 	require.Len(t, lines, 5)
 	for i, line := range lines {
 		assert.Equal(t, 10, ansi.StringWidth(line), "row %d", i)
@@ -29,13 +29,13 @@ func TestCenteredHint_Geometry(t *testing.T) {
 	assert.Equal(t, "", strings.TrimSpace(ansi.Strip(lines[4])))
 
 	// Truncation with ellipsis when text exceeds width.
-	trunc := centeredHint("abcdefghijklmnop", s.Dim, 5, 1)
+	trunc := centeredHint("abcdefghijklmnop", styles.Dim, 5, 1)
 	require.Len(t, trunc, 1)
 	assert.Equal(t, 5, ansi.StringWidth(trunc[0]))
 	assert.Contains(t, ansi.Strip(trunc[0]), "…")
 
 	// h > content: still h rows, single text row.
-	tall := centeredHint("x", s.Dim, 3, 7)
+	tall := centeredHint("x", styles.Dim, 3, 7)
 	require.Len(t, tall, 7)
 	nonBlank := 0
 	for _, line := range tall {
@@ -116,8 +116,8 @@ func TestDetailTitle_Style(t *testing.T) {
 		ID: "req-1", Timestamp: "t", Method: "GET", URL: "/x", StatusCode: 200,
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, s.DetailTitle.Render("Request: req-1"))
-	assert.NotContains(t, out, s.Header.Render("Request: req-1"))
+	assert.Contains(t, out, styles.DetailTitle.Render("Request: req-1"))
+	assert.NotContains(t, out, styles.Header.Render("Request: req-1"))
 }
 
 func TestRequestsHeader_FixedUnderScroll(t *testing.T) {

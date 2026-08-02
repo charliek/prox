@@ -218,11 +218,11 @@ func TestCycleTheme_Wraps(t *testing.T) {
 // Theme-mutating: must not call t.Parallel.
 func TestSetTheme_RebuildsStyles(t *testing.T) {
 	withTestTheme(t, "legacy")
-	legacyOK := colorStr(s.Running.GetForeground())
+	legacyOK := colorStr(styles.Running.GetForeground())
 	assert.Equal(t, "10", legacyOK)
 
 	withTestTheme(t, "tokyo-night")
-	assert.NotEqual(t, legacyOK, colorStr(s.Running.GetForeground()))
+	assert.NotEqual(t, legacyOK, colorStr(styles.Running.GetForeground()))
 	assert.Equal(t, "tokyo-night", CurrentThemeName())
 }
 
@@ -230,6 +230,6 @@ func TestDirectBaseModel_StylesNonNil(t *testing.T) {
 	// Package init installed tokyo-night; constructing via newTestBaseModel
 	// must not see nil/zero styles (panel S5).
 	_ = newTestBaseModel()
-	assert.NotEmpty(t, colorStr(s.Running.GetForeground()))
-	assert.NotEmpty(t, s.ProcessColors)
+	assert.NotEmpty(t, colorStr(styles.Running.GetForeground()))
+	assert.NotEmpty(t, styles.ProcessColors)
 }

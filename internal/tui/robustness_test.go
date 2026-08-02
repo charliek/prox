@@ -134,16 +134,16 @@ func TestTruncatePadDisplay(t *testing.T) {
 
 func TestGetProcessStyle_EmptyPalette(t *testing.T) {
 	pinANSIProfile(t)
-	prev := s
-	t.Cleanup(func() { s = prev })
+	prev := styles
+	t.Cleanup(func() { styles = prev })
 
-	s.ProcessColors = nil
+	styles.ProcessColors = nil
 	got := getProcessStyle("api", nil)
-	assert.Equal(t, s.DefaultProcess, got)
+	assert.Equal(t, styles.DefaultProcess, got)
 
-	s.ProcessColors = []lipgloss.Style{}
+	styles.ProcessColors = []lipgloss.Style{}
 	got = getProcessStyle("api", nil)
-	assert.Equal(t, s.DefaultProcess, got)
+	assert.Equal(t, styles.DefaultProcess, got)
 }
 
 func TestThemeFromTOML_UnknownLogTrace(t *testing.T) {

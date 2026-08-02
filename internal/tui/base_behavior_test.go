@@ -1532,11 +1532,11 @@ func TestLogsSearch_HighlightGuard(t *testing.T) {
 
 	m := newLogsModel(20, []string{"plain"})
 
-	// ASCII line + ASCII query: the matched run is wrapped in s.SearchHighlight.
+	// ASCII line + ASCII query: the matched run is wrapped in styles.SearchHighlight.
 	m.logSearchQuery = "match"
 	ascii := m.highlightLogLine("hello match world")
 	assert.NotEqual(t, "hello match world", ascii, "an ASCII match is inline-highlighted")
-	assert.Contains(t, ascii, s.SearchHighlight.Render("match"), "the matched run is styled")
+	assert.Contains(t, ascii, styles.SearchHighlight.Render("match"), "the matched run is styled")
 	assert.Contains(t, ascii, "hello ")
 	assert.Contains(t, ascii, " world")
 

@@ -65,8 +65,8 @@ func (b *BaseModel) panelTitle() string {
 // Layout: ╭─ <title> ────╮. Callers guarantee width ≥ panelMinWidth (4).
 func (b *BaseModel) renderPanelTop(width int) string {
 	br := lipgloss.RoundedBorder()
-	return s.Panel.Render(br.TopLeft) + renderPanelTitleMid(b.panelTitle(), width-2) +
-		s.Panel.Render(br.TopRight)
+	return styles.Panel.Render(br.TopLeft) + renderPanelTitleMid(b.panelTitle(), width-2) +
+		styles.Panel.Render(br.TopRight)
 }
 
 // renderBorderTitleMid builds the top-border mid segment of display width
@@ -95,21 +95,21 @@ func renderBorderTitleMid(label string, inner int, borderStyle, labelStyle lipgl
 
 // renderPanelTitleMid builds the top-border mid segment of display width inner.
 func renderPanelTitleMid(title string, inner int) string {
-	return renderBorderTitleMid(title, inner, s.Panel, s.PanelTitle)
+	return renderBorderTitleMid(title, inner, styles.Panel, styles.PanelTitle)
 }
 
 // renderPanelBottom builds the bottom border row: ╰────╯. Callers guarantee
 // width ≥ panelMinWidth (4).
 func (b *BaseModel) renderPanelBottom(width int) string {
 	br := lipgloss.RoundedBorder()
-	return s.Panel.Render(br.BottomLeft) +
-		s.Panel.Render(strings.Repeat(br.Bottom, width-2)) +
-		s.Panel.Render(br.BottomRight)
+	return styles.Panel.Render(br.BottomLeft) +
+		styles.Panel.Render(strings.Repeat(br.Bottom, width-2)) +
+		styles.Panel.Render(br.BottomRight)
 }
 
 // wrapPanelContentRow wraps one viewport content line with left/right borders.
 // line must already be display-width == viewport.Width.
 func wrapPanelContentRow(line string) string {
 	br := lipgloss.RoundedBorder()
-	return s.Panel.Render(br.Left) + line + s.Panel.Render(br.Right)
+	return styles.Panel.Render(br.Left) + line + styles.Panel.Render(br.Right)
 }

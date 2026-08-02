@@ -84,8 +84,8 @@ func TestGatedDetail(t *testing.T) {
 // (plan 018 D13) reuse OK/Err rather than introducing a new palette entry.
 func TestHealthDotStyles_ReuseProcessColors(t *testing.T) {
 	th := CurrentTheme()
-	assert.Equal(t, string(th.OK), colorStr(s.HealthyDot.GetForeground()))
-	assert.Equal(t, string(th.Err), colorStr(s.UnhealthyDot.GetForeground()))
+	assert.Equal(t, string(th.OK), colorStr(styles.HealthyDot.GetForeground()))
+	assert.Equal(t, string(th.Err), colorStr(styles.UnhealthyDot.GetForeground()))
 }
 
 // TestHealthDot pins the process panel's health indicator (plan 018 D13):
@@ -101,10 +101,10 @@ func TestHealthDot(t *testing.T) {
 		status domain.HealthStatus
 		want   string
 	}{
-		{"healthy", domain.HealthStatusHealthy, s.HealthyDot.Render(" ●")},
+		{"healthy", domain.HealthStatusHealthy, styles.HealthyDot.Render(" ●")},
 		// Distinct glyph, not just a distinct color: monochrome/NO_COLOR and
 		// red-green color-blind readers must still tell the states apart.
-		{"unhealthy", domain.HealthStatusUnhealthy, s.UnhealthyDot.Render(" ✗")},
+		{"unhealthy", domain.HealthStatusUnhealthy, styles.UnhealthyDot.Render(" ✗")},
 		{"unknown", domain.HealthStatusUnknown, ""},
 		{"unset", domain.HealthStatus(""), ""},
 	}

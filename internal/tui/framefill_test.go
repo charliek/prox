@@ -354,7 +354,7 @@ func TestLegacy_ProcessPanelByteIdentity(t *testing.T) {
 	}
 	out := b.processPanel()
 	require.Contains(t, out, "\n", "legacy Header MarginBottom must still embed a spacer newline")
-	want := s.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top,
+	want := styles.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top,
 		processStyle(domain.ProcessStateRunning).Render("1:web")))
 	assert.Equal(t, want, out)
 }
@@ -536,6 +536,6 @@ func TestLegacy_SelectionBandDisabled(t *testing.T) {
 	assert.Contains(t, m.viewport.View(), "❯")
 
 	// Cursor style itself must remain FG-only under legacy (C5 pin).
-	_, no := s.Cursor.GetBackground().(lipgloss.NoColor)
+	_, no := styles.Cursor.GetBackground().(lipgloss.NoColor)
 	assert.True(t, no, "legacy Cursor must not gain FullFill/Selection Background")
 }

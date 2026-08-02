@@ -39,8 +39,8 @@ func TestFormatLogEntry_UndetectedByteIdentical(t *testing.T) {
 	}
 	got := m.formatLogEntry(entry)
 	proc := getProcessStyle("api", m.processes).Render("api       ")
-	ts := s.Dim.Render("15:04:05")
-	sep := s.Base.Render(" ")
+	ts := styles.Dim.Render("15:04:05")
+	sep := styles.Base.Render(" ")
 	want := ts + sep + proc + sep + "hello plain world"
 	assert.Equal(t, want, got)
 }
@@ -63,10 +63,10 @@ func TestFormatLogEntry_LevelColors(t *testing.T) {
 		line  string
 		style lipgloss.Style
 	}{
-		{1, "level=error boom", s.LogError},
-		{2, "level=warn careful", s.LogWarn},
-		{3, "level=debug noise", s.LogDebug},
-		{4, "level=info ok", s.LogInfo},
+		{1, "level=error boom", styles.LogError},
+		{2, "level=warn careful", styles.LogWarn},
+		{3, "level=debug noise", styles.LogDebug},
+		{4, "level=info ok", styles.LogInfo},
 	}
 	for _, tc := range cases {
 		entry := domain.LogEntry{Process: "api", Line: tc.line, DisplaySeq: tc.seq}
@@ -86,8 +86,8 @@ func TestFormatLogEntry_StderrBadgeIntactWithLevel(t *testing.T) {
 		Process: "api", Line: "level=error boom", Stream: domain.StreamStderr, DisplaySeq: 1,
 	}
 	got := m.formatLogEntry(entry)
-	assert.Contains(t, got, s.Err.Render(" ERR "))
-	assert.Contains(t, got, s.LogError.Render("level=error boom"))
+	assert.Contains(t, got, styles.Err.Render(" ERR "))
+	assert.Contains(t, got, styles.LogError.Render("level=error boom"))
 }
 
 func TestFormatLogEntry_HighlightComposesWithLevel(t *testing.T) {
@@ -101,10 +101,10 @@ func TestFormatLogEntry_HighlightComposesWithLevel(t *testing.T) {
 	entry := domain.LogEntry{Process: "api", Line: "level=error boom now", DisplaySeq: 1}
 	got := m.formatLogEntry(entry)
 
-	assert.Contains(t, got, s.SearchHighlight.Render("boom"), "highlighted span keeps search colour")
-	assert.Contains(t, got, s.LogError.Render("level=error "), "prefix keeps level tint")
-	assert.Contains(t, got, s.LogError.Render(" now"), "suffix keeps level tint")
-	assert.NotContains(t, got, s.LogError.Render("boom"))
+	assert.Contains(t, got, styles.SearchHighlight.Render("boom"), "highlighted span keeps search colour")
+	assert.Contains(t, got, styles.LogError.Render("level=error "), "prefix keeps level tint")
+	assert.Contains(t, got, styles.LogError.Render(" now"), "suffix keeps level tint")
+	assert.NotContains(t, got, styles.LogError.Render("boom"))
 }
 
 func TestSummarizeJSONLog_SortedDepthCapRemainder(t *testing.T) {
@@ -168,7 +168,7 @@ func TestFormatLogEntry_JSONSummary(t *testing.T) {
 	assert.Contains(t, plain, `level="error"`)
 	assert.Contains(t, plain, `msg="fail"`)
 	assert.NotContains(t, plain, `{"level"`, "raw blob dropped when it does not fit")
-	assert.Contains(t, got, s.LogError.Render(`code=500  level="error"  msg="fail"`))
+	assert.Contains(t, got, styles.LogError.Render(`code=500  level="error"  msg="fail"`))
 }
 
 func TestFormatLogEntry_JSONSummary_WrapOnOffConsistent(t *testing.T) {
@@ -231,11 +231,11 @@ func TestFormatProxyRequest_MethodAndStatusColors(t *testing.T) {
 		status int
 		msty   lipgloss.Style
 	}{
-		{"GET", 200, s.HTTPGet},
-		{"POST", 404, s.HTTPPost},
-		{"PUT", 500, s.HTTPPut},
-		{"DELETE", 301, s.HTTPDelete},
-		{"PATCH", 0, s.HTTPPatch},
+		{"GET", 200, styles.HTTPGet},
+		{"POST", 404, styles.HTTPPost},
+		{"PUT", 500, styles.HTTPPut},
+		{"DELETE", 301, styles.HTTPDelete},
+		{"PATCH", 0, styles.HTTPPatch},
 	}
 	for _, c := range cases {
 		req := proxy.RequestRecord{
@@ -248,16 +248,16 @@ func TestFormatProxyRequest_MethodAndStatusColors(t *testing.T) {
 		tok := fmt.Sprintf("%3d", c.status)
 		switch {
 		case c.status < 200:
-			assert.Contains(t, got, s.Dim.Render(tok))
+			assert.Contains(t, got, styles.Dim.Render(tok))
 		case c.status >= 500:
-			assert.Contains(t, got, s.Status5xx.Render(tok))
+			assert.Contains(t, got, styles.Status5xx.Render(tok))
 		case c.status >= 400:
-			assert.Contains(t, got, s.Status4xx.Render(tok))
+			assert.Contains(t, got, styles.Status4xx.Render(tok))
 		case c.status >= 300:
 			assert.Contains(t, got, tok)
-			assert.NotContains(t, got, s.Status2xx.Render(tok))
+			assert.NotContains(t, got, styles.Status2xx.Render(tok))
 		default:
-			assert.Contains(t, got, s.Status2xx.Render(tok))
+			assert.Contains(t, got, styles.Status2xx.Render(tok))
 		}
 	}
 }
@@ -272,11 +272,11 @@ func TestFormatProxyRequest_DurationScale(t *testing.T) {
 			StatusCode: 200, Duration: time.Duration(ms) * time.Millisecond,
 		})
 	}
-	assert.Contains(t, mk(50), s.HTTPSuccess.Render("   50ms"))
-	assert.Contains(t, mk(300), s.Base.Render("  300ms"))
-	assert.NotContains(t, mk(300), s.Warn.Render("  300ms"))
-	assert.Contains(t, mk(800), s.Warn.Render("  800ms"))
-	assert.Contains(t, mk(3000), s.HTTPError.Render(" 3000ms"))
+	assert.Contains(t, mk(50), styles.HTTPSuccess.Render("   50ms"))
+	assert.Contains(t, mk(300), styles.Base.Render("  300ms"))
+	assert.NotContains(t, mk(300), styles.Warn.Render("  300ms"))
+	assert.Contains(t, mk(800), styles.Warn.Render("  800ms"))
+	assert.Contains(t, mk(3000), styles.HTTPError.Render(" 3000ms"))
 }
 
 func TestFormatProxyRequest_InFlightDim(t *testing.T) {
@@ -288,8 +288,8 @@ func TestFormatProxyRequest_InFlightDim(t *testing.T) {
 		StatusCode: 200, InFlight: true,
 	}
 	got := m.formatProxyRequest(req)
-	assert.Contains(t, got, s.Dim.Render("  ...ms"))
-	assert.Contains(t, got, s.Dim.Render("200"))
+	assert.Contains(t, got, styles.Dim.Render("  ...ms"))
+	assert.Contains(t, got, styles.Dim.Render("200"))
 }
 
 func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {
@@ -301,7 +301,7 @@ func TestFormatRequestDetail_BoldMethodURL(t *testing.T) {
 		Method: "POST", URL: "/api/v1/things", StatusCode: 200, DurationMs: 12,
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, s.Bold.Render("POST")+s.Base.Render(" ")+s.Base.Render("/api/v1/things"))
+	assert.Contains(t, out, styles.Bold.Render("POST")+styles.Base.Render(" ")+styles.Base.Render("/api/v1/things"))
 	assert.NotContains(t, out, "Method:   POST")
 }
 
@@ -317,11 +317,11 @@ func TestFormatRequestDetail_JSONBodySyntaxColor(t *testing.T) {
 		},
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, s.JSONKey.Render(`"s"`))
-	assert.Contains(t, out, s.JSONString.Render(`"hi"`))
-	assert.Contains(t, out, s.JSONNumber.Render("1"))
-	assert.Contains(t, out, s.JSONBool.Render("true"))
-	assert.Contains(t, out, s.JSONNull.Render("null"))
+	assert.Contains(t, out, styles.JSONKey.Render(`"s"`))
+	assert.Contains(t, out, styles.JSONString.Render(`"hi"`))
+	assert.Contains(t, out, styles.JSONNumber.Render("1"))
+	assert.Contains(t, out, styles.JSONBool.Render("true"))
+	assert.Contains(t, out, styles.JSONNull.Render("null"))
 }
 
 func TestFormatRequestDetail_NonJSONBodyUnchanged(t *testing.T) {
@@ -336,8 +336,8 @@ func TestFormatRequestDetail_NonJSONBodyUnchanged(t *testing.T) {
 		},
 	}
 	out := strings.Join(b.formatRequestDetail(), "\n")
-	assert.Contains(t, out, s.Base.Render("  ")+plain)
-	assert.NotContains(t, out, s.JSONKey.Render(`"hello"`))
+	assert.Contains(t, out, styles.Base.Render("  ")+plain)
+	assert.NotContains(t, out, styles.JSONKey.Render(`"hello"`))
 }
 
 func TestHighlightJSONText_RoundTripPlain(t *testing.T) {

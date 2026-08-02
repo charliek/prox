@@ -251,14 +251,14 @@ const helpKeyDescGap = "  "
 func renderHelpKeyRow(row helpKeyRow, keyW int) string {
 	if row.key == "" {
 		indent := keyW + len(helpKeyDescGap)
-		return fillPad(indent) + s.Base.Render(row.desc)
+		return fillPad(indent) + styles.Base.Render(row.desc)
 	}
-	keyPart := s.HelpKey.Render(row.key)
+	keyPart := styles.HelpKey.Render(row.key)
 	pad := keyW - ansi.StringWidth(row.key)
 	if pad < 0 {
 		pad = 0
 	}
-	return keyPart + fillPad(pad) + fillPad(len(helpKeyDescGap)) + s.Base.Render(row.desc)
+	return keyPart + fillPad(pad) + fillPad(len(helpKeyDescGap)) + styles.Base.Render(row.desc)
 }
 
 // renderHelpBodyLines builds styled physical lines (pre-wrap) for the modal body.
@@ -272,7 +272,7 @@ func renderHelpBodyLines(sections []helpSection) []string {
 		if i > 0 {
 			out = append(out, "")
 		}
-		out = append(out, s.HelpSection.Render(sec.title))
+		out = append(out, styles.HelpSection.Render(sec.title))
 		for _, row := range sec.rows {
 			out = append(out, renderHelpKeyRow(row, keyW))
 		}

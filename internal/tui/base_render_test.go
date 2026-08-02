@@ -326,7 +326,7 @@ func TestFormatRequestDetail_BodySections(t *testing.T) {
 	assert.Contains(t, stripANSI(out), `"key": "value"`)
 	assert.Contains(t, out, "Response Body (10 bytes)")
 	assert.Contains(t, out, "(body no longer available)")
-	assert.Contains(t, out, s.Bold.Render("POST")+s.Base.Render(" ")+s.Base.Render("/api/v1/things"))
+	assert.Contains(t, out, styles.Bold.Render("POST")+styles.Base.Render(" ")+styles.Base.Render("/api/v1/things"))
 }
 
 // TestFormatRequestDetail_InFlight_ShowsDurationNote verifies the Duration
@@ -424,7 +424,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("web")
-		wantDot := s.HealthyDot.Render(" ●")
+		wantDot := styles.HealthyDot.Render(" ●")
 		assert.Contains(t, out, wantName+wantDot, "the dot follows the name as its own styled segment")
 		assert.NotContains(t, out, wantName+" ●", "the dot must be styled, not plain text")
 	})
@@ -437,7 +437,7 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		out := b.processPanel()
 		wantName := processStyle(domain.ProcessStateRunning).Render("api")
-		wantDot := s.UnhealthyDot.Render(" ✗")
+		wantDot := styles.UnhealthyDot.Render(" ✗")
 		assert.Contains(t, out, wantName+wantDot)
 	})
 
@@ -472,10 +472,10 @@ func TestProcessPanel_HealthDot(t *testing.T) {
 		}
 		// joinSep mirrors processPanel's HeaderSep-styled separators under
 		// FullFill (empty under legacy) — no dot anywhere.
-		want := s.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
+		want := styles.Header.Render(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join([]string{
 			processStyle(domain.ProcessStateRunning).Render("1:web"),
 			processStyle(domain.ProcessStateWaiting).Render("2:worker (waiting on: postgres)"),
-		}, s.HeaderSep.Render("  "))))
+		}, styles.HeaderSep.Render("  "))))
 		assert.Equal(t, want, b.processPanel())
 	})
 }

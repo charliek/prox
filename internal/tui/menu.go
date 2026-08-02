@@ -341,13 +341,13 @@ func (b *BaseModel) toggleMenuBar() tea.Cmd {
 // left-aligned; the remainder of the row is HeaderBG fill.
 func (b *BaseModel) renderMenuBar() string {
 	var bld strings.Builder
-	bld.WriteString(s.MenuBarFill.Render(" "))
-	bld.WriteString(s.MenuBrand.Render("prox"))
+	bld.WriteString(styles.MenuBarFill.Render(" "))
+	bld.WriteString(styles.MenuBrand.Render("prox"))
 	if b.projectName != "" {
-		bld.WriteString(s.MenuBarFill.Render(" "))
-		bld.WriteString(s.MenuHint.Render(b.projectName))
+		bld.WriteString(styles.MenuBarFill.Render(" "))
+		bld.WriteString(styles.MenuHint.Render(b.projectName))
 	}
-	bld.WriteString(s.MenuBarFill.Render(" "))
+	bld.WriteString(styles.MenuBarFill.Render(" "))
 
 	x := ansi.StringWidth(bld.String())
 	y := 0 // menu bar is always row 0 when visible; caller places it first
@@ -355,11 +355,11 @@ func (b *BaseModel) renderMenuBar() string {
 	for _, id := range menuOrder {
 		text := menuCellText(id)
 		w := ansi.StringWidth(text)
-		style := s.MenuCell
+		style := styles.MenuCell
 		if b.menuOpen() && MenuID(b.openMenu) == id {
-			style = s.MenuCellHover
+			style = styles.MenuCellHover
 		} else if !b.menuOpen() && b.hoveredMenuCell == int(id) {
-			style = s.MenuCellHover
+			style = styles.MenuCellHover
 		}
 		bld.WriteString(style.Render(text))
 		hits.menuCells = append(hits.menuCells, menuCellHit{
@@ -373,7 +373,7 @@ func (b *BaseModel) renderMenuBar() string {
 	w := ansi.StringWidth(line)
 	switch {
 	case w < b.width:
-		line += s.MenuBarFill.Render(strings.Repeat(" ", b.width-w))
+		line += styles.MenuBarFill.Render(strings.Repeat(" ", b.width-w))
 	case w > b.width:
 		line = ansi.Cut(line, 0, b.width)
 	}
@@ -466,16 +466,16 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	rowY := boxTop + 1
 
 	// Top border.
-	rows = append(rows, s.Dropdown.Render(br.TopLeft)+
-		s.Dropdown.Render(strings.Repeat(br.Top, innerW))+
-		s.Dropdown.Render(br.TopRight))
+	rows = append(rows, styles.Dropdown.Render(br.TopLeft)+
+		styles.Dropdown.Render(strings.Repeat(br.Top, innerW))+
+		styles.Dropdown.Render(br.TopRight))
 
 	renderInd := func(hidden int) {
 		label := fmt.Sprintf("… %d more …", hidden)
 		content := strings.Repeat(" ", pad) + label
 		content = padFrameRow(content, innerW)
-		inner := s.DropdownDim.Render(ansi.Cut(content, 0, innerW))
-		row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
+		inner := styles.DropdownDim.Render(ansi.Cut(content, 0, innerW))
+		row := styles.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + styles.Dropdown.Render(br.Right)
 		rows = append(rows, row)
 		hitRows = append(hitRows, menuRowHit{
 			Index: -1,
@@ -495,8 +495,8 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 			content := strings.Repeat("─", max(1, innerW-pad*2))
 			content = strings.Repeat(" ", pad) + content + strings.Repeat(" ", pad)
 			content = ansi.Cut(content, 0, innerW)
-			inner := s.DropdownDim.Render(padFrameRow(content, innerW))
-			row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
+			inner := styles.DropdownDim.Render(padFrameRow(content, innerW))
+			row := styles.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + styles.Dropdown.Render(br.Right)
 			rows = append(rows, row)
 			hitRows = append(hitRows, menuRowHit{
 				Index: -1,
@@ -505,7 +505,7 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 		default:
 			highlighted := i == b.menuHighlight && it.Cmd != ""
 			inner := renderMenuItemInner(it, innerW, pad, hintGap, highlighted)
-			row := s.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + s.Dropdown.Render(br.Right)
+			row := styles.Dropdown.Render(br.Left) + padFrameRow(inner, innerW) + styles.Dropdown.Render(br.Right)
 			rows = append(rows, row)
 			idx := i
 			if it.Cmd == "" {
@@ -524,9 +524,9 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	}
 
 	// Bottom border.
-	rows = append(rows, s.Dropdown.Render(br.BottomLeft)+
-		s.Dropdown.Render(strings.Repeat(br.Bottom, innerW))+
-		s.Dropdown.Render(br.BottomRight))
+	rows = append(rows, styles.Dropdown.Render(br.BottomLeft)+
+		styles.Dropdown.Render(strings.Repeat(br.Bottom, innerW))+
+		styles.Dropdown.Render(br.BottomRight))
 
 	hits := b.mustHits()
 	hits.dropdown = menuDropdownHit{
@@ -561,17 +561,17 @@ func renderMenuItemInner(it MenuItem, innerW, pad, hintGap int, highlighted bool
 
 	var leftStyle, hintStyle, gapStyle lipgloss.Style
 	if highlighted {
-		leftStyle = s.DropdownItemSelected
-		gapStyle = s.DropdownSelectedGap
-		hintStyle = s.DropdownItemSelectedHint
+		leftStyle = styles.DropdownItemSelected
+		gapStyle = styles.DropdownSelectedGap
+		hintStyle = styles.DropdownItemSelectedHint
 	} else if it.Cmd == "" {
-		leftStyle = s.DropdownItemMuted
-		gapStyle = s.DropdownGap
+		leftStyle = styles.DropdownItemMuted
+		gapStyle = styles.DropdownGap
 		hintStyle = leftStyle
 	} else {
-		leftStyle = s.DropdownItem
-		gapStyle = s.DropdownGap
-		hintStyle = s.DropdownItemHint
+		leftStyle = styles.DropdownItem
+		gapStyle = styles.DropdownGap
+		hintStyle = styles.DropdownItemHint
 	}
 
 	hintW := 0

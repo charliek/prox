@@ -70,7 +70,7 @@ type styleSet struct {
 // assignment — never mutate fields in place. The TUI is single-goroutine;
 // theme-mutating tests must not run in parallel (see withTestTheme).
 var (
-	s                  styleSet
+	styles             styleSet
 	sel                styleSet // FullFill cursor-row styles (SelectionBG fill)
 	selectionRowActive bool     // true while formatters run under sel
 	currentTheme       *Theme
@@ -91,7 +91,7 @@ func SetTheme(t *Theme) {
 		t = tokyoNightTheme()
 	}
 	currentTheme = t
-	s = buildStyleSet(t)
+	styles = buildStyleSet(t)
 	if t.FullFill {
 		sel = buildSelectionStyleSet(t)
 	} else {
@@ -99,18 +99,18 @@ func SetTheme(t *Theme) {
 	}
 }
 
-// withSelectionStyles runs fn with s swapped to the SelectionBG fill set when
-// selected under a FullFill theme. Legacy and non-selected rows keep s as-is
+// withSelectionStyles runs fn with styles swapped to the SelectionBG fill set when
+// selected under a FullFill theme. Legacy and non-selected rows keep styles as-is
 // so escape output stays byte-identical to pre-band rendering.
 func withSelectionStyles(selected bool, fn func()) {
 	if !selected || currentTheme == nil || !currentTheme.FullFill {
 		fn()
 		return
 	}
-	prev, prevFlag := s, selectionRowActive
-	s, selectionRowActive = sel, true
+	prev, prevFlag := styles, selectionRowActive
+	styles, selectionRowActive = sel, true
 	fn()
-	s, selectionRowActive = prev, prevFlag
+	styles, selectionRowActive = prev, prevFlag
 }
 
 // SetThemeByName resolves name and installs it. Returns the canonical name and

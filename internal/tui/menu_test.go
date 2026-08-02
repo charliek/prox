@@ -19,7 +19,7 @@ func TestRelayout_FrameHeightCombos(t *testing.T) {
 				m.settings.MenuBar = menu
 				m.settings.ProcessPanel = panel
 				m = clientUpdate(m, tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
-				frame := m.mainView(footerMsg{})
+				frame := m.View()
 				assert.Equal(t, sz.h, lipgloss.Height(frame),
 					"menu=%v panel=%v size=%dx%d chrome=%d vp=%d",
 					menu, panel, sz.w, sz.h, m.chromeHeight(), m.viewport.Height)
@@ -40,7 +40,7 @@ func TestRelayout_ToggleCallsRelayout(t *testing.T) {
 	m = clientUpdate(m, keyRune('m'))
 	assert.False(t, m.settings.MenuBar)
 	assert.Equal(t, vpBefore+1, m.viewport.Height, "hiding menu bar frees one viewport row")
-	assert.Equal(t, 24, lipgloss.Height(m.mainView(footerMsg{})))
+	assert.Equal(t, 24, lipgloss.Height(m.View()))
 }
 
 func TestMenuBar_TogglePersists(t *testing.T) {
@@ -202,7 +202,7 @@ func TestMenu_MouseOpenBlursTextInput(t *testing.T) {
 	m.projectName = "demo"
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	// Render once so hit-rects exist.
-	_ = m.mainView(footerMsg{})
+	_ = m.View()
 	require.NotEmpty(t, m.mustHits().menuCells)
 
 	m.mode = ModeStringFilter
@@ -225,7 +225,7 @@ func TestMenu_MouseClickDropdownActivates(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
-	_ = m.mainView(footerMsg{}) // record dropdown hits
+	_ = m.View() // record dropdown hits
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	require.GreaterOrEqual(t, len(hits.dropdown.Rows), 2)
@@ -247,7 +247,7 @@ func TestMenu_MouseClickAwayCloses(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = clientUpdate(m, keyRune('v'))
 	require.True(t, m.menuOpen())
-	_ = m.mainView(footerMsg{})
+	_ = m.View()
 
 	m = clientUpdate(m, tea.MouseMsg{
 		X: 0, Y: 10,

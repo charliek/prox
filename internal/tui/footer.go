@@ -76,16 +76,16 @@ func (b *BaseModel) setStatusFlash(msg footerMsg, class flashClass, delay time.D
 }
 
 // styleFooterMsg renders msg for the footer left band. Errors get `✗ ` +
-// Err-bold on FooterBG (s.FooterError — readable on light themes where the
+// Err-bold on FooterBG (styles.FooterError — readable on light themes where the
 // badge FG blends into FooterBG); info is plain FooterFG on FooterBG.
 func styleFooterMsg(msg footerMsg) string {
 	if msg.empty() {
 		return ""
 	}
 	if msg.kind == footerKindError {
-		return s.FooterError.Render("✗ " + msg.text)
+		return styles.FooterError.Render("✗ " + msg.text)
 	}
-	return s.FooterLabel.Render(msg.text)
+	return styles.FooterLabel.Render(msg.text)
 }
 
 // renderFooterHints styles key+label pairs (FooterKey+bold / FooterFG) with
@@ -97,10 +97,10 @@ func renderFooterHints(hints []footerHint) string {
 	var b strings.Builder
 	for i, h := range hints {
 		if i > 0 {
-			b.WriteString(s.FooterLabel.Render(" · "))
+			b.WriteString(styles.FooterLabel.Render(" · "))
 		}
-		b.WriteString(s.FooterKey.Render(h.key))
-		b.WriteString(s.FooterLabel.Render(h.label))
+		b.WriteString(styles.FooterKey.Render(h.key))
+		b.WriteString(styles.FooterLabel.Render(h.label))
 	}
 	return b.String()
 }
@@ -118,7 +118,7 @@ func padFooterRow(row string, width int) string {
 	case w > width:
 		return ansi.Cut(row, 0, width)
 	default:
-		return row + s.FooterLabel.Render(strings.Repeat(" ", width-w))
+		return row + styles.FooterLabel.Render(strings.Repeat(" ", width-w))
 	}
 }
 

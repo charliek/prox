@@ -154,11 +154,11 @@ func (b *BaseModel) streamHealthSegments() []string {
 		// handleStreamStatus); a first-connect Syncing stays silent.
 		case st.State == stream.StateReconnecting,
 			st.State == stream.StateSyncing && b.streamDropped[id]:
-			segs = append(segs, s.Warn.Render("⚠ "+id.String()+": reconnecting…"))
+			segs = append(segs, styles.Warn.Render("⚠ "+id.String()+": reconnecting…"))
 		case st.State == stream.StateUnavailable:
 			segs = append(segs, id.String()+": n/a")
 		case st.State == stream.StateClosed:
-			segs = append(segs, s.Warn.Render("⚠ "+id.String()+": disconnected"))
+			segs = append(segs, styles.Warn.Render("⚠ "+id.String()+": disconnected"))
 		}
 	}
 	return segs

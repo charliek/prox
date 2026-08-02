@@ -157,7 +157,7 @@ func TestThemeMenu_MouseActivate(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = openThemeMenu(m)
-	_ = m.mainView(footerMsg{})
+	_ = m.View()
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 

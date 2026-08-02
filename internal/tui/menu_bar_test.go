@@ -15,6 +15,8 @@ import (
 
 func menuBarPlainLine(t *testing.T, m ClientModel) string {
 	t.Helper()
+	// Deliberately mainView, not View(): View() prepends OSC-22 to the whole
+	// frame; this helper needs the first mainView row for menu-bar layout text.
 	frame := m.mainView(footerMsg{})
 	lines := strings.Split(frame, "\n")
 	require.NotEmpty(t, lines)
@@ -55,7 +57,7 @@ func TestMenuBar_TruncatesAtNarrowWidth(t *testing.T) {
 	m := newTestModel()
 	m.projectName = "very-long-project-name"
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 24, Height: 12})
-	frame := m.mainView(footerMsg{})
+	frame := m.View()
 	line := strings.Split(frame, "\n")[0]
 	assert.Equal(t, 24, ansi.StringWidth(line))
 }
@@ -100,7 +102,7 @@ func TestMenuBar_HitRectsFollowLeftCells(t *testing.T) {
 	m := newTestModel()
 	m.projectName = "demo"
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
-	_ = m.mainView(footerMsg{})
+	_ = m.View()
 	hits := m.mustHits()
 	require.Len(t, hits.menuCells, 3)
 	assert.Equal(t, MenuView, hits.menuCells[0].ID)

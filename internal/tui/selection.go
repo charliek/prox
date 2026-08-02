@@ -3,7 +3,7 @@ package tui
 // Selection-band helpers (plan 023 E1 / C16).
 //
 // FullFill cursor rows rebuild segments with SelectionBG (via sel styleSet) and
-// pad with s.Selection so every cell of every wrapped display row is on the
+// pad with styles.Selection so every cell of every wrapped display row is on the
 // band. SearchHighlight keeps SearchHitBG (search-hit precedence). Legacy
 // (FullFill=false) never enters the band path — marker-only cursor rendering
 // stays byte-identical to pre-C16 (C5 pins).

@@ -104,7 +104,7 @@ func (b *BaseModel) requestsPagingSegments() []string {
 		}
 	}
 	if b.pagingErr != nil {
-		segs = append(segs, s.Warn.Render("⚠ older: "+truncateError(b.pagingErr, maxErrorDisplayLen)))
+		segs = append(segs, styles.Warn.Render("⚠ older: "+truncateError(b.pagingErr, maxErrorDisplayLen)))
 	}
 	return segs
 }

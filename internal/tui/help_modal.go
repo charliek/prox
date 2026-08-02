@@ -19,10 +19,10 @@ const (
 	helpModalFooter = "esc/?/q/enter close · j/k scroll"
 
 	// helpModalFrameChrome is lipgloss border (2) + padding vertical (2).
-	// MUST match s.Help (styles.go): border + Padding(1, 2).
+	// MUST match styles.Help (styles.go): border + Padding(1, 2).
 	helpModalFrameChrome = 4
 
-	// helpModalHorizChrome is border L/R (2) + padding L/R (4) — s.Help too.
+	// helpModalHorizChrome is border L/R (2) + padding L/R (4) — styles.Help too.
 	// When the outer box is narrower than this, helpHorizChrome degrades:
 	// drop side padding first, then the border (plan 023 A2).
 	helpModalHorizChrome = 6
@@ -295,7 +295,7 @@ func (b *BaseModel) helpModalBoxDims() (boxW, desiredH int) {
 
 // renderHelpBorderTitleMid builds the top-border mid segment of display width inner.
 func renderHelpBorderTitleMid(title string, inner int) string {
-	return renderBorderTitleMid(title, inner, s.HelpBorder, s.HelpTitle)
+	return renderBorderTitleMid(title, inner, styles.HelpBorder, styles.HelpTitle)
 }
 
 // spliceHelpBorderTitle replaces the top border row with a titled variant.
@@ -306,7 +306,7 @@ func spliceHelpBorderTitle(topRow string, outerW int, title string) string {
 	br := lipgloss.RoundedBorder()
 	inner := outerW - 2
 	mid := renderHelpBorderTitleMid(title, inner)
-	row := s.HelpBorder.Render(br.TopLeft) + mid + s.HelpBorder.Render(br.TopRight)
+	row := styles.HelpBorder.Render(br.TopLeft) + mid + styles.HelpBorder.Render(br.TopRight)
 	return padFrameRow(row, outerW)
 }
 
@@ -344,11 +344,11 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 			end = len(body)
 		}
 		visible = append(visible, body[offset:end]...)
-		visible = append(visible, ansi.Cut(s.Dim.Render(fmt.Sprintf(
+		visible = append(visible, ansi.Cut(styles.Dim.Render(fmt.Sprintf(
 			"… lines %d-%d of %d (j/k scroll) …", offset+1, end, len(body))), 0, innerW))
 	}
 
-	footer := ansi.Cut(s.Dim.Render(helpModalFooter), 0, innerW)
+	footer := ansi.Cut(styles.Dim.Render(helpModalFooter), 0, innerW)
 
 	parts := make([]string, 0, 2+len(visible))
 	if !bordered {
@@ -364,7 +364,7 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 	// the border — never render wider than the frame (padFrameRow clamps).
 	// The borderless rung keeps Padding(2,0): helpModalFrameChrome budgets
 	// 2+2 vertical chrome regardless of the horizontal ladder.
-	style := s.Help
+	style := styles.Help
 	widthArg := w - 2
 	switch {
 	case w >= helpModalHorizChrome:

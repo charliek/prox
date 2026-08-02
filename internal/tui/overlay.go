@@ -29,7 +29,7 @@ func fillPad(n int) string {
 	if n <= 0 {
 		return ""
 	}
-	return s.Base.Render(strings.Repeat(" ", n))
+	return styles.Base.Render(strings.Repeat(" ", n))
 }
 
 // centeredHint returns h rows of width w with text styled and centered both
@@ -86,7 +86,7 @@ func padFrameRow(row string, width int) string {
 }
 
 // padSelectionRow is padFrameRow for FullFill cursor-band rows: trailing fill
-// uses s.Selection (SelectionBG) so the band spans the full viewport width.
+// uses styles.Selection (SelectionBG) so the band spans the full viewport width.
 func padSelectionRow(row string, width int) string {
 	if width <= 0 {
 		return ""
@@ -96,7 +96,7 @@ func padSelectionRow(row string, width int) string {
 	case w > width:
 		return ansi.Cut(row, 0, width)
 	case w < width:
-		return row + s.Selection.Render(strings.Repeat(" ", width-w))
+		return row + styles.Selection.Render(strings.Repeat(" ", width-w))
 	default:
 		return row
 	}

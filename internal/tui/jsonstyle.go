@@ -181,9 +181,9 @@ func highlightJSONText(text string) string {
 				j++
 			}
 			if j < len(text) && text[j] == ':' {
-				b.WriteString(s.JSONKey.Render(str))
+				b.WriteString(styles.JSONKey.Render(str))
 			} else {
-				b.WriteString(s.JSONString.Render(str))
+				b.WriteString(styles.JSONString.Render(str))
 			}
 			i = next
 			continue
@@ -234,11 +234,11 @@ func scanJSONLiteral(text string, i int) (string, int, lipgloss.Style, bool) {
 	rest := text[i:]
 	switch {
 	case strings.HasPrefix(rest, "null") && literalEnd(rest, 4):
-		return "null", i + 4, s.JSONNull, true
+		return "null", i + 4, styles.JSONNull, true
 	case strings.HasPrefix(rest, "true") && literalEnd(rest, 4):
-		return "true", i + 4, s.JSONBool, true
+		return "true", i + 4, styles.JSONBool, true
 	case strings.HasPrefix(rest, "false") && literalEnd(rest, 5):
-		return "false", i + 5, s.JSONBool, true
+		return "false", i + 5, styles.JSONBool, true
 	}
 	// Number: optional minus, digits, optional frac/exp — JSON subset.
 	j := i
@@ -272,7 +272,7 @@ func scanJSONLiteral(text string, i int) (string, int, lipgloss.Style, bool) {
 			j++
 		}
 	}
-	return text[i:j], j, s.JSONNumber, true
+	return text[i:j], j, styles.JSONNumber, true
 }
 
 // literalEnd reports whether rest[n] is a JSON literal boundary (or EOS).
