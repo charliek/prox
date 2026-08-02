@@ -95,12 +95,12 @@ func (b *BaseModel) requestsPagingSegments() []string {
 	var segs []string
 	switch b.pagingPhase {
 	case pagingLoading:
-		segs = append(segs, "loading older…")
+		segs = append(segs, styles.FooterLabel.Render("loading older…"))
 	case pagingExhausted:
 		// Suppressed on an empty list: "start of history" on a list with no
 		// history at all (a proxy that has served nothing yet) says nothing.
 		if b.viewMode == ViewModeRequests && len(b.proxyRequests) > 0 {
-			segs = append(segs, "start of history")
+			segs = append(segs, styles.FooterLabel.Render("start of history"))
 		}
 	}
 	if b.pagingErr != nil {

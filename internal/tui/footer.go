@@ -105,20 +105,24 @@ func renderFooterHints(hints []footerHint) string {
 	return b.String()
 }
 
-// padFooterRow pads or truncates row to exactly width columns using FooterBG
-// spaces (whole footer band — no unstyled holes, plan 023 B2).
-func padFooterRow(row string, width int) string {
+// padFooterRow joins left and right with FooterBG padding BETWEEN them so the
+// right group's last glyph sits at the final column (plan 024 F3). When right
+// is empty the mid-pad fills to width (end fill). Oversize content is cut.
+func padFooterRow(left, right string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	w := ansi.StringWidth(row)
+	lw := ansi.StringWidth(left)
+	rw := ansi.StringWidth(right)
+	need := lw + rw
 	switch {
-	case w == width:
-		return row
-	case w > width:
-		return ansi.Cut(row, 0, width)
+	case need == width:
+		return left + right
+	case need > width:
+		return ansi.Cut(left+right, 0, width)
 	default:
-		return row + styles.FooterLabel.Render(strings.Repeat(" ", width-w))
+		mid := styles.FooterLabel.Render(strings.Repeat(" ", width-need))
+		return left + mid + right
 	}
 }
 
@@ -139,13 +143,14 @@ func dropFooterHint(hints []footerHint) []footerHint {
 // fitFooterRow applies the narrow-width degradation ladder (plan 023 B2):
 // drop hints RTL (whole pairs) → drop count → ANSI-truncate status.
 // Returns styled left and right segments (no outer Status padding yet).
+// padFooterRow inserts the flexible mid-pad (≥ gap) so right ends flush.
 func fitFooterRow(width int, leftStyled, countStyled string, hints []footerHint) (left, right string) {
 	left = leftStyled
 	hints = append([]footerHint(nil), hints...)
 	showCount := countStyled != ""
 
-	const gap = 2 // "  " between left and right
-	// Leading FooterLabel pad (1); trailing filled by padFooterRow.
+	const gap = 2 // minimum columns between left and right
+	// Leading FooterLabel pad (1); mid/trailing fill by padFooterRow.
 	const statusPad = 1
 
 	innerW := width - statusPad
@@ -153,18 +158,20 @@ func fitFooterRow(width int, leftStyled, countStyled string, hints []footerHint)
 		innerW = 0
 	}
 
+	styledSpace := styles.FooterLabel.Render(" ")
 	buildRight := func() string {
 		parts := make([]string, 0, 2)
-		if showCount && countStyled != "" {
+		if showCount {
 			parts = append(parts, countStyled)
 		}
 		hs := renderFooterHints(hints)
 		if hs != "" {
 			parts = append(parts, hs)
 		}
-		return strings.Join(parts, " ")
+		return strings.Join(parts, styledSpace)
 	}
 
+	ellipsis := styles.FooterLabel.Render("…")
 	for {
 		right = buildRight()
 		need := ansi.StringWidth(left) + gap + ansi.StringWidth(right)
@@ -179,12 +186,12 @@ func fitFooterRow(width int, leftStyled, countStyled string, hints []footerHint)
 			showCount = false
 			continue
 		}
-		// Truncate left to remaining budget.
+		// Truncate left to remaining budget (styled ellipsis — no bare hole).
 		budget := innerW - gap - ansi.StringWidth(right)
 		if budget < 0 {
 			budget = 0
 		}
-		left = ansi.Truncate(left, budget, "…")
+		left = ansi.Truncate(left, budget, ellipsis)
 		right = buildRight()
 		break
 	}

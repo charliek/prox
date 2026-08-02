@@ -156,7 +156,7 @@ func (b *BaseModel) streamHealthSegments() []string {
 			st.State == stream.StateSyncing && b.streamDropped[id]:
 			segs = append(segs, styles.Warn.Render("⚠ "+id.String()+": reconnecting…"))
 		case st.State == stream.StateUnavailable:
-			segs = append(segs, id.String()+": n/a")
+			segs = append(segs, styles.FooterLabel.Render(id.String()+": n/a"))
 		case st.State == stream.StateClosed:
 			segs = append(segs, styles.Warn.Render("⚠ "+id.String()+": disconnected"))
 		}

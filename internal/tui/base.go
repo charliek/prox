@@ -287,14 +287,19 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 }
 
 // applyTextInputTheme sets prompt/cursor/text styles from the active theme.
+// FooterBG is carried on every style so the filter/search input paints the
+// footer band (plan 024 F3) — FG stays theme FG for contrast on light FooterBG.
 func applyTextInputTheme(ti *textinput.Model) {
 	th := CurrentTheme()
 	if th == nil {
 		return
 	}
-	ti.PromptStyle = lipgloss.NewStyle().Foreground(th.FooterKey)
-	ti.TextStyle = lipgloss.NewStyle().Foreground(th.FG)
-	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Cursor)
+	bg := th.FooterBG
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(th.FooterKey).Background(bg)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(th.FG).Background(bg)
+	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(th.Dim).Background(bg)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Cursor).Background(bg)
+	ti.Cursor.TextStyle = lipgloss.NewStyle().Foreground(th.FG).Background(bg)
 }
 
 // handleWindowSize handles window resize messages.
@@ -2739,13 +2744,9 @@ func (b *BaseModel) statusBar(msg footerMsg) string {
 	countStyled := styles.FooterLabel.Render(countPlain)
 
 	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints())
-	pad := styles.FooterLabel.Render(" ")
-	gap := styles.FooterLabel.Render("  ")
-	row := pad + left + gap + right
-	// padFrameRow fills any remaining columns with theme Base (FooterBG under
-	// the Status band is applied per-segment above — trailing pad uses Base
-	// which is theme BG; prefer Status-colored fill for the footer band).
-	return singleFrameLine(padFooterRow(row, b.width))
+	// Leading pad + flush-right mid-pad between left and right (plan 024 F3).
+	leading := styles.FooterLabel.Render(" ")
+	return singleFrameLine(padFooterRow(leading+left, right, b.width))
 }
 
 // mainView renders the main TUI layout. Chrome rows are derived from settings
@@ -2819,7 +2820,8 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		lines = append(lines, b.renderPanelBottom(b.width))
 	}
 
-	lines = append(lines, padFooterRow(singleFrameLine(b.statusBar(msg)), b.width))
+	// statusBar already returns an exact-width single-line FooterBG row.
+	lines = append(lines, b.statusBar(msg))
 
 	if b.menuOpen() {
 		lines = b.applyMenuOverlay(lines)
