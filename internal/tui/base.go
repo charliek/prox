@@ -2224,9 +2224,12 @@ func shouldPrettyPrintJSON(body *BodyData) bool {
 // expressed with proc:/-proc: clauses (WS8 retired ModeFilter/filterProcesses).
 // Preallocates like filteredProxyRequests (plan 023 C14).
 func (b *BaseModel) filteredEntries() []domain.LogEntry {
-	result := make([]domain.LogEntry, 0, len(b.logEntries))
 	expr := b.logsFilter.LastGood
 	useExpr := !expr.IsEmpty()
+	var result []domain.LogEntry
+	if !useExpr && b.soloProcess == "" {
+		result = make([]domain.LogEntry, 0, len(b.logEntries))
+	}
 
 	for _, entry := range b.logEntries {
 		// Process filter

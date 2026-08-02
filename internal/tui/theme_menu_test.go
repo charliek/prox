@@ -269,6 +269,17 @@ func TestThemeMenu_CacheInvalidationOnOpenPaths(t *testing.T) {
 		assertHas(t, themeLabels(m), "delta", true)
 	})
 
+	t.Run("render fallback caches theme names", func(t *testing.T) {
+		m := newTestModel()
+		require.Nil(t, m.themeMenuNames)
+		_ = m.menuItems(MenuTheme)
+		require.NotNil(t, m.themeMenuNames)
+		cached := m.themeMenuNames
+		_ = m.menuItems(MenuTheme)
+		assert.Equal(t, cached, m.themeMenuNames,
+			"fallback must populate themeMenuNames so render reuses one ReadDir result")
+	})
+
 	t.Run("close reopen", func(t *testing.T) {
 		writeUserTheme(t, dir, "epsilon")
 		m := newTestModel()

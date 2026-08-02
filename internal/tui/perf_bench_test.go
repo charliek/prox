@@ -18,27 +18,43 @@ import (
 
 const benchLogN = 500
 
-func benchLogLines() []domain.LogEntry {
+func benchLogLinesWith(line func(int) string) []domain.LogEntry {
 	out := make([]domain.LogEntry, benchLogN)
 	for i := 0; i < benchLogN; i++ {
-		var line string
-		switch i % 4 {
-		case 0:
-			line = fmt.Sprintf(`{"level":"info","msg":"ok","n":%d,"svc":"api"}`, i)
-		case 1:
-			line = fmt.Sprintf(`{"level":"error","msg":"fail","code":%d}`, 400+i%50)
-		case 2:
-			line = fmt.Sprintf("level=info plain log line %d hello world", i)
-		default:
-			line = fmt.Sprintf("something happened without a level %d", i)
-		}
 		out[i] = domain.LogEntry{
 			Timestamp: time.Unix(0, int64(i)),
 			Process:   "api",
-			Line:      line,
+			Line:      line(i),
 		}
 	}
 	return out
+}
+
+func benchLogLines() []domain.LogEntry {
+	return benchLogLinesWith(func(i int) string {
+		switch i % 4 {
+		case 0:
+			return fmt.Sprintf(`{"level":"info","msg":"ok","n":%d,"svc":"api"}`, i)
+		case 1:
+			return fmt.Sprintf(`{"level":"error","msg":"fail","code":%d}`, 400+i%50)
+		case 2:
+			return fmt.Sprintf("level=info plain log line %d hello world", i)
+		default:
+			return fmt.Sprintf("something happened without a level %d", i)
+		}
+	})
+}
+
+func benchPlainLogLines() []domain.LogEntry {
+	return benchLogLinesWith(func(i int) string {
+		return fmt.Sprintf("level=info plain log line %d hello world", i)
+	})
+}
+
+func benchJSONLogLines() []domain.LogEntry {
+	return benchLogLinesWith(func(i int) string {
+		return fmt.Sprintf(`{"level":"info","msg":"ok","n":%d,"svc":"api"}`, i)
+	})
 }
 
 func BenchmarkLogIngest(b *testing.B) {
@@ -54,11 +70,15 @@ func BenchmarkLogIngest(b *testing.B) {
 }
 
 func BenchmarkLogRowRender(b *testing.B) {
+	benchmarkUpdateViewport(b, benchLogLines())
+}
+
+func benchmarkUpdateViewport(b *testing.B, lines []domain.LogEntry) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 40})
 	m.settings.Wrap = false
 	m.settings.Timestamps = true
-	for _, e := range benchLogLines() {
+	for _, e := range lines {
 		m.appendLogEntry(e)
 	}
 	b.ReportAllocs()
@@ -68,17 +88,35 @@ func BenchmarkLogRowRender(b *testing.B) {
 	}
 }
 
-func BenchmarkFilteredEntries(b *testing.B) {
+func BenchmarkUpdateViewport_Plain(b *testing.B) {
+	benchmarkUpdateViewport(b, benchPlainLogLines())
+}
+
+func BenchmarkUpdateViewport_JSON(b *testing.B) {
+	benchmarkUpdateViewport(b, benchJSONLogLines())
+}
+
+func benchmarkFilteredEntries(b *testing.B, setup func(*BaseModel)) {
 	m := newTestBaseModel()
 	for _, e := range benchLogLines() {
 		m.appendLogEntry(e)
 	}
-	m.setLogsFilterQuery(`level:error OR "hello"`)
+	setup(m)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = m.filteredEntries()
 	}
+}
+
+func BenchmarkFilteredEntries(b *testing.B) {
+	benchmarkFilteredEntries(b, func(m *BaseModel) {
+		m.setLogsFilterQuery(`level:error OR "hello"`)
+	})
+}
+
+func BenchmarkFilteredEntries_NoFilter(b *testing.B) {
+	benchmarkFilteredEntries(b, func(*BaseModel) {})
 }
 
 func BenchmarkThemeMenuItems(b *testing.B) {

@@ -154,8 +154,9 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 		names := b.themeMenuNames
 		if names == nil {
 			// Fallback for callers that build Theme items without opening
-			// (tests); the open path always populates themeMenuNames first.
+			// (tests); populate the cache so render never repeats ReadDir.
 			names = AvailableThemes()
+			b.themeMenuNames = names
 		}
 		current := CurrentThemeName()
 		items := make([]MenuItem, len(names))

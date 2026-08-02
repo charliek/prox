@@ -93,12 +93,12 @@ func TestClassifyLevel_Corpus(t *testing.T) {
 	}
 }
 
-func TestIsJSONObject(t *testing.T) {
+func TestIngestLogMeta_JSONObject(t *testing.T) {
 	t.Parallel()
-	assert.True(t, isJSONObject(`{"level":"error"}`))
-	assert.False(t, isJSONObject("not json"))
-	assert.False(t, isJSONObject(`[1,2,3]`))
-	assert.False(t, isJSONObject(`{"broken"`))
+	assert.True(t, ingestLogMeta(`{"level":"error"}`).isJSON)
+	assert.False(t, ingestLogMeta("not json").isJSON)
+	assert.False(t, ingestLogMeta(`[1,2,3]`).isJSON)
+	assert.False(t, ingestLogMeta(`{"broken"`).isJSON)
 }
 
 func TestLogMeta_AppendLogEntry(t *testing.T) {

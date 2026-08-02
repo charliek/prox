@@ -175,14 +175,3 @@ func ingestLogMeta(raw string) logMeta {
 	level, has := classifyLevelHeuristics(raw)
 	return logMeta{level: level, hasLevel: has}
 }
-
-// isJSONObject reports whether raw is a JSON object (trimmed leading `{` and
-// unmarshals as map). C9 reuses this for JSON pretty-print detection.
-func isJSONObject(raw string) bool {
-	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, "{") {
-		return false
-	}
-	var obj map[string]any
-	return json.Unmarshal([]byte(trimmed), &obj) == nil
-}
