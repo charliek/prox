@@ -82,6 +82,7 @@ func (b *BaseModel) closeMenu() {
 	b.openMenu = -1
 	b.menuHighlight = 0
 	b.menuWindow = 0
+	b.hoveredMenuCell = -1
 	// Immediate invalidation: a menu can close in Update before the next
 	// render, so frame-top resetFrame alone is not enough (plan 023 A1).
 	h := b.mustHits()
@@ -94,6 +95,7 @@ func (b *BaseModel) openMenuFirst(id MenuID) {
 	b.openMenu = int(id)
 	b.menuHighlight = b.menuFirstSelectable(id)
 	b.menuWindow = 0
+	b.hoveredMenuCell = -1
 }
 
 func (b *BaseModel) menuFirstSelectable(id MenuID) int {
@@ -443,6 +445,33 @@ func (b *BaseModel) toggleMenuBar() tea.Cmd {
 	return nil
 }
 
+// ConfigPathProjectName derives the menu-bar project label from the absolute
+// path of the resolved config file (plan 023 B3: basename of its directory).
+func ConfigPathProjectName(absConfigPath string) string {
+	if absConfigPath == "" {
+		return ""
+	}
+	return dirBaseName(filepath.Dir(absConfigPath))
+}
+
+// StatusProjectName derives the menu-bar project label from GET /status
+// project_dir (plan 023 B3). Empty project_dir returns "" so callers fall
+// back to the cwd basename via resolveProjectName.
+func StatusProjectName(projectDir string) string {
+	if projectDir == "" {
+		return ""
+	}
+	return dirBaseName(projectDir)
+}
+
+func dirBaseName(dir string) string {
+	base := filepath.Base(dir)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	return base
+}
+
 // resolveProjectName returns opts.ProjectName, or the cwd base as fallback (WS3).
 func resolveProjectName(name string) string {
 	if name != "" {
@@ -452,11 +481,10 @@ func resolveProjectName(name string) string {
 	if err != nil || cwd == "" {
 		return "prox"
 	}
-	base := filepath.Base(cwd)
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		return "prox"
+	if base := dirBaseName(cwd); base != "" {
+		return base
 	}
-	return base
+	return "prox"
 }
 
 // filepathAbs is os.Getwd-backed; separated for tests that want to stub later.
@@ -465,60 +493,63 @@ var filepathAbs = func(path string) (string, error) {
 }
 
 // renderMenuBar draws the menu row and records cell hit-rects.
-// Layout (WS3): left `prox <project>`, right-aligned View/Filter/Theme cells.
+// Layout (plan 023 B3): `prox` (bold HeaderFG) + Dim project name + cells,
+// left-aligned; the remainder of the row is HeaderBG fill.
 func (b *BaseModel) renderMenuBar() string {
 	th := CurrentTheme()
-	rowBG := lipgloss.NewStyle().Background(th.HeaderBG).Foreground(th.HeaderFG)
-
-	project := b.projectName
-	if project == "" {
-		project = "prox"
-	}
-	left := " prox  " + project + " "
-
-	type cell struct {
-		id   MenuID
-		text string
-	}
-	cells := make([]cell, 0, len(menuOrder))
-	cellsW := 0
-	for _, id := range menuOrder {
-		text := menuCellText(id)
-		cells = append(cells, cell{id: id, text: text})
-		cellsW += ansi.StringWidth(text)
-	}
-
-	leftW := ansi.StringWidth(left)
-	gap := b.width - leftW - cellsW
-	if gap < 1 {
-		gap = 1
-	}
+	rowBG := lipgloss.NewStyle().Background(th.HeaderBG)
+	brandStyle := lipgloss.NewStyle().
+		Foreground(th.HeaderFG).
+		Background(th.HeaderBG).
+		Bold(true)
+	dimStyle := lipgloss.NewStyle().
+		Foreground(th.Dim).
+		Background(th.HeaderBG)
+	closedStyle := lipgloss.NewStyle().
+		Foreground(th.Title).
+		Background(th.HeaderBG)
+	selStyle := lipgloss.NewStyle().
+		Foreground(th.SelectionFG).
+		Background(th.SelectionBG)
 
 	var bld strings.Builder
-	bld.WriteString(rowBG.Render(left))
-	bld.WriteString(rowBG.Render(strings.Repeat(" ", gap)))
+	bld.WriteString(rowBG.Render(" "))
+	bld.WriteString(brandStyle.Render("prox"))
+	if b.projectName != "" {
+		bld.WriteString(rowBG.Render(" "))
+		bld.WriteString(dimStyle.Render(b.projectName))
+	}
+	bld.WriteString(rowBG.Render(" "))
 
-	x := leftW + gap
+	x := ansi.StringWidth(bld.String())
 	y := 0 // menu bar is always row 0 when visible; caller places it first
 	hits := b.mustHits()
-	for _, c := range cells {
-		w := ansi.StringWidth(c.text)
-		style := rowBG
-		if b.menuOpen() && MenuID(b.openMenu) == c.id {
-			style = lipgloss.NewStyle().
-				Background(th.SelectionBG).
-				Foreground(th.SelectionFG)
+	for _, id := range menuOrder {
+		text := menuCellText(id)
+		w := ansi.StringWidth(text)
+		style := closedStyle
+		if b.menuOpen() && MenuID(b.openMenu) == id {
+			style = selStyle
+		} else if !b.menuOpen() && b.hoveredMenuCell == int(id) {
+			style = selStyle
 		}
-		bld.WriteString(style.Render(c.text))
+		bld.WriteString(style.Render(text))
 		hits.menuCells = append(hits.menuCells, menuCellHit{
-			ID:   c.id,
+			ID:   id,
 			Rect: HitRect{X: x, Y: y, W: w, H: 1},
 		})
 		x += w
 	}
 
 	line := bld.String()
-	return padFrameRow(line, b.width)
+	w := ansi.StringWidth(line)
+	switch {
+	case w < b.width:
+		line += rowBG.Render(strings.Repeat(" ", b.width-w))
+	case w > b.width:
+		line = ansi.Cut(line, 0, b.width)
+	}
+	return line
 }
 
 // dropdownBoxRows builds the windowed dropdown rows (indicators + visible
@@ -798,6 +829,24 @@ func (b *BaseModel) handleMenuMotion(msg tea.MouseMsg) bool {
 	consumed := false
 
 	if b.settings.MenuBar {
+		if b.menuOpen() {
+			if b.hoveredMenuCell >= 0 {
+				b.hoveredMenuCell = -1
+				consumed = true
+			}
+		} else {
+			hovered := -1
+			for _, h := range hits.menuCells {
+				if h.Rect.Contains(x, y) {
+					hovered = int(h.ID)
+					break
+				}
+			}
+			if hovered != b.hoveredMenuCell {
+				b.hoveredMenuCell = hovered
+				consumed = true
+			}
+		}
 		for _, h := range hits.menuCells {
 			if h.Rect.Contains(x, y) {
 				consumed = true
@@ -808,6 +857,9 @@ func (b *BaseModel) handleMenuMotion(msg tea.MouseMsg) bool {
 				break
 			}
 		}
+	} else if b.hoveredMenuCell >= 0 {
+		b.hoveredMenuCell = -1
+		consumed = true
 	}
 
 	if hits.hasDropdown && hits.dropdown.Bounds.Contains(x, y) {

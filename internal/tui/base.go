@@ -164,12 +164,16 @@ type BaseModel struct {
 	// menuHighlight is the full-list index of the highlighted dropdown row.
 	// menuWindow is the first visible item index — reset on open/sibling slide,
 	// follows the highlight (see deriveMenuWindowStart).
+	// hoveredMenuCell is the closed-bar cell under the pointer (-1 = none).
+	// Set by free motion when no menu is open; cleared on leave, open, close,
+	// bar hide, resize, and help capture (plan 023 B3).
 	// Hit-rects live in hits (shared across View value-copies — plan 022 WS0)
 	// and are cleared on close (strix stale-rect discipline / Codex #1).
-	openMenu      int
-	menuHighlight int
-	menuWindow    int
-	hits          *hitRegistry
+	openMenu        int
+	menuHighlight   int
+	menuWindow      int
+	hoveredMenuCell int
+	hits            *hitRegistry
 
 	// logRowSpans maps DisplaySeq → display-row span in the logs viewport
 	// content. Rebuilt every updateViewport (plan 021 WS4 / Codex #2): when wrap
@@ -258,6 +262,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		helpConfig:          helpConfig,
 		settings:            DefaultSettings(),
 		openMenu:            -1, // closed
+		hoveredMenuCell:     -1,
 		hits:                &hitRegistry{},
 	}
 	b.viewport.MouseWheelEnabled = false // TUI owns all wheel routing (Codex #5)
@@ -280,6 +285,7 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	// Invalidate hit-rects on the real model before relayout — resize can
 	// leave stale coordinates until the next View (plan 023 A1 / T3).
 	b.mustHits().resetFrame()
+	b.hoveredMenuCell = -1
 	b.width = msg.Width
 	b.height = msg.Height
 	b.relayout()

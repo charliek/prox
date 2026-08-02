@@ -563,8 +563,9 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		// re-read from ~/.prox/token.
 		client := NewClientWithToken(dialableAPIURL(cfg.API.Host, boundAPIPort(apiListener, cfg.API.Port)), token)
 		tuiOpts := tui.ClientOptions{
-			Help:       tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
-			ShutdownCh: coordinator.TriggerCh(),
+			Help:        tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
+			ShutdownCh:  coordinator.TriggerCh(),
+			ProjectName: tui.ConfigPathProjectName(absConfigPath),
 		}
 		// Ports feed curl-copy only; pass them when a proxy is actually
 		// listening (disabled/--no-proxy → port-less https://<host><url>).

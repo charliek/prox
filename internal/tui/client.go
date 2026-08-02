@@ -141,9 +141,9 @@ type ClientOptions struct {
 	// result — outranks it; see View.
 	ConnectedStatus string
 
-	// ProjectName is shown in the menu bar (WS3). Empty → RunClient resolves
-	// the cwd base. CLI wiring of an explicit name lands with a later commit;
-	// C3 only adds the field + cwd fallback.
+	// ProjectName is shown in the menu bar after the brand (plan 023 B3).
+	// Empty → resolveProjectName falls back to the cwd basename. Callers
+	// (`prox up --tui`, `prox attach`) supply an explicit derivation.
 	ProjectName string
 
 	// ProxyHTTPSPort/ProxyHTTPPort are the local proxy listen ports (up --tui

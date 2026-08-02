@@ -178,7 +178,7 @@ func TestHover_StaleDropdownRectsRejected(t *testing.T) {
 	assert.Equal(t, hlAfterSlide, m.menuHighlight, "stale row must not set highlight")
 }
 
-func TestHover_MenuBarNoOpWhenClosed(t *testing.T) {
+func TestHover_MenuBarClosedSetsHover(t *testing.T) {
 	m := newTestModel()
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	_ = m.View()
@@ -186,6 +186,7 @@ func TestHover_MenuBarNoOpWhenClosed(t *testing.T) {
 
 	m = clientUpdate(m, motionAt(cell.Rect.X, cell.Rect.Y))
 	assert.False(t, m.menuOpen())
+	assert.Equal(t, int(MenuView), m.hoveredMenuCell)
 	assert.Equal(t, -1, m.openMenu)
 	assert.Equal(t, 0, m.menuHighlight)
 	assert.Equal(t, 0, m.menuWindow)
