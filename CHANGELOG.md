@@ -2,7 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.3.0
+
+The TUI release. `prox up --tui` and `prox attach` are now one redesigned
+TUI (plans 021–024, PR #102): a menu bar with View, Filter, and Theme
+dropdowns; six truecolor theme presets plus user TOML themes; a per-view
+filter query language with regex and status-range terms; styled log and
+request rendering with level detection across common dev log formats;
+grab-for-agent copy keys (request ID, curl, exact JSON); full mouse
+routing with pointer-shape feedback; a centered help modal; and
+persistent settings. Requests gained scroll-back paging to the full 5000
+records, reconnect rebasing, and toggleable columns including request
+IDs. Beyond the TUI: prox commands now refuse to control a different
+project's instance (plan 020), and a crashing process's error is no
+longer swallowed at startup. As always the shared daemon requires an
+exact version match: restart the daemon and every project against the
+new binary after upgrading.
 
 ### Added
 
