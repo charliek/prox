@@ -24,25 +24,40 @@ func pinANSIProfile(t *testing.T) {
 	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
 }
 
-func TestFormatLogEntry_UndetectedByteIdentical(t *testing.T) {
+func TestFormatLogEntry_UndetectedPlain(t *testing.T) {
 	pinANSIProfile(t)
-	withTestTheme(t, "tokyo-night")
 
-	m := newTestModel()
-	m.settings.Timestamps = true
-	m.settings.Wrap = false
+	const line = "hello plain world"
 	entry := domain.LogEntry{
 		Timestamp:  time.Date(2026, 8, 1, 15, 4, 5, 0, time.UTC),
 		Process:    "api",
-		Line:       "hello plain world",
+		Line:       line,
 		DisplaySeq: 1,
 	}
-	got := m.formatLogEntry(entry)
-	proc := getProcessStyle("api", m.processes).Render("api       ")
-	ts := styles.Dim.Render("15:04:05")
-	sep := styles.Base.Render(" ")
-	want := ts + sep + proc + sep + "hello plain world"
-	assert.Equal(t, want, got)
+	for _, tc := range []struct {
+		theme string
+		raw   bool // legacy: Base is a no-op — content stays raw (byte-identical to C8)
+	}{
+		{"tokyo-night", false},
+		{"legacy", true},
+	} {
+		t.Run(tc.theme, func(t *testing.T) {
+			withTestTheme(t, tc.theme)
+			m := newTestModel()
+			m.settings.Timestamps = true
+			m.settings.Wrap = false
+			got := m.formatLogEntry(entry)
+			proc := getProcessStyle("api", m.processes).Render("api       ")
+			ts := styles.Dim.Render("15:04:05")
+			sep := styles.Base.Render(" ")
+			content := styles.Base.Render(line)
+			if tc.raw {
+				content = line
+			}
+			want := ts + sep + proc + sep + content
+			assert.Equal(t, want, got)
+		})
+	}
 }
 
 func TestFormatLogEntry_LevelColors(t *testing.T) {
@@ -218,7 +233,9 @@ func TestFormatLogEntry_NonJSONUntouched(t *testing.T) {
 	m.logMeta = map[int64]logMeta{1: {isJSON: false}}
 	entry := domain.LogEntry{Process: "api", Line: line, DisplaySeq: 1}
 	got := m.formatLogEntry(entry)
-	assert.True(t, strings.HasSuffix(got, line))
+	// Content is Base-wrapped under FullFill (plan 024 F1); not JSON-summarized.
+	assert.True(t, strings.HasSuffix(got, styles.Base.Render(line)))
+	assert.NotContains(t, ansi.Strip(got), `=`, "non-JSON must not become path=value summary")
 }
 
 func TestFormatProxyRequest_MethodAndStatusColors(t *testing.T) {

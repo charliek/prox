@@ -147,6 +147,77 @@ func colorBGKey(c color.Color) string {
 	return fmt.Sprintf("rgb:%d,%d,%d", r>>8, g>>8, b>>8)
 }
 
+// childSpanExemptCells marks log-content cells whose background was cleared or
+// recolored by an embedded (child-originated) SGR after the TUI had already
+// painted theme/chrome BG on that row's content (plan 024 F1 / N1).
+//
+// Plain ANSI-free lines never set these bits: they stay fully asserted. Cells
+// that never saw chrome BG in the content region are also NOT exempt — that is
+// a TUI hole, not a child span. Trailing padFrameRow spaces re-enter chrome BG
+// and clear the child-span state.
+func childSpanExemptCells(frame string, allowed map[string]bool, inLogContent func(row, col int) bool) map[[2]int]bool {
+	p := ansi.NewParser()
+	var state byte
+	active := ""
+	rowIdx := 0
+	col := 0
+	sawChrome := false
+	inChild := false
+	exempt := map[[2]int]bool{}
+
+	flush := func() {
+		rowIdx++
+		col = 0
+		// SGR state carries across rows in real terminals, but each log line
+		// is its own lipgloss.Render run — reset per-row tracking.
+		sawChrome = false
+		inChild = false
+	}
+
+	isChrome := func(bg string) bool {
+		return bg != "" && allowed[bg]
+	}
+
+	input := frame
+	for len(input) > 0 {
+		seq, width, n, newState := ansi.DecodeSequence(input, state, p)
+		state = newState
+
+		if width > 0 {
+			for i := 0; i < width; i++ {
+				if inLogContent != nil && inLogContent(rowIdx, col) {
+					if isChrome(active) {
+						sawChrome = true
+						inChild = false
+					} else if sawChrome {
+						// Emitted a non-chrome cell after chrome was painted in
+						// this content region → child reset/recolor mid-span.
+						inChild = true
+					}
+					if inChild {
+						exempt[[2]int{rowIdx, col}] = true
+					}
+				}
+				col++
+			}
+			input = input[n:]
+			continue
+		}
+
+		if len(seq) == 1 && seq[0] == '\n' {
+			flush()
+			input = input[n:]
+			continue
+		}
+
+		if ansi.Cmd(p.Command()).Final() == 'm' {
+			active = applySGRBackground(active, p.Params())
+		}
+		input = input[n:]
+	}
+	return exempt
+}
+
 // themeChromeBGKeys returns the set of background keys a FullFill theme may
 // paint on TUI-generated cells (theme surface + chrome slots).
 func themeChromeBGKeys(t *Theme) map[string]bool {
@@ -222,11 +293,17 @@ func TestFrameFill_LightTheme_ChromePaddingOverlays(t *testing.T) {
 	}
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
-	// Nested 0m/49m inside child log content — those cells are exempt.
+	// Nested 0m/49m inside child log content — mid-span cells are exempt.
+	// Plain level-less line must be fully asserted (plan 024 F1 / N1).
 	const nested = "before\x1b[0mMID\x1b[49mAFTER"
+	const plain = "plain line no level"
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
 		Timestamp: time.Date(2026, 8, 1, 15, 4, 5, 0, time.UTC),
 		Process:   "web", Line: nested, DisplaySeq: 1,
+	}))
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Date(2026, 8, 1, 15, 4, 6, 0, time.UTC),
+		Process:   "web", Line: plain, DisplaySeq: 2,
 	}))
 	m = clientUpdate(m, ProxyRequestMsg(proxy.RequestRecord{
 		ID: "r1", Method: "GET", URL: "/unstyled-url", StatusCode: 301,
@@ -234,8 +311,8 @@ func TestFrameFill_LightTheme_ChromePaddingOverlays(t *testing.T) {
 		Duration: 150 * time.Millisecond, // mid band → Base
 	}))
 
-	// Corpus A: normal logs frame (padding + process spacer + unstyled URL path
-	// exercised after switching views below).
+	// Corpus A: normal logs frame (padding + process spacer + plain level-less
+	// line must carry theme BG; nested child escapes stay exempt mid-span).
 	frame := m.View()
 	assertFrameContract(t, m)
 
@@ -243,20 +320,30 @@ func TestFrameFill_LightTheme_ChromePaddingOverlays(t *testing.T) {
 	ox, oy := m.viewportOrigin()
 	vpTop := oy
 	vpBot := oy + m.viewport.Height - 1
-	exemptLog := func(row, col int) bool {
+	inLogContent := func(row, col int) bool {
 		if row < vpTop || row > vpBot {
 			return false
 		}
-		// First viewport content row holds our single log entry's content cells
-		// (col 0 is the panel's left border when drawn).
-		if row == vpTop && col >= ox+prefixW {
-			// Trailing padFrameRow spaces are TUI-generated — not exempt.
-			contentW := ansi.StringWidth(nested)
-			return col < ox+prefixW+contentW
+		// Content columns only (past ts/process prefix). Trailing pad is outside.
+		if col < ox+prefixW {
+			return false
 		}
-		return false
+		var contentW int
+		switch row {
+		case vpTop: // nested entry
+			contentW = ansi.StringWidth(nested)
+		case vpTop + 1: // plain entry
+			contentW = ansi.StringWidth(plain)
+		default:
+			return false
+		}
+		return col < ox+prefixW+contentW
 	}
-	assertNoDefaultBGOutsideExempt(t, frame, th, exemptLog)
+	allowed := themeChromeBGKeys(th)
+	childExempt := childSpanExemptCells(frame, allowed, inLogContent)
+	assertNoDefaultBGOutsideExempt(t, frame, th, func(row, col int) bool {
+		return childExempt[[2]int{row, col}]
+	})
 
 	// Corpus B: requests view — unstyled URL + 3xx status + mid-band duration.
 	m.setViewMode(ViewModeRequests)

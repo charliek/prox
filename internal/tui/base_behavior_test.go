@@ -1533,23 +1533,27 @@ func TestLogsSearch_HighlightGuard(t *testing.T) {
 	m := newLogsModel(20, []string{"plain"})
 
 	// ASCII line + ASCII query: the matched run is wrapped in styles.SearchHighlight.
+	// Leading/trailing runs go through styles.Base (plan 024 F1).
 	m.logSearchQuery = "match"
-	ascii := m.highlightLogLine("hello match world")
+	ascii := m.styleLogContent("hello match world", styles.Base)
 	assert.NotEqual(t, "hello match world", ascii, "an ASCII match is inline-highlighted")
 	assert.Contains(t, ascii, styles.SearchHighlight.Render("match"), "the matched run is styled")
-	assert.Contains(t, ascii, "hello ")
-	assert.Contains(t, ascii, " world")
+	assert.Contains(t, ascii, styles.Base.Render("hello "))
+	assert.Contains(t, ascii, styles.Base.Render(" world"))
 
 	// Unicode line: case-folding would shift byte offsets, so the guard trips and
-	// the line falls back to no inline highlight (row marker alone) — unchanged.
+	// the line falls back to no inline highlight (row marker alone) — Base-wrapped.
 	uni := "日本語 match テスト"
-	assert.Equal(t, uni, m.highlightLogLine(uni), "a unicode line falls back to no highlight")
+	assert.Equal(t, styles.Base.Render(uni), m.styleLogContent(uni, styles.Base),
+		"a unicode line falls back to no highlight (Base-wrapped)")
 
 	// ESC-bearing line: a digit query can match inside the ANSI escape, so the
 	// guard trips and the escape is left intact rather than split.
 	m.logSearchQuery = "31"
 	ansiLine := "x \x1b[31mred\x1b[0m match"
-	assert.Equal(t, ansiLine, m.highlightLogLine(ansiLine), "an ESC-bearing line falls back, escape intact")
+	got := m.styleLogContent(ansiLine, styles.Base)
+	assert.Equal(t, styles.Base.Render(ansiLine), got, "an ESC-bearing line falls back, escape intact")
+	assert.Contains(t, got, "\x1b[31mred\x1b[0m", "source escape survives inside Base wrap")
 }
 
 func TestLogsSearch_UnicodeAndAnsiRenderSafely(t *testing.T) {

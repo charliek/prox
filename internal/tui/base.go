@@ -2465,8 +2465,10 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 
 // formatLogContent builds the log-line body (after ts/process/ERR prefix):
 // JSON lines become a path=value summary (C9); level-tinted content composes
-// with / search highlight. Undetected plain lines stay byte-identical to C8.
-// JSON formatting uses ingest-cached pairs — no re-Unmarshal (plan 023 C14).
+// with / search highlight. Unleveled plain lines render through styles.Base
+// under FullFill (plan 024 F1); legacy Base is a no-op so they stay
+// byte-identical to C8. JSON formatting uses ingest-cached pairs — no
+// re-Unmarshal (plan 023 C14).
 func (b *BaseModel) formatLogContent(entry domain.LogEntry) string {
 	meta := b.logMeta[entry.DisplaySeq]
 	line := entry.Line
@@ -2481,8 +2483,7 @@ func (b *BaseModel) formatLogContent(entry domain.LogEntry) string {
 		line = formatJSONSummary(meta.pairs, strings.TrimSpace(entry.Line), width)
 	}
 
-	levelStyle, tint := logLevelStyle(meta)
-	return b.styleLogContent(line, levelStyle, tint)
+	return b.styleLogContent(line, logLevelStyle(meta))
 }
 
 // logContentWidth is the columns available for the log body once the
@@ -2518,40 +2519,40 @@ func (b *BaseModel) logContentWidth(entry domain.LogEntry) int {
 }
 
 // logLevelStyle picks the C9 content tint for a cached meta. Info uses
-// LogInfo; trace stays default FG (no tint) so only debug is dim among the
-// low-severity levels. Unknown / !hasLevel → no tint.
-func logLevelStyle(meta logMeta) (lipgloss.Style, bool) {
+// LogInfo; trace stays default FG (no severity tint) so only debug is dim
+// among the low-severity levels. Unknown / !hasLevel / trace → styles.Base
+// (theme FG+BG under FullFill; empty/no-op under legacy — plan 024 F1).
+func logLevelStyle(meta logMeta) lipgloss.Style {
 	if !meta.hasLevel {
-		return lipgloss.Style{}, false
+		return styles.Base
 	}
 	switch meta.level {
 	case LogLevelError:
-		return styles.LogError, true
+		return styles.LogError
 	case LogLevelWarn:
-		return styles.LogWarn, true
+		return styles.LogWarn
 	case LogLevelDebug:
-		return styles.LogDebug, true
+		return styles.LogDebug
 	case LogLevelInfo:
-		return styles.LogInfo, true
-	default: // trace / unknown
-		return lipgloss.Style{}, false
+		return styles.LogInfo
+	default: // trace / unknown — theme surface, no severity tint
+		return styles.Base
 	}
 }
 
-// styleLogContent applies level tint then / search highlight. Highlight is
-// resolved on the PLAIN content so byte offsets stay valid; level colour wraps
-// the non-match spans so SearchHighlight's reset does not leak the level tint
-// past the match (C9). When no tint, this is highlightLogLine alone.
-// Under the selection band (selectionRowActive), non-match spans use the
-// active Base (SelectionBG) so SearchHitBG wins only on the hit cells.
-func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style, tint bool) string {
-	if !tint {
-		return b.highlightLogLine(line)
-	}
+// styleLogContent applies level tint (or Base for unleveled lines — plan 024
+// F1) then / search highlight. Highlight is resolved on the PLAIN content so
+// byte offsets stay valid; level colour wraps the non-match spans so
+// SearchHighlight's reset does not leak the level tint past the match (C9).
+// Under the selection band (selectionRowActive), levelStyle is the active Base
+// (SelectionBG) so SearchHitBG wins only on the hit cells.
+func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style) string {
 	q := b.logSearchQuery
 	if q == "" || !isASCIINoESC(q) || !isASCIINoESC(line) {
 		return levelStyle.Render(line)
 	}
+	// Both sides are ASCII, so ToLower does not shift byte offsets: the index
+	// found in the lowered line is valid in the original.
 	idx := strings.Index(strings.ToLower(line), strings.ToLower(q))
 	if idx < 0 {
 		return levelStyle.Render(line)
@@ -2562,51 +2563,10 @@ func (b *BaseModel) styleLogContent(line string, levelStyle lipgloss.Style, tint
 		levelStyle.Render(line[end:])
 }
 
-// highlightLogLine wraps the first case-insensitive match of the active
-// logSearchQuery in line with styles.SearchHighlight (D9). It highlights only
-// when BOTH the query and the WHOLE line are plain ASCII with no ESC byte:
-// case-folding an ASCII line preserves byte offsets (so the styled run lands
-// exactly on the match), and excluding ESC keeps a digit query from matching
-// inside an ANSI escape sequence. Any other line (unicode, or one already
-// carrying escape codes) falls back to the unstyled text — the row marker alone
-// signals the match. Returns line unchanged when no search is active or nothing
-// matches (except under the selection band, where raw content is Base-wrapped
-// so the band has no default-BG holes).
-func (b *BaseModel) highlightLogLine(line string) string {
-	q := b.logSearchQuery
-	if q == "" {
-		if selectionRowActive {
-			return styles.Base.Render(line)
-		}
-		return line
-	}
-	if !isASCIINoESC(q) || !isASCIINoESC(line) {
-		if selectionRowActive {
-			return styles.Base.Render(line)
-		}
-		return line
-	}
-	// Both sides are ASCII, so ToLower does not shift byte offsets: the index
-	// found in the lowered line is valid in the original.
-	idx := strings.Index(strings.ToLower(line), strings.ToLower(q))
-	if idx < 0 {
-		if selectionRowActive {
-			return styles.Base.Render(line)
-		}
-		return line
-	}
-	end := idx + len(q)
-	pre, mid, post := line[:idx], line[idx:end], line[end:]
-	if selectionRowActive {
-		return styles.Base.Render(pre) + styles.SearchHighlight.Render(mid) + styles.Base.Render(post)
-	}
-	return pre + styles.SearchHighlight.Render(mid) + post
-}
-
 // isASCIINoESC reports whether s is pure ASCII (every byte < 0x80) and contains
 // no ESC byte (0x1b). It gates the inline search highlight: non-ASCII text
 // breaks the byte-offset-preserving case fold, and an embedded ESC means a
-// match could split an ANSI escape sequence (see highlightLogLine).
+// match could split an ANSI escape sequence (see styleLogContent).
 func isASCIINoESC(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 || s[i] == 0x1b {
