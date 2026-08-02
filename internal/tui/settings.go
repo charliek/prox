@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/BurntSushi/toml"
 )
@@ -19,15 +20,50 @@ type Settings struct {
 	MenuBar      bool
 }
 
+// settingKey identifies a single persisted settings field for typed partial
+// saves (plan 023 D1 / C12). Callers pass these to SaveSettingsChanged —
+// never arbitrary strings.
+type settingKey int
+
+const (
+	settingTheme settingKey = iota
+	settingViewProcessPanel
+	settingViewTimestamps
+	settingViewWrap
+	settingViewMenuBar
+)
+
+// allSettingKeys is every currently persisted key (full-save / SaveSettings).
+var allSettingKeys = []settingKey{
+	settingTheme,
+	settingViewProcessPanel,
+	settingViewTimestamps,
+	settingViewWrap,
+	settingViewMenuBar,
+}
+
 // ErrConfigUnparseable is returned by SaveSettings when the on-disk file exists
 // but cannot be parsed — the file is left byte-identical (strix never-clobber
 // rule, panel S4 / config.rs:117-124).
 var ErrConfigUnparseable = errors.New("config file is unparseable")
 
+// errSettingsMayNotHavePersisted is returned when the rename succeeded but a
+// subsequent fsync failed — the bytes are in the directory entry, but durability
+// is not guaranteed (plan 023 D1).
+var errSettingsMayNotHavePersisted = errors.New("settings saved but may not have persisted")
+
 // settingsPathFunc returns the settings file path. Overridable in tests
 // (default: ~/.prox/tui/config.toml — prox's established user dir, not XDG;
 // panel Codex #9).
 var settingsPathFunc = defaultSettingsPath
+
+// Test seams for the flock-serialized transaction (plan 023 D1 lock-exclusion
+// + fsync-failure wording). Nil in production.
+var (
+	settingsBeforeFlockHook func()
+	settingsAfterReadHook   func()
+	fsyncFileFn             = func(f *os.File) error { return f.Sync() }
+)
 
 func defaultSettingsPath() string {
 	home, err := os.UserHomeDir()
@@ -123,12 +159,22 @@ func applySettingsFromMap(s *Settings, root map[string]any) []string {
 	return warnings
 }
 
-// SaveSettings merges s into the on-disk file, preserving unknown keys.
-// Comments and key ordering are lost on rewrite — BurntSushi cannot preserve
-// them and a second TOML dep is not worth it (panel S4). Returns
-// ErrConfigUnparseable when an existing file fails to parse; the file is never
-// modified in that case.
+// SaveSettings writes all known keys from s (full save). Prefer
+// SaveSettingsChanged at mutation call sites so concurrent writers merge
+// only their changed fields.
 func SaveSettings(s Settings) error {
+	return SaveSettingsChanged(s, allSettingKeys...)
+}
+
+// SaveSettingsChanged runs a flock-serialized read→validate→merge→write→rename
+// →fsync transaction. Only the typed keys in changed are merged from s into a
+// freshly re-read on-disk map (unknown TOML keys preserved). Corrupt on-disk
+// TOML refuses inside the lock and leaves the file byte-identical.
+func SaveSettingsChanged(s Settings, changed ...settingKey) error {
+	if len(changed) == 0 {
+		return nil
+	}
+
 	path := settingsPathFunc()
 	if path == "" {
 		return fmt.Errorf("cannot determine settings path")
@@ -139,43 +185,108 @@ func SaveSettings(s Settings) error {
 		return err
 	}
 
-	root := make(map[string]any)
-	if data, err := os.ReadFile(path); err == nil {
-		if _, err := toml.Decode(string(data), &root); err != nil {
-			return fmt.Errorf("%w: %v", ErrConfigUnparseable, err)
+	return withSettingsLock(path, func() error {
+		root := make(map[string]any)
+		if data, err := os.ReadFile(path); err == nil {
+			if _, err := toml.Decode(string(data), &root); err != nil {
+				return fmt.Errorf("%w: %v", ErrConfigUnparseable, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
 
-	mergeSettingsIntoMap(root, s)
+		if settingsAfterReadHook != nil {
+			settingsAfterReadHook()
+		}
 
-	var buf bytes.Buffer
-	enc := toml.NewEncoder(&buf)
-	if err := enc.Encode(root); err != nil {
-		return err
-	}
+		mergeChangedSettingsIntoMap(root, s, changed)
 
-	return atomicWriteFile(path, buf.Bytes(), 0o644)
+		var buf bytes.Buffer
+		enc := toml.NewEncoder(&buf)
+		if err := enc.Encode(root); err != nil {
+			return err
+		}
+
+		return atomicWriteFile(path, buf.Bytes(), 0o644)
+	})
 }
 
-func mergeSettingsIntoMap(root map[string]any, s Settings) {
-	if s.Theme != "" {
-		root[keyTheme] = s.Theme
+// withSettingsLock serializes the settings transaction under an exclusive
+// flock on a sidecar config.toml.lock (darwin/linux only — prox does not
+// ship Windows).
+func withSettingsLock(path string, fn func() error) error {
+	lockPath := path + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening settings lock: %w", err)
 	}
-	view, _ := root[keyView].(map[string]any)
-	if view == nil {
-		view = make(map[string]any)
+	defer f.Close()
+
+	if settingsBeforeFlockHook != nil {
+		settingsBeforeFlockHook()
 	}
-	view[keyProcessPanel] = s.ProcessPanel
-	view[keyTimestamps] = s.Timestamps
-	view[keyWrap] = s.Wrap
-	view[keyMenuBar] = s.MenuBar
-	root[keyView] = view
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking settings: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+
+	return fn()
+}
+
+func mergeChangedSettingsIntoMap(root map[string]any, s Settings, changed []settingKey) {
+	var view map[string]any
+	viewLoaded := false
+	ensureView := func() map[string]any {
+		if viewLoaded {
+			return view
+		}
+		view, _ = root[keyView].(map[string]any)
+		if view == nil {
+			view = make(map[string]any)
+		}
+		viewLoaded = true
+		return view
+	}
+	viewTouched := false
+	for _, k := range changed {
+		switch k {
+		case settingTheme:
+			if s.Theme != "" {
+				root[keyTheme] = s.Theme
+			}
+		case settingViewProcessPanel:
+			ensureView()[keyProcessPanel] = s.ProcessPanel
+			viewTouched = true
+		case settingViewTimestamps:
+			ensureView()[keyTimestamps] = s.Timestamps
+			viewTouched = true
+		case settingViewWrap:
+			ensureView()[keyWrap] = s.Wrap
+			viewTouched = true
+		case settingViewMenuBar:
+			ensureView()[keyMenuBar] = s.MenuBar
+			viewTouched = true
+		}
+	}
+	if viewTouched {
+		root[keyView] = view
+	}
+}
+
+// formatSettingsSaveError builds the footer flash text for a save failure.
+// Post-rename fsync failures already say "may not have persisted"; other
+// errors keep the "settings not saved:" prefix.
+func formatSettingsSaveError(err error) string {
+	if errors.Is(err, errSettingsMayNotHavePersisted) {
+		return err.Error()
+	}
+	return "settings not saved: " + err.Error()
 }
 
 // atomicWriteFile writes data to path via a unique temp file in the same
-// directory (fsync, chmod, rename). The temp file is removed on any error.
+// directory (fsync, chmod, rename, fsync file, fsync parent dir). The temp
+// file is removed on any error before rename. Post-rename fsync failures
+// return errSettingsMayNotHavePersisted.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
@@ -194,7 +305,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := fsyncFileFn(tmp); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -208,5 +319,22 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	cleanup = false
+
+	if err := fsyncPath(path); err != nil {
+		return fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, err)
+	}
+	if err := fsyncPath(dir); err != nil {
+		return fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, err)
+	}
 	return nil
+}
+
+// fsyncPath opens path (file or directory) and fsyncs it.
+func fsyncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return fsyncFileFn(f)
 }

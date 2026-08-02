@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -210,8 +213,147 @@ func TestSaveSettings_AtomicWrite(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	for _, e := range entries {
-		assert.False(t, strings.HasSuffix(e.Name(), ".tmp"), "stray temp file: %s", e.Name())
+		name := e.Name()
+		assert.False(t, strings.HasSuffix(name, ".tmp"), "stray temp file: %s", name)
 	}
+}
+
+// Two Settings structs with disjoint typed changed-sets saved sequentially from
+// stale in-memory views — both changes must persist (plan 023 D1 / C12).
+func TestSaveSettingsChanged_StaleViewMerge(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	withTestSettingsPath(t, path)
+
+	require.NoError(t, SaveSettings(Settings{
+		Theme:        "legacy",
+		ProcessPanel: true,
+		Timestamps:   true,
+		Wrap:         true,
+		MenuBar:      true,
+	}))
+
+	stale1, warnings := LoadSettings()
+	require.Empty(t, warnings)
+	stale2 := stale1 // identical stale snapshot
+
+	stale1.Wrap = false
+	require.NoError(t, SaveSettingsChanged(stale1, settingViewWrap))
+
+	// stale2 still believes Wrap=true; saving only theme must not clobber wrap.
+	stale2.Theme = "dark"
+	require.NoError(t, SaveSettingsChanged(stale2, settingTheme))
+
+	loaded, warnings := LoadSettings()
+	require.Empty(t, warnings)
+	assert.Equal(t, "dark", loaded.Theme)
+	assert.False(t, loaded.Wrap, "wrap=false from first stale save must survive")
+	assert.True(t, loaded.ProcessPanel)
+	assert.True(t, loaded.Timestamps)
+	assert.True(t, loaded.MenuBar)
+}
+
+// Lock exclusion: writer1 pauses after re-read under the flock; writer2 reaches
+// beforeFlock then blocks on flock until writer1 finishes. Writer2's re-read
+// must see writer1's write — the interleaving merge-alone would lose (plan 023 D1).
+func TestSaveSettingsChanged_LockExclusion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	withTestSettingsPath(t, path)
+
+	require.NoError(t, SaveSettings(Settings{
+		Theme:        "legacy",
+		ProcessPanel: true,
+		Timestamps:   true,
+		Wrap:         true,
+		MenuBar:      true,
+	}))
+
+	w1AtAfterRead := make(chan struct{})
+	w1Continue := make(chan struct{})
+	w2AtBeforeFlock := make(chan struct{})
+	w2MayFlock := make(chan struct{})
+
+	var afterReadCount atomic.Int32
+	settingsAfterReadHook = func() {
+		if afterReadCount.Add(1) == 1 {
+			close(w1AtAfterRead)
+			<-w1Continue
+		}
+	}
+	t.Cleanup(func() {
+		settingsAfterReadHook = nil
+		settingsBeforeFlockHook = nil
+	})
+
+	errc := make(chan error, 2)
+
+	go func() {
+		s := Settings{Wrap: false, Theme: "legacy", ProcessPanel: true, Timestamps: true, MenuBar: true}
+		errc <- SaveSettingsChanged(s, settingViewWrap)
+	}()
+	<-w1AtAfterRead // w1 holds flock, has re-read original
+
+	settingsBeforeFlockHook = func() {
+		close(w2AtBeforeFlock)
+		<-w2MayFlock
+	}
+
+	go func() {
+		// Stale view still has Wrap=true — without lock+re-read this would
+		// overwrite w1's wrap=false when merging theme onto a stale root.
+		s := Settings{Theme: "dark", Wrap: true, ProcessPanel: true, Timestamps: true, MenuBar: true}
+		errc <- SaveSettingsChanged(s, settingTheme)
+	}()
+	<-w2AtBeforeFlock // w2 about to flock; w1 still holds the lock
+	close(w2MayFlock) // w2 proceeds into flock (blocks until w1 unlocks)
+	close(w1Continue) // w1 merges+writes+unlocks; w2 then re-reads w1's file
+
+	require.NoError(t, <-errc)
+	require.NoError(t, <-errc)
+
+	loaded, warnings := LoadSettings()
+	require.Empty(t, warnings)
+	assert.Equal(t, "dark", loaded.Theme)
+	assert.False(t, loaded.Wrap, "w2 must re-read under lock and keep w1's wrap=false")
+}
+
+func TestSaveSettings_FsyncFailureWording(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	withTestSettingsPath(t, path)
+
+	prev := fsyncFileFn
+	call := 0
+	fsyncFileFn = func(f *os.File) error {
+		call++
+		// Temp-file sync (pre-rename) succeeds; post-rename path/dir sync fails.
+		if call >= 2 {
+			return errors.New("injected fsync failure")
+		}
+		return prev(f)
+	}
+	t.Cleanup(func() { fsyncFileFn = prev })
+
+	err := SaveSettingsChanged(Settings{Theme: "dark"}, settingTheme)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errSettingsMayNotHavePersisted)
+	assert.Contains(t, err.Error(), "may not have persisted")
+	assert.NotContains(t, formatSettingsSaveError(err), "settings not saved")
+	assert.Contains(t, formatSettingsSaveError(err), "may not have persisted")
+
+	// Rename already happened — theme must be on disk despite fsync failure.
+	loaded, warnings := LoadSettings()
+	require.Empty(t, warnings)
+	assert.Equal(t, "dark", loaded.Theme)
+}
+
+func TestFormatSettingsSaveError(t *testing.T) {
+	assert.Equal(t, "settings not saved: disk full",
+		formatSettingsSaveError(errors.New("disk full")))
+	wrapped := fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, errors.New("sync failed"))
+	assert.Equal(t, "settings saved but may not have persisted: sync failed",
+		formatSettingsSaveError(wrapped))
 }
 
 func TestThemeCycleKey(t *testing.T) {

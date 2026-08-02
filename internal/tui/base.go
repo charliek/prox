@@ -920,8 +920,8 @@ func (b *BaseModel) setThemeByName(name string) tea.Cmd {
 
 	var msg footerMsg
 	var class flashClass
-	if err := SaveSettings(b.settings); err != nil {
-		msg = footerError("settings not saved: " + err.Error())
+	if err := SaveSettingsChanged(b.settings, settingTheme); err != nil {
+		msg = footerError(formatSettingsSaveError(err))
 		class = flashSettingsSave
 	} else {
 		msg = footerInfo(themeFlashMessage(canonical, warnings))
@@ -992,8 +992,8 @@ func (b *BaseModel) toggleFollow() {
 func (b *BaseModel) toggleProcessPanel() tea.Cmd {
 	b.settings.ProcessPanel = !b.settings.ProcessPanel
 	b.relayout()
-	if err := SaveSettings(b.settings); err != nil {
-		return b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
+	if err := SaveSettingsChanged(b.settings, settingViewProcessPanel); err != nil {
+		return b.setStatusFlash(footerError(formatSettingsSaveError(err)), flashSettingsSave, statusFlashClearDelay)
 	}
 	return nil
 }
@@ -1003,8 +1003,8 @@ func (b *BaseModel) toggleProcessPanel() tea.Cmd {
 func (b *BaseModel) toggleTimestamps() tea.Cmd {
 	b.settings.Timestamps = !b.settings.Timestamps
 	var cmd tea.Cmd
-	if err := SaveSettings(b.settings); err != nil {
-		cmd = b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
+	if err := SaveSettingsChanged(b.settings, settingViewTimestamps); err != nil {
+		cmd = b.setStatusFlash(footerError(formatSettingsSaveError(err)), flashSettingsSave, statusFlashClearDelay)
 	}
 	b.updateViewport()
 	return cmd
@@ -1019,8 +1019,8 @@ func (b *BaseModel) toggleWrap() tea.Cmd {
 	}
 	b.settings.Wrap = !b.settings.Wrap
 	var cmd tea.Cmd
-	if err := SaveSettings(b.settings); err != nil {
-		cmd = b.setStatusFlash(footerError("settings not saved: "+err.Error()), flashSettingsSave, statusFlashClearDelay)
+	if err := SaveSettingsChanged(b.settings, settingViewWrap); err != nil {
+		cmd = b.setStatusFlash(footerError(formatSettingsSaveError(err)), flashSettingsSave, statusFlashClearDelay)
 	}
 	b.updateViewport()
 	if b.viewMode == ViewModeLogs {
