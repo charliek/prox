@@ -36,10 +36,10 @@ type Theme struct {
 	HTTPSuccess, HTTPRedirect, HTTPWarning, HTTPError lipgloss.Color
 
 	// Logs / JSON / search / stderr badge
-	LogError, LogWarn, LogInfo, LogDebug, LogTrace lipgloss.Color
-	JSONKey, JSONString, JSONNumber, JSONBool      lipgloss.Color
-	SearchHitBG, SearchHitFG                       lipgloss.Color
-	ErrBadgeFG, ErrBadgeBG                         lipgloss.Color
+	LogError, LogWarn, LogInfo, LogDebug      lipgloss.Color
+	JSONKey, JSONString, JSONNumber, JSONBool lipgloss.Color
+	SearchHitBG, SearchHitFG                  lipgloss.Color
+	ErrBadgeFG, ErrBadgeBG                    lipgloss.Color
 
 	// ProcPalette cycles process-name colours (9 entries in every preset).
 	ProcPalette []lipgloss.Color
@@ -126,6 +126,15 @@ func themeForCanonical(canonical string) *Theme {
 	}
 }
 
+// unsafeThemeName reports whether name is unsafe for filepath.Join under the
+// user themes directory (path separators or a .. segment).
+func unsafeThemeName(name string) bool {
+	if strings.Contains(name, "..") {
+		return true
+	}
+	return strings.ContainsAny(name, `/\`)
+}
+
 // ResolveTheme loads name as a preset (aliases folded) or a user TOML under
 // ~/.prox/tui/themes/. Presets shadow same-named user files. Unknown names and
 // malformed files resolve to tokyo-night with a warning. Returns the canonical
@@ -133,6 +142,12 @@ func themeForCanonical(canonical string) *Theme {
 func ResolveTheme(name string) (canonical string, theme *Theme, warnings []string) {
 	if c := presetCanonical(name); c != "" {
 		return c, themeForCanonical(c), nil
+	}
+
+	if unsafeThemeName(name) {
+		return "tokyo-night", tokyoNightTheme(), []string{
+			fmt.Sprintf("invalid theme name %q; using tokyo-night", name),
+		}
 	}
 
 	dir := themesDirFunc()
@@ -233,7 +248,7 @@ func tokyoNightTheme() *Theme {
 		Cursor: purple,
 		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
 		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim, LogTrace: rgb(60, 67, 99),
+		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
 		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
 		SearchHitBG: warn, SearchHitFG: rgb(26, 27, 38),
 		ErrBadgeFG: rgb(192, 202, 245), ErrBadgeBG: errc,
@@ -263,7 +278,7 @@ func darkTheme() *Theme {
 		Cursor: purple,
 		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
 		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim, LogTrace: rgb(88, 88, 88),
+		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
 		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
 		SearchHitBG: warn, SearchHitFG: rgb(28, 28, 28),
 		ErrBadgeFG: rgb(228, 228, 228), ErrBadgeBG: errc,
@@ -293,7 +308,7 @@ func lightTheme() *Theme {
 		Cursor: purple,
 		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
 		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim, LogTrace: rgb(192, 192, 192),
+		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
 		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
 		SearchHitBG: warn, SearchHitFG: rgb(250, 250, 250),
 		ErrBadgeFG: rgb(250, 250, 250), ErrBadgeBG: errc,
@@ -323,7 +338,7 @@ func catppuccinTheme() *Theme {
 		Cursor: purple,
 		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
 		HTTPSuccess: ok, HTTPRedirect: cyan, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim, LogTrace: rgb(69, 71, 90),
+		LogError: errc, LogWarn: waiting, LogInfo: info, LogDebug: dim,
 		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: cyan,
 		SearchHitBG: warn, SearchHitFG: rgb(30, 30, 46),
 		ErrBadgeFG: rgb(205, 214, 244), ErrBadgeBG: errc,
@@ -353,7 +368,7 @@ func gruvboxTheme() *Theme {
 		Cursor: purple,
 		OK:     ok, Warn: warn, Err: errc, Waiting: waiting,
 		HTTPSuccess: ok, HTTPRedirect: aqua, HTTPWarning: warn, HTTPError: errc,
-		LogError: errc, LogWarn: waiting, LogInfo: aqua, LogDebug: dim, LogTrace: rgb(80, 73, 69),
+		LogError: errc, LogWarn: waiting, LogInfo: aqua, LogDebug: dim,
 		JSONKey: purple, JSONString: ok, JSONNumber: waiting, JSONBool: aqua,
 		SearchHitBG: warn, SearchHitFG: rgb(40, 40, 40),
 		ErrBadgeFG: rgb(235, 219, 178), ErrBadgeBG: errc,
@@ -384,7 +399,7 @@ func legacyTheme() *Theme {
 		HTTPSuccess: lipgloss.Color("10"), HTTPRedirect: lipgloss.Color("14"),
 		HTTPWarning: lipgloss.Color("11"), HTTPError: lipgloss.Color("9"),
 		LogError: lipgloss.Color("9"), LogWarn: lipgloss.Color("11"),
-		LogInfo: lipgloss.Color("12"), LogDebug: lipgloss.Color("8"), LogTrace: lipgloss.Color("240"),
+		LogInfo: lipgloss.Color("12"), LogDebug: lipgloss.Color("8"),
 		JSONKey: lipgloss.Color("13"), JSONString: lipgloss.Color("10"),
 		JSONNumber: lipgloss.Color("11"), JSONBool: lipgloss.Color("12"),
 		SearchHitBG: lipgloss.Color("11"), SearchHitFG: lipgloss.Color("0"),
@@ -533,8 +548,6 @@ func colorSlot(t *Theme, key string) *lipgloss.Color {
 		return &t.LogInfo
 	case "log_debug":
 		return &t.LogDebug
-	case "log_trace":
-		return &t.LogTrace
 	case "json_key":
 		return &t.JSONKey
 	case "json_string":

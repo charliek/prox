@@ -2321,7 +2321,7 @@ func (b *BaseModel) formatProxyRequest(req proxy.RequestRecord) string {
 	}
 	if cols.Host {
 		// Truncate over-long names so columns don't drift (CodeRabbit PR #102).
-		subdomain := ansi.Truncate(fmt.Sprintf("%-10s", req.Subdomain), 10, "")
+		subdomain := truncatePadDisplay(req.Subdomain, 10)
 		appendCell(s.Dim.Render(subdomain), sep2)
 	}
 	if cols.Method {
@@ -2401,6 +2401,9 @@ func httpMethodStyle(method string) lipgloss.Style {
 
 // getProcessStyle returns the style for a process name
 func getProcessStyle(name string, processes []domain.ProcessInfo) lipgloss.Style {
+	if len(s.ProcessColors) == 0 {
+		return s.DefaultProcess
+	}
 	// Find process index for color
 	for i, p := range processes {
 		if p.Name == name {
@@ -2417,7 +2420,7 @@ func (b *BaseModel) formatLogEntry(entry domain.LogEntry) string {
 
 	// Format process name with padding; truncate over-long names so columns
 	// don't drift (CodeRabbit PR #102).
-	procName := ansi.Truncate(fmt.Sprintf("%-10s", entry.Process), 10, "")
+	procName := truncatePadDisplay(entry.Process, 10)
 
 	// Build line
 	prefix := procStyle.Render(procName)

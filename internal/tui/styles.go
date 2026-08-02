@@ -35,14 +35,13 @@ type styleSet struct {
 	// spliced into the top border (plan 023 E2). Manual composition — lipgloss
 	// has no native border-title. FullFill gets t.BG; legacy is FG-only so
 	// C5 byte-identity pins stay green (panel is new chrome under legacy).
-	Panel, PanelTitle         lipgloss.Style
-	HTTPSuccess, HTTPRedirect lipgloss.Style
-	HTTPWarning, HTTPError    lipgloss.Style
+	Panel, PanelTitle      lipgloss.Style
+	HTTPSuccess, HTTPError lipgloss.Style
 	// Method / status class styles (plan 021 C9). Mapped from existing Theme
 	// HTTP/OK/Warn/Err/FG slots — no new Theme TOML keys.
 	HTTPGet, HTTPPost, HTTPPut, HTTPDelete, HTTPPatch lipgloss.Style
 	Status2xx, Status4xx, Status5xx                   lipgloss.Style
-	// Log level content tints + JSON syntax (C9). LogTrace stays unstyled
+	// Log level content tints + JSON syntax (C9). Trace stays unstyled
 	// (default FG) so debug is the only dim level tint.
 	LogError, LogWarn, LogInfo, LogDebug lipgloss.Style
 	JSONKey, JSONString, JSONNumber      lipgloss.Style
@@ -197,10 +196,8 @@ func buildStyleSet(t *Theme) styleSet {
 			Background(t.FooterBG).
 			Bold(true),
 
-		HTTPSuccess:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
-		HTTPRedirect: fillBG(lipgloss.NewStyle().Foreground(t.HTTPRedirect), t),
-		HTTPWarning:  fillBG(lipgloss.NewStyle().Foreground(t.HTTPWarning), t),
-		HTTPError:    fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
+		HTTPSuccess: fillBG(lipgloss.NewStyle().Foreground(t.HTTPSuccess), t),
+		HTTPError:   fillBG(lipgloss.NewStyle().Foreground(t.HTTPError), t),
 
 		// Method colors (C9): GET=info-ish redirect cyan, POST=OK, PUT=waiting,
 		// DELETE=err, PATCH=warn. Unknown methods stay default FG.

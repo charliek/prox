@@ -77,7 +77,7 @@ func allColorSlots(th *Theme) []namedColor {
 		{"HTTPSuccess", th.HTTPSuccess}, {"HTTPRedirect", th.HTTPRedirect},
 		{"HTTPWarning", th.HTTPWarning}, {"HTTPError", th.HTTPError},
 		{"LogError", th.LogError}, {"LogWarn", th.LogWarn}, {"LogInfo", th.LogInfo},
-		{"LogDebug", th.LogDebug}, {"LogTrace", th.LogTrace},
+		{"LogDebug", th.LogDebug},
 		{"JSONKey", th.JSONKey}, {"JSONString", th.JSONString},
 		{"JSONNumber", th.JSONNumber}, {"JSONBool", th.JSONBool},
 		{"SearchHitBG", th.SearchHitBG}, {"SearchHitFG", th.SearchHitFG},

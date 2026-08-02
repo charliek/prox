@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -36,8 +37,9 @@ type logMeta struct {
 }
 
 // logfmtLevelRE matches level= / lvl= tokens on the raw line (case-insensitive).
-// First match wins. Compiled once at package init.
-var logfmtLevelRE = regexp.MustCompile(`(?i)\b(?:level|lvl)=(debug|info|warn|warning|error|trace|fatal)\b`)
+// The key must be at line start or preceded by whitespace so tokens embedded in
+// words (xlevel=, mylevel=) do not match. First match wins.
+var logfmtLevelRE = regexp.MustCompile(`(?i)(?:^|\s)(?:level|lvl)=(debug|info|warn|warning|error|trace|fatal)(?:\s|$|[\]\)\}:,])`)
 
 // bareLevelRE matches a standalone UPPERCASE level token early in a line —
 // the shape of python's %(levelname)s (stridelabs-python dev), tracing's
@@ -120,12 +122,24 @@ func classifyLevelHeuristics(raw string) (LogLevel, bool) {
 	}
 	scan := ansi.Strip(raw)
 	if len(scan) > bareLevelScanLimit {
-		scan = scan[:bareLevelScanLimit]
+		scan = truncateUTF8Bytes(scan, bareLevelScanLimit)
 	}
 	if m := bareLevelRE.FindStringSubmatch(scan); len(m) >= 2 {
 		return normalizeLevel(m[1])
 	}
 	return LogLevelUnknown, false
+}
+
+// truncateUTF8Bytes returns the prefix of s with byte length ≤ max that does
+// not split a UTF-8 code point.
+func truncateUTF8Bytes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // ingestLogMeta classifies a line at append time. JSON objects pay one

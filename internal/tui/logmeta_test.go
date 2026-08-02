@@ -52,7 +52,7 @@ func TestClassifyLevel_Corpus(t *testing.T) {
 		{"json pino numeric info", `{"level":30,"msg":"x"}`, LogLevelInfo, true},
 		{"json pino numeric error", `{"level":50,"msg":"x"}`, LogLevelError, true},
 		{"json numeric out of range", `{"level":123}`, LogLevelUnknown, false},
-		{"json no level key, logfmt in value", `{"msg":"level=info x"}`, LogLevelInfo, true},
+		{"json logfmt in value rejected", `{"msg":"level=info x"}`, LogLevelUnknown, false},
 		{"json no level, no heuristic", `{"msg":"hi"}`, LogLevelUnknown, false},
 		{"logfmt info", "level=INFO msg=x", LogLevelInfo, true},
 		{"logfmt fatal", "level=fatal", LogLevelError, true},
