@@ -697,7 +697,7 @@ func keyRune(r rune) tea.KeyMsg {
 // newRequestsModel builds a ClientModel in the requests view holding n requests
 // (IDs req-000..req-{n-1}, URLs /path/000..), with the viewport sized so its
 // content Height is viewportHeight (handleWindowSize/relayout subtracts
-// defaultChromeHeight + defaultPanelBorder). followMode starts true, so the cursor begins pinned
+// defaultChromeHeight + defaultPanelBorder + defaultRequestsHeaderRows). followMode starts true, so the cursor begins pinned
 // to the newest row.
 func newRequestsModel(n, viewportHeight int) ClientModel {
 	return newSearchModel(viewportHeight, makeTestRequests(n))
@@ -830,14 +830,14 @@ func TestRequestsCursor_VisibilityResize(t *testing.T) {
 	assert.True(t, cursorVisible(m))
 
 	// Shrink the window: cursor must stay visible.
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight() + defaultPanelBorder()})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
 	// Grow it back: still visible, and the viewport must not be left scrolled
 	// past the true bottom (a grown window shrinks the valid max YOffset —
 	// blank overscroll would report the cursor "visible" while showing gaps).
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + defaultChromeHeight() + defaultPanelBorder()})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
@@ -1064,12 +1064,13 @@ func TestRequestsCursor_MarkerOnCursorRow(t *testing.T) {
 
 // newSearchModel builds a ClientModel in the requests view holding the given request
 // records, viewport sized to viewportHeight, follow-mode default (true) so the
-// cursor starts pinned to the newest row.
+// cursor starts pinned to the newest row. Height accounts for the C11 requests
+// header row (defaultRequestsHeaderRows) in addition to chrome + panel border.
 func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) ClientModel {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = reqs
-	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder()})
+	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 }
 
 // commitSearch drives the `/`-search flow: enter search mode, set the query,

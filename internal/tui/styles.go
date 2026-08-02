@@ -21,6 +21,9 @@ type styleSet struct {
 	Warn                        lipgloss.Style // generic ⚠ segments (stream health, paging)
 	HealthyDot, UnhealthyDot    lipgloss.Style
 	Header, Status, Help        lipgloss.Style
+	// DetailTitle is the request-detail "Request: <id>" line and section
+	// headings (plan 023 B6) — t.Title+bold on theme BG, not the Header band.
+	DetailTitle lipgloss.Style
 	// HelpBorder / HelpTitle / HelpSection paint the help modal border chars,
 	// the title spliced into the top border, and section headings (plan 023 B5).
 	HelpBorder, HelpTitle, HelpSection lipgloss.Style
@@ -164,6 +167,7 @@ func buildStyleSet(t *Theme) styleSet {
 		Status: lipgloss.NewStyle().
 			Background(t.FooterBG).
 			Padding(0, 1),
+		DetailTitle: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
 		Help:        help,
 		HelpBorder:  fillBG(lipgloss.NewStyle().Foreground(t.BorderFocused), t),
 		HelpTitle:   fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),

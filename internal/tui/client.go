@@ -553,6 +553,9 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *ClientModel) beginRequestDetail(requestID string) tea.Cmd {
 	m.selectedRequestID = requestID
 	m.viewMode = ViewModeRequestDetail
+	// Detail drops the requests header row — relayout so viewport height and
+	// YPosition match the new chrome before rendering (frame contract, C11).
+	m.relayout()
 	m.detailLoading = true
 	m.requestDetail = nil
 	m.requestDetailRaw = nil

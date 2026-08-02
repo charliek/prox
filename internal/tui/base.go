@@ -349,8 +349,10 @@ func defaultPanelBorder() int { return 2 }
 
 // contentRect is the outer content band between chromeAbove and chromeBelow
 // (plan 023 B2). The viewport panel (C7) draws inside this rect when it fits
-// — viewport geometry is inset by panelBorder()/2 on each edge. C11 further
-// extends chrome via viewMode-dependent rows.
+// — viewport geometry is inset by panelBorder()/2 on each edge. C11's requests
+// header row sits INSIDE this rect (below the panel top border, above the
+// scrolling viewport) via requestsHeaderRows() — chromeAbove stays
+// viewMode-independent so the panel frame does not jump on view switch.
 func (b *BaseModel) contentRect() HitRect {
 	y := b.chromeAbove()
 	h := b.height - b.chromeHeight()
@@ -364,12 +366,33 @@ func (b *BaseModel) contentRect() HitRect {
 	return HitRect{X: 0, Y: y, W: w, H: h}
 }
 
+// requestsHeaderRows is the fixed column-label row in the requests view (plan
+// 023 B6 / C11): viewport-external chrome inside the panel content area. Returns
+// 0 outside requests view, or when the content band cannot fit header + ≥1
+// viewport row after the panel border (avoids frame overflow on tight heights).
+func (b *BaseModel) requestsHeaderRows() int {
+	if b.viewMode != ViewModeRequests {
+		return 0
+	}
+	rH := b.height - b.chromeHeight()
+	if rH-b.panelBorder() < 2 {
+		return 0
+	}
+	return 1
+}
+
+// defaultRequestsHeaderRows is the requests header cost under roomy frames
+// (always 1). Test helpers that size a WindowSizeMsg for a target requests
+// viewport height add this on top of defaultChromeHeight+defaultPanelBorder.
+func defaultRequestsHeaderRows() int { return 1 }
+
 // viewportOrigin is the top-left of the viewport content (frame coordinates),
-// inset by the panel border when drawn.
+// inset by the panel border when drawn, and shifted down by the requests
+// header row when present (C11).
 func (b *BaseModel) viewportOrigin() (x, y int) {
 	r := b.contentRect()
 	inset := b.panelBorder() / 2
-	return r.X + inset, r.Y + inset
+	return r.X + inset, r.Y + inset + b.requestsHeaderRows()
 }
 
 // footerRowY is the frame Y of the merged footer band.
@@ -383,17 +406,20 @@ func (b *BaseModel) isFooterY(y int) bool {
 }
 
 // relayout derives viewport geometry from enabled chrome rows. Called on
-// WindowSizeMsg AND every visibility toggle (a toggle emits no resize, so
-// without this the viewport keeps stale geometry — Codex #8). C4 flips
+// WindowSizeMsg, every visibility toggle (a toggle emits no resize, so
+// without this the viewport keeps stale geometry — Codex #8), and view-mode
+// switches (C11 requests header changes viewport height). C4 flips
 // ProcessPanel and calls relayout the same way. Panel border (C7) insets the
-// viewport by panelBorder() rows/cols when contentRect is large enough.
+// viewport by panelBorder() rows/cols when contentRect is large enough; the
+// requests header (C11) further shrinks height and shifts YPosition.
 func (b *BaseModel) relayout() {
 	if b.width <= 0 || b.height <= 0 {
 		return
 	}
 	r := b.contentRect()
 	border := b.panelBorder()
-	vpH := r.H - border
+	header := b.requestsHeaderRows()
+	vpH := r.H - border - header
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -402,7 +428,7 @@ func (b *BaseModel) relayout() {
 		vpW = 1
 	}
 	inset := border / 2
-	yPos := r.Y + inset
+	yPos := r.Y + inset + header
 	if !b.ready {
 		b.viewport = viewport.New(vpW, vpH)
 		b.viewport.YPosition = yPos
@@ -933,6 +959,9 @@ func (b *BaseModel) setViewMode(mode ViewMode) {
 		b.detailLoading = false
 	}
 	b.viewMode = mode
+	// Relayout before updateViewport: requests header (C11) changes viewport
+	// height/origin, and SetContent must see the post-switch geometry.
+	b.relayout()
 	b.updateViewport()
 	if b.mode == ModeHelp {
 		b.refreshHelpMemo()
@@ -1689,17 +1718,34 @@ func (b *BaseModel) updateViewport() {
 		// formatting so the marker (baked into content below) and the scroll
 		// invariant agree within this single render (D6/D8).
 		b.resolveRequestCursor(requests)
-		for i, req := range requests {
-			// Prefix the cursor row with a styled marker and every other row
-			// with two spaces so columns stay aligned (D10).
-			marker := s.Base.Render("  ")
-			if i == b.cursorIdx {
-				marker = s.Cursor.Render("❯ ")
+		if len(requests) == 0 {
+			hint := "No requests yet — traffic through the proxy appears here"
+			if !b.requestsFilter.LastGood.IsEmpty() {
+				hint = "No lines match " + b.requestsFilter.LastGood.Serialize()
 			}
-			lines = append(lines, marker+b.formatProxyRequest(req))
+			lines = centeredHint(hint, s.Dim, b.viewport.Width, b.viewport.Height)
+		} else {
+			for i, req := range requests {
+				// Prefix the cursor row with a styled marker and every other row
+				// with two spaces so columns stay aligned (D10).
+				marker := s.Base.Render("  ")
+				if i == b.cursorIdx {
+					marker = s.Cursor.Render("❯ ")
+				}
+				lines = append(lines, marker+b.formatProxyRequest(req))
+			}
 		}
 	default: // ViewModeLogs
 		entries := b.filteredEntries()
+		if len(entries) == 0 {
+			b.logRowSpans = nil
+			hint := "No log output yet"
+			if !b.logsFilter.LastGood.IsEmpty() {
+				hint = "No lines match " + b.logsFilter.LastGood.Serialize()
+			}
+			lines = centeredHint(hint, s.Dim, b.viewport.Width, b.viewport.Height)
+			break
+		}
 		// A `/`-search adds a cursor row marker (mirroring the requests block).
 		// Resolve the Seq-anchored cursor against the just-computed list BEFORE
 		// formatting so the marker index and formatLogEntry's inline highlight
@@ -1806,8 +1852,8 @@ func (b *BaseModel) formatRequestDetail() []string {
 
 	d := b.requestDetail
 
-	// Header: bold method + full URL (curl-ish first line, plan 021 C9).
-	lines = append(lines, s.Header.Render(fmt.Sprintf("Request: %s", d.ID)))
+	// Title: t.Title+bold (plan 023 B6 — was Header band misuse).
+	lines = append(lines, s.DetailTitle.Render(fmt.Sprintf("Request: %s", d.ID)))
 	lines = append(lines, "")
 	lines = append(lines, s.Bold.Render(d.Method)+s.Base.Render(" ")+s.Base.Render(d.URL))
 	lines = append(lines, s.Base.Render(fmt.Sprintf("  Time:     %s", d.Timestamp)))
@@ -1848,14 +1894,14 @@ func (b *BaseModel) formatRequestDetail() []string {
 	// Request headers (key Dim, value default — C9)
 	if len(d.RequestHeaders) > 0 {
 		lines = append(lines, "")
-		lines = append(lines, s.Header.Render("Request Headers"))
+		lines = append(lines, s.DetailTitle.Render("Request Headers"))
 		lines = append(lines, formatHeaderTable(d.RequestHeaders)...)
 	}
 
 	// Response headers
 	if len(d.ResponseHeaders) > 0 {
 		lines = append(lines, "")
-		lines = append(lines, s.Header.Render("Response Headers"))
+		lines = append(lines, s.DetailTitle.Render("Response Headers"))
 		lines = append(lines, formatHeaderTable(d.ResponseHeaders)...)
 	}
 
@@ -1903,7 +1949,7 @@ func renderBodySection(title string, b *BodyData) []string {
 	if b == nil || b.Size == 0 {
 		return nil
 	}
-	lines := []string{"", s.Header.Render(bodySectionTitle(title, b))}
+	lines := []string{"", s.DetailTitle.Render(bodySectionTitle(title, b))}
 	return append(lines, renderBodyLines(b)...)
 }
 
@@ -2165,6 +2211,22 @@ func (b *BaseModel) getSelectedRequest() string {
 		return ""
 	}
 	return b.cursorID
+}
+
+// formatRequestsHeaderRow builds the fixed column-label row for the requests
+// view (plan 023 B6). Widths match formatProxyRequest; a two-space indent
+// mirrors the cursor-marker column on data rows so labels stay aligned.
+func (b *BaseModel) formatRequestsHeaderRow() string {
+	sep2 := s.Base.Render("  ")
+	sep1 := s.Base.Render(" ")
+	indent := s.Base.Render("  ")
+	return indent +
+		s.Dim.Render(fmt.Sprintf("%-8s", "Time")) + sep2 +
+		s.Dim.Render(fmt.Sprintf("%-10s", "Host")) + sep2 +
+		s.Dim.Render(fmt.Sprintf("%-7s", "Method")) + sep1 +
+		s.Dim.Render(fmt.Sprintf("%3s", "Sta")) + sep1 +
+		s.Dim.Render(fmt.Sprintf("%-7s", "Duration")) + sep2 +
+		s.Dim.Render("URL")
 }
 
 // formatProxyRequest formats a single proxy request for display
@@ -2729,6 +2791,21 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 	drawPanel := b.canDrawPanel()
 	if drawPanel {
 		lines = append(lines, b.renderPanelTop(b.width))
+	}
+
+	// Requests column header: inside the panel, above scrolling viewport rows
+	// (plan 023 B6 / C11). Fixed under scroll because it is not viewport content.
+	if b.requestsHeaderRows() > 0 {
+		hdr := b.formatRequestsHeaderRow()
+		if CurrentTheme().FullFill {
+			hdr = trimTrailingSpacesANSI(hdr)
+		}
+		hdr = padFrameRow(hdr, b.viewport.Width)
+		if drawPanel {
+			lines = append(lines, wrapPanelContentRow(hdr))
+		} else {
+			lines = append(lines, padFrameRow(hdr, b.width))
+		}
 	}
 
 	for _, line := range strings.Split(b.viewport.View(), "\n") {

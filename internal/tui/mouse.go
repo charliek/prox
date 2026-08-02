@@ -51,6 +51,11 @@ func (m *ClientModel) handleContentMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 		return true, nil
 	}
 
+	// Requests column header (C11): consumed no-op — never maps to request row 0.
+	if m.isRequestsHeaderY(msg.Y) {
+		return true, nil
+	}
+
 	if idx := m.processPanelHit(msg.X, msg.Y); idx >= 0 {
 		m.toggleSoloProcess(idx)
 		m.updateViewport()
@@ -111,7 +116,7 @@ func (m *ClientModel) handleMouseWheel(delta int) (bool, tea.Cmd) {
 
 // viewportLocalRow maps a frame Y coordinate to a 0-based row within the
 // viewport window. ok is false when Y is outside the viewport content (panel
-// border rows and chrome are excluded).
+// border rows, the requests header chrome, and other chrome are excluded).
 func (b *BaseModel) viewportLocalRow(y int) (local int, ok bool) {
 	_, oy := b.viewportOrigin()
 	h := b.viewport.Height
@@ -122,6 +127,22 @@ func (b *BaseModel) viewportLocalRow(y int) (local int, ok bool) {
 		return 0, false
 	}
 	return y - oy, true
+}
+
+// requestsHeaderFrameY is the frame Y of the fixed requests column-header row.
+func (b *BaseModel) requestsHeaderFrameY() (int, bool) {
+	if b.requestsHeaderRows() == 0 {
+		return 0, false
+	}
+	r := b.contentRect()
+	inset := b.panelBorder() / 2
+	return r.Y + inset, true
+}
+
+// isRequestsHeaderY reports whether frame Y falls on the requests header chrome.
+func (b *BaseModel) isRequestsHeaderY(y int) bool {
+	hy, ok := b.requestsHeaderFrameY()
+	return ok && y == hy
 }
 
 // processPanelRowY is the frame Y of the process-panel content row.

@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -29,6 +30,43 @@ func fillPad(n int) string {
 		return ""
 	}
 	return s.Base.Render(strings.Repeat(" ", n))
+}
+
+// centeredHint returns h rows of width w with text styled and centered both
+// horizontally and vertically (plan 023 B6 empty states). Text truncates with
+// "…" when wider than w. Empty/degenerate sizes yield blank Base-padded rows.
+func centeredHint(text string, style lipgloss.Style, w, h int) []string {
+	if h < 1 {
+		h = 1
+	}
+	lines := make([]string, h)
+	if w < 1 {
+		for i := range lines {
+			lines[i] = ""
+		}
+		return lines
+	}
+	trunc := ansi.Truncate(text, w, "…")
+	tw := ansi.StringWidth(trunc)
+	padLeft := (w - tw) / 2
+	if padLeft < 0 {
+		padLeft = 0
+	}
+	padRight := w - padLeft - tw
+	if padRight < 0 {
+		padRight = 0
+	}
+	centered := fillPad(padLeft) + style.Render(trunc) + fillPad(padRight)
+	blank := fillPad(w)
+	mid := h / 2
+	for i := range lines {
+		if i == mid {
+			lines[i] = centered
+		} else {
+			lines[i] = blank
+		}
+	}
+	return lines
 }
 
 // padFrameRow pads or truncates row to exactly width display columns.
