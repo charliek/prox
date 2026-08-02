@@ -21,9 +21,13 @@ type styleSet struct {
 	Warn                        lipgloss.Style // generic ⚠ segments (stream health, paging)
 	HealthyDot, UnhealthyDot    lipgloss.Style
 	Header, Status, Help        lipgloss.Style
-	Err, Dim                    lipgloss.Style
-	FooterKey, FooterLabel      lipgloss.Style // two-tone footer hints (plan 023 B2)
-	FooterError                 lipgloss.Style // ✗ error flash: Err-bold on FooterBG
+	// HelpBorder / HelpTitle / HelpSection paint the help modal border chars,
+	// the title spliced into the top border, and section headings (plan 023 B5).
+	HelpBorder, HelpTitle, HelpSection lipgloss.Style
+	HelpKey                            lipgloss.Style // FooterKey color on modal BG
+	Err, Dim                           lipgloss.Style
+	FooterKey, FooterLabel             lipgloss.Style // two-tone footer hints (plan 023 B2)
+	FooterError                        lipgloss.Style // ✗ error flash: Err-bold on FooterBG
 	// Panel / PanelTitle paint the viewport panel border chars and the title
 	// spliced into the top border (plan 023 E2). Manual composition — lipgloss
 	// has no native border-title. FullFill gets t.BG; legacy is FG-only so
@@ -116,7 +120,7 @@ func buildStyleSet(t *Theme) styleSet {
 		Background(t.BG).
 		Padding(1, 2).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(t.Border)
+		BorderForeground(t.BorderFocused)
 	if t.FullFill {
 		help = help.BorderBackground(t.BG)
 	}
@@ -160,7 +164,11 @@ func buildStyleSet(t *Theme) styleSet {
 		Status: lipgloss.NewStyle().
 			Background(t.FooterBG).
 			Padding(0, 1),
-		Help: help,
+		Help:        help,
+		HelpBorder:  fillBG(lipgloss.NewStyle().Foreground(t.BorderFocused), t),
+		HelpTitle:   fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
+		HelpSection: fillBG(lipgloss.NewStyle().Foreground(t.Title).Bold(true), t),
+		HelpKey:     fillBG(lipgloss.NewStyle().Foreground(t.FooterKey).Bold(true), t),
 
 		// Panel border chars (manual rounded frame around the viewport).
 		// Not a lipgloss.Border style — renderers paint ╭─╮│╰╯ directly.

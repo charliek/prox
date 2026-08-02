@@ -237,6 +237,9 @@ type BaseModel struct {
 	// helpOffset scrolls the help modal body when it exceeds the modal inner
 	// height (clampHelpOffset on the real model; reset on open/close).
 	helpOffset int
+
+	// helpMemo caches the wrapped help body across ClientModel copies (plan 023 B5).
+	helpMemo *helpMemoCache
 }
 
 // newBaseModel creates a new BaseModel with the given help configuration
@@ -264,6 +267,7 @@ func newBaseModel(helpConfig HelpConfig) BaseModel {
 		openMenu:            -1, // closed
 		hoveredMenuCell:     -1,
 		hits:                &hitRegistry{},
+		helpMemo:            &helpMemoCache{},
 	}
 	b.viewport.MouseWheelEnabled = false // TUI owns all wheel routing (Codex #5)
 	return b
@@ -293,7 +297,10 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 	// Clamp help on resize so the first k after a shrink works immediately
 	// (plan 022 WS4 / PR #102 lesson — never clamp only in View).
 	if b.mode == ModeHelp {
+		b.refreshHelpMemo()
 		b.clampHelpOffset()
+	} else {
+		b.invalidateHelpMemo()
 	}
 }
 
@@ -896,6 +903,10 @@ func (b *BaseModel) setThemeByName(name string) tea.Cmd {
 	}
 	applyTextInputTheme(&b.textInput)
 	b.updateViewport()
+	if b.mode == ModeHelp {
+		b.refreshHelpMemo()
+		b.clampHelpOffset()
+	}
 	return b.setStatusFlash(msg, class, statusFlashClearDelay)
 }
 
@@ -923,6 +934,10 @@ func (b *BaseModel) setViewMode(mode ViewMode) {
 	}
 	b.viewMode = mode
 	b.updateViewport()
+	if b.mode == ModeHelp {
+		b.refreshHelpMemo()
+		b.clampHelpOffset()
+	}
 }
 
 // toggleFollow is the shared Follow toggle used by the F key and the View menu
@@ -2769,133 +2784,6 @@ func (b *BaseModel) helpQuit() string {
 		return b.helpConfig.QuitMessage
 	}
 	return "Quit"
-}
-
-// logsHelpText is the full (unwindowed) logs help content.
-func (b *BaseModel) logsHelpText() string {
-	help := fmt.Sprintf(`%s
-
-Navigation:
-  j/k, ↑/↓     Scroll (up pauses auto-follow)
-  PgUp/PgDn    Half-page scroll
-  g/Home       Jump to top (pauses follow)
-  G/End        Jump to bottom (resumes follow)
-  F            Toggle auto-follow
-  Tab          Switch to Requests view
-  scroll wheel Scroll (3 lines per notch; up pauses follow)
-
-Filter & search:
-  s            Filter bar (query language, live)
-               e.g. proc:api level:error -health
-  f            Filter menu (process + level checks)
-  /            Search — jump cursor to match (does not hide lines)
-  n/N          Next/previous search match
-  Esc          Clear filters, search, and solo
-
-Processes:
-  1-9          Solo a process (toggle); click panel chip too
-
-View & chrome:
-  p            Toggle process panel
-  T            Toggle timestamps in log lines
-  w            Toggle soft-wrap
-  m            Toggle menu bar
-  v            Open View menu (bar visible)
-  t            Cycle theme
-  ?            This help
-
-Copy (grab-for-agent):
-  y            Copy parked search line (when cursor set)
-
-Actions:
-  r            Restart soloed process
-  q/Ctrl+C     %s
-
-Mouse:
-  wheel        Scroll logs; scroll open dropdown (not viewport) when menu open
-  click line   Park cursor on that entry (disengages follow)
-  click chip   Solo/unsolo process
-  menu bar     Click or hover cells; click dropdown rows; ←/→ switch open menus
-  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
-		b.helpTitle("[Logs View]"), b.helpQuit())
-
-	return help
-}
-
-// requestsHelpText is the full (unwindowed) requests help content.
-func (b *BaseModel) requestsHelpText() string {
-	help := fmt.Sprintf(`%s
-
-Navigation (cursor row ❯):
-  j/k, ↑/↓     Move cursor (up pauses follow; onto newest resumes)
-  PgUp/PgDn    Move cursor half a page
-  g/Home       Cursor to top (pauses follow)
-  G/End        Cursor to bottom (resumes follow)
-  F            Toggle auto-follow
-  Tab          Switch to Logs view
-  scroll wheel Move cursor (3 rows/notch; follow rules match j/k)
-
-Filter & search:
-  s            Filter bar (query language, live)
-               e.g. method:GET status:5xx host:api url:/orders
-  f            Filter menu (status class, methods)
-  /            Search URL/method/subdomain (navigate, not filter)
-  n/N          Next/previous search match
-  Esc          Back from detail, or clear filters/search
-
-Requests:
-  Enter        Open detail for cursor row
-  click row    Move cursor; double-click opens detail
-
-View & chrome:
-  p/T/w/m/v/t  Same as Logs view (panel, timestamps, wrap, menu, theme)
-  ?            This help
-
-Copy (grab-for-agent):
-  y            Copy full request ID (cursor row)
-  c            Copy as curl
-  Y            Copy detail JSON (detail view)
-
-Actions:
-  q/Ctrl+C     %s
-
-Mouse:
-  wheel        Move cursor; scroll open dropdown (not viewport) when menu open
-  click row    Move cursor; double-click opens detail
-  click chip   Solo/unsolo process
-  menu bar     Click or hover cells; click dropdown rows; ←/→ between menus
-  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
-		b.helpTitle("[Requests View]"), b.helpQuit())
-
-	return help
-}
-
-// detailHelpText is the full (unwindowed) detail help content.
-func (b *BaseModel) detailHelpText() string {
-	help := fmt.Sprintf(`%s
-
-Navigation:
-  j/k, ↑/↓     Scroll detail content
-  PgUp/PgDn    Page scroll
-  scroll wheel Scroll (3 lines per notch)
-  Esc          Back to requests list
-
-Copy (grab-for-agent):
-  y            Copy full request ID
-  c            Copy as curl
-  Y            Copy wire JSON (exact API payload)
-
-View & chrome:
-  ?            This help
-  q/Ctrl+C     %s
-
-Mouse:
-  wheel        Scroll detail; scroll open dropdown when menu open
-  menu bar     Click or hover cells; click dropdown rows
-  help open    Wheel scrolls when content exceeds the modal; click outside closes`,
-		b.helpTitle("[Request Detail]"), b.helpQuit())
-
-	return help
 }
 
 // containsIgnoreCase performs a case-insensitive substring search

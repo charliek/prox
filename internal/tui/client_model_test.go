@@ -826,10 +826,12 @@ func TestClientModel_HelpConfigFromOptions(t *testing.T) {
 	require.True(t, m.mode == ModeHelp)
 
 	help := m.View()
-	assert.Contains(t, help, "(Local Mode)")
 	assert.Contains(t, help, "Quit (stops all processes)")
 	assert.NotContains(t, help, "(Client Mode)")
 	assert.NotContains(t, help, "daemon continues running")
+	// TitleSuffix no longer appears in the bordered title (plan 023 B5); border
+	// shows the view label only.
+	assert.Contains(t, help, "Help — Logs")
 	// Live chrome behind the modal (merged footer).
 	assert.Contains(t, ansi.Strip(help), "? help")
 	assert.Contains(t, ansi.Strip(help), "[FOLLOW]")

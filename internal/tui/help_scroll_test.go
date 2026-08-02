@@ -23,7 +23,7 @@ func TestHelp_WindowsToModalInnerHeight(t *testing.T) {
 	view := m.View()
 	assert.LessOrEqual(t, len(strings.Split(view, "\n")), 20,
 		"frame must not exceed terminal height")
-	assert.Contains(t, view, "Prox - Process Manager", "title stays visible")
+	assert.Contains(t, view, "Help — Logs", "border title stays visible")
 	assert.Contains(t, view, helpModalFooter)
 	// Live chrome behind the modal (merged footer; sticky ? help survives at 90).
 	assert.Contains(t, ansi.Strip(view), "? help")
@@ -38,7 +38,7 @@ func TestHelp_ScrollKeysMoveWindow(t *testing.T) {
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 90, Height: 20})
 	m = clientUpdate(m, keyRune('?'))
 
-	require.Contains(t, m.View(), "Prox - Process Manager")
+	require.Contains(t, m.View(), "Help — Logs")
 	require.Greater(t, m.helpMaxOffset(), 0)
 
 	m.handleHelpKey(keyRune('j'))
@@ -90,7 +90,7 @@ func TestHelp_FitsWithoutWindowing(t *testing.T) {
 	m = clientUpdate(m, keyRune('?'))
 
 	view := m.View()
-	assert.Contains(t, view, "Prox - Process Manager")
+	assert.Contains(t, view, "Help — Logs")
 	assert.Contains(t, view, helpModalFooter)
 	assert.Equal(t, 0, m.helpMaxOffset())
 	assert.NotContains(t, view, "lines 1-", "no scroll indicator when it fits")
@@ -154,7 +154,7 @@ func TestHelp_StreamingBehindModal(t *testing.T) {
 	view := m.View()
 	assert.Contains(t, view, "STREAMBEH1")
 	assert.Contains(t, view, helpModalFooter)
-	assert.Contains(t, view, "Prox - Process Manager")
+	assert.Contains(t, view, "Help — Logs")
 	assert.Contains(t, view, "1/1 lines")
 }
 

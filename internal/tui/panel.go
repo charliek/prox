@@ -17,7 +17,8 @@ const (
 	// panelMinHeight is top border + ≥1 content row + bottom border.
 	panelMinHeight = 3
 	// panelTitlePrefixW is the "─ " before the title in the top mid segment.
-	panelTitlePrefixW = 2
+	// Shared by every titled border (viewport panel, help modal — plan 023 B5).
+	borderTitlePrefixW = 2
 )
 
 // panelBorder returns the row/col cost of the viewport panel (0 or 2).
@@ -68,26 +69,33 @@ func (b *BaseModel) renderPanelTop(width int) string {
 		s.Panel.Render(br.TopRight)
 }
 
-// renderPanelTitleMid builds the top-border mid segment of display width inner.
-// Title truncates with "…" when needed; omitted entirely when inner < 4
-// (no room for "─ " + ≥1 title column).
-func renderPanelTitleMid(title string, inner int) string {
+// renderBorderTitleMid builds the top-border mid segment of display width
+// inner with the label spliced in: `─ label ───`. Label truncates with "…"
+// when needed; omitted entirely when inner < borderTitlePrefixW+1 (no room for
+// "─ " + ≥1 label column). Shared by the viewport panel (C7) and the help
+// modal border title (plan 023 B5).
+func renderBorderTitleMid(label string, inner int, borderStyle, labelStyle lipgloss.Style) string {
 	br := lipgloss.RoundedBorder()
 	if inner <= 0 {
 		return ""
 	}
-	if title == "" || inner < panelTitlePrefixW+1 {
-		return s.Panel.Render(strings.Repeat(br.Top, inner))
+	if label == "" || inner < borderTitlePrefixW+1 {
+		return borderStyle.Render(strings.Repeat(br.Top, inner))
 	}
-	budget := inner - panelTitlePrefixW
-	trunc := ansi.Truncate(title, budget, "…")
+	budget := inner - borderTitlePrefixW
+	trunc := ansi.Truncate(label, budget, "…")
 	tw := ansi.StringWidth(trunc)
 	if tw == 0 {
-		return s.Panel.Render(strings.Repeat(br.Top, inner))
+		return borderStyle.Render(strings.Repeat(br.Top, inner))
 	}
-	fill := inner - panelTitlePrefixW - tw // ≥ 0: tw ≤ budget by ansi.Truncate
-	return s.Panel.Render(br.Top+" ") + s.PanelTitle.Render(trunc) +
-		s.Panel.Render(strings.Repeat(br.Top, fill))
+	fill := inner - borderTitlePrefixW - tw // ≥ 0: tw ≤ budget by ansi.Truncate
+	return borderStyle.Render(br.Top+" ") + labelStyle.Render(trunc) +
+		borderStyle.Render(strings.Repeat(br.Top, fill))
+}
+
+// renderPanelTitleMid builds the top-border mid segment of display width inner.
+func renderPanelTitleMid(title string, inner int) string {
+	return renderBorderTitleMid(title, inner, s.Panel, s.PanelTitle)
 }
 
 // renderPanelBottom builds the bottom border row: ╰────╯. Callers guarantee

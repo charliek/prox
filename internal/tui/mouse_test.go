@@ -327,25 +327,35 @@ func TestHelpView_NoDeadBindings(t *testing.T) {
 	m := newTestModel()
 	// Large frame so the modal shows every section without windowing.
 	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 80})
-	logs := m.logsHelpText()
+
+	logs := strings.Join(renderHelpBodyLines(m.logsHelpSections()), "\n")
 	assert.Contains(t, logs, "Copy")
-	assert.Contains(t, logs, "  y            Copy")
-	assert.Contains(t, logs, "  m            Toggle menu bar")
-	assert.Contains(t, logs, "  t            Cycle theme")
+	assert.Contains(t, logs, "y")
+	assert.Contains(t, logs, "Copy parked search line")
+	assert.Contains(t, logs, "m")
+	assert.Contains(t, logs, "Toggle menu bar")
+	assert.Contains(t, logs, "t")
+	assert.Contains(t, logs, "Cycle theme")
 	assert.NotContains(t, logs, "ModeFilter")
 	assert.NotContains(t, logs, "Filter mode")
 	assert.NotContains(t, logs, "Select all")
 
-	reqs := m.requestsHelpText()
+	reqs := strings.Join(renderHelpBodyLines(m.requestsHelpSections()), "\n")
 	assert.Contains(t, reqs, "method:GET")
 	assert.Contains(t, reqs, "double-click")
-	assert.Contains(t, reqs, "  c            Copy as curl")
+	assert.Contains(t, reqs, "c")
+	assert.Contains(t, reqs, "Copy as curl")
 	assert.NotContains(t, reqs, "ModeFilter")
 
 	m.viewMode = ViewModeRequestDetail
-	detail := m.detailHelpText()
+	detail := strings.Join(renderHelpBodyLines(m.detailHelpSections()), "\n")
 	assert.Contains(t, detail, "Copy wire JSON")
 	assert.Contains(t, detail, "scroll wheel")
+	assert.Contains(t, detail, "Toggle process panel")
+	assert.Contains(t, detail, "Toggle menu bar")
+	assert.Contains(t, detail, "Toggle timestamps")
+	assert.Contains(t, detail, "Toggle soft-wrap")
+	assert.Contains(t, detail, "Cycle theme")
 }
 
 func TestHelpMouse_ModalFirstRouting(t *testing.T) {

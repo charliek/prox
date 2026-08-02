@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -17,10 +18,6 @@ const (
 	// helpModalFooter is the fixed chrome row inside the box.
 	helpModalFooter = "esc/?/q/enter close · j/k scroll"
 
-	// helpModalFixedRows are non-scrollable content rows inside the padded
-	// area: title + footer. Border (2) + padding (2) sit outside this count.
-	helpModalFixedRows = 2
-
 	// helpModalFrameChrome is lipgloss border (2) + padding vertical (2).
 	// MUST match s.Help (styles.go): border + Padding(1, 2).
 	helpModalFrameChrome = 4
@@ -30,6 +27,18 @@ const (
 	// drop side padding first, then the border (plan 023 A2).
 	helpModalHorizChrome = 6
 )
+
+// helpMemoCache holds the memoized wrapped help body. Heap-allocated and shared
+// across ClientModel copies — render-time writes to a value copy are discarded
+// (same pattern as hitRegistry — plan 023 B5).
+type helpMemoCache struct {
+	width     int
+	height    int
+	viewMode  ViewMode
+	themeName string
+	wrapped   []string
+	wrapCalls int // instrumentation: incremented on each body wrap pass
+}
 
 // helpModalRect returns the centred help box geometry (plan 022 WS4).
 // Width = clamp(70% of frameW, min(60, frameW-4), min(100, frameW-4)).
@@ -83,12 +92,12 @@ func helpModalRect(frameW, frameH, contentLines int) (x, y, w, h int) {
 
 // wrapHelpLines wraps each physical line of raw to width visual columns
 // (ansi.Wrap). Offset math counts the resulting visual lines.
-func wrapHelpLines(raw string, width int) []string {
+func wrapHelpLines(raw []string, width int) []string {
 	if width < 1 {
 		width = 1
 	}
 	var out []string
-	for _, line := range strings.Split(raw, "\n") {
+	for _, line := range raw {
 		if line == "" {
 			out = append(out, "")
 			continue
@@ -123,6 +132,51 @@ func helpInnerWidth(boxW int) int {
 	return w
 }
 
+// helpModalFixedRows is the non-scrollable content rows inside the padded area.
+// When a top border exists the title lives in the border; borderless keeps the
+// legacy in-content title row.
+func helpModalFixedRows(boxW int) int {
+	if boxW >= 3 {
+		return 1 // footer only
+	}
+	return 2 // title + footer
+}
+
+func (b *BaseModel) mustHelpMemo() *helpMemoCache {
+	if b.helpMemo == nil {
+		panic("tui: helpMemo is nil; construct via newBaseModel or newTestBaseModel")
+	}
+	return b.helpMemo
+}
+
+func (b *BaseModel) invalidateHelpMemo() {
+	b.mustHelpMemo().wrapped = nil
+}
+
+func (b *BaseModel) helpMemoValid() bool {
+	m := b.helpMemo
+	if m == nil || m.wrapped == nil {
+		return false
+	}
+	return m.width == b.width &&
+		m.height == b.height &&
+		m.viewMode == b.viewMode &&
+		m.themeName == CurrentThemeName()
+}
+
+// refreshHelpMemo rebuilds the wrapped body on the real model (Update paths).
+func (b *BaseModel) refreshHelpMemo() {
+	memo := b.mustHelpMemo()
+	innerW := helpInnerWidth(b.helpModalOuterWidth())
+	physical := renderHelpBodyLines(b.helpSections())
+	memo.wrapCalls++
+	memo.wrapped = wrapHelpLines(physical, innerW)
+	memo.width = b.width
+	memo.height = b.height
+	memo.viewMode = b.viewMode
+	memo.themeName = CurrentThemeName()
+}
+
 // enterHelp opens the help modal: closes any menu permanently, clears the
 // request double-click tracker, and clamps the scroll offset (plan 022 WS4).
 func (b *BaseModel) enterHelp() {
@@ -130,6 +184,7 @@ func (b *BaseModel) enterHelp() {
 	b.mode = ModeHelp
 	b.helpOffset = 0
 	b.clearRequestClickTracker()
+	b.refreshHelpMemo()
 	b.clampHelpOffset()
 }
 
@@ -138,6 +193,7 @@ func (b *BaseModel) exitHelp() {
 	b.mode = ModeNormal
 	b.helpOffset = 0
 	b.clearRequestClickTracker()
+	b.invalidateHelpMemo()
 }
 
 // clampHelpOffset keeps helpOffset in range on the real model (never in View —
@@ -152,40 +208,6 @@ func (b *BaseModel) clampHelpOffset() {
 	}
 }
 
-// helpRawText returns the unwindowed help source for the current view mode.
-func (b *BaseModel) helpRawText() string {
-	switch b.viewMode {
-	case ViewModeRequests:
-		return b.requestsHelpText()
-	case ViewModeRequestDetail:
-		return b.detailHelpText()
-	default:
-		return b.logsHelpText()
-	}
-}
-
-// helpTitleLine is the fixed modal title for the current view.
-func (b *BaseModel) helpTitleLine() string {
-	switch b.viewMode {
-	case ViewModeRequests:
-		return b.helpTitle("[Requests View]")
-	case ViewModeRequestDetail:
-		return b.helpTitle("[Request Detail]")
-	default:
-		return b.helpTitle("[Logs View]")
-	}
-}
-
-// helpBodySource drops the leading title line from the help text — the modal
-// shows that title as fixed chrome.
-func (b *BaseModel) helpBodySource() string {
-	raw := b.helpRawText()
-	if i := strings.IndexByte(raw, '\n'); i >= 0 {
-		return strings.TrimPrefix(raw[i+1:], "\n")
-	}
-	return ""
-}
-
 // helpModalOuterWidth is the box width for the current frame.
 func (b *BaseModel) helpModalOuterWidth() int {
 	_, _, w, _ := helpModalRect(b.width, b.height, 1)
@@ -193,14 +215,20 @@ func (b *BaseModel) helpModalOuterWidth() int {
 }
 
 // helpWrappedBody returns the full wrapped body (visual lines) for offset math.
+// View() only reads a valid memo; stale/nil memo computes fresh without caching.
 func (b *BaseModel) helpWrappedBody() []string {
-	return wrapHelpLines(b.helpBodySource(), helpInnerWidth(b.helpModalOuterWidth()))
+	if b.helpMemoValid() {
+		return b.helpMemo.wrapped
+	}
+	innerW := helpInnerWidth(b.helpModalOuterWidth())
+	return wrapHelpLines(renderHelpBodyLines(b.helpSections()), innerW)
 }
 
 // helpContentBudget is the number of body rows available inside the modal
 // (including the indicator slot when windowing). Derived from modal inner
 // height — NOT b.height-4 (plan 022 WS4 / panel correction 7).
 func (b *BaseModel) helpContentBudget() int {
+	boxW := b.helpModalOuterWidth()
 	maxOuter := b.height - 4
 	if maxOuter < 1 {
 		maxOuter = 1
@@ -208,12 +236,12 @@ func (b *BaseModel) helpContentBudget() int {
 			maxOuter = b.height
 		}
 	}
-	// Lines available inside border+padding for title + body + footer.
+	// Lines available inside border+padding for fixed chrome + body.
 	maxInner := maxOuter - helpModalFrameChrome
 	if maxInner < 1 {
 		maxInner = 1
 	}
-	budget := maxInner - helpModalFixedRows
+	budget := maxInner - helpModalFixedRows(boxW)
 	if budget < 1 {
 		return 1
 	}
@@ -260,9 +288,26 @@ func (b *BaseModel) helpModalBoxDims() (boxW, desiredH int) {
 	if bodyRows > budget {
 		bodyRows = budget // windowed: budget rows (content + indicator)
 	}
-	// title + bodyRows + footer, plus border+padding.
-	desiredH = helpModalFixedRows + bodyRows + helpModalFrameChrome
+	// fixed chrome + bodyRows + border+padding.
+	desiredH = helpModalFixedRows(boxW) + bodyRows + helpModalFrameChrome
 	return boxW, desiredH
+}
+
+// renderHelpBorderTitleMid builds the top-border mid segment of display width inner.
+func renderHelpBorderTitleMid(title string, inner int) string {
+	return renderBorderTitleMid(title, inner, s.HelpBorder, s.HelpTitle)
+}
+
+// spliceHelpBorderTitle replaces the top border row with a titled variant.
+func spliceHelpBorderTitle(topRow string, outerW int, title string) string {
+	if outerW < 3 || title == "" {
+		return topRow
+	}
+	br := lipgloss.RoundedBorder()
+	inner := outerW - 2
+	mid := renderHelpBorderTitleMid(title, inner)
+	row := s.HelpBorder.Render(br.TopLeft) + mid + s.HelpBorder.Render(br.TopRight)
+	return padFrameRow(row, outerW)
 }
 
 // helpModalBoxRows builds the bordered help box rows and their top-left anchor.
@@ -273,6 +318,7 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 	_, desiredH := b.helpModalBoxDims()
 	x, y, w, h := helpModalRect(b.width, b.height, desiredH)
 	innerW := helpInnerWidth(w)
+	bordered := w >= 3
 
 	body := b.helpWrappedBody()
 	budget := b.helpContentBudget()
@@ -302,12 +348,13 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 			"… lines %d-%d of %d (j/k scroll) …", offset+1, end, len(body))), 0, innerW))
 	}
 
-	// Truncate title/footer to inner width so the bordered box stays uniform.
-	title := ansi.Cut(b.helpTitleLine(), 0, innerW)
 	footer := ansi.Cut(s.Dim.Render(helpModalFooter), 0, innerW)
 
 	parts := make([]string, 0, 2+len(visible))
-	parts = append(parts, title)
+	if !bordered {
+		title := ansi.Cut(b.helpTitleLine(), 0, innerW)
+		parts = append(parts, title)
+	}
 	parts = append(parts, visible...)
 	parts = append(parts, footer)
 
@@ -333,6 +380,9 @@ func (b *BaseModel) helpModalBoxRows() (rows []string, x, y int) {
 	}
 	box := style.Width(widthArg).Render(strings.Join(parts, "\n"))
 	rows = strings.Split(box, "\n")
+	if bordered && len(rows) > 0 {
+		rows[0] = spliceHelpBorderTitle(rows[0], w, b.helpBorderTitle())
+	}
 	// Degenerate clamp: never exceed the rect height/width.
 	if len(rows) > h {
 		rows = rows[:h]
