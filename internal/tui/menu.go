@@ -55,9 +55,11 @@ const (
 )
 
 // MenuItem is one dropdown row. Checked/Selected are nil for plain rows;
-// Separator skips highlight navigation (strix on_key_menu).
+// Separator skips highlight navigation (strix on_key_menu). Hint is an
+// optional right-aligned keyboard shortcut (plan 023 B4); empty when none.
 type MenuItem struct {
 	Label     string
+	Hint      string
 	Checked   *bool // checkbox marker
 	Selected  *bool // radio marker
 	Separator bool
@@ -134,13 +136,13 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 		wrap := b.settings.Wrap
 		follow := b.followMode
 		return []MenuItem{
-			{Label: "Logs", Selected: &logsOn, Cmd: MenuCmdSetLogs},
-			{Label: "Requests", Selected: &reqsOn, Cmd: MenuCmdSetRequests},
+			{Label: "Logs", Hint: "Tab", Selected: &logsOn, Cmd: MenuCmdSetLogs},
+			{Label: "Requests", Hint: "Tab", Selected: &reqsOn, Cmd: MenuCmdSetRequests},
 			{Separator: true},
-			{Label: "Process panel", Checked: &panel, Cmd: MenuCmdToggleProcessPanel},
-			{Label: "Timestamps", Checked: &timestamps, Cmd: MenuCmdToggleTimestamps},
-			{Label: "Wrap lines", Checked: &wrap, Cmd: MenuCmdToggleWrap},
-			{Label: "Follow", Checked: &follow, Cmd: MenuCmdToggleFollow},
+			{Label: "Process panel", Hint: "p", Checked: &panel, Cmd: MenuCmdToggleProcessPanel},
+			{Label: "Timestamps", Hint: "T", Checked: &timestamps, Cmd: MenuCmdToggleTimestamps},
+			{Label: "Wrap lines", Hint: "w", Checked: &wrap, Cmd: MenuCmdToggleWrap},
+			{Label: "Follow", Hint: "F", Checked: &follow, Cmd: MenuCmdToggleFollow},
 		}
 	case MenuTheme:
 		names := AvailableThemes()
@@ -151,6 +153,7 @@ func (b *BaseModel) menuItems(id MenuID) []MenuItem {
 			selected[i] = name == current
 			items[i] = MenuItem{
 				Label:    name,
+				Hint:     "t", // theme-cycle key (handleNavigationKey)
 				Selected: &selected[i],
 				Cmd:      menuCmdSetTheme(name),
 			}
@@ -214,6 +217,9 @@ func (b *BaseModel) menuStepDir(id MenuID, item int, down bool, wrap bool) int {
 // menuReservedBottom is the footer band — dropdowns never cover it (plan 023 B2).
 const menuReservedBottom = 1
 
+// menuBorderSize is the rounded-border cost in rows and columns (plan 023 B4).
+const menuBorderSize = 2
+
 func (b *BaseModel) menuBoxTop() int {
 	if b.settings.MenuBar {
 		return 1
@@ -221,8 +227,10 @@ func (b *BaseModel) menuBoxTop() int {
 	return 0
 }
 
+// menuAvail is the inner (content) row budget for the open dropdown — frame
+// height minus bar, footer, and the top+bottom border (plan 023 B4).
 func (b *BaseModel) menuAvail() int {
-	return b.height - b.menuBoxTop() - menuReservedBottom
+	return b.height - b.menuBoxTop() - menuReservedBottom - menuBorderSize
 }
 
 // menuWindowMaxOffset is the largest menuWindow for n item rows and avail.
@@ -552,9 +560,11 @@ func (b *BaseModel) renderMenuBar() string {
 	return line
 }
 
-// dropdownBoxRows builds the windowed dropdown rows (indicators + visible
-// items) and records hit-rects matching EXACTLY those rows; activatable rows
-// carry their full-list Index so hover/click map visible → item (plan 022 WS3).
+// dropdownBoxRows builds the windowed dropdown (rounded border + indicators +
+// visible items) and records hit-rects for content rows only; activatable rows
+// carry their full-list Index so hover/click map visible → item (plan 022 WS3 /
+// plan 023 B4). Bounds include the border so border clicks are consumed no-ops
+// (menu stays open), not click-away closes.
 func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	if !b.menuOpen() || !b.settings.MenuBar {
 		return nil, 0, 0
@@ -563,36 +573,43 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	items := b.menuItems(id)
 
 	th := CurrentTheme()
-	const pad = 1 // 1-space padding (strix plain look / user brief)
+	const pad = 1 // leading edge pad inside the border
+	const hintGap = 1
 	n := len(items)
 
-	// Inner content width: marker gutter + label (and indicator text when the
-	// list actually scrolls — indicators are a prox addition, plan 022 WS3).
+	// Inner content width: marker+label (+ hint column) and indicator text when
+	// the list scrolls. Outer box = inner + left/right border.
 	maxInner := 0
 	for _, it := range items {
 		if it.Separator {
 			continue
 		}
-		w := ansi.StringWidth(menuMarker(it) + " " + it.Label)
+		w := menuItemInnerWidth(it, pad, hintGap)
 		if w > maxInner {
 			maxInner = w
 		}
 	}
 	if maxInner == 0 {
-		maxInner = ansi.StringWidth("(coming soon)")
+		maxInner = ansi.StringWidth("(coming soon)") + pad*2
 	}
 	if avail := b.menuAvail(); n > avail && avail >= 4 {
-		// Widest possible "… N more …" for this list.
-		indW := ansi.StringWidth(fmt.Sprintf("… %d more …", n))
+		indW := ansi.StringWidth(fmt.Sprintf("… %d more …", n)) + pad*2
 		if indW > maxInner {
 			maxInner = indW
 		}
 	}
-	innerW := maxInner + pad*2
-	boxW = innerW
+	innerW := maxInner
+	boxW = innerW + menuBorderSize
 	if boxW > b.width {
 		boxW = b.width
-		innerW = boxW
+		innerW = boxW - menuBorderSize
+	}
+	if b.width < 3 {
+		// Too narrow for a non-corrupting rounded border.
+		h := b.mustHits()
+		h.dropdown = menuDropdownHit{}
+		h.hasDropdown = false
+		return nil, 0, 0
 	}
 
 	// Anchor under the cell; clamp so the box stays on-screen.
@@ -613,7 +630,6 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	boxTop := b.menuBoxTop()
 	avail := b.menuAvail()
 	if avail < 1 || n == 0 {
-		// Degenerate: menu state open, no rows / no hits (plan 022 WS3).
 		h := b.mustHits()
 		h.dropdown = menuDropdownHit{}
 		h.hasDropdown = false
@@ -623,20 +639,32 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	visStart, visEnd, topInd, botInd := menuWindowLayout(n, avail,
 		deriveMenuWindowStart(n, avail, b.menuWindow, b.menuHighlight))
 
+	borderStyle := lipgloss.NewStyle().
+		Foreground(th.Border).
+		Background(th.BG)
 	dimStyle := lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+	br := lipgloss.RoundedBorder()
+
 	hitRows := make([]menuRowHit, 0, avail)
-	rows = make([]string, 0, avail)
-	rowY := boxTop
+	rows = make([]string, 0, avail+menuBorderSize)
+	contentX := boxX + 1
+	rowY := boxTop + 1
+
+	// Top border.
+	rows = append(rows, borderStyle.Render(br.TopLeft)+
+		borderStyle.Render(strings.Repeat(br.Top, innerW))+
+		borderStyle.Render(br.TopRight))
 
 	renderInd := func(hidden int) {
 		label := fmt.Sprintf("… %d more …", hidden)
 		content := strings.Repeat(" ", pad) + label
 		content = padFrameRow(content, innerW)
-		row := padFrameRow(dimStyle.Render(ansi.Cut(content, 0, innerW)), boxW)
+		inner := dimStyle.Render(ansi.Cut(content, 0, innerW))
+		row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
 		rows = append(rows, row)
 		hitRows = append(hitRows, menuRowHit{
 			Index: -1,
-			Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
+			Rect:  HitRect{X: contentX, Y: rowY, W: innerW, H: 1},
 		})
 		rowY++
 	}
@@ -652,31 +680,17 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 			content := strings.Repeat("─", max(1, innerW-pad*2))
 			content = strings.Repeat(" ", pad) + content + strings.Repeat(" ", pad)
 			content = ansi.Cut(content, 0, innerW)
-			row := padFrameRow(dimStyle.Render(content), boxW)
+			inner := dimStyle.Render(padFrameRow(content, innerW))
+			row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
 			rows = append(rows, row)
 			hitRows = append(hitRows, menuRowHit{
 				Index: -1,
-				Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
+				Rect:  HitRect{X: contentX, Y: rowY, W: innerW, H: 1},
 			})
 		default:
-			label := menuMarker(it) + " " + it.Label
-			if it.Cmd == "" && it.Label == "(coming soon)" {
-				label = it.Label
-			}
-			content := strings.Repeat(" ", pad) + label
-			content = padFrameRow(content, innerW)
-
-			var style lipgloss.Style
-			if i == b.menuHighlight && it.Cmd != "" {
-				style = lipgloss.NewStyle().
-					Background(th.SelectionBG).
-					Foreground(th.SelectionFG)
-			} else if it.Cmd == "" {
-				style = dimStyle
-			} else {
-				style = lipgloss.NewStyle().Foreground(th.FG).Background(th.BG)
-			}
-			row := padFrameRow(style.Render(ansi.Cut(content, 0, innerW)), boxW)
+			highlighted := i == b.menuHighlight && it.Cmd != ""
+			inner := renderMenuItemInner(it, innerW, pad, hintGap, highlighted, th)
+			row := borderStyle.Render(br.Left) + padFrameRow(inner, innerW) + borderStyle.Render(br.Right)
 			rows = append(rows, row)
 			cmd := it.Cmd
 			idx := i
@@ -686,7 +700,7 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 			hitRows = append(hitRows, menuRowHit{
 				Cmd:   cmd,
 				Index: idx,
-				Rect:  HitRect{X: boxX, Y: rowY, W: boxW, H: 1},
+				Rect:  HitRect{X: contentX, Y: rowY, W: innerW, H: 1},
 			})
 		}
 		rowY++
@@ -696,6 +710,11 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 		renderInd(n - visEnd)
 	}
 
+	// Bottom border.
+	rows = append(rows, borderStyle.Render(br.BottomLeft)+
+		borderStyle.Render(strings.Repeat(br.Bottom, innerW))+
+		borderStyle.Render(br.BottomRight))
+
 	hits := b.mustHits()
 	hits.dropdown = menuDropdownHit{
 		Menu:   id,
@@ -704,6 +723,98 @@ func (b *BaseModel) dropdownBoxRows() (rows []string, boxX, boxW int) {
 	}
 	hits.hasDropdown = true
 	return rows, boxX, boxW
+}
+
+// menuItemInnerWidth is the preferred inner width for one item (pads + label +
+// optional hint column with a minimum gap).
+func menuItemInnerWidth(it MenuItem, pad, hintGap int) int {
+	left := menuMarker(it) + " " + it.Label
+	w := pad + ansi.StringWidth(left)
+	if it.Hint != "" {
+		w += hintGap + ansi.StringWidth(it.Hint) + pad
+	} else {
+		w += pad
+	}
+	return w
+}
+
+// renderMenuItemInner paints one dropdown content row of exactly innerW columns:
+// left-aligned marker+label, right-aligned Hint in Dim, ANSI-aware label
+// truncation when tight (plan 023 B4).
+func renderMenuItemInner(it MenuItem, innerW, pad, hintGap int, highlighted bool, th *Theme) string {
+	label := it.Label
+	marker := menuMarker(it)
+	hint := it.Hint
+
+	var leftStyle, hintStyle, gapStyle lipgloss.Style
+	if highlighted {
+		leftStyle = lipgloss.NewStyle().
+			Foreground(th.SelectionFG).
+			Background(th.SelectionBG)
+		gapStyle = lipgloss.NewStyle().Background(th.SelectionBG)
+		hintStyle = lipgloss.NewStyle().
+			Foreground(th.Dim).
+			Background(th.SelectionBG)
+	} else if it.Cmd == "" {
+		leftStyle = lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+		gapStyle = lipgloss.NewStyle().Background(th.BG)
+		hintStyle = leftStyle
+	} else {
+		leftStyle = lipgloss.NewStyle().Foreground(th.FG).Background(th.BG)
+		gapStyle = lipgloss.NewStyle().Background(th.BG)
+		hintStyle = lipgloss.NewStyle().Foreground(th.Dim).Background(th.BG)
+	}
+
+	hintW := 0
+	if hint != "" {
+		hintW = ansi.StringWidth(hint) + pad // hint + trailing edge pad
+	}
+	// Budget for leading pad + marker + space + label (+ min gap when hint).
+	leftBudget := innerW - hintW
+	if hint != "" {
+		leftBudget -= hintGap
+	}
+	if leftBudget < 1 {
+		leftBudget = 1
+	}
+
+	prefix := strings.Repeat(" ", pad) + marker + " "
+	prefixW := ansi.StringWidth(prefix)
+	labelBudget := leftBudget - prefixW
+	if labelBudget < 1 {
+		labelBudget = 1
+	}
+	truncLabel := ansi.Truncate(label, labelBudget, "…")
+	leftPlain := prefix + truncLabel
+	// If still over budget (tiny innerW), cut hard.
+	if ansi.StringWidth(leftPlain) > leftBudget {
+		leftPlain = ansi.Cut(leftPlain, 0, leftBudget)
+	}
+
+	gapCols := innerW - ansi.StringWidth(leftPlain) - hintW
+	if gapCols < 0 {
+		gapCols = 0
+	}
+	if hint != "" && gapCols < hintGap {
+		// Prefer keeping the hint: shrink left further.
+		shrink := hintGap - gapCols
+		lw := ansi.StringWidth(leftPlain)
+		if lw > shrink {
+			leftPlain = ansi.Cut(leftPlain, 0, lw-shrink)
+			gapCols = hintGap
+		}
+	}
+
+	var bld strings.Builder
+	bld.WriteString(leftStyle.Render(leftPlain))
+	if gapCols > 0 {
+		bld.WriteString(gapStyle.Render(strings.Repeat(" ", gapCols)))
+	}
+	if hint != "" {
+		bld.WriteString(hintStyle.Render(hint))
+		bld.WriteString(gapStyle.Render(strings.Repeat(" ", pad)))
+	}
+	return padFrameRow(bld.String(), innerW)
 }
 
 func menuMarker(it MenuItem) string {

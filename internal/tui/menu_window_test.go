@@ -36,7 +36,7 @@ func openThemeAtHeight(t *testing.T, height int, userThemes int) ClientModel {
 }
 
 func TestMenuWindow_ClampWithIndicators(t *testing.T) {
-	// Height=12 → avail = 12 - 1 - 1 = 10. 6 presets + 6 user = 12 > 10 → clamp.
+	// Height=12 → avail = 12 - 1 - 1 - 2(border) = 8. 6 presets + 6 user = 12 > 8 → clamp.
 	m := openThemeAtHeight(t, 12, 6)
 	items := m.menuItems(MenuTheme)
 	require.GreaterOrEqual(t, len(items), 12)
@@ -45,8 +45,9 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	avail := m.menuAvail()
-	require.Equal(t, 10, avail)
-	assert.Equal(t, avail, hits.dropdown.Bounds.H, "rendered rows == avail when clamped with bottom indicator")
+	require.Equal(t, 8, avail)
+	assert.Equal(t, avail, len(hits.dropdown.Rows), "content rows == avail when clamped with bottom indicator")
+	assert.Equal(t, avail+menuBorderSize, hits.dropdown.Bounds.H, "Bounds include top+bottom border")
 	assert.Equal(t, 0, m.menuWindow)
 
 	// At top: bottom indicator only, no top indicator.
@@ -89,13 +90,14 @@ func TestMenuWindow_ClampWithIndicators(t *testing.T) {
 }
 
 func TestMenuWindow_NoIndicatorsWhenAvailSmall(t *testing.T) {
-	// Height=5 → avail = 5 - 1 - 1 = 3. Indicators only when avail >= 4.
-	m := openThemeAtHeight(t, 5, 6)
+	// Height=7 → avail = 7 - 1 - 1 - 2 = 3. Indicators only when avail >= 4.
+	m := openThemeAtHeight(t, 7, 6)
 	require.Equal(t, 3, m.menuAvail())
 	_ = m.View()
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
-	assert.Equal(t, 3, hits.dropdown.Bounds.H)
+	assert.Equal(t, 3, len(hits.dropdown.Rows))
+	assert.Equal(t, 3+menuBorderSize, hits.dropdown.Bounds.H)
 	for _, r := range hits.dropdown.Rows {
 		assert.NotEqual(t, -1, r.Index, "no indicator rows when avail < 4")
 		assert.NotEqual(t, MenuCommand(""), r.Cmd)
@@ -229,23 +231,28 @@ func TestMenuWheel_ClosedStillScrollsViewport(t *testing.T) {
 }
 
 // assertDropdownRectGeometry pins the shared geometry honesty checks used by
-// every menu (plan 023 C1 rect-honesty generalization).
+// every menu (plan 023 C1 rect-honesty + C9 border inset).
 func assertDropdownRectGeometry(t *testing.T, m ClientModel) {
 	t.Helper()
 	hits := m.mustHits()
 	require.True(t, hits.hasDropdown)
 	frameH := m.height
 	avail := m.menuAvail()
+	bounds := hits.dropdown.Bounds
+	assert.Equal(t, len(hits.dropdown.Rows)+menuBorderSize, bounds.H,
+		"Bounds include top+bottom border around content rows")
+	assert.LessOrEqual(t, len(hits.dropdown.Rows), avail)
 	for _, r := range hits.dropdown.Rows {
-		assert.GreaterOrEqual(t, r.Rect.Y, 1)
+		assert.GreaterOrEqual(t, r.Rect.Y, bounds.Y+1, "content inset +1 row for top border")
+		assert.Less(t, r.Rect.Y, bounds.Y+bounds.H-1, "content above bottom border")
 		assert.Less(t, r.Rect.Y, frameH-menuReservedBottom,
 			"row Y=%d must stay above footer", r.Rect.Y)
 		assert.Less(t, r.Rect.Y+r.Rect.H, frameH)
-		assert.Equal(t, hits.dropdown.Bounds.X, r.Rect.X, "row X matches bounds")
-		assert.Equal(t, hits.dropdown.Bounds.W, r.Rect.W, "row W matches bounds")
+		assert.Equal(t, bounds.X+1, r.Rect.X, "content inset +1 col for left border")
+		assert.Equal(t, bounds.W-2, r.Rect.W, "content width excludes L/R border")
 	}
-	assert.LessOrEqual(t, hits.dropdown.Bounds.H, avail)
-	assert.Equal(t, hits.dropdown.Bounds.H, len(hits.dropdown.Rows))
+	// Never cover the footer: outer bottom edge is strictly above footer row.
+	assert.LessOrEqual(t, bounds.Y+bounds.H, frameH-menuReservedBottom)
 }
 
 // TestMenuWindow_RectHonesty generalizes rect-honesty over View/Filter/Theme
@@ -257,7 +264,7 @@ func TestMenuWindow_RectHonesty(t *testing.T) {
 		{80, 24},
 		{120, 40},
 		{60, 16},
-		{80, 12}, // Theme overflows here (12 items > avail 10): exercises indicators
+		{80, 12}, // Theme overflows here (12 items > avail 8): exercises indicators
 	}
 	menus := []struct {
 		name MenuID
@@ -410,8 +417,8 @@ func assertMenuRectHonestyActivate(t *testing.T, m ClientModel, id MenuID) {
 }
 
 func TestMenuWindow_DegenerateAvailZero(t *testing.T) {
-	// avail = height - boxTop - 1 < 1 → height < 3 with menu bar.
-	m := openThemeAtHeight(t, 2, 6)
+	// avail = height - boxTop - reserved - border < 1 → height < 5 with menu bar.
+	m := openThemeAtHeight(t, 4, 6)
 	require.Less(t, m.menuAvail(), 1)
 	require.True(t, m.menuOpen())
 

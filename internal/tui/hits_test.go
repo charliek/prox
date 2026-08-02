@@ -185,3 +185,121 @@ func TestMustHits_PanicsOnNil(t *testing.T) {
 	b := &BaseModel{}
 	_ = b.mustHits()
 }
+
+// TestOverlayClickThrough_DropdownAndHelp is T4 (plan 023): overlay clicks
+// activate only the overlay — viewport cursor/solo underneath stay put.
+func TestOverlayClickThrough_DropdownAndHelp(t *testing.T) {
+	dir := t.TempDir()
+	withTestSettingsPath(t, filepath.Join(dir, "config.toml"))
+
+	lines := mouseTestLines(30)
+	m := newLogsModel(10, lines)
+	m.processes = []domain.ProcessInfo{
+		{Name: "p", State: domain.ProcessStateRunning},
+		{Name: "api", State: domain.ProcessStateRunning},
+	}
+	m.projectName = "demo"
+	m.settings.MenuBar = true
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = clientUpdate(m, keyRune('g')) // top, follow off
+	m.soloProcess = "p"
+	entries := m.filteredEntries()
+	require.GreaterOrEqual(t, len(entries), 3)
+	m.setLogCursor(entries, 2)
+	m.updateViewport()
+	require.Equal(t, "p", m.soloProcess)
+	require.Equal(t, 2, m.logCursorIdx)
+	cursorSeq := m.logCursorSeq
+	cursorIdx := m.logCursorIdx
+	yo := m.viewport.YOffset
+	tsBefore := m.settings.Timestamps
+
+	// --- Dropdown row click: only the menu item activates ---
+	m = clientUpdate(m, keyRune('v'))
+	require.True(t, m.menuOpen())
+	_ = m.View()
+	var tsRow menuRowHit
+	found := false
+	for _, r := range m.mustHits().dropdown.Rows {
+		if r.Cmd == MenuCmdToggleTimestamps {
+			tsRow = r
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Timestamps row visible")
+	m = clientUpdate(m, clickAt(tsRow.Rect.X+1, tsRow.Rect.Y))
+	assert.False(t, m.menuOpen())
+	assert.Equal(t, !tsBefore, m.settings.Timestamps, "Timestamps toggled")
+	assert.Equal(t, "p", m.soloProcess, "solo untouched by dropdown activate")
+	assert.Equal(t, cursorSeq, m.logCursorSeq, "log cursor seq untouched")
+	assert.Equal(t, cursorIdx, m.logCursorIdx, "log cursor idx untouched")
+	assert.Equal(t, yo, m.viewport.YOffset, "viewport scroll untouched")
+
+	// --- Dropdown border click: consumed no-op, menu stays open ---
+	m = clientUpdate(m, keyRune('v'))
+	require.True(t, m.menuOpen())
+	_ = m.View()
+	bounds := m.mustHits().dropdown.Bounds
+	require.True(t, m.mustHits().hasDropdown)
+	m = clientUpdate(m, clickAt(bounds.X, bounds.Y)) // top-left corner = border
+	assert.True(t, m.menuOpen(), "border click must not close menu")
+	assert.Equal(t, ViewModeLogs, m.viewMode)
+	assert.Equal(t, "p", m.soloProcess)
+	assert.Equal(t, cursorSeq, m.logCursorSeq)
+
+	// Right border cell on a content row: in Bounds, not in row Rect.
+	_ = m.View()
+	bounds = m.mustHits().dropdown.Bounds
+	row0 := m.mustHits().dropdown.Rows[0]
+	borderX := bounds.X + bounds.W - 1
+	require.False(t, row0.Rect.Contains(borderX, row0.Rect.Y))
+	require.True(t, bounds.Contains(borderX, row0.Rect.Y))
+	m = clientUpdate(m, clickAt(borderX, row0.Rect.Y))
+	assert.True(t, m.menuOpen(), "side-border click stays open")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	require.False(t, m.menuOpen())
+
+	// --- Help box click: no-op, viewport cursor unchanged ---
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	_ = m.View()
+	box := m.helpModalGeometry()
+	require.Greater(t, box.W, 0)
+	m = clientUpdate(m, clickAt(box.X+box.W/2, box.Y+box.H/2))
+	assert.Equal(t, ModeHelp, m.mode, "inside-help click must not dismiss")
+	assert.Equal(t, "p", m.soloProcess)
+	assert.Equal(t, cursorSeq, m.logCursorSeq)
+	assert.Equal(t, cursorIdx, m.logCursorIdx)
+	assert.Equal(t, yo, m.viewport.YOffset)
+}
+
+func TestMenuItem_HintsPopulated(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	items := m.menuItems(MenuView)
+	want := map[string]string{
+		"Logs":          "Tab",
+		"Requests":      "Tab",
+		"Process panel": "p",
+		"Timestamps":    "T",
+		"Wrap lines":    "w",
+		"Follow":        "F",
+	}
+	for _, it := range items {
+		if it.Separator {
+			continue
+		}
+		assert.Equal(t, want[it.Label], it.Hint, "item %q", it.Label)
+	}
+	for _, it := range m.menuItems(MenuTheme) {
+		assert.Equal(t, "t", it.Hint, "theme %q", it.Label)
+	}
+	for _, it := range m.menuItems(MenuFilter) {
+		if it.Separator {
+			continue
+		}
+		assert.Empty(t, it.Hint, "filter item %q has no matching key", it.Label)
+	}
+}
