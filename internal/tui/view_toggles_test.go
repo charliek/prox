@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -396,6 +397,85 @@ func TestWrap_RequestsViewUnaffected(t *testing.T) {
 	assert.Equal(t, countBefore, m.viewport.TotalLineCount(), "requests never wrap")
 	assert.Equal(t, before, m.viewport.View())
 	assert.Nil(t, m.logRowSpans, "log spans cleared outside logs view")
+}
+
+// Continuations hang-indent to the content column so the timestamp/process
+// gutter stays empty (plan 024 F5 / N5).
+func TestWrap_ContinuationHangIndent(t *testing.T) {
+	m := newLogsModelNarrow(70, 10, []string{
+		strings.Repeat("word ", 40),
+	})
+	m.settings.Wrap = true
+	m.settings.Timestamps = true
+	m.updateViewport()
+	m.viewport.GotoTop()
+
+	require.Len(t, m.logEntries, 1)
+	entry := m.logEntries[0]
+	sp := m.logRowSpans[entry.DisplaySeq]
+	require.Greater(t, sp.Last-sp.First, 0, "entry must wrap")
+	require.Equal(t, 0, sp.First)
+
+	prefixW := m.viewport.Width - m.logContentWidth(entry)
+	require.Greater(t, prefixW, 0)
+	require.GreaterOrEqual(t, m.logContentWidth(entry), minHangContentWidth,
+		"fixture must use hang-indent path")
+
+	rows := strings.Split(m.viewport.View(), "\n")
+	require.Greater(t, len(rows), 1)
+
+	first := ansi.Strip(rows[0])
+	// First row carries process chrome (padded name); not a space-only gutter.
+	assert.Contains(t, first, "p")
+	assert.NotEqual(t, strings.Repeat(" ", ansi.StringWidth(first)), first)
+
+	cont := ansi.Strip(rows[1])
+	require.GreaterOrEqual(t, ansi.StringWidth(cont), prefixW, "continuation: %q", cont)
+	gutterStr := ansi.Cut(cont, 0, prefixW)
+	assert.Equal(t, strings.Repeat(" ", prefixW), gutterStr,
+		"continuation must start with prefix-width spaces (gutter preserved)")
+	rest := strings.TrimSpace(ansi.Cut(cont, prefixW, ansi.StringWidth(cont)))
+	assert.NotEmpty(t, rest, "content resumes after gutter: %q", cont)
+}
+
+func TestWrap_HangIndentNarrowWidthFallsBack(t *testing.T) {
+	// Viewport so narrow that content budget < minHangContentWidth → no hang
+	// indent (whole-line wrap). prefixW with timestamps ≈ 20; width 28 →
+	// contentW ≈ 8 < 10.
+	m := newLogsModelNarrow(28, 8, []string{
+		strings.Repeat("abcdefghij ", 20),
+	})
+	m.settings.Wrap = true
+	m.settings.Timestamps = true
+	m.updateViewport()
+	m.viewport.GotoTop()
+
+	require.Len(t, m.logEntries, 1)
+	entry := m.logEntries[0]
+	contentW := m.logContentWidth(entry)
+	require.Less(t, contentW, minHangContentWidth,
+		"fixture must land in the clamp path (contentW=%d)", contentW)
+
+	sp := m.logRowSpans[entry.DisplaySeq]
+	require.Greater(t, sp.Last-sp.First, 0)
+	rows := strings.Split(m.viewport.View(), "\n")
+	require.Greater(t, len(rows), 1)
+	cont := ansi.Strip(rows[1])
+	assert.NotEqual(t, "", strings.TrimSpace(cont))
+	assert.LessOrEqual(t, ansi.StringWidth(rows[1]), m.viewport.Width)
+}
+
+func TestHangIndentWrap_Unit(t *testing.T) {
+	parts := hangIndentWrap("PRE:", "hello world again more", 12, 16, 4)
+	require.GreaterOrEqual(t, len(parts), 2)
+	assert.True(t, strings.HasPrefix(ansi.Strip(parts[0]), "PRE:"), "first: %q", parts[0])
+	cont := ansi.Strip(parts[1])
+	assert.True(t, strings.HasPrefix(cont, "    "), "hang indent: %q", cont)
+
+	// Clamp: contentWidth too small → whole-line wrap, no forced indent.
+	fb := hangIndentWrap("PRE:", "abcdefghijklmnop", 5, 12, 4)
+	require.NotEmpty(t, fb)
+	assert.LessOrEqual(t, ansi.StringWidth(fb[0]), 12)
 }
 
 func TestMenu_ViewRowOrder(t *testing.T) {

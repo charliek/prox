@@ -168,9 +168,8 @@ func (b *BaseModel) helpMemoValid() bool {
 func (b *BaseModel) refreshHelpMemo() {
 	memo := b.mustHelpMemo()
 	innerW := helpInnerWidth(b.helpModalOuterWidth())
-	physical := renderHelpBodyLines(b.helpSections())
 	memo.wrapCalls++
-	memo.wrapped = wrapHelpLines(physical, innerW)
+	memo.wrapped = wrapHelpBody(b.helpSections(), innerW)
 	memo.width = b.width
 	memo.height = b.height
 	memo.viewMode = b.viewMode
@@ -221,7 +220,7 @@ func (b *BaseModel) helpWrappedBody() []string {
 		return b.helpMemo.wrapped
 	}
 	innerW := helpInnerWidth(b.helpModalOuterWidth())
-	return wrapHelpLines(renderHelpBodyLines(b.helpSections()), innerW)
+	return wrapHelpBody(b.helpSections(), innerW)
 }
 
 // helpContentBudget is the number of body rows available inside the modal

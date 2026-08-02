@@ -32,6 +32,52 @@ func padLeftDisplay(s string, width int) string {
 	return strings.Repeat(" ", width-w) + s
 }
 
+// minHangContentWidth is the minimum content-column budget required to apply
+// hanging indent on wrapped continuations (logs gutter / help desc column).
+// Below this, indent would starve the wrap and we fall back to whole-line wrap
+// with no hang indent (plan 024 F5 / N5).
+const minHangContentWidth = 10
+
+func splitWrapLines(wrapped string) []string {
+	parts := strings.Split(wrapped, "\n")
+	if len(parts) == 0 {
+		return []string{""}
+	}
+	return parts
+}
+
+// hangIndentWrap wraps content at contentWidth and emits prefix+first-part on
+// row 0, then fillPad(hangCols)+Base-painted part on each continuation.
+// contentWidth and hangCols must come from the same width chain as the first
+// row (viewport − prefix). When contentWidth < minHangContentWidth or
+// hangCols <= 0, falls back to wrapping prefix+content at fullWidth with no
+// hang indent.
+//
+// ansi.Wrap preserves SGR on the first segment only — continuations arrive
+// bare — so each continuation is re-stripped and painted through styles.Base
+// (theme BG under FullFill; SelectionBG inside withSelectionStyles). Span math
+// and render share this helper so logRowSpans stay in sync (plan 024 F5).
+func hangIndentWrap(prefix, content string, contentWidth, fullWidth, hangCols int) []string {
+	if contentWidth < minHangContentWidth || hangCols <= 0 {
+		limit := fullWidth
+		if limit < 1 {
+			limit = 1
+		}
+		return splitWrapLines(ansi.Wrap(prefix+content, limit, ""))
+	}
+	parts := splitWrapLines(ansi.Wrap(content, contentWidth, ""))
+	out := make([]string, len(parts))
+	indent := fillPad(hangCols)
+	for i, p := range parts {
+		if i == 0 {
+			out[i] = prefix + p
+			continue
+		}
+		out[i] = indent + styles.Base.Render(ansi.Strip(p))
+	}
+	return out
+}
+
 // skipDisplayWidth returns the byte offset into s after the first w display columns.
 func skipDisplayWidth(s string, w int) int {
 	if w <= 0 {

@@ -249,16 +249,31 @@ func helpKeyColumnWidth(sections []helpSection) int {
 const helpKeyDescGap = "  "
 
 func renderHelpKeyRow(row helpKeyRow, keyW int) string {
+	return helpKeyPrefix(row, keyW) + styles.Base.Render(row.desc)
+}
+
+// helpKeyPrefix returns the styled key column + gap (or desc-column indent for
+// empty-key example rows). Display width is always keyW + len(helpKeyDescGap).
+func helpKeyPrefix(row helpKeyRow, keyW int) string {
+	descStart := keyW + len(helpKeyDescGap)
 	if row.key == "" {
-		indent := keyW + len(helpKeyDescGap)
-		return fillPad(indent) + styles.Base.Render(row.desc)
+		return fillPad(descStart)
 	}
 	keyPart := styles.HelpKey.Render(row.key)
 	pad := keyW - ansi.StringWidth(row.key)
 	if pad < 0 {
 		pad = 0
 	}
-	return keyPart + fillPad(pad) + fillPad(len(helpKeyDescGap)) + styles.Base.Render(row.desc)
+	return keyPart + fillPad(pad) + fillPad(len(helpKeyDescGap))
+}
+
+// wrapHelpKeyRow wraps a key+desc row with hanging indent on the description
+// column (plan 024 F5). Continuations are fillPad(hangCols) + desc fragment.
+func wrapHelpKeyRow(row helpKeyRow, keyW, width int) []string {
+	prefix := helpKeyPrefix(row, keyW)
+	hangCols := ansi.StringWidth(prefix)
+	styledDesc := styles.Base.Render(row.desc)
+	return hangIndentWrap(prefix, styledDesc, width-hangCols, width, hangCols)
 }
 
 // renderHelpBodyLines builds styled physical lines (pre-wrap) for the modal body.
@@ -275,6 +290,30 @@ func renderHelpBodyLines(sections []helpSection) []string {
 		out = append(out, styles.HelpSection.Render(sec.title))
 		for _, row := range sec.rows {
 			out = append(out, renderHelpKeyRow(row, keyW))
+		}
+	}
+	return out
+}
+
+// wrapHelpBody wraps section titles at full width and key rows with hanging
+// description indent (plan 024 F5). Used by the help memo path.
+func wrapHelpBody(sections []helpSection, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	if len(sections) == 0 {
+		return nil
+	}
+	keyW := helpKeyColumnWidth(sections)
+	var out []string
+	for i, sec := range sections {
+		if i > 0 {
+			out = append(out, "")
+		}
+		title := styles.HelpSection.Render(sec.title)
+		out = append(out, wrapHelpLines([]string{title}, width)...)
+		for _, row := range sec.rows {
+			out = append(out, wrapHelpKeyRow(row, keyW, width)...)
 		}
 	}
 	return out

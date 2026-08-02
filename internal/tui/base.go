@@ -1818,6 +1818,7 @@ func (b *BaseModel) updateViewport() {
 		for i, entry := range entries {
 			selected := searching && i == b.logCursorIdx
 			var line string
+			var parts []string
 			withSelectionStyles(selected, func() {
 				line = b.formatLogEntry(entry)
 				if searching {
@@ -1827,19 +1828,25 @@ func (b *BaseModel) updateViewport() {
 					}
 					line = marker + line
 				}
+				if wrapOn && wrapWidth > 0 {
+					// Hang-indent continuations (plan 024 F5): wrap CONTENT at
+					// logContentWidth (same P3 width chain as the first row) and
+					// prepend Base-painted prefix-width spaces so the
+					// timestamp/process gutter is preserved. Runs inside
+					// withSelectionStyles so fillPad carries SelectionBG on the
+					// band. Span math uses the same parts slice.
+					contentW := b.logContentWidth(entry)
+					prefixW := wrapWidth - contentW
+					if prefixW < 0 {
+						prefixW = 0
+					}
+					totalW := ansi.StringWidth(line)
+					prefix := ansi.Cut(line, 0, prefixW)
+					content := ansi.Cut(line, prefixW, totalW)
+					parts = hangIndentWrap(prefix, content, contentW, wrapWidth, prefixW)
+				}
 			})
 			if wrapOn && wrapWidth > 0 {
-				// Highlight before wrap — offsets stay valid on the unwrapped
-				// string (plan 021 WS4). Requests never take this branch.
-				// ansi.Wrap, not Wordwrap: an unbroken token longer than the
-				// width must be SPLIT — Wordwrap leaves it over-wide, the
-				// terminal hard-wraps it visually, and the entry↔display-row
-				// span mapping below drifts by one row (CodeRabbit PR #102).
-				wrapped := ansi.Wrap(line, wrapWidth, "")
-				parts := strings.Split(wrapped, "\n")
-				if len(parts) == 0 {
-					parts = []string{""}
-				}
 				first := row
 				for _, p := range parts {
 					lines = append(lines, p)
