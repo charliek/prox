@@ -1,0 +1,477 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/charliek/prox/internal/domain"
+)
+
+func wheelDown() tea.MouseMsg {
+	return tea.MouseMsg{
+		X: 0, Y: 5,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	}
+}
+
+func wheelUp() tea.MouseMsg {
+	return tea.MouseMsg{
+		X: 0, Y: 5,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelUp,
+	}
+}
+
+func clickAt(x, y int) tea.MouseMsg {
+	return tea.MouseMsg{
+		X: x, Y: y,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	}
+}
+
+func TestMouseWheelEnabledFalseOnNewModel(t *testing.T) {
+	m := newTestModel()
+	assert.False(t, m.viewport.MouseWheelEnabled, "TUI owns wheel routing (Codex #5)")
+}
+
+func TestMouseWheel_LogsScrollsThreeRowsNoDoubleScroll(t *testing.T) {
+	m := newLogsModel(10, mouseTestLines(30))
+	m = clientUpdate(m, keyRune('g')) // top, follow off
+	require.Equal(t, 0, m.viewport.YOffset)
+
+	m = clientUpdate(m, wheelDown())
+	assert.Equal(t, wheelScrollRows, m.viewport.YOffset,
+		"exactly 3 rows per notch — not 6 from bubbles viewport forwarding")
+	require.False(t, m.viewport.MouseWheelEnabled)
+
+	// Direct viewport wheel is a no-op with MouseWheelEnabled=false.
+	vp := m.viewport
+	vp.MouseWheelEnabled = false
+	vpBefore := vp.YOffset
+	vp, _ = vp.Update(wheelDown())
+	assert.Equal(t, vpBefore, vp.YOffset, "bubbles viewport must not scroll wheel events")
+}
+
+func TestMouseWheel_LogsWheelUpDisengagesFollow(t *testing.T) {
+	m := newLogsModel(10, mouseTestLines(20))
+	require.True(t, m.followMode)
+	before := m.viewport.YOffset
+	require.Greater(t, before, 0, "precondition: follow parks at bottom")
+
+	m = clientUpdate(m, wheelUp())
+	assert.False(t, m.followMode)
+	assert.Equal(t, before-wheelScrollRows, m.viewport.YOffset)
+}
+
+func TestMouseWheel_LogsWheelDownAtBottomReengagesFollow(t *testing.T) {
+	m := newLogsModel(10, mouseTestLines(30))
+	m = clientUpdate(m, wheelUp())
+	require.False(t, m.followMode)
+
+	for !m.viewport.AtBottom() {
+		m = clientUpdate(m, wheelDown())
+	}
+	assert.True(t, m.followMode, "wheel down to bottom re-engages follow")
+}
+
+func TestMouseWheel_RequestsMovesCursorThree(t *testing.T) {
+	m := newRequestsModel(10, 8)
+	require.Equal(t, 9, m.cursorIdx)
+
+	m = clientUpdate(m, wheelUp())
+	assert.Equal(t, 9-wheelScrollRows, m.cursorIdx)
+	assert.False(t, m.followMode)
+}
+
+func TestMouseWheel_RequestsFollowOnWheelUpDisengages(t *testing.T) {
+	m := newRequestsModel(10, 8)
+	require.True(t, m.followMode)
+	require.Equal(t, 9, m.cursorIdx)
+
+	m = clientUpdate(m, wheelUp())
+	assert.False(t, m.followMode)
+	assert.Equal(t, 6, m.cursorIdx)
+}
+
+func TestMouseWheel_RequestsWheelDownOntoNewestReengagesFollow(t *testing.T) {
+	m := newRequestsModel(10, 8)
+	m = clientUpdate(m, keyRune('g'))
+	require.False(t, m.followMode)
+	require.Equal(t, 0, m.cursorIdx)
+
+	m = clientUpdate(m, wheelDown())
+	m = clientUpdate(m, wheelDown())
+	m = clientUpdate(m, wheelDown())
+	assert.Equal(t, 9, m.cursorIdx)
+	assert.True(t, m.followMode, "wheel onto newest row re-engages follow like j")
+}
+
+func TestMouseWheel_RequestsViewportNotIndependentlyScrolled(t *testing.T) {
+	m := newRequestsModel(20, 5)
+	m = clientUpdate(m, keyRune('g'))
+	require.Equal(t, 0, m.cursorIdx)
+	yoBefore := m.viewport.YOffset
+
+	m = clientUpdate(m, wheelDown())
+	assert.Equal(t, wheelScrollRows, m.cursorIdx)
+	assert.Equal(t, yoBefore, m.viewport.YOffset,
+		"wheel moves cursor only — bubbles viewport wheel is disabled")
+}
+
+func TestMouseWheel_RequestsOldestVisibleTriggersPaging(t *testing.T) {
+	stub := &stubTUIClient{snapshot: olderPage(2), nextBeforeID: "cur-2"}
+	m := primedPagingModel(stub, 10, "cur-1")
+	require.Equal(t, pagingReady, m.pagingPhase)
+
+	var pagingCmd tea.Cmd
+	for i := 0; i < 20; i++ {
+		var cmd tea.Cmd
+		m, cmd = clientUpdateModel(m, wheelUp())
+		if cmd != nil {
+			pagingCmd = cmd
+			break
+		}
+	}
+	require.NotNil(t, pagingCmd, "wheel onto oldest visible row should arm scroll-back fetch")
+	assert.Equal(t, pagingLoading, m.pagingPhase)
+	_ = pageMsgFrom(t, pagingCmd)
+}
+
+func TestMouseWheel_DetailScrollsViewport(t *testing.T) {
+	m := newRequestsModel(5, 4)
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+	require.Equal(t, ViewModeRequestDetail, m.viewMode)
+	lines := make([]string, 40)
+	for i := range lines {
+		lines[i] = "detail body line"
+	}
+	m.requestDetail = &RequestDetailData{
+		ID: "req-004", Method: "GET", URL: "/long",
+		RequestBody: &BodyData{Data: strings.Join(lines, "\n"), ContentType: "text/plain"},
+	}
+	m.detailLoading = false
+	m.updateViewport()
+	m.viewport.SetYOffset(0)
+	require.Greater(t, m.viewport.TotalLineCount(), m.viewport.Height)
+
+	m = clientUpdate(m, wheelDown())
+	assert.Equal(t, wheelScrollRows, m.viewport.YOffset)
+}
+
+func TestMouse_ClickProcessPanelSoloToggle(t *testing.T) {
+	m := newTestModel()
+	m.processes = []domain.ProcessInfo{
+		{Name: "web", State: domain.ProcessStateRunning},
+		{Name: "api", State: domain.ProcessStateRunning},
+	}
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 2)
+
+	rowY, ok := m.processPanelRowY()
+	require.True(t, ok)
+	m = clientUpdate(m, clickAt(2, rowY))
+	assert.Equal(t, "web", m.soloProcess)
+
+	m = clientUpdate(m, clickAt(2, rowY))
+	assert.Empty(t, m.soloProcess, "second click unsolos like 1-9 toggle")
+}
+
+func TestMouse_ProcessChipHitsRefreshPerFrame(t *testing.T) {
+	m := newTestModel()
+	m.processes = []domain.ProcessInfo{
+		{Name: "web", State: domain.ProcessStateRunning},
+	}
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 1)
+
+	m.processes = append(m.processes, domain.ProcessInfo{Name: "api", State: domain.ProcessStateRunning})
+	_ = m.View()
+	require.Len(t, m.mustHits().chips, 2, "chip rects are re-recorded each frame")
+}
+
+func TestMouse_ClickLogLineParksCursorAndDisengagesFollow(t *testing.T) {
+	lines := []string{"alpha", "beta target", "gamma"}
+	m := newLogsModel(8, lines)
+	require.True(t, m.followMode)
+
+	local := 1
+	_, oy := m.viewportOrigin()
+	contentY := oy + local
+	m = clientUpdate(m, clickAt(5, contentY))
+
+	entries := m.filteredEntries()
+	idx := m.entryIndexContainingRow(entries, m.viewport.YOffset+local)
+	require.Equal(t, entries[idx].DisplaySeq, m.logCursorSeq)
+	assert.Equal(t, idx, m.logCursorIdx)
+	assert.False(t, m.followMode)
+}
+
+func TestMouse_ClickRequestRowMovesCursor(t *testing.T) {
+	m := newRequestsModel(6, 6)
+	require.Equal(t, 5, m.cursorIdx)
+
+	local := 0
+	_, oy := m.viewportOrigin()
+	y := oy + local
+	m = clientUpdate(m, clickAt(10, y))
+	assert.Equal(t, m.viewport.YOffset, m.cursorIdx)
+}
+
+func TestMouse_DoubleClickOpensDetail(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	nowFunc = func() time.Time { return t0 }
+	defer func() { nowFunc = time.Now }()
+
+	m := newRequestsModel(4, 6)
+	row := 2
+	_, oy := m.viewportOrigin()
+	y := oy + row
+
+	m = clientUpdate(m, clickAt(10, y))
+	require.Equal(t, ViewModeRequests, m.viewMode)
+	assert.Equal(t, row, m.cursorIdx)
+
+	nowFunc = func() time.Time { return t0.Add(200 * time.Millisecond) }
+	newModel, cmd := m.Update(clickAt(10, y))
+	m = newModel.(ClientModel)
+	require.NotNil(t, cmd)
+	assert.Equal(t, ViewModeRequestDetail, m.viewMode)
+}
+
+func TestMouse_DoubleClickSlowDoesNotOpenDetail(t *testing.T) {
+	t0 := time.Unix(2000, 0)
+	nowFunc = func() time.Time { return t0 }
+	defer func() { nowFunc = time.Now }()
+
+	m := newRequestsModel(4, 6)
+	row := 1
+	_, oy := m.viewportOrigin()
+	y := oy + row
+
+	m = clientUpdate(m, clickAt(10, y))
+	nowFunc = func() time.Time { return t0.Add(600 * time.Millisecond) }
+	m = clientUpdate(m, clickAt(10, y))
+	assert.Equal(t, ViewModeRequests, m.viewMode)
+}
+
+func TestMouse_DoubleClickDifferentRowDoesNotOpenDetail(t *testing.T) {
+	t0 := time.Unix(3000, 0)
+	nowFunc = func() time.Time { return t0 }
+	defer func() { nowFunc = time.Now }()
+
+	m := newRequestsModel(4, 6)
+	_, oy := m.viewportOrigin()
+	y0 := oy + 0
+	y2 := oy + 2
+
+	m = clientUpdate(m, clickAt(10, y0))
+	nowFunc = func() time.Time { return t0.Add(100 * time.Millisecond) }
+	m = clientUpdate(m, clickAt(10, y2))
+	assert.Equal(t, ViewModeRequests, m.viewMode)
+	assert.Equal(t, 2, m.cursorIdx)
+}
+
+func TestMouse_ClickAfterMenuCloseIgnoresStaleRects(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = clientUpdate(m, keyRune('v'))
+	_ = m.View()
+	hits := m.mustHits()
+	require.True(t, hits.hasDropdown)
+
+	stale := hits.dropdown.Rows[0]
+	m = clientUpdate(m, tea.MouseMsg{
+		X: 0, Y: 10,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	require.False(t, m.menuOpen())
+	require.False(t, m.mustHits().hasDropdown)
+
+	m = clientUpdate(m, tea.MouseMsg{
+		X: stale.Rect.X, Y: stale.Rect.Y,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	assert.Equal(t, ViewModeLogs, m.viewMode)
+}
+
+func TestMouse_IgnoredInTextInputModes(t *testing.T) {
+	m := newLogsModel(8, mouseTestLines(10))
+	m = clientUpdate(m, keyRune('s'))
+	require.Equal(t, ModeStringFilter, m.mode)
+	before := m.viewport.YOffset
+
+	m = clientUpdate(m, wheelDown())
+	assert.Equal(t, before, m.viewport.YOffset)
+	assert.Equal(t, ModeStringFilter, m.mode)
+
+	_, oy := m.viewportOrigin()
+	contentY := oy + 1
+	m = clientUpdate(m, clickAt(5, contentY))
+	assert.Equal(t, ModeStringFilter, m.mode)
+	assert.Equal(t, before, m.viewport.YOffset)
+}
+
+func TestHelpView_NoDeadBindings(t *testing.T) {
+	m := newTestModel()
+	// Large frame so the modal shows every section without windowing.
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 80})
+
+	logs := strings.Join(renderHelpBodyLines(m.logsHelpSections()), "\n")
+	assert.Contains(t, logs, "Copy")
+	assert.Contains(t, logs, "y")
+	assert.Contains(t, logs, "Copy parked search line")
+	assert.Contains(t, logs, "m")
+	assert.Contains(t, logs, "Toggle menu bar")
+	assert.Contains(t, logs, "t")
+	assert.Contains(t, logs, "Cycle theme")
+	assert.NotContains(t, logs, "ModeFilter")
+	assert.NotContains(t, logs, "Filter mode")
+	assert.NotContains(t, logs, "Select all")
+
+	reqs := strings.Join(renderHelpBodyLines(m.requestsHelpSections()), "\n")
+	assert.Contains(t, reqs, "method:GET")
+	assert.Contains(t, reqs, "double-click")
+	assert.Contains(t, reqs, "c")
+	assert.Contains(t, reqs, "Copy as curl")
+	assert.NotContains(t, reqs, "ModeFilter")
+
+	m.viewMode = ViewModeRequestDetail
+	detail := strings.Join(renderHelpBodyLines(m.detailHelpSections()), "\n")
+	assert.Contains(t, detail, "Copy wire JSON")
+	assert.Contains(t, detail, "scroll wheel")
+	assert.Contains(t, detail, "Toggle process panel")
+	assert.Contains(t, detail, "Toggle menu bar")
+	assert.Contains(t, detail, "Toggle timestamps")
+	assert.Contains(t, detail, "Toggle soft-wrap")
+	assert.Contains(t, detail, "Cycle theme")
+}
+
+func TestHelpMouse_ModalFirstRouting(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	require.Greater(t, m.helpMaxOffset(), 0)
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	// Wheel over the box scrolls help.
+	before := m.helpOffset
+	m = clientUpdate(m, tea.MouseMsg{
+		X: box.X + box.W/2, Y: box.Y + box.H/2,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	assert.Equal(t, before+1, m.helpOffset)
+	assert.Equal(t, ModeHelp, m.mode)
+
+	// Wheel outside is consumed — no help scroll, viewport untouched.
+	before = m.helpOffset
+	vpBefore := m.viewport.YOffset
+	m = clientUpdate(m, tea.MouseMsg{
+		X: 0, Y: 0,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	assert.Equal(t, before, m.helpOffset)
+	assert.Equal(t, vpBefore, m.viewport.YOffset)
+	assert.Equal(t, ModeHelp, m.mode)
+
+	// Outside press on a menu-cell coord closes help and does NOT open a menu.
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEsc})
+	m = clientUpdate(m, keyRune('v'))
+	require.True(t, m.menuOpen())
+	_ = m.View()
+	cell := m.mustHits().menuCells[0]
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	require.False(t, m.menuOpen())
+
+	m = clientUpdate(m, clickAt(cell.Rect.X, cell.Rect.Y))
+	assert.Equal(t, ModeNormal, m.mode, "outside press closes help")
+	assert.False(t, m.menuOpen(), "outside press must not open/activate a menu")
+}
+
+func TestHelpMouse_OutsidePressClosesAndSwallows(t *testing.T) {
+	m := newRequestsModel(8, 8)
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	// Arm a double-click tracker, then open help (clears it), then re-arm
+	// is impossible while help is open — outside press must clear + swallow.
+	_, oy := m.viewportOrigin()
+	y := oy
+	m = clientUpdate(m, clickAt(10, y))
+	require.NotEqual(t, -1, m.lastRequestClickIdx)
+
+	m = clientUpdate(m, keyRune('?'))
+	require.Equal(t, ModeHelp, m.mode)
+	assert.Equal(t, -1, m.lastRequestClickIdx)
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	// Outside press closes, clears tracker, does not arm a request click.
+	outsideX, outsideY := 0, 0
+	if box.Contains(outsideX, outsideY) {
+		outsideX = box.X + box.W + 1
+		outsideY = 0
+	}
+	m = clientUpdate(m, clickAt(outsideX, outsideY))
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Equal(t, -1, m.lastRequestClickIdx, "outside press cleared tracker and did not arm")
+
+	// A follow-up click can arm normally — proving the outside press was
+	// swallowed (never completed a double-click path through help dismiss).
+	m = clientUpdate(m, clickAt(10, y))
+	assert.NotEqual(t, -1, m.lastRequestClickIdx)
+}
+
+func TestHelpMouse_InsidePressNoOp(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = clientUpdate(m, keyRune('?'))
+	_ = m.View()
+	box := m.helpModalGeometry()
+
+	m = clientUpdate(m, clickAt(box.X+1, box.Y+1))
+	assert.Equal(t, ModeHelp, m.mode)
+	assert.Equal(t, 0, m.helpOffset)
+}
+
+func TestRenderKeyHints_FitsFrame(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
+	bar := ansi.Strip(m.statusBar(footerMsg{}))
+	assert.Contains(t, bar, "m menu")
+	assert.Contains(t, bar, "? help")
+	assert.Contains(t, bar, "q quit")
+	assert.LessOrEqual(t, ansi.StringWidth(m.statusBar(footerMsg{})), 120)
+}
+
+func TestMouse_ProcessPanelNoOpInRequestsView(t *testing.T) {
+	m := newTestModel()
+	m.viewMode = ViewModeRequests
+	m.processes = []domain.ProcessInfo{{Name: "web", State: domain.ProcessStateRunning}}
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	rowY, _ := m.processPanelRowY()
+	m = clientUpdate(m, clickAt(2, rowY))
+	assert.Empty(t, m.soloProcess)
+}
+
+func mouseTestLines(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "line"
+	}
+	return out
+}

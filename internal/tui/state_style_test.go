@@ -22,19 +22,24 @@ func colorStr(c lipgloss.TerminalColor) string {
 // TestProcessStyle_GatedStates pins the plan 013 D5 state-to-style mapping:
 // waiting is a distinct amber, blocked shares the crashed red, completed rests
 // gray like stopped, and every prior mapping is unchanged.
+//
+// Uses the legacy preset so the ANSI-256 values match the pre-theme palette.
+// Theme-mutating: must not call t.Parallel (package-global style set).
 func TestProcessStyle_GatedStates(t *testing.T) {
+	withTestTheme(t, "legacy")
+	th := CurrentTheme()
 	tests := []struct {
 		state domain.ProcessState
 		want  lipgloss.Color
 	}{
-		{domain.ProcessStateRunning, runningColor},
-		{domain.ProcessStateStopped, stoppedColor},
-		{domain.ProcessStateCrashed, crashedColor},
-		{domain.ProcessStateStarting, startingColor},
-		{domain.ProcessStateStopping, stoppingColor},
-		{domain.ProcessStateWaiting, waitingColor},
-		{domain.ProcessStateBlocked, blockedColor},
-		{domain.ProcessStateCompleted, completedColor},
+		{domain.ProcessStateRunning, th.OK},
+		{domain.ProcessStateStopped, th.Dim},
+		{domain.ProcessStateCrashed, th.Err},
+		{domain.ProcessStateStarting, th.Warn},
+		{domain.ProcessStateStopping, th.Warn},
+		{domain.ProcessStateWaiting, th.Waiting},
+		{domain.ProcessStateBlocked, th.Err},
+		{domain.ProcessStateCompleted, th.Dim},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.state), func(t *testing.T) {
@@ -76,11 +81,11 @@ func TestGatedDetail(t *testing.T) {
 }
 
 // TestHealthDotStyles_ReuseProcessColors pins that the health-dot styles
-// (plan 018 D13) reuse the existing running/crashed colors rather than
-// introducing a new palette entry.
+// (plan 018 D13) reuse OK/Err rather than introducing a new palette entry.
 func TestHealthDotStyles_ReuseProcessColors(t *testing.T) {
-	assert.Equal(t, string(runningColor), colorStr(healthyDotStyle.GetForeground()))
-	assert.Equal(t, string(crashedColor), colorStr(unhealthyDotStyle.GetForeground()))
+	th := CurrentTheme()
+	assert.Equal(t, string(th.OK), colorStr(styles.HealthyDot.GetForeground()))
+	assert.Equal(t, string(th.Err), colorStr(styles.UnhealthyDot.GetForeground()))
 }
 
 // TestHealthDot pins the process panel's health indicator (plan 018 D13):
@@ -96,10 +101,10 @@ func TestHealthDot(t *testing.T) {
 		status domain.HealthStatus
 		want   string
 	}{
-		{"healthy", domain.HealthStatusHealthy, healthyDotStyle.Render(" ●")},
+		{"healthy", domain.HealthStatusHealthy, styles.HealthyDot.Render(" ●")},
 		// Distinct glyph, not just a distinct color: monochrome/NO_COLOR and
 		// red-green color-blind readers must still tell the states apart.
-		{"unhealthy", domain.HealthStatusUnhealthy, unhealthyDotStyle.Render(" ✗")},
+		{"unhealthy", domain.HealthStatusUnhealthy, styles.UnhealthyDot.Render(" ✗")},
 		{"unknown", domain.HealthStatusUnknown, ""},
 		{"unset", domain.HealthStatus(""), ""},
 	}

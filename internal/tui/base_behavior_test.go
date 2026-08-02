@@ -43,6 +43,66 @@ func TestTUI_HandleKey_Quit(t *testing.T) {
 	_ = newModel
 }
 
+// TestCtrlC_QuitsFromAllCaptureStates (T6) pins ctrl+c as a global quit that
+// fires before every capture layer: mode dispatch (help/search/filter) and
+// open-menu key capture (plan 023 A3 / B3). q keeps per-mode behavior.
+func TestCtrlC_QuitsFromAllCaptureStates(t *testing.T) {
+	ctrlC := tea.KeyMsg{Type: tea.KeyCtrlC}
+
+	assertQuits := func(t *testing.T, m ClientModel) {
+		t.Helper()
+		_, cmd := clientUpdateModel(m, ctrlC)
+		assert.Equal(t, tea.QuitMsg{}, runCmdWithin(t, cmd))
+	}
+
+	t.Run("Normal", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		require.Equal(t, ModeNormal, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("Help", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('?'))
+		require.Equal(t, ModeHelp, m.mode)
+		assertQuits(t, m)
+
+		// q closes help without quitting (per-mode behavior preserved).
+		m = newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('?'))
+		m, cmd := clientUpdateModel(m, keyRune('q'))
+		assert.Equal(t, ModeNormal, m.mode)
+		assert.Nil(t, cmd, "q in help must not quit")
+	})
+
+	t.Run("Search", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('/'))
+		require.Equal(t, ModeSearch, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("StringFilter", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('s'))
+		require.Equal(t, ModeStringFilter, m.mode)
+		assertQuits(t, m)
+	})
+
+	t.Run("OpenDropdown", func(t *testing.T) {
+		m := newTestModel()
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		m = clientUpdate(m, keyRune('v'))
+		require.True(t, m.menuOpen())
+		assertQuits(t, m)
+	})
+}
+
 func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 	model := newTestModel()
 
@@ -51,11 +111,14 @@ func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 	m := newModel.(ClientModel)
 	assert.Equal(t, ModeHelp, m.mode)
 
-	// Test switching to filter mode
+	// Test switching to filter menu (f opens Filter dropdown when menu bar visible)
 	model = newTestModel()
+	model = clientUpdate(model, tea.WindowSizeMsg{Width: 80, Height: 24})
 	newModel, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	m = newModel.(ClientModel)
-	assert.Equal(t, ModeFilter, m.mode)
+	assert.True(t, m.menuOpen())
+	assert.Equal(t, int(MenuFilter), m.openMenu)
+	assert.Equal(t, ModeNormal, m.mode)
 
 	// Test switching to search mode
 	model = newTestModel()
@@ -73,13 +136,17 @@ func TestTUI_HandleKey_ModeSwitch(t *testing.T) {
 func TestTUI_HandleKey_EscClearsFilters(t *testing.T) {
 	model := newTestModel()
 	model.soloProcess = "test"
-	model.searchPattern = "pattern"
+	model.setLogsFilterQuery("pattern")
+	model.setRequestsFilterQuery("status:500")
 
 	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyEscape})
 	m := newModel.(ClientModel)
 
 	assert.Empty(t, m.soloProcess)
-	assert.Empty(t, m.searchPattern)
+	assert.Empty(t, m.logsFilter.RawQuery)
+	assert.True(t, m.logsFilter.LastGood.IsEmpty())
+	assert.Empty(t, m.requestsFilter.RawQuery)
+	assert.True(t, m.requestsFilter.LastGood.IsEmpty())
 }
 
 func TestTUI_LogEntryMsg(t *testing.T) {
@@ -144,9 +211,9 @@ func TestFilteredEntries(t *testing.T) {
 		assert.Equal(t, "web", e.Process)
 	}
 
-	// String filter
+	// String filter (bare substring — same as today's s-bar)
 	model.soloProcess = ""
-	model.searchPattern = "log 1"
+	model.setLogsFilterQuery("log 1")
 	entries = model.filteredEntries()
 	assert.Len(t, entries, 2)
 	for _, e := range entries {
@@ -260,12 +327,12 @@ func TestFilteredProxyRequests(t *testing.T) {
 	assert.Len(t, requests, 4)
 
 	// String filter on URL
-	model.searchPattern = "users"
+	model.setRequestsFilterQuery("users")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 
 	// String filter on method
-	model.searchPattern = "GET"
+	model.setRequestsFilterQuery("GET")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 	for _, r := range requests {
@@ -273,7 +340,7 @@ func TestFilteredProxyRequests(t *testing.T) {
 	}
 
 	// String filter on subdomain
-	model.searchPattern = "api"
+	model.setRequestsFilterQuery("api")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 	for _, r := range requests {
@@ -281,7 +348,7 @@ func TestFilteredProxyRequests(t *testing.T) {
 	}
 
 	// Case-insensitive filter
-	model.searchPattern = "API"
+	model.setRequestsFilterQuery("API")
 	requests = model.filteredProxyRequests()
 	assert.Len(t, requests, 2)
 }
@@ -358,7 +425,7 @@ func TestTUI_ProxyRequestMsg(t *testing.T) {
 	assert.Len(t, filtered, 2)
 
 	// Test filtering
-	m.searchPattern = "users"
+	m.setRequestsFilterQuery("users")
 	filtered = m.filteredProxyRequests()
 	assert.Len(t, filtered, 1)
 	assert.Equal(t, "/api/users", filtered[0].URL)
@@ -463,7 +530,7 @@ func TestFormatProxyRequest_StatusCode0(t *testing.T) {
 	assert.Contains(t, formatted, "api")
 	assert.Contains(t, formatted, "GET")
 	assert.Contains(t, formatted, "/test")
-	assert.Contains(t, formatted, "  0") // Status code 0 with 3-char right-aligned padding
+	assert.Contains(t, formatted, "     0") // Status code 0 with 6-char right-aligned padding
 
 	// Verify exact padding for subdomain (10 chars left-aligned)
 	// "api" should be followed by 7 spaces to make 10 chars total
@@ -473,8 +540,8 @@ func TestFormatProxyRequest_StatusCode0(t *testing.T) {
 	// "GET" should be followed by 4 spaces to make 7 chars total
 	assert.Contains(t, formatted, "GET    ") // 7 chars total
 
-	// Verify duration is 5 chars right-aligned (100ms = "  100")
-	assert.Contains(t, formatted, "  100")
+	// Verify duration is 8 chars right-aligned (100ms).
+	assert.Contains(t, formatted, "   100ms")
 }
 
 func TestFormatProxyRequest_DurationOverflow(t *testing.T) {
@@ -525,7 +592,7 @@ func TestFormatProxyRequest_InFlight(t *testing.T) {
 
 	formatted := model.formatProxyRequest(req)
 
-	assert.Contains(t, formatted, "  ...ms", "duration column should render dots, 5-char padded, with the ms suffix")
+	assert.Contains(t, formatted, "   ...ms", "duration column should render dots, 8-char padded, with the ms suffix")
 	assert.NotContains(t, formatted, "0ms", "in-flight rows must not render a fake zero duration")
 	assert.Contains(t, formatted, "200", "status should show the real header-time code")
 }
@@ -562,8 +629,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 		durationMs int64
 		wantSub    string // Expected subdomain with padding (10 chars)
 		wantMethod string // Expected method with padding (7 chars)
-		wantStatus string // Expected status with padding (3 chars)
-		wantDur    string // Expected duration with padding (5 chars)
+		wantStatus string // Expected status with padding (6 chars)
+		wantDur    string // Expected duration with padding (8 chars)
 	}{
 		{
 			name:       "short fields",
@@ -573,8 +640,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			durationMs: 1,
 			wantSub:    "a         ", // 1 + 9 spaces
 			wantMethod: "GET    ",    // 3 + 4 spaces
-			wantStatus: "200",        // already 3 chars
-			wantDur:    "    1",      // 4 spaces + 1
+			wantStatus: "   200",     // right-aligned in 6 cols
+			wantDur:    "     1ms",   // right-aligned in 8 cols
 		},
 		{
 			name:       "max length subdomain",
@@ -584,8 +651,8 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			durationMs: 9999,
 			wantSub:    "webservice", // exactly 10 chars
 			wantMethod: "DELETE ",    // 6 + 1 space
-			wantStatus: "404",
-			wantDur:    " 9999", // 1 space + 4 digits
+			wantStatus: "   404",
+			wantDur:    "  9999ms",
 		},
 		{
 			name:       "single digit status",
@@ -594,9 +661,9 @@ func TestFormatProxyRequest_Padding(t *testing.T) {
 			statusCode: 0,
 			durationMs: 50,
 			wantSub:    "api       ",
-			wantMethod: "OPTIONS", // exactly 7 chars
-			wantStatus: "  0",     // 2 spaces + 0
-			wantDur:    "   50",   // 3 spaces + 50
+			wantMethod: "OPTIONS",  // exactly 7 chars
+			wantStatus: "     0",   // right-aligned in 6 cols
+			wantDur:    "    50ms", // right-aligned in 8 cols
 		},
 	}
 
@@ -629,8 +696,8 @@ func keyRune(r rune) tea.KeyMsg {
 
 // newRequestsModel builds a ClientModel in the requests view holding n requests
 // (IDs req-000..req-{n-1}, URLs /path/000..), with the viewport sized so its
-// content Height is viewportHeight (handleWindowSize subtracts the 6-row
-// header+footer margin). followMode starts true, so the cursor begins pinned
+// content Height is viewportHeight (handleWindowSize/relayout subtracts
+// defaultChromeHeight + defaultPanelBorder + defaultRequestsHeaderRows). followMode starts true, so the cursor begins pinned
 // to the newest row.
 func newRequestsModel(n, viewportHeight int) ClientModel {
 	return newSearchModel(viewportHeight, makeTestRequests(n))
@@ -730,7 +797,7 @@ func TestRequestsCursor_VisibilityKeyboardJumps(t *testing.T) {
 // requests branch of updateViewport must scroll it so the cursor is visible.
 func TestRequestsCursor_VisibilityTabIn(t *testing.T) {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight() + defaultPanelBorder()}) // viewport height 5
 
 	// Fill logs and requests while in the logs view.
 	for i := 0; i < 30; i++ {
@@ -763,14 +830,14 @@ func TestRequestsCursor_VisibilityResize(t *testing.T) {
 	assert.True(t, cursorVisible(m))
 
 	// Shrink the window: cursor must stay visible.
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 
 	// Grow it back: still visible, and the viewport must not be left scrolled
 	// past the true bottom (a grown window shrinks the valid max YOffset —
 	// blank overscroll would report the cursor "visible" while showing gaps).
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 30 + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 	assert.Equal(t, 20, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
 	maxOffset := m.viewport.TotalLineCount() - m.viewport.Height
@@ -784,7 +851,7 @@ func TestRequestsCursor_VisibilityResize(t *testing.T) {
 func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 	m := newRequestsModel(40, 5)
 	// Narrow to rows /path/030../path/039 (10 rows), follow off.
-	m.searchPattern = "/path/03"
+	m.setRequestsFilterQuery("/path/03")
 	m.followMode = false
 	m.updateViewport()
 
@@ -797,7 +864,8 @@ func TestRequestsCursor_VisibilityFilterClear(t *testing.T) {
 	// esc clears the filter; the cursor's row (req-032, full-list index 32) must
 	// remain and be scrolled on-screen.
 	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
-	assert.Empty(t, m.searchPattern)
+	assert.Empty(t, m.requestsFilter.RawQuery)
+	assert.True(t, m.requestsFilter.LastGood.IsEmpty())
 	assert.Equal(t, "req-032", m.cursorID)
 	assert.Equal(t, 32, m.cursorIdx)
 	assert.True(t, cursorVisible(m))
@@ -996,12 +1064,13 @@ func TestRequestsCursor_MarkerOnCursorRow(t *testing.T) {
 
 // newSearchModel builds a ClientModel in the requests view holding the given request
 // records, viewport sized to viewportHeight, follow-mode default (true) so the
-// cursor starts pinned to the newest row.
+// cursor starts pinned to the newest row. Height accounts for the C11 requests
+// header row (defaultRequestsHeaderRows) in addition to chrome + panel border.
 func newSearchModel(viewportHeight int, reqs []proxy.RequestRecord) ClientModel {
 	m := newTestModel()
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = reqs
-	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	return clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 }
 
 // commitSearch drives the `/`-search flow: enter search mode, set the query,
@@ -1117,7 +1186,7 @@ func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
 	reqs[12].URL = "/match/c" // api  -> in the filtered list
 
 	m := newSearchModel(40, reqs)
-	m.searchPattern = "api" // active `s` filter: only the 10 api rows remain
+	m.setRequestsFilterQuery("api") // active `s` filter: only the 10 api rows remain
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g'))
@@ -1129,7 +1198,7 @@ func TestRequestsSearch_ComposesWithFilter(t *testing.T) {
 	assert.Equal(t, "req-012", m.cursorID)
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "req-004", m.cursorID, "wraps over api matches only, skipping the filtered-out web row")
-	assert.Equal(t, "api", m.searchPattern, "the `s` filter is untouched")
+	assert.Equal(t, "api", m.requestsFilter.RawQuery, "the `s` filter is untouched")
 }
 
 func TestRequestsSearch_DoesNotFilter(t *testing.T) {
@@ -1139,7 +1208,7 @@ func TestRequestsSearch_DoesNotFilter(t *testing.T) {
 	before := len(m.filteredProxyRequests())
 
 	m = commitSearch(m, "needle")
-	assert.Empty(t, m.searchPattern, "/ in the requests view must not touch the `s` filter")
+	assert.Empty(t, m.requestsFilter.RawQuery, "/ in the requests view must not touch the `s` filter")
 	assert.Equal(t, "needle", m.requestSearchQuery)
 	assert.Len(t, m.filteredProxyRequests(), before, "/ navigates; it must not hide rows")
 	assert.Len(t, m.proxyRequests, 10)
@@ -1160,7 +1229,7 @@ func TestRequestsSearch_NoMatch(t *testing.T) {
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, 1, m.cursorIdx)
 
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/zzz-nomatch (0 matches)", "status shows the 0-match form")
 }
 
@@ -1178,14 +1247,14 @@ func TestRequestsSearch_EscClearsQuery(t *testing.T) {
 // --- Logs-view search navigation tests (C4 / D6-D10) ---
 
 // newLogsModel builds a ClientModel in the (default) logs view, viewport sized so its
-// content height is viewportHeight (handleWindowSize subtracts the 6-row
-// margin), then streams the given lines through handleLogEntry so each entry is
+// content height is viewportHeight (handleWindowSize/relayout subtracts
+// defaultChromeHeight + defaultPanelBorder), then streams the given lines through handleLogEntry so each entry is
 // stamped with a unique non-zero Seq — the logs search cursor anchors by Seq, so
 // a zero Seq would break the anchor. followMode starts true (default), pinning
 // the cursor to the newest line until a jump or scroll disengages it.
 func newLogsModel(viewportHeight int, lines []string) ClientModel {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder()})
 	base := time.Unix(0, 0)
 	for i, line := range lines {
 		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
@@ -1218,7 +1287,7 @@ func TestLogsSearch_SlashNavigates(t *testing.T) {
 
 	m = commitSearch(m, "drop")
 	assert.Equal(t, "drop", m.logSearchQuery, "logs-view / commits the navigation query")
-	assert.Empty(t, m.searchPattern, "logs-view / must not touch the `s` filter")
+	assert.Empty(t, m.logsFilter.RawQuery, "logs-view / must not touch the `s` filter")
 	assert.Empty(t, m.requestSearchQuery, "logs-view / must not set the requests query")
 	assert.Len(t, m.filteredEntries(), before, "logs-view / navigates; it must not hide lines")
 	assert.Equal(t, "drop it", logCursorLine(t, m), "the cursor lands on the matching line")
@@ -1272,7 +1341,7 @@ func TestLogsSearch_ComposesWithFilter(t *testing.T) {
 	m := newLogsModel(20, []string{
 		"keep needle a", "drop needle b", "keep plain", "keep needle c", "drop needle d",
 	})
-	m.searchPattern = "keep" // active `s` filter -> rows 0,2,3 survive
+	m.setLogsFilterQuery("keep") // active `s` filter -> rows 0,2,3 survive
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g')) // origin -> top of the filtered list
@@ -1283,7 +1352,7 @@ func TestLogsSearch_ComposesWithFilter(t *testing.T) {
 	assert.Equal(t, "keep needle c", logCursorLine(t, m), "n skips the filtered-out drop rows")
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, "keep needle a", logCursorLine(t, m), "wraps over the filtered matches only")
-	assert.Equal(t, "keep", m.searchPattern, "the `s` filter is untouched")
+	assert.Equal(t, "keep", m.logsFilter.RawQuery, "the `s` filter is untouched")
 }
 
 func TestLogsSearch_NoMatch(t *testing.T) {
@@ -1298,7 +1367,7 @@ func TestLogsSearch_NoMatch(t *testing.T) {
 	m = clientUpdate(m, keyRune('n'))
 	assert.Equal(t, -1, m.logCursorIdx)
 
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/zzz (0 matches)", "status shows the 0-match form")
 }
 
@@ -1314,7 +1383,7 @@ func TestLogsSearch_NoMatchAfterPriorMatchClearsCursor(t *testing.T) {
 	assert.Equal(t, "zzz", m.logSearchQuery)
 	assert.Equal(t, -1, m.logCursorIdx, "a no-match search clears the prior cursor index")
 	assert.Equal(t, int64(0), m.logCursorSeq, "and its Seq anchor")
-	assert.Contains(t, m.statusBar(""), "/zzz (0 matches)")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/zzz (0 matches)")
 }
 
 func TestLogsSearch_EscClears(t *testing.T) {
@@ -1336,9 +1405,9 @@ func TestLogsSearch_StatusIndicator(t *testing.T) {
 	m = commitSearch(m, "needle")
 	require.Equal(t, 0, m.logCursorIdx)
 
-	assert.Contains(t, m.statusBar(""), "/needle (1/2)", "shows the cursor's match position of the total")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/needle (1/2)", "shows the cursor's match position of the total")
 	m = clientUpdate(m, keyRune('n'))
-	assert.Contains(t, m.statusBar(""), "/needle (2/2)", "advancing updates the position")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/needle (2/2)", "advancing updates the position")
 }
 
 func TestLogsSearch_FollowPreservedOnNewestRowMatch(t *testing.T) {
@@ -1368,7 +1437,7 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 	m = commitSearch(m, "hit")
 	require.Equal(t, "hit mid", logCursorLine(t, m))
 	require.False(t, m.followMode)
-	require.Contains(t, m.statusBar(""), "/hit (1/1)")
+	require.Contains(t, m.statusBar(footerMsg{}), "/hit (1/1)")
 
 	// A new log line arrives while the search is parked off-newest.
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
@@ -1379,12 +1448,12 @@ func TestLogsSearch_OffNewestJumpSurvivesLogArrival(t *testing.T) {
 
 	assert.False(t, m.followMode, "a streaming arrival must not re-engage follow while a search is parked")
 	assert.Equal(t, "hit mid", logCursorLine(t, m), "the cursor stays on the match, not yanked to the new newest row")
-	assert.Contains(t, m.statusBar(""), "/hit (1/1)", "match position is preserved across the arrival")
+	assert.Contains(t, m.statusBar(footerMsg{}), "/hit (1/1)", "match position is preserved across the arrival")
 }
 
 func TestLogsSearch_EvictionAnchorSurvives(t *testing.T) {
 	m := newTestModel()
-	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 11}) // viewport height 5
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 5 + defaultChromeHeight() + defaultPanelBorder()}) // viewport height 5
 	feed := func(line string) {
 		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
 	}
@@ -1463,24 +1532,28 @@ func TestLogsSearch_HighlightGuard(t *testing.T) {
 
 	m := newLogsModel(20, []string{"plain"})
 
-	// ASCII line + ASCII query: the matched run is wrapped in searchHighlightStyle.
+	// ASCII line + ASCII query: the matched run is wrapped in styles.SearchHighlight.
+	// Leading/trailing runs go through styles.Base (plan 024 F1).
 	m.logSearchQuery = "match"
-	ascii := m.highlightLogLine("hello match world")
+	ascii := m.styleLogContent("hello match world", styles.Base)
 	assert.NotEqual(t, "hello match world", ascii, "an ASCII match is inline-highlighted")
-	assert.Contains(t, ascii, searchHighlightStyle.Render("match"), "the matched run is styled")
-	assert.Contains(t, ascii, "hello ")
-	assert.Contains(t, ascii, " world")
+	assert.Contains(t, ascii, styles.SearchHighlight.Render("match"), "the matched run is styled")
+	assert.Contains(t, ascii, styles.Base.Render("hello "))
+	assert.Contains(t, ascii, styles.Base.Render(" world"))
 
 	// Unicode line: case-folding would shift byte offsets, so the guard trips and
-	// the line falls back to no inline highlight (row marker alone) — unchanged.
+	// the line falls back to no inline highlight (row marker alone) — Base-wrapped.
 	uni := "日本語 match テスト"
-	assert.Equal(t, uni, m.highlightLogLine(uni), "a unicode line falls back to no highlight")
+	assert.Equal(t, styles.Base.Render(uni), m.styleLogContent(uni, styles.Base),
+		"a unicode line falls back to no highlight (Base-wrapped)")
 
 	// ESC-bearing line: a digit query can match inside the ANSI escape, so the
 	// guard trips and the escape is left intact rather than split.
 	m.logSearchQuery = "31"
 	ansiLine := "x \x1b[31mred\x1b[0m match"
-	assert.Equal(t, ansiLine, m.highlightLogLine(ansiLine), "an ESC-bearing line falls back, escape intact")
+	got := m.styleLogContent(ansiLine, styles.Base)
+	assert.Equal(t, styles.Base.Render(ansiLine), got, "an ESC-bearing line falls back, escape intact")
+	assert.Contains(t, got, "\x1b[31mred\x1b[0m", "source escape survives inside Base wrap")
 }
 
 func TestLogsSearch_UnicodeAndAnsiRenderSafely(t *testing.T) {
@@ -1509,13 +1582,13 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	reqs[3].URL = "/path/needle" // matches both the `path` filter and the search
 	m := newSearchModel(40, reqs)
 	m.soloProcess = "web" // a logs concept: must NOT appear in the requests view
-	m.searchPattern = "path"
+	m.setRequestsFilterQuery("path")
 	m.followMode = false
 	m.updateViewport()
 	m = clientUpdate(m, keyRune('g'))
 
 	m = commitSearch(m, "needle")
-	bar := m.statusBar("")
+	bar := m.statusBar(footerMsg{})
 	assert.Contains(t, bar, "/needle (1/1)", "search indicator wins, with the cursor's match position")
 	assert.Contains(t, bar, "filter: path", "the active `s` filter is appended")
 	assert.NotContains(t, bar, "Showing:", "solo is never shown in the requests view")
@@ -1523,7 +1596,7 @@ func TestRequestsSearch_StatusPrecedence(t *testing.T) {
 	// Prompt precedence: while typing a search, the input prompt wins over the
 	// committed indicator.
 	m2 := clientUpdate(m, keyRune('/'))
-	assert.Contains(t, m2.statusBar(""), "Search:", "the mode prompt takes precedence")
+	assert.Contains(t, m2.statusBar(footerMsg{}), "Search:", "the mode prompt takes precedence")
 }
 
 func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
@@ -1531,7 +1604,7 @@ func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
 	m.width = 120
 
 	m.requestSearchQuery = "日本語テスト"
-	unicodeBar := m.statusBar("")
+	unicodeBar := m.statusBar(footerMsg{})
 
 	// The layout is measured in display columns, not bytes: an ASCII query of
 	// the same DISPLAY width must produce a bar of the same rendered width.
@@ -1540,7 +1613,7 @@ func TestRequestsSearch_UnicodeStatusWidth(t *testing.T) {
 	// right side's lipgloss.Width back to len — the right side is
 	// structurally ASCII, so no assertion can distinguish them there.
 	m.requestSearchQuery = strings.Repeat("x", lipgloss.Width("日本語テスト"))
-	asciiBar := m.statusBar("")
+	asciiBar := m.statusBar(footerMsg{})
 	assert.Equal(t, lipgloss.Width(asciiBar), lipgloss.Width(unicodeBar),
 		"a Unicode query must not change the status-bar layout width")
 }

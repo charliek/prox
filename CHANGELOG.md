@@ -4,12 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-TUI unification (plan 018): `prox up --tui` and `prox attach` are now one
-TUI. The owner's TUI is the same API-client TUI attach has always run, so
-every feature, key binding, and fix lands in both at once.
-
 ### Added
 
+- **TUI redesign** (plan 021): menu bar with View, Filter, and Theme dropdowns;
+  truecolor themes (six presets plus user TOML in `~/.prox/tui/themes/`); filter
+  query language on the `s` bar with a matching Filter menu; view toggles for
+  process panel, timestamps, and soft-wrap; styled log/request/detail rendering;
+  grab-for-agent copy keys (`y` / `c` / `Y`); and full mouse routing (wheel,
+  row/chip clicks, double-click to open request detail). Settings persist in
+  `~/.prox/tui/config.toml`.
+- **Dropdown height clamping with scroll indicators** (plan 022). Long menus
+  (for example the Theme list on short terminals) window to the available frame
+  height with “… N more …” indicators; the mouse wheel scrolls an open dropdown
+  and is consumed so the viewport underneath does not move.
+- **Free-motion menu hover** (plan 022). Hovering the menu bar slides an open
+  menu across sibling cells; hovering dropdown rows moves the highlight (requires
+  all-motion mouse reporting).
+- **Broader log-level detection** for `level:` filters and level tints. Beyond
+  JSON `level`/`lvl` and logfmt `level=`, the classifier now reads JSON
+  `severity` keys (Cloud Logging / stridelabs-python deployed format),
+  pino/bunyan numeric levels (`{"level":30}`), `critical` as error, and a
+  standalone UPPERCASE level token early in the line — covering python
+  logging's dev format, tracing's text layer, pino-pretty, and uvicorn access
+  lines, ANSI colors included. Previously these lines had no detected level,
+  so `level:info` filtered them all out.
 - **Requests scroll-back in the TUI** (plan 018). Scrolling to the top of the
   requests list now loads the next older page of requests from the ring
   automatically (1000 at a time, up to the full 5000 the server retains), so
@@ -33,58 +51,30 @@ every feature, key binding, and fix lands in both at once.
   healthy, a red `✗` while unhealthy — styled independently of the process's own
   state color so it can't be swallowed or recolored. A process with no
   healthcheck (or one still reporting `unknown`) renders exactly as before.
-
-### Fixed
-
-- **A prox command can no longer control a *different* project's prox** (plan
-  020). Commands discovered a running prox from `.prox/prox.state`, or failing
-  that from `api.port` in the local `prox.yaml`, and then trusted whatever was
-  listening there. With two projects on the same `api.port` — or one stale
-  state file whose port had since been taken — `prox status` reported another
-  project's processes as yours and `prox down` stopped another project
-  outright. Every client command now verifies that the prox answering owns
-  *this* project before acting, and refuses by name when it does not:
-
-  ```
-  Error: prox is not running for this project.
-  A prox for /Users/you/projects/other is listening on 127.0.0.1:5552.
-  Run commands from that directory, or target it deliberately with
-    --addr http://127.0.0.1:5552
-  ```
-
-  Identity is the project directory, compared by device+inode, so symlinked
-  roots, `/tmp` vs `/private/tmp`, a custom `-c`, and `prox.yml` vs
-  `prox.yaml` all still resolve to "yes, that's yours". Git worktrees of one
-  repo are correctly treated as separate projects — they are separate
-  directories running potentially different code — with no VCS knowledge in
-  prox. `--addr` bypasses the check entirely for deliberate cross-directory
-  work, and now genuinely does so for `prox attach`, which previously failed
-  before it ever consulted the flag.
-- **The examples no longer teach a pinned `api.port`** (plan 020). `api.port`
-  is dynamic by default and that is the safe mode, but four shipped examples
-  presented a pinned `api: {port: 5555}` block as the baseline shape of a
-  `prox.yaml` — so copied configs, including agent-authored ones, collided on
-  one port. This is the root cause of the cross-project bug above. **This
-  repo's own `prox.yaml` no longer pins the port either**, so its dev API port
-  is now dynamic; use `prox status` to see the actual port.
-- **Foreground `prox up` no longer swallows the reason a process crashed**
-  (plan 020). Logs were subscribed after the supervisor had already started
-  the processes, so a process that died instantly — a typo in `cmd:`, a
-  missing binary — could emit its error before anything was listening, leaving
-  the banner and then silence. The subscription is now established before any
-  process starts. (Foreground `prox up` still does not exit on its own when
-  every process is dead; that is tracked separately.)
-- **The version-skew message's instructions now work when followed** (plan
-  020). On a shared-daemon version mismatch, prox told you to run
-  `prox proxy stop --force` and then `prox up` in each project — but `prox up`
-  fails there ("already running"), bare `prox restart` requires a process
-  name, and the still-running old projects resurrected an old daemon within
-  ~15s, so the retry hit the same error. The instructions are now phased —
-  stop every project, confirm the proxy has exited, then restart them — which
-  also removes the need for `--force` and the resurrection race entirely.
+- **Requests column toggles** (plan 023). The View menu gains a Columns
+  section in Requests view: Time, Host, Method, Status, Duration, and ID are
+  individually toggleable (URL always on). Defaults are all on; choices persist
+  under `[requests]` in `~/.prox/tui/config.toml`. `/` search matches only
+  visible columns; copy keys are unaffected.
+- **OSC 22 pointer shapes** (plan 023). On supporting terminals (kitty, WezTerm,
+  Alacritty, Ghostty, …), the mouse pointer switches to a hand over menu-bar
+  cells, activatable dropdown rows, and process chips.
+- **`re:` regex filters for logs** (plan 023). The logs `s` bar accepts
+  `re:<pattern>` and `-re:<pattern>` terms (RE2, ≤256 bytes, compiled once at
+  parse; multiple positive `re:` terms AND together).
+- **Status-range filters for requests** (plan 023). The requests `s` bar now
+  accepts `status:>=N`, `status:<=N`, and inclusive `status:N-M` ranges (100–599)
+  in addition to exact codes and `4xx`/`5xx` classes.
 
 ### Changed
 
+- **`?` help is now a centered modal** over the live TUI (plan 022). Logs and
+  requests keep updating behind it; the wheel scrolls the modal when content is
+  taller than the box; Esc, `?`, `q`, Enter, or a click outside the box closes
+  it (replacing the old full-screen help view).
+- **TUI unification** (plan 018): `prox up --tui` and `prox attach` are now one
+  TUI. The owner's TUI is the same API-client TUI attach has always run, so
+  every feature, key binding, and fix lands in both at once.
 - **`prox up --tui` runs the same API-client TUI as `prox attach`** (plan
   018). It is now a client of the API server `prox up` starts in its own
   process rather than a second, local-only implementation reading the
@@ -137,6 +127,120 @@ every feature, key binding, and fix lands in both at once.
   of starting everything and then drawing a full-screen TUI nobody can see
   or quit. Non-interactive callers want plain `prox up` (streams logs to
   stdout) or `prox up -d`.
+- **Merged footer row** (plan 023). Status text, view/follow/count badges, and
+  key hints now share a single footer band with typed messages, precedence, and
+  narrow-width hint degradation.
+- **Bordered viewport panel, dropdowns, and help modal** (plan 023). The main
+  content viewport has a rounded titled border; dropdown menus use rounded
+  borders with a right-aligned hint column; the help modal uses a focused border
+  colour and a title spliced into the top edge.
+- **Full-width selection band on FullFill themes** (plan 023). The active cursor
+  row (including every wrapped display row of a log entry) paints a
+  full-viewport-width band; `/` search hits inside the band keep their
+  highlight colour.
+- **Logfmt level detection tightened** (plan 023). `level=` / `lvl=` tokens
+  must appear at line start or after whitespace so embedded tokens like
+  `xlevel=` no longer match.
+- **Settings persistence hardened** (plan 023). `~/.prox/tui/config.toml` saves
+  use a flock-serialized read→merge→write→rename transaction with directory
+  fsync so concurrent writers cannot clobber each other.
+
+### Fixed
+
+- **TUI menu bar, dropdown, and process-chip mouse clicks** (plan 022). Hit
+  rectangles were recorded during render but discarded because `View` uses a
+  value receiver — the live model never saw them, so menu and chip clicks were
+  dead in the real app. Clicks now use a shared hit registry that survives the
+  render copy.
+- **A prox command can no longer control a *different* project's prox** (plan
+  020). Commands discovered a running prox from `.prox/prox.state`, or failing
+  that from `api.port` in the local `prox.yaml`, and then trusted whatever was
+  listening there. With two projects on the same `api.port` — or one stale
+  state file whose port had since been taken — `prox status` reported another
+  project's processes as yours and `prox down` stopped another project
+  outright. Every client command now verifies that the prox answering owns
+  *this* project before acting, and refuses by name when it does not:
+
+  ```
+  Error: prox is not running for this project.
+  A prox for /Users/you/projects/other is listening on 127.0.0.1:5552.
+  Run commands from that directory, or target it deliberately with
+    --addr http://127.0.0.1:5552
+  ```
+
+  Identity is the project directory, compared by device+inode, so symlinked
+  roots, `/tmp` vs `/private/tmp`, a custom `-c`, and `prox.yml` vs
+  `prox.yaml` all still resolve to "yes, that's yours". Git worktrees of one
+  repo are correctly treated as separate projects — they are separate
+  directories running potentially different code — with no VCS knowledge in
+  prox. `--addr` bypasses the check entirely for deliberate cross-directory
+  work, and now genuinely does so for `prox attach`, which previously failed
+  before it ever consulted the flag.
+- **The examples no longer teach a pinned `api.port`** (plan 020). `api.port`
+  is dynamic by default and that is the safe mode, but four shipped examples
+  presented a pinned `api: {port: 5555}` block as the baseline shape of a
+  `prox.yaml` — so copied configs, including agent-authored ones, collided on
+  one port. This is the root cause of the cross-project bug above. **This
+  repo's own `prox.yaml` no longer pins the port either**, so its dev API port
+  is now dynamic; use `prox status` to see the actual port.
+- **Foreground `prox up` no longer swallows the reason a process crashed**
+  (plan 020). Logs were subscribed after the supervisor had already started
+  the processes, so a process that died instantly — a typo in `cmd:`, a
+  missing binary — could emit its error before anything was listening, leaving
+  the banner and then silence. The subscription is now established before any
+  process starts. (Foreground `prox up` still does not exit on its own when
+  every process is dead; that is tracked separately.)
+- **The version-skew message's instructions now work when followed** (plan
+  020). On a shared-daemon version mismatch, prox told you to run
+  `prox proxy stop --force` and then `prox up` in each project — but `prox up`
+  fails there ("already running"), bare `prox restart` requires a process
+  name, and the still-running old projects resurrected an old daemon within
+  ~15s, so the retry hit the same error. The instructions are now phased —
+  stop every project, confirm the proxy has exited, then restart them — which
+  also removes the need for `--force` and the resurrection race entirely.
+- **`ctrl+c` now quits from every mode** (plan 023), including the help modal
+  and filter/search text entry, where it was previously swallowed.
+- **Help modal width on narrow terminals** (plan 023). Side padding and then the
+  border degrade before content so the box no longer overflows very small
+  frames.
+- **Filter query serialization** (plan 023). Bare terms round-trip verbatim
+  (never re-quoted); unknown `level:` tokens are dropped on serialize.
+- **Frame-fill on light themes** (plan 023). FullFill presets no longer leave
+  default-background holes in chrome rows; footer error flashes use readable
+  styling on light footer backgrounds.
+- **JSON log rendering performance** (plan 023). JSON object lines are parsed
+  once at ingest (level detection and path=value summary share one unmarshal);
+  wrap-on display keeps summary plus compact raw consistently.
+- **Plain log/request text now carries the theme background** (plan 024).
+  Level-less lines rendered on the terminal-default background — 62% of the
+  frame in the light theme. Every TUI-formatted line now renders through the
+  base (or level-tinted) style, and the frame-fill scanner no longer
+  blanket-exempts the log region: only cells inside a line's own child ANSI
+  spans stay exempt.
+- **Requests header/data column alignment** (plan 024). The header rendered
+  `Duration` at 8 columns while data cells were 7 (ID and URL data sat one
+  column left of their labels), and the Status header read `Sta`. Header and
+  rows now share one column-spec table; `Status` is a full label with data
+  padded to match.
+- **Footer band flush and fill** (plan 024). The key-hint group is padded
+  flush to the right edge instead of floating mid-band, and every footer
+  segment — join spaces, stream-health `n/a`, paging notices, truncation
+  ellipses, and the filter text input itself — now renders on the footer
+  background, eliminating default-background holes (including the 43-column
+  hole while editing a filter).
+- **Border and glyph details** (plan 024). Panel and help border titles
+  render `─ Label ─` (they rendered `─ Logs────`); a clamped dropdown's
+  bottom border now stops one row above the panel's bottom border instead of
+  landing on it; a hovered closed menu cell is now visually distinct from an
+  open one; and Theme dropdown rows no longer repeat the `t` hint.
+- **Wrapped-row hanging indent** (plan 024). Wrapped log continuation rows
+  keep the timestamp/process gutter instead of dedenting to column 1, and
+  wrapped help descriptions hang-indent to the description column.
+- **Selective log-filter allocation regression** (plan 024). The plan-023
+  `filteredEntries` preallocation reserved full capacity even with an active
+  filter (50152 B/op); full preallocation now applies only when no filter is
+  active, restoring selective filters to ~1000 B/op while keeping the
+  no-filter fast path.
 
 ## v0.2.4
 

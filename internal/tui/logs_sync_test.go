@@ -466,21 +466,18 @@ func TestLogsSync_EmptyBatchIsNoOp(t *testing.T) {
 	assert.Equal(t, seqBefore, m.logSeq, "an empty batch stamps nothing")
 }
 
-// TestLogsSync_BatchDoesNotRegisterProcesses pins the filter-map division of
-// labor: batch entries flow through exactly the same append path as live ones,
-// and neither registers a process in filterProcesses — that map is owned by the
-// process list (ProcessesMsg). A batch must not smuggle in filter state a live
-// entry would not have created.
-func TestLogsSync_BatchDoesNotRegisterProcesses(t *testing.T) {
+// TestLogsSync_BatchDoesNotAutoFilterByProcess pins that batch entries flow
+// through exactly the same append path as live ones and remain visible with an
+// empty filter.
+func TestLogsSync_BatchDoesNotAutoFilterByProcess(t *testing.T) {
 	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
 	m, _ = clientUpdateModel(m, tea.WindowSizeMsg{Width: 120, Height: 20})
 
 	m = clientUpdate(m, LogsSyncMsg{Entries: []domain.LogEntry{{Process: "batch-only", Line: "x"}}})
 	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{Process: "live-only", Line: "y"}))
 
-	assert.Empty(t, m.filterProcesses, "log arrivals never register processes, by either path")
 	assert.Equal(t, []string{"x", "y"}, logLines(m.filteredEntries()),
-		"and both remain visible under the empty filter map")
+		"both remain visible with no active filter")
 }
 
 // clientUpdateModel is clientUpdate keeping the returned command, for the

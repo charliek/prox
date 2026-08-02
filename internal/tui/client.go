@@ -30,6 +30,20 @@ type RestartResultMsg struct {
 // RestartResultClearMsg is sent to clear the restart result after a delay
 type RestartResultClearMsg struct{}
 
+// StatusFlashClearMsg clears a short-lived status-bar flash (theme cycle,
+// copy, etc.). Seq is the flash generation captured when the timer was
+// scheduled: two delays (2s copy, 3s general) share the statusFlash field,
+// and without a generation a stale timer clears a NEWER flash early
+// (CodeRabbit PR #102). Clears only when Seq matches the current generation.
+type StatusFlashClearMsg struct {
+	Seq int
+}
+
+// StartupWarningsMsg delivers non-fatal settings/theme load warnings to the log pane.
+type StartupWarningsMsg struct {
+	Warnings []string
+}
+
 // RequestDetailMsg is sent when request details are loaded. Seq is the
 // fetchRequestDetail call's sequence number (ClientModel.detailFetchSeq at
 // dispatch time) — the handler drops any msg whose Seq doesn't match the
@@ -39,6 +53,10 @@ type RequestDetailMsg struct {
 	ID      string
 	Seq     int
 	Details *RequestDetailData
+	// Raw is the wire GET /api/v1/proxy/requests/{id}?include=body payload.
+	// Retained for Y copy — RequestDetailData drops hostname and other fields
+	// (plan 021 WS10 / Codex #10).
+	Raw *api.ProxyRequestDetailResponse
 }
 
 // RequestDetailErrorMsg is sent when loading request details fails. Seq is
@@ -96,6 +114,9 @@ type BodyData struct {
 // restartResultClearDelay is how long to show restart result before clearing
 const restartResultClearDelay = 3 * time.Second
 
+// statusFlashClearDelay matches restart feedback timing for consistency.
+const statusFlashClearDelay = 3 * time.Second
+
 // restartResultClearCmd returns a command that clears the restart result after a delay
 func restartResultClearCmd() tea.Cmd {
 	return tea.Tick(restartResultClearDelay, func(t time.Time) tea.Msg {
@@ -110,7 +131,7 @@ func restartResultClearCmd() tea.Cmd {
 // are per-caller, so this stays deliberately small rather than growing into a
 // general settings bag.
 type ClientOptions struct {
-	// Help supplies the help overlay's title suffix and quit wording. The two
+	// Help supplies the help modal's title suffix and quit wording. The two
 	// callers must word quit differently: leaving attach abandons a daemon that
 	// keeps running, leaving `up --tui` takes the processes down with it.
 	Help HelpConfig
@@ -119,6 +140,17 @@ type ClientOptions struct {
 	// wrong. Every degraded wording — connection outage, old daemon, restart
 	// result — outranks it; see View.
 	ConnectedStatus string
+
+	// ProjectName is shown in the menu bar after the brand (plan 023 B3).
+	// Empty → resolveProjectName falls back to the cwd basename. Callers
+	// (`prox up --tui`, `prox attach`) supply an explicit derivation.
+	ProjectName string
+
+	// ProxyHTTPSPort/ProxyHTTPPort are the local proxy listen ports (up --tui
+	// only). Attach passes 0 — curl copy omits :port for shared-daemon-on-443
+	// (plan 021 WS10 / panel B2). HTTPPort is reserved; curl is HTTPS-first.
+	ProxyHTTPSPort int
+	ProxyHTTPPort  int
 
 	// ShutdownCh, when non-nil, quits the program on close. This is how an
 	// out-of-band shutdown request (POST /shutdown, via the coordinator's
@@ -169,15 +201,24 @@ type ClientModel struct {
 	// fetches), so it lives here rather than on BaseModel, matching
 	// connectionError above.
 	detailFetchSeq int
+
+	// startupWarnings are surfaced as system log lines on first Update (WS2).
+	startupWarnings []string
+
+	// requestDetailRaw is the last applied wire detail response for Y copy
+	// (plan 021 WS10 / Codex #10). Cleared when leaving detail view.
+	requestDetailRaw *api.ProxyRequestDetailResponse
 }
 
 // NewClientModel creates a new TUI model for client mode
 func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
-	return ClientModel{
+	m := ClientModel{
 		BaseModel: newBaseModel(opts.Help),
 		client:    client,
 		opts:      opts,
 	}
+	m.projectName = resolveProjectName(opts.ProjectName)
+	return m
 }
 
 // Init starts the external-shutdown wait, and nothing else. Client mode has no
@@ -189,10 +230,20 @@ func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 // With no ShutdownCh (attach) there is nothing to wait for and Init returns nil,
 // which is also what the no-poll proof in client_model_test.go pins.
 func (m ClientModel) Init() tea.Cmd {
-	if m.opts.ShutdownCh == nil {
+	var cmds []tea.Cmd
+	if m.opts.ShutdownCh != nil {
+		cmds = append(cmds, waitForExternalShutdown(m.opts.ShutdownCh))
+	}
+	if len(m.startupWarnings) > 0 {
+		warnings := m.startupWarnings
+		cmds = append(cmds, func() tea.Msg {
+			return StartupWarningsMsg{Warnings: warnings}
+		})
+	}
+	if len(cmds) == 0 {
 		return nil
 	}
-	return waitForExternalShutdown(m.opts.ShutdownCh)
+	return tea.Batch(cmds...)
 }
 
 // waitForExternalShutdown blocks in a command goroutine until ch closes (or
@@ -258,6 +309,26 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseMsg:
+		m.noteMousePosition(msg.X, msg.Y)
+		// Modal first, then menu, then content (plan 022 WS4 — invert of the
+		// pre-modal order where menu ran before the ModeHelp short-circuit).
+		if m.mode == ModeHelp {
+			m.handleHelpMouse(msg)
+			return m, nil
+		}
+		if handled, cmd := m.handleMenuMouse(msg); handled {
+			return m, cmd
+		}
+		// Non-menu mouse in text modes is ignored (menu blur handled above).
+		if m.mode == ModeSearch || m.mode == ModeStringFilter {
+			return m, nil
+		}
+		if handled, navCmd := m.handleContentMouse(msg); handled {
+			cmd := m.maybeFetchOlderRequests()
+			return m, tea.Batch(navCmd, cmd)
+		}
+
 	case ExternalShutdownMsg:
 		// Same exit as q/Ctrl-C: RunClient returns and the caller runs its
 		// normal shutdown sequence, so both routes are identical.
@@ -322,12 +393,6 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// alone, and the OK transition that precedes the first snapshot has
 		// already cleared it.
 		m.processes = []domain.ProcessInfo(msg)
-		// Update filter map with any new processes
-		for _, p := range m.processes {
-			if _, ok := m.filterProcesses[p.Name]; !ok {
-				m.filterProcesses[p.Name] = true
-			}
-		}
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process
@@ -337,6 +402,17 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case RestartResultClearMsg:
 		m.lastRestartProcess = ""
 		m.lastRestartError = nil
+
+	case StatusFlashClearMsg:
+		if msg.Seq == m.statusFlashSeq {
+			m.statusFlash = footerMsg{}
+			m.statusFlashClass = flashTransient
+		}
+
+	case StartupWarningsMsg:
+		for _, w := range msg.Warnings {
+			m.appendLogEntry(systemLogEntry(w))
+		}
 
 	case RequestDetailMsg:
 		// Every mutation — including detailLoading, previously cleared
@@ -355,6 +431,7 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !supersededByFinal {
 				m.detailLoading = false
 				m.requestDetail = msg.Details
+				m.requestDetailRaw = msg.Raw
 				m.detailError = nil
 				m.detailRefreshFailed = false
 				m.updateViewport()
@@ -377,12 +454,12 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Handle viewport updates
+	// Handle viewport updates for unhandled messages (wheel disabled — TUI routes scroll).
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
 
 	// Handle text input if in filter/search mode
-	if m.mode == ModeFilter || m.mode == ModeSearch || m.mode == ModeStringFilter {
+	if m.mode == ModeSearch || m.mode == ModeStringFilter {
 		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
 	}
@@ -390,13 +467,25 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// handleKey processes keyboard input
+// handleKey processes keyboard input.
+// Key routing order (plan 023 A3): ctrl+c quit (before every capture layer) →
+// open-menu capture (with ?→help special case) → text/help modes → client
+// actions (q/r/Enter) → menu openers + normal navigation. Text modes consume ?
+// as text. ModeHelp captures all keys except ctrl+c; q closes help without
+// quitting.
 func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Handle mode-specific keys first
+	// Global quit before open-menu capture and mode dispatch (plan 023 A3 / B3).
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+
+	// 1. Open-menu capture: every key consumed, never re-dispatched.
+	if m.menuOpen() {
+		return m, m.handleMenuKey(msg)
+	}
+
+	// 2. Mode-specific keys (textinput / help).
 	switch m.mode {
-	case ModeFilter:
-		_, cmd := m.handleFilterKey(msg)
-		return m, cmd
 	case ModeSearch:
 		_, cmd := m.handleSearchKey(msg)
 		return m, cmd
@@ -408,9 +497,9 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Normal mode keys
+	// 3. Client actions.
 	switch msg.String() {
-	case "q", "ctrl+c":
+	case "q":
 		return m, tea.Quit
 
 	case "r":
@@ -429,36 +518,53 @@ func (m ClientModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.viewMode == ViewModeRequests {
 			requestID := m.getSelectedRequest()
 			if requestID != "" {
-				m.selectedRequestID = requestID
-				m.viewMode = ViewModeRequestDetail
-				m.detailLoading = true
-				m.requestDetail = nil
-				m.detailError = nil
-				m.detailRefreshFailed = false
-				m.renderDetailFromTop()
-				m.detailFetchSeq++
-				return m, m.fetchRequestDetail(requestID, m.detailFetchSeq)
+				return m, m.beginRequestDetail(requestID)
 			}
 		}
 		return m, nil
 	}
 
-	// Handle common navigation keys. A handled key may have moved the requests
-	// cursor onto the oldest visible row, which is scroll-back's trigger (D11):
-	// the check has to run HERE rather than inside handleNavigationKey, which
-	// returns a bool and cannot dispatch a command.
-	if m.handleNavigationKey(msg) {
-		// The command is evaluated BEFORE m is copied into the return values:
-		// maybeFetchOlderRequests mutates m (pagingPhase=loading), and Go does
-		// not specify the order of a plain operand relative to a call in the
-		// same return statement — `return m, m.maybeFetchOlderRequests()` could
-		// legally return a model copy without the mutation, silently breaking
-		// single-flight (CodeRabbit, PR #88).
-		cmd := m.maybeFetchOlderRequests()
+	// 4. Grab-for-agent copy (WS10): y/c/Y in requests + detail; logs y when
+	// a /-search cursor is parked.
+	if handled, cmd := m.handleCopyKey(msg); handled {
 		return m, cmd
 	}
 
+	// 5. Menu openers (m/v/f) + common navigation.
+	wasDetail := m.viewMode == ViewModeRequestDetail
+	handled, navCmd := m.handleNavigationKey(msg)
+	if wasDetail && m.viewMode != ViewModeRequestDetail {
+		m.requestDetailRaw = nil
+	}
+	if handled {
+		// maybeFetchOlderRequests is evaluated BEFORE m is copied into the
+		// return values: it mutates m (pagingPhase=loading), and Go does not
+		// specify the order of a plain operand relative to a call in the same
+		// return statement — `return m, tea.Batch(navCmd, m.maybeFetchOlderRequests())`
+		// could legally return a model copy without the mutation, silently
+		// breaking single-flight (CodeRabbit, PR #88).
+		cmd := m.maybeFetchOlderRequests()
+		return m, tea.Batch(navCmd, cmd)
+	}
+
 	return m, nil
+}
+
+// beginRequestDetail opens the request detail view and starts a fetch.
+func (m *ClientModel) beginRequestDetail(requestID string) tea.Cmd {
+	m.selectedRequestID = requestID
+	m.viewMode = ViewModeRequestDetail
+	// Detail drops the requests header row — relayout so viewport height and
+	// YPosition match the new chrome before rendering (frame contract, C11).
+	m.relayout()
+	m.detailLoading = true
+	m.requestDetail = nil
+	m.requestDetailRaw = nil
+	m.detailError = nil
+	m.detailRefreshFailed = false
+	m.renderDetailFromTop()
+	m.detailFetchSeq++
+	return m.fetchRequestDetail(requestID, m.detailFetchSeq)
 }
 
 // fetchRequestDetail returns a command to fetch request details from the API,
@@ -499,7 +605,7 @@ func (m ClientModel) fetchRequestDetail(id string, seq int) tea.Cmd {
 			}
 		}
 
-		return RequestDetailMsg{ID: id, Seq: seq, Details: detail}
+		return RequestDetailMsg{ID: id, Seq: seq, Details: detail, Raw: resp}
 	}
 }
 
@@ -521,38 +627,21 @@ func clientBodyToBodyData(body *api.CapturedBodyResponse) *BodyData {
 	}
 }
 
-// View renders the TUI
+// View renders the TUI. ModeHelp returns the live main frame with the help
+// modal spliced on top (plan 022 WS4) — log streams keep updating behind it.
 func (m ClientModel) View() string {
+	// Frame-top reset: every renderer re-records or loses (plan 023 A1).
+	// Must run before the !ready early return so a connecting frame cannot
+	// leave prior-session rects live.
+	m.mustHits().resetFrame()
 	if !m.ready {
 		return "Connecting to prox..."
 	}
 
-	switch m.mode {
-	case ModeHelp:
-		return m.helpView()
-	default:
-		statusInfo := m.opts.ConnectedStatus
-		if errors.Is(m.connectionError, errProcessesStreamUnsupported) {
-			// The old-daemon park is not an outage and never self-heals by
-			// waiting, so "retrying..." would be a lie — render the actionable
-			// hint instead.
-			statusInfo = truncateError(m.connectionError, maxErrorDisplayLen)
-		} else if m.connectionError != nil && m.streamHealth[StreamProcesses].State == stream.StateClosed {
-			// Terminal: the loop is gone (auth failure classified terminal, or
-			// quit teardown) and no retry will ever happen — promising one
-			// would be a lie too (codex C12 finding).
-			statusInfo = "Connection lost: " + truncateError(m.connectionError, maxErrorDisplayLen)
-		} else if m.connectionError != nil {
-			// One wording for every transient degraded processes-stream state:
-			// the per-stream detail lives in the status bar's health segments.
-			statusInfo = "Connection error (retrying...)"
-		} else if m.lastRestartProcess != "" {
-			if m.lastRestartError != nil {
-				statusInfo = "Restart failed: " + truncateError(m.lastRestartError, maxErrorDisplayLen)
-			} else {
-				statusInfo = "Restarted: " + m.lastRestartProcess
-			}
-		}
-		return m.mainView(statusInfo)
+	statusInfo := m.resolveFooterMsg()
+	frame := m.mainView(statusInfo)
+	if m.mode == ModeHelp {
+		frame = m.spliceHelpModal(frame)
 	}
+	return m.appendCursorShape(frame)
 }

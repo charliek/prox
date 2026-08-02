@@ -657,8 +657,10 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	// for the one command most likely to want it (plan 020 C3 part D).
 	client := NewClient(apiAddr)
 
-	// Verify connection
-	if _, err := client.GetStatus(); err != nil {
+	// Verify connection and learn the daemon's registered project directory
+	// for the menu-bar label (plan 023 B3).
+	status, err := client.GetStatus()
+	if err != nil {
 		return clientError(err, "Is prox running? Try 'prox up -d' first.")
 	}
 
@@ -671,6 +673,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 			QuitMessage: "Quit (daemon continues running)",
 		},
 		ConnectedStatus: "Connected via API",
+		ProjectName:     tui.StatusProjectName(status.ProjectDir),
 		ShutdownCh:      nil,
 	}
 	if err := tui.RunClient(client, opts); err != nil {

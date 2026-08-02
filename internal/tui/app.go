@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -61,18 +62,40 @@ type TUIClient interface {
 // RunClient starts the TUI application in client mode (connected via API).
 //
 // opts carries the caller's wording and, for a caller that supervises processes,
-// its shutdown channel. Unlike Run above, RunClient starts no goroutine of its
-// own to quit the program: the wait on opts.ShutdownCh is a command the model
-// returns from Init (see ClientOptions.ShutdownCh), so every quit — user
-// keypress or out-of-band request — arrives as a message through Update.
+// its shutdown channel. RunClient starts no goroutine of its own to quit the
+// program: the wait on opts.ShutdownCh is a command the model returns from Init
+// (see ClientOptions.ShutdownCh), so every quit — user keypress or out-of-band
+// request — arrives as a message through Update.
 func RunClient(client TUIClient, opts ClientOptions) error {
+	settings, warnings := LoadSettings()
+	if settings.Theme != "" {
+		_, themeWarnings := SetThemeByName(settings.Theme)
+		warnings = append(warnings, themeWarnings...)
+	}
+
 	model := NewClientModel(client, opts)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	model.settings = settings
+	model.startupWarnings = warnings
+	if model.projectName == "" {
+		model.projectName = resolveProjectName(opts.ProjectName)
+	}
+
+	// WithMouseAllMotion (?1003) enables free-motion menu hover (plan 022 WS2,
+	// strix parity). Motion floods input at cell rate: hover handlers stay O(1)
+	// and mutate only on effective change, so the renderer's identical-frame
+	// skip suppresses tty writes. Documented fallback if real terminals suffer:
+	// toggle mouse only while a menu is open, then drag-only.
+	// viewport.MouseWheelEnabled is false on the model so bubbles does not
+	// double-scroll wheel events (Codex #5).
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion(), tea.WithOutput(os.Stdout))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go runClientStreams(ctx, client, p.Send)
 
+	// Restore the terminal pointer on every exit path (plan 023 C17). The app
+	// binds no suspend key; if one is added later, reset/restore should join it.
+	defer resetTerminalPointer()
 	_, err := p.Run()
 
 	// Cleanup: cancel context to stop the stream loops
@@ -285,6 +308,7 @@ func streamedProxyRequest(send func(tea.Msg), req api.ProxyRequestResponse) prox
 		Method:     req.Method,
 		URL:        req.URL,
 		Subdomain:  req.Subdomain,
+		Hostname:   req.Hostname, // plan 021 C10 / Codex #10 — was dropped before
 		StatusCode: req.StatusCode,
 		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
 		RemoteAddr: req.RemoteAddr,

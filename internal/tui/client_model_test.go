@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -274,7 +275,7 @@ func newClientRequestsModel(stub *stubTUIClient, n, viewportHeight int) ClientMo
 	m := NewClientModel(stub, attachClientOptions())
 	m.viewMode = ViewModeRequests
 	m.proxyRequests = makeTestRequests(n)
-	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: viewportHeight + 6})
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: viewportHeight + defaultChromeHeight() + defaultPanelBorder() + defaultRequestsHeaderRows()})
 	return nm.(ClientModel)
 }
 
@@ -315,14 +316,11 @@ func TestClientModel_NeverPollsProcesses(t *testing.T) {
 	assert.Zero(t, stub.getProcessesCalls(), "nothing in attach mode may poll REST /processes")
 }
 
-// TestClientModel_ProcessesMsgUpdatesListAndFilterMap pins that a snapshot
-// delivered by the stream lands exactly as the poll's result did: the process
-// list is replaced wholesale and every new name is registered (defaulting to
-// visible) in the filter map, while an existing name's filter choice is left
-// alone.
-func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
+// TestClientModel_ProcessesMsgUpdatesList pins that a snapshot delivered by the
+// stream lands exactly as the poll's result did: the process list is replaced
+// wholesale.
+func TestClientModel_ProcessesMsgUpdatesList(t *testing.T) {
 	m := NewClientModel(&stubTUIClient{}, attachClientOptions())
-	m.filterProcesses["web"] = false // the user hid this one earlier
 
 	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{
 		{Name: "web", State: domain.ProcessState("running"), PID: 10},
@@ -332,8 +330,6 @@ func TestClientModel_ProcessesMsgUpdatesListAndFilterMap(t *testing.T) {
 	require.Len(t, m.processes, 2)
 	assert.Equal(t, "web", m.processes[0].Name)
 	assert.Equal(t, 10, m.processes[0].PID)
-	assert.False(t, m.filterProcesses["web"], "an existing filter choice survives a snapshot")
-	assert.True(t, m.filterProcesses["api"], "a newly seen process defaults to visible")
 
 	// A later snapshot replaces the list wholesale (processes can disappear).
 	m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{{Name: "api"}}))
@@ -814,21 +810,30 @@ func TestClientModel_EmptyConnectedStatusRendersNothing(t *testing.T) {
 	assert.NotContains(t, m.View(), "Connected via API")
 }
 
-// TestClientModel_HelpConfigFromOptions pins the help overlay's two per-caller
-// strings threading through ClientOptions into BaseModel.
+// TestClientModel_HelpConfigFromOptions pins the help modal's two per-caller
+// strings threading through ClientOptions into BaseModel. View() shows BOTH
+// live chrome and the help box (plan 022 WS4).
 func TestClientModel_HelpConfigFromOptions(t *testing.T) {
 	opts := ClientOptions{Help: HelpConfig{
 		TitleSuffix: "(Local Mode)",
 		QuitMessage: "Quit (stops all processes)",
 	}}
 	m := NewClientModel(&stubTUIClient{}, opts)
-	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 80})
 	m = nm.(ClientModel)
-	m.mode = ModeHelp
+	nm, _ = m.Update(keyRune('?')) // open via the real entry path
+	m = nm.(ClientModel)
+	require.True(t, m.mode == ModeHelp)
 
 	help := m.View()
-	assert.Contains(t, help, "(Local Mode)")
 	assert.Contains(t, help, "Quit (stops all processes)")
 	assert.NotContains(t, help, "(Client Mode)")
 	assert.NotContains(t, help, "daemon continues running")
+	// TitleSuffix no longer appears in the bordered title (plan 023 B5); border
+	// shows the view label only.
+	assert.Contains(t, help, "Help — Logs")
+	// Live chrome behind the modal (merged footer).
+	assert.Contains(t, ansi.Strip(help), "? help")
+	assert.Contains(t, ansi.Strip(help), "[FOLLOW]")
+	assert.Contains(t, help, helpModalFooter)
 }
