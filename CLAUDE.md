@@ -18,7 +18,9 @@ failures.
 ## Docs build
 
 **Not part of the per-commit gate above.** Only for commits that touch
-`docs/`, `zensical.toml`, or the docs workflows:
+`docs/`, `zensical.toml`, `pyproject.toml`, `uv.lock`, or the docs workflows
+— the same set both docs workflows trigger on, since a dependency or
+lockfile change can break the build just as easily as a content change:
 
 ```shell
 uv run --locked zensical build --strict
