@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - 'docs/**'
-      - 'mkdocs.yml'
+      - 'zensical.toml'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/docs-pr.yml'
@@ -25,4 +25,4 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.13
       - run: uv sync --locked --group docs
-      - run: uv run --locked mkdocs build --strict
+      - run: uv run --locked zensical build --strict
