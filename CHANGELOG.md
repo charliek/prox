@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Changed
+
+- **Documentation now builds with [Zensical](https://zensical.org) instead of
+  MkDocs + Material for MkDocs** (plan 025). Material for MkDocs entered
+  maintenance mode in November 2025; Zensical is the successor from the same
+  team. `mkdocs.yml` is replaced by a native `zensical.toml`, and the docs
+  dependency group is a single `zensical` pin — `mkdocs`, `mkdocs-material`
+  and `pymdown-extensions` are gone. Published URLs, page structure and
+  heading anchors are unchanged, so existing links (including deep links)
+  still resolve. The site adopts Zensical's "modern" theme variant, so it
+  looks different; `variant = "classic"` restores the Material appearance.
+- **Both docs workflows now build `--strict`.** Previously only the PR build
+  was strict and `validation.links` was warn-only, so a broken link could
+  reach the published site. Zensical validates links and anchors natively and
+  aborts under `--strict`. `docs.yml` also gained `uv.lock` in its paths
+  filter, which it was missing, so a lockfile-only docs bump now redeploys.
+- `pymdown-extensions` is no longer a direct dependency; it comes in
+  transitively via `zensical`. The config still declares eight `pymdownx.*`
+  extensions, so if a future Zensical release drops that dependency the docs
+  build will need a direct pin again.
+
 ## v0.3.0
 
 The TUI release. `prox up --tui` and `prox attach` are now one redesigned

@@ -222,17 +222,18 @@ make clean    # Remove build artifacts
 
 ## Documentation Development
 
-The documentation site uses MkDocs with Material theme.
+The documentation site is built with [Zensical](https://zensical.org),
+configured in `zensical.toml`.
 
 ```bash
 # Install dependencies
 uv sync --group docs
 
 # Local preview (http://127.0.0.1:7070)
-uv run mkdocs serve
+uv run zensical serve
 
-# Build static site
-uv run mkdocs build
+# Build static site (--strict fails on broken links and anchors)
+uv run zensical build --strict
 ```
 
 Documentation is automatically published to GitHub Pages on push to main.

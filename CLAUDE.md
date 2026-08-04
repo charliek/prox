@@ -15,10 +15,33 @@ make lint && make test && make test-race && make build
 NOT pipe through `| tail` or similar; that swallows the exit code and hides
 failures.
 
+## Docs build
+
+**Not part of the per-commit gate above.** Only for commits that touch
+`docs/`, `zensical.toml`, `pyproject.toml`, `uv.lock`, or the docs workflows
+— the same set both docs workflows trigger on, since a dependency or
+lockfile change can break the build just as easily as a content change:
+
+```shell
+uv run --locked zensical build --strict
+```
+
+The site is [Zensical](https://zensical.org) (not MkDocs — migrated in plan
+025), configured in `zensical.toml`, built into `site-build/`. `--strict`
+fails on broken links and anchors and is what both CI workflows run, so run
+it locally before pushing docs changes. `uv run zensical serve` previews on
+`http://127.0.0.1:7070`.
+
+Two gotchas worth knowing: Zensical **silently ignores unknown config keys**
+even under `--strict`, so a green build does not prove a config edit did
+what you meant; and the `pymdownx.emoji` callables live in the
+`zensical.extensions.emoji` namespace — the Material for MkDocs
+`material.extensions.emoji` namespace aborts the build.
+
 ## Plans
 
 Panel-reviewed plans live OUTSIDE this repo, at
-`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 025). One plan → one
+`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 026). One plan → one
 PR of small gated commits. The plan file is never committed here, so the PR
 body must carry the plan's substance — reviewers and future readers only
 have the PR, not the plan file.

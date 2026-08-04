@@ -17,8 +17,11 @@ coverage.out
 # Python/uv
 .venv/
 
-# MkDocs build output
+# Docs build output
 site-build/
+
+# Zensical differential-build cache (root only)
+/.cache/
 
 # Prox runtime data
 .prox/

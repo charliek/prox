@@ -1,0 +1,140 @@
+# =============================================================================
+# Documentation Style Guidelines
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for all CLI options and configuration fields
+# - Code blocks with language hints (yaml, bash, json)
+# - Use admonitions sparingly (only for important notes/warnings)
+# - Examples should be copy-pasteable
+# - Keep pages focused and concise - one topic per page
+# - No deep troubleshooting guides - keep it minimal but useful
+# =============================================================================
+
+[project]
+
+site_name = "prox"
+site_description = "A modern process manager for development with an API-first design"
+site_author = "prox Contributors"
+site_url = "https://charliek.github.io/prox/"
+
+repo_name = "charliek/prox"
+repo_url = "https://github.com/charliek/prox"
+edit_uri = "edit/main/docs/"
+
+docs_dir = "docs"
+site_dir = "site-build"
+
+dev_addr = "127.0.0.1:7070"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Quick Start" = "getting-started/quick-start.md" },
+  ] },
+  { "Guides" = [
+    { "Local DNS & Certificates" = "guides/local-dns.md" },
+    { "Shared Proxy Across Projects" = "guides/shared-proxy.md" },
+    { "Dependencies, Tasks, and Process Gating" = "guides/dependencies.md" },
+  ] },
+  { "Design Notes" = [
+    { "Shared Proxy Across Projects" = "discovery/shared-proxy-across-projects.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "Configuration" = "reference/configuration.md" },
+    { "TUI" = "reference/tui.md" },
+    { "HTTP API" = "reference/api.md" },
+  ] },
+  { "Development" = [
+    { "Setup" = "development/setup.md" },
+    { "Architecture" = "development/architecture.md" },
+  ] },
+]
+
+# -----------------------------------------------------------------------------
+# Theme
+# -----------------------------------------------------------------------------
+[project.theme]
+
+# Pinned explicitly rather than relying on the default. "classic" reproduces
+# the Material for MkDocs look if that is ever wanted.
+variant = "modern"
+
+features = [
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "navigation.expand",
+  "navigation.footer",
+  "navigation.sections",
+  "navigation.top",
+  "search.highlight",
+  "search.share",
+]
+
+[project.theme.icon]
+logo = "material/console"
+
+[project.theme.font]
+text = "Roboto"
+code = "Roboto Mono"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+# -----------------------------------------------------------------------------
+# Extra
+# -----------------------------------------------------------------------------
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/charliek/prox"
+
+# -----------------------------------------------------------------------------
+# Markdown extensions
+# -----------------------------------------------------------------------------
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.details]
+
+# NOTE: the callable namespace is "zensical.extensions.emoji", not
+# "material.extensions.emoji" - the latter aborts the build under Zensical.
+[project.markdown_extensions.pymdownx.emoji]
+emoji_generator = "zensical.extensions.emoji.to_svg"
+emoji_index = "zensical.extensions.emoji.twemoji"
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
