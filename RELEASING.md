@@ -56,7 +56,7 @@ NOT bumped:
   GoReleaser. The ldflag references `{{.Version}}`, which GoReleaser
   computes from `${GITHUB_REF_NAME#v}` at build time. No source-tree
   manifest to bump.
-- `pyproject.toml` — for the mkdocs docs site; has its own version
+- `pyproject.toml` — for the Zensical docs site; has its own version
   cadence and is NOT touched by releases.
 
 ## Snapshot / dev versioning
