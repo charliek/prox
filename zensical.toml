@@ -54,46 +54,15 @@ nav = [
 # -----------------------------------------------------------------------------
 # Theme
 # -----------------------------------------------------------------------------
+# The shared StrideLabs theme (stridelabs-docs-theme, pinned in pyproject.toml)
+# supplies the palette, the self-hosted type stack, the feature toggles, and
+# the owl + project-icon header lockup. Anything set here overrides it.
 [project.theme]
+name = "stridelabs"
 
-# Pinned explicitly rather than relying on the default. "classic" reproduces
-# the Material for MkDocs look if that is ever wanted.
-variant = "modern"
-
-features = [
-  "content.code.annotate",
-  "content.code.copy",
-  "content.tabs.link",
-  "navigation.expand",
-  "navigation.footer",
-  "navigation.sections",
-  "navigation.top",
-  "search.highlight",
-  "search.share",
-]
-
+# The icon that says *which* tool this is -- rendered beside the shared owl.
 [project.theme.icon]
 logo = "material/console"
-
-[project.theme.font]
-text = "Roboto"
-code = "Roboto Mono"
-
-[[project.theme.palette]]
-media = "(prefers-color-scheme: light)"
-scheme = "default"
-primary = "indigo"
-accent = "indigo"
-toggle.icon = "lucide/sun"
-toggle.name = "Switch to dark mode"
-
-[[project.theme.palette]]
-media = "(prefers-color-scheme: dark)"
-scheme = "slate"
-primary = "indigo"
-accent = "indigo"
-toggle.icon = "lucide/moon"
-toggle.name = "Switch to light mode"
 
 # -----------------------------------------------------------------------------
 # Extra

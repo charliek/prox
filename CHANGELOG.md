@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Docs now use the shared StrideLabs theme**
+  ([stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+  v0.2.0), so this site and the other StrideLabs docs sites share one look
+  without copying CSS between repos. The header pairs the StrideLabs owl with
+  prox's own console icon; headings are Fraunces, body Inter, code JetBrains
+  Mono. Page URLs, structure and heading anchors are unchanged.
+
+  `zensical.toml` shrinks accordingly — the palette, fonts and feature
+  toggles now come from the theme and were deleted here. The theme installs
+  as a plain git dependency from a public repo, so there is no registry auth
+  and forks can still build the docs.
+
+  Fonts are **self-hosted** by the theme: the site no longer makes any
+  request to `fonts.googleapis.com` or `fonts.gstatic.com`, so no visitor IPs
+  reach a third party.
+
 - **Documentation now builds with [Zensical](https://zensical.org) instead of
   MkDocs + Material for MkDocs** (plan 025). Material for MkDocs entered
   maintenance mode in November 2025; Zensical is the successor from the same
