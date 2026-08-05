@@ -7,4 +7,11 @@ requires-python = ">=3.12"
 [dependency-groups]
 docs = [
     "zensical>=0.0.52",
+    "stridelabs-docs-theme",
 ]
+
+# Shared StrideLabs docs theme, installed straight from its public repo -- no
+# PyPI or registry auth, so forks and outside contributors can build the docs
+# unchanged. uv.lock pins the resolved commit alongside the tag.
+[tool.uv.sources]
+stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.1" }
