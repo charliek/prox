@@ -14,4 +14,4 @@ docs = [
 # PyPI or registry auth, so forks and outside contributors can build the docs
 # unchanged. uv.lock pins the resolved commit alongside the tag.
 [tool.uv.sources]
-stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.0" }
+stridelabs-docs-theme = { git = "https://github.com/charliek/stridelabs-docs-theme", tag = "v0.2.1" }

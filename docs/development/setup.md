@@ -90,12 +90,12 @@ The documentation site is built with [Zensical](https://zensical.org),
 configured in `zensical.toml`.
 
 ```bash
-# Install dependencies
-uv sync --group docs
+# Install dependencies (--locked pins the exact theme commit from uv.lock)
+uv sync --locked --group docs
 
 # Local preview (http://127.0.0.1:7070)
-uv run zensical serve
+uv run --locked zensical serve
 
 # Build static site (--strict fails on broken links and anchors)
-uv run zensical build --strict
+uv run --locked zensical build --strict
 ```

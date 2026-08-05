@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - **Docs now use the shared StrideLabs theme**
   ([stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
-  v0.2.0), so this site and the other StrideLabs docs sites share one look
+  v0.2.1), so this site and the other StrideLabs docs sites share one look
   without copying CSS between repos. The header pairs the StrideLabs owl with
   prox's own console icon; headings are Fraunces, body Inter, code JetBrains
   Mono. Page URLs, structure and heading anchors are unchanged.
@@ -19,8 +19,10 @@ All notable changes to this project will be documented in this file.
   and forks can still build the docs.
 
   Fonts are **self-hosted** by the theme: the site no longer makes any
-  request to `fonts.googleapis.com` or `fonts.gstatic.com`, so no visitor IPs
-  reach a third party.
+  request to `fonts.googleapis.com` or `fonts.gstatic.com`, so the Google
+  Fonts CDN never sees a visitor IP. (This covers fonts specifically — the
+  repo integration still calls `api.github.com` for star and fork counts,
+  since `repo_url` is set.)
 
 - **Documentation now builds with [Zensical](https://zensical.org) instead of
   MkDocs + Material for MkDocs** (plan 025). Material for MkDocs entered
