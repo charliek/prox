@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - **Docs now use the shared StrideLabs theme**
   ([stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
-  v0.2.1), so this site and the other StrideLabs docs sites share one look
+  v0.2.2), so this site and the other StrideLabs docs sites share one look
   without copying CSS between repos. The header pairs the StrideLabs owl with
   prox's own console icon; headings are Fraunces, body Inter, code JetBrains
   Mono. Page URLs, structure and heading anchors are unchanged.
@@ -42,6 +42,13 @@ All notable changes to this project will be documented in this file.
   transitively via `zensical`. The config still declares eight `pymdownx.*`
   extensions, so if a future Zensical release drops that dependency the docs
   build will need a direct pin again.
+
+- **Fixed the docs header lockup overlapping the site title in the mobile
+  drawer.** Behind the hamburger menu on a phone, the divider and project icon
+  painted on top of the site name. Zensical sizes that drawer slot for a single
+  glyph, so the wider lockup overflowed it. Fixed upstream in
+  [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+  v0.2.2; this bumps the pin. Desktop was never affected.
 
 ## v0.3.0
 
