@@ -20,12 +20,13 @@ const proxTUIEnvVar = "PROX_TUI"
 //
 //   - tuiModeRequired came from an explicit `--tui` on THIS command line. That
 //     is an assertion, so an incapable terminal is an error the user must see.
-//   - tuiModePreferred came from an environment variable (or, after plan 026
-//     C7, from the default). That is a standing preference carried into every
-//     shell, so an incapable terminal silently degrades to plain streaming —
-//     making it hard-error would turn one `export PROX_TUI=1` into a booby trap
-//     for every piped `prox up` in that shell.
-//   - tuiModePlain is "stream logs to the terminal", today's behavior.
+//   - tuiModePreferred came from an environment variable, or from the default
+//     a bare foreground `prox up` now carries (plan 026 C7). That is a standing
+//     preference rather than a per-invocation assertion, so an incapable
+//     terminal silently degrades to plain streaming — making it hard-error
+//     would turn one `export PROX_TUI=1`, or the mere fact of a new default,
+//     into a booby trap for every piped `prox up`.
+//   - tuiModePlain is "stream logs to the terminal".
 type tuiMode int
 
 const (
@@ -66,7 +67,12 @@ type tuiModeInputs struct {
 	Detach             bool
 	Env                string // raw PROX_TUI, "" if unset
 	EnvPresent         bool
-	AutoDefault        bool // false pre-flip (plan 026 C3), true post-flip (C7)
+	// AutoDefault is what a bare `prox up` — no flag, no env — resolves to.
+	// runUp passes true (plan 026 C7, the flip); the false rows stay in the
+	// matrix because they are the semantics every other caller and every
+	// pre-flip release had, and because "nothing asked for anything" is the row
+	// most likely to be changed again by accident.
+	AutoDefault bool
 }
 
 // tuiEnvTrue and tuiEnvFalse are the exact accepted PROX_TUI vocabularies,

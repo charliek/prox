@@ -6,6 +6,50 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A foreground `prox up` now opens the interactive TUI** (plan 026).
+  Previously it streamed plain logs and the TUI was reachable only behind an
+  explicit `--tui`, or via `prox up -d` + `prox attach`; the best view was the
+  one nobody saw. **This is a breaking UX change** to foreground `prox up`.
+
+  The TUI is *preferred*, never required: `prox up` falls back to plain log
+  streaming, silently and without an error, whenever the terminal cannot host a
+  full-screen UI — stdin or stdout is not a terminal (a pipe, a redirect, CI, an
+  agent harness), `TERM` is unset or `dumb`, or the process is not in the
+  terminal's foreground process group (a backgrounded `prox up &`, which would
+  otherwise stop on `SIGTTIN` the moment the TUI read the keyboard). Scripted
+  and CI invocations therefore behave exactly as before. If the TUI itself fails
+  to start, the session says so and degrades to plain streaming rather than
+  failing a command that never asked for a TUI. That fallback replays what the
+  log buffer still holds — the most recent 1000 entries, which on a quiet
+  startup is everything and on a noisy one is not; anything older has already
+  been evicted from the ring and is gone.
+
+  **Escape hatches:** `prox up --no-tui` for one run, or `PROX_TUI=0` (also
+  `false`, `no`, `off`) for a whole shell. `--tui` is retained as the explicit
+  "require it" form — it now *fails* rather than falls back when the terminal
+  cannot host a TUI, naming which condition failed — mirroring how `--capture`
+  was kept after capture became default-on. A flag that asserts something —
+  `--tui`, `--tui=false`, `--no-tui` — beats `PROX_TUI`, which is then not
+  consulted at all; `--no-tui=false` asserts nothing (it is the flag's own
+  default spelled out loud) and falls through to `PROX_TUI` and the default.
+  `--detach` short-circuits the whole decision, so `prox up -d` is unaffected by
+  any of it.
+
+  **`q` in the `prox up` TUI stops your processes**, exactly as Ctrl-C does: the
+  foreground `prox up` is their supervisor, so nothing outlives it. This is
+  unchanged behavior, but it is now the default view rather than an opt-in one,
+  so the owner-mode footer reads `q stop` (attach still reads `q quit`) and the
+  help modal names `prox up -d` + `prox attach` as the way to keep processes
+  running past quit.
+
+- **A `-d` child's stdlib `log` diagnostics now reach `.prox/prox.log`**
+  (plan 026). `daemon.SetupLogging` reassigns the `os.Stderr` variable, but the
+  stdlib logger captured the original at package init and the daemon child's
+  real fd 2 is `/dev/null` — so every `log.Printf` in a detached session was
+  written to nowhere. Those lines (shared-proxy connection loss and recovery,
+  API/SSE errors, net/http TLS handshake failures and handler panics) now land
+  in the daemon log file, which is a real increase in that file's volume.
+
 - **Docs now use the shared StrideLabs theme**
   ([stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
   v0.2.2), so this site and the other StrideLabs docs sites share one look

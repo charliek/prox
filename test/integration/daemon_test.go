@@ -60,7 +60,7 @@ processes:
 
 	// Verify API is accessible
 	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, 10*time.Second)
+	waitForAPI(t, apiAddr, apiReadyTimeout)
 
 	// Clean up: stop the daemon
 	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
@@ -335,7 +335,7 @@ processes:
 
 	// Verify API is accessible on the dynamic port
 	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, 10*time.Second)
+	waitForAPI(t, apiAddr, apiReadyTimeout)
 
 	t.Logf("Daemon using dynamic port: %d", state.Port)
 
@@ -398,7 +398,7 @@ processes:
 
 	// Verify API is accessible on the configured port
 	apiAddr := "http://127.0.0.1:16666"
-	waitForAPI(t, apiAddr, 10*time.Second)
+	waitForAPI(t, apiAddr, apiReadyTimeout)
 
 	// Clean up
 	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
@@ -454,7 +454,7 @@ processes:
 
 	// Wait for API to be ready before running CLI command
 	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, 10*time.Second)
+	waitForAPI(t, apiAddr, apiReadyTimeout)
 
 	// Run status command without specifying --addr
 	// It should auto-discover the API address from .prox/prox.state
@@ -522,7 +522,7 @@ processes:
 
 	// Verify API is accessible
 	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, 10*time.Second)
+	waitForAPI(t, apiAddr, apiReadyTimeout)
 
 	t.Logf("Foreground mode using dynamic port: %d", state.Port)
 }

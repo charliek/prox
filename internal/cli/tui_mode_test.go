@@ -58,6 +58,24 @@ func TestResolveTUIMode_Matrix(t *testing.T) {
 			in:   tuiModeInputs{NoTUISet: true, NoTUIVal: true, Detach: true},
 			want: tuiModePlain, wantAuto: tuiModePlain,
 		},
+		{
+			// THE regression row for plan 026's highest risk (codex review of
+			// C7). TUIVal without TUISet is what a caller passing the RESOLVED
+			// value — or a raw `useTUI` read that never asks Changed() — looks
+			// like from in here. With the flip on, that value is true for every
+			// `prox up -d` typed at a normal terminal, so a conflict predicate
+			// reading it would reject essentially every detached start. The
+			// pty test (TestUpDetach_OnPTYStartsDaemon) proves the composite
+			// property end to end; THIS row is what isolates the predicate.
+			name: "--detach + a TUI value that was never typed: no conflict, plain",
+			in:   tuiModeInputs{TUISet: false, TUIVal: true, Detach: true},
+			want: tuiModePlain, wantAuto: tuiModePlain,
+		},
+		{
+			name: "--no-tui=false + --detach: asserts nothing, still plain",
+			in:   tuiModeInputs{NoTUISet: true, NoTUIVal: false, Detach: true},
+			want: tuiModePlain, wantAuto: tuiModePlain,
+		},
 
 		// --- conflicts --------------------------------------------------------
 		{
@@ -281,6 +299,59 @@ func TestResolveTUIMode_AutoDefaultOnlyMovesTheUnaskedRow(t *testing.T) {
 		require.NoError(t, errOff)
 		require.NoError(t, errOn)
 		assert.Equal(t, gotOff.String(), gotOn.String(), "inputs %+v must not depend on AutoDefault", in)
+	}
+}
+
+// TestResolveTUIMode_DetachIsUnconditionallyPlain states, as a property, the
+// two claims that actually carry `prox up -d`'s immunity to the flip. The pty
+// test (test/integration/tui_pty_test.go, TestUpDetach_OnPTYStartsDaemon) pins
+// the composite behavior on a real terminal, but it cannot isolate either claim:
+// the short-circuit below runs before terminal capability is ever consulted, so
+// a conflict check reading the resolved mode could not fire there anyway. This
+// is where the isolation lives (codex review of plan 026 C7).
+//
+//  1. Detach ⇒ plain for EVERY other combination of inputs, AutoDefault
+//     included. The resolver is not handed terminal capability at all — runUp
+//     probes the terminal only after this returns — so "regardless of terminal
+//     capability" is a structural property of the short-circuit, and this
+//     enumerates the inputs it must survive.
+//  2. The --tui/--detach conflict requires TUISet && TUIVal — the flag TYPED
+//     as an assertion. Neither a bare `-d` nor `--tui=false -d` nor
+//     `--no-tui=false -d` may error, whatever the value half says.
+func TestResolveTUIMode_DetachIsUnconditionallyPlain(t *testing.T) {
+	// Every input shape that is NOT an explicit `--tui` assertion. The one
+	// combination deliberately absent is TUISet && TUIVal, which is the
+	// conflict and is asserted separately below.
+	others := []tuiModeInputs{
+		{},
+		{TUISet: true, TUIVal: false},
+		{TUISet: false, TUIVal: true}, // the "resolved value passed as if typed" bug
+		{NoTUISet: true, NoTUIVal: true},
+		{NoTUISet: true, NoTUIVal: false},
+		{Env: "1", EnvPresent: true},
+		{Env: "0", EnvPresent: true},
+		{Env: "banana", EnvPresent: true},
+		{Env: "", EnvPresent: true},
+	}
+	for _, base := range others {
+		for _, auto := range []bool{false, true} {
+			in := base
+			in.Detach = true
+			in.AutoDefault = auto
+
+			got, warnings, err := resolveTUIMode(in)
+
+			require.NoError(t, err, "no non-asserted input may make `prox up -d` an error: %+v", in)
+			assert.Equal(t, tuiModePlain.String(), got.String(), "detach must short-circuit to plain: %+v", in)
+			assert.Empty(t, warnings, "detach skips the env parse entirely, so the -d parent and its re-exec'd child cannot double-warn: %+v", in)
+		}
+	}
+
+	// The conflict fires for, and only for, a typed `--tui`.
+	for _, auto := range []bool{false, true} {
+		_, _, err := resolveTUIMode(tuiModeInputs{TUISet: true, TUIVal: true, Detach: true, AutoDefault: auto})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--tui and --detach are mutually exclusive")
 	}
 }
 

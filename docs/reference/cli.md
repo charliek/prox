@@ -33,7 +33,7 @@ An explicit `--addr` skips both discovery and this check — it is the deliberat
 
 ### up
 
-Start processes. By default runs in the foreground; use `--detach` for background/daemon mode.
+Start processes. By default runs in the foreground, where it opens the [interactive TUI](tui.md) if the terminal can host one and streams plain logs otherwise; use `--detach` for background/daemon mode.
 
 ```bash
 prox up [processes...]
@@ -42,8 +42,8 @@ prox up [processes...]
 | Flag | Description |
 |------|-------------|
 | `--detach, -d` | Run in background (daemon mode) |
-| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`; requires a terminal that can host it — see below) |
-| `--no-tui` | Never open the interactive TUI for this run. Overrides `PROX_TUI`; mutually exclusive with `--tui` |
+| `--tui` | Require the interactive TUI, and fail if the terminal cannot host one. The TUI is already the default in the foreground, so this is the explicit "I insist" form (foreground only, mutually exclusive with `--detach` — see below) |
+| `--no-tui` | Never open the interactive TUI for this run; stream plain logs instead. Overrides `PROX_TUI`; mutually exclusive with `--tui` |
 | `--api-port, -p` | Override API server port (otherwise dynamic) |
 | `--http-port` | Override proxy HTTP port |
 | `--https-port` | Override proxy HTTPS port |
@@ -54,23 +54,21 @@ prox up [processes...]
 **Examples:**
 
 ```bash
-# Start all processes (foreground)
+# Start all processes (foreground: the TUI in a terminal, plain logs under a pipe)
 prox up
 
-# Start in background (daemon mode)
-prox up -d
-
-# Start specific processes
+# Same, for specific processes
 prox up web api
 
-# Start with TUI (foreground only)
-prox up --tui
-
-# Start specific processes with TUI
-prox up --tui web api
-
-# Opt out of the TUI (overrides PROX_TUI=1)
+# Stream plain logs on a terminal too
 prox up --no-tui
+
+# Start in background (daemon mode), then watch it whenever you like
+prox up -d
+prox attach
+
+# Require the TUI: fail rather than fall back if the terminal cannot host one
+prox up --tui
 
 # Override API port
 prox up --api-port 6000
@@ -97,17 +95,22 @@ When no port is specified (via `--api-port` or `api.port` in config), prox autom
 
 **`-d`/`--detach` readiness:** the parent process no longer exits `0` the instant it forks the child. It polls for up to 15s for the child to write a PID-matched `.prox/prox.state` and answer `GET /health`, then prints `prox started (pid N, api http://host:port)` and exits `0` — a truthful signal that the daemon is actually accepting requests. If the child dies during startup (bad config, port bind failure), `prox up -d` exits `1` and prints the last ~20 lines of `.prox/prox.log`. If the child never becomes ready within 15s, `prox up -d` prints the same diagnostics, sends SIGTERM to the child (SIGKILL after a 5s grace if it doesn't exit), and exits `1`.
 
-**TUI mode resolution.** Whether `prox up` opens the interactive TUI is decided by, in order of precedence: an explicit flag, then the `PROX_TUI` environment variable, then whether the terminal can host it. Today the TUI only opens when something asks for it — a bare `prox up` streams plain logs.
+**TUI mode resolution.** Whether `prox up` opens the interactive TUI is decided by, in order of precedence: a flag that asserts something, then the `PROX_TUI` environment variable, then whether the terminal can host it. A bare foreground `prox up` **prefers the TUI**: it opens on a terminal that can host one and falls back to plain log streaming everywhere else, without an error.
 
 | Source | Effect |
 |--------|--------|
 | `--tui` | Open the TUI, and **fail** if the terminal cannot host one — an explicit request is an assertion |
 | `--no-tui`, `--tui=false` | Never open the TUI |
-| `PROX_TUI=1` (also `true`, `yes`, `on`) | Prefer the TUI. Falls back to plain log streaming — silently, without an error — when the terminal cannot host one |
+| `--no-tui=false` | Asserts nothing (it is the flag's own default spelled out loud) — falls through to `PROX_TUI` and the default below |
+| `PROX_TUI=1` (also `true`, `yes`, `on`) | Prefer the TUI (the default anyway) |
 | `PROX_TUI=0` (also `false`, `no`, `off`) | Never open the TUI |
-| neither | Plain log streaming |
+| neither | Prefer the TUI. Falls back to plain log streaming — silently, without an error — when the terminal cannot host one |
 
-`PROX_TUI` values are matched case-insensitively and trimmed of surrounding whitespace; any other value (including an empty one) is reported as a warning and ignored. An explicit flag wins over `PROX_TUI` outright — when a flag is present the variable is not consulted at all, so a bad value next to a flag produces no warning. `--detach` short-circuits the whole decision: a daemon has no terminal, so `PROX_TUI` is not read and `prox up -d` is unaffected by it.
+Quitting the TUI with `q` **stops your processes**, exactly as Ctrl-C does: the foreground `prox up` is their supervisor, so nothing outlives it. Use `prox up -d` and [`prox attach`](#attach) for a TUI you can walk away from.
+
+If the TUI is preferred rather than required and it fails to start, `prox up` says so and degrades to plain log streaming rather than failing a command that never asked for a TUI. The fallback replays what the log buffer still holds — the most recent 1000 entries — so a quiet startup is recovered in full and a noisy one is not: entries the ring has already evicted are gone. (The replay also repeats the startup lines already printed above the TUI, so those appear twice on this path.) With an explicit `--tui` the same failure exits non-zero instead.
+
+`PROX_TUI` values are matched case-insensitively and trimmed of surrounding whitespace; any other value (including an empty one) is reported as a warning and ignored. A flag that asserts something — `--tui`, `--tui=false`, `--no-tui` — wins over `PROX_TUI` outright: the variable is then not consulted at all, so a bad value next to such a flag produces no warning. `--no-tui=false` is the exception, because it asserts nothing: it falls through to `PROX_TUI` exactly as an absent flag does. `--detach` short-circuits the whole decision: a daemon has no terminal, so `PROX_TUI` is not read and `prox up -d` is unaffected by it.
 
 **A terminal can host the TUI when** stdin *and* stdout are both terminals, `TERM` is set to something other than `dumb`, and the process is in the terminal's foreground process group (so a backgrounded `prox up &` is excluded — reading the keyboard from a background job raises `SIGTTIN` and stops it). `--tui` reports which of the three conditions failed.
 
@@ -254,7 +257,7 @@ prox down
 
 ### attach
 
-Attach TUI to a running daemon. Opens an interactive terminal UI connected via the API.
+Attach the TUI to a running daemon. Opens an interactive terminal UI connected via the API — the same TUI a foreground `prox up` shows, so `attach` is for the daemons you started with `-d`.
 
 ```bash
 prox attach
@@ -269,8 +272,8 @@ prox up -d
 # Attach TUI to running daemon
 prox attach
 
-# TUI operations work the same as `prox up --tui`
-# Press q to detach (daemon continues running)
+# TUI operations work the same as they do under `prox up`
+# Press q to detach (daemon continues running, unlike q under `prox up`)
 ```
 
 **Connection Errors:**

@@ -41,7 +41,7 @@ processes for local development. It supports:
   - Real-time log aggregation and filtering
   - HTTP/HTTPS reverse proxy with hostname routing, shared across projects
   - Proxied request inspection (prox requests) with captured bodies
-  - Interactive TUI for monitoring
+  - An interactive TUI, shown by default when you run 'prox up' in a terminal
   - Background daemon mode`,
 	Version:           version.Version,
 	SilenceUsage:      true,

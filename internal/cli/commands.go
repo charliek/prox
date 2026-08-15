@@ -637,7 +637,11 @@ var attachCmd = &cobra.Command{
 	Long: `Attach the interactive TUI to a running prox daemon.
 
 This allows you to monitor and interact with processes started with
-'prox up -d' (daemon mode).
+'prox up -d' (daemon mode). A foreground 'prox up' already shows the same TUI
+itself, so attach is for daemons you started detached.
+
+The two differ only in ownership: quitting attach with 'q' leaves the daemon
+and its processes running, while quitting a foreground 'prox up' stops them.
 
 Examples:
   prox attach`,

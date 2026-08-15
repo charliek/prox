@@ -6,7 +6,7 @@ A modern process manager for development with an API-first design.
 
 - **Simple by default** - Procfile-like experience with minimal configuration
 - **API-first** - Full process control and log access via HTTP
-- **Interactive TUI** - Real-time log viewing with menu bar, themes, query filter bar, and mouse support
+- **Interactive TUI, by default** - `prox up` in a terminal opens it: real-time log viewing with menu bar, themes, query filter bar, and mouse support
 - **HTTP/HTTPS proxy** - Friendly local hostnames with shared multi-project port support
 - **Health checks** - Optional health monitoring for processes
 
@@ -91,10 +91,17 @@ Start all processes:
 prox up
 ```
 
-Start with the interactive TUI:
+In a terminal that opens the interactive TUI; piped, redirected or in CI it streams plain logs instead. To stream plain logs on a terminal too:
 
 ```bash
-prox up --tui
+prox up --no-tui
+```
+
+Quitting the TUI with `q` stops the processes, like Ctrl-C. To leave them running, start detached and attach when you want to look:
+
+```bash
+prox up -d
+prox attach
 ```
 
 ## Configuration
@@ -134,8 +141,9 @@ processes:
 ## CLI Commands
 
 ```bash
-prox up [processes...]           # Start processes (foreground)
-prox up --tui [processes...]     # Start with interactive TUI
+prox up [processes...]           # Start processes (foreground: TUI in a terminal, plain logs otherwise)
+prox up --no-tui [processes...]  # Start in the foreground with plain log streaming
+prox up -d [processes...]        # Start in the background; `prox attach` opens the TUI on it
 prox stop                        # Stop running instance
 prox restart <process>           # Restart a process (re-reads prox.yaml, applies its current config)
 prox status                      # Show process status

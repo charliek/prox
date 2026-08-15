@@ -21,6 +21,23 @@ const (
 	testAPIAddr = "http://127.0.0.1:15555"
 )
 
+// TestMain scrubs PROX_TUI from this test process's environment before any test
+// runs, so no `prox` subprocess started here can inherit a developer's own
+// setting (codex review of plan 026 C7).
+//
+// PROX_TUI is a documented per-shell knob that outranks terminal capability, and
+// nearly every test in this package launches the real binary with an inherited
+// environment. An ambient PROX_TUI=1 makes the TUI-default tests pass even
+// against a reverted default; an ambient PROX_TUI=0 makes them fail against
+// correct code; an ambient garbage value adds a warning line to output several
+// tests assert on. Tests that mean to exercise the variable set it explicitly on
+// cmd.Env, which is unaffected by this. (The pty helpers filter it out of
+// cmd.Env as well, so they do not silently depend on this.)
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("PROX_TUI")
+	os.Exit(m.Run())
+}
+
 // buildBinary builds the prox binary and returns its path
 func buildBinary(t *testing.T) string {
 	t.Helper()
@@ -43,6 +60,21 @@ func buildBinary(t *testing.T) string {
 
 	return binary
 }
+
+// apiReadyTimeout is the standard budget for "has the daemon's API come up
+// yet?" across this suite.
+//
+// It is not a performance assertion — every use polls for something that either
+// happens or fails the test — so a generous budget costs only how long a real
+// failure takes to report. It was a fixed 10s, which does not survive
+// `make test-race`: that builds and runs every package concurrently with race
+// instrumentation, so the whole unit suite competes with these integration
+// tests for cores and a race-instrumented `prox up` regularly needs more than
+// 10s to bind and answer. The failure signature is a wave of "API did not
+// become ready within 10s" across unrelated tests, which reads exactly like a
+// real regression and is not one. See ptyWaitTimeout in tui_pty_test.go for the
+// same problem on the pty side.
+const apiReadyTimeout = 30 * time.Second
 
 // waitForAPI waits for the API to be ready
 func waitForAPI(t *testing.T, addr string, timeout time.Duration) {

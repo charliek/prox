@@ -39,7 +39,7 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 	defer killProx(cmd)
 
 	// Wait for API to be ready
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	// Give processes time to start
 	time.Sleep(500 * time.Millisecond)
@@ -70,7 +70,7 @@ func TestUpCommand_ProcessList(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
@@ -108,7 +108,7 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 	binary := buildBinary(t)
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Request shutdown via API
@@ -143,7 +143,7 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	out, exitCode := runProx(t, binary, "stop", "-c", configPath("integration"))
@@ -178,7 +178,7 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	start := time.Now()
@@ -205,7 +205,7 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Fire the first stop in the background; it waits for the drain. Capture its
@@ -285,7 +285,7 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"), "long")
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
@@ -327,7 +327,7 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	defer killProx(prox.cmd)
 
 	// Wait for API to be ready
-	waitForAPI(t, grandchildAPIAddr, 10*time.Second)
+	waitForAPI(t, grandchildAPIAddr, apiReadyTimeout)
 
 	// Wait until the grandchild's startup marker is visible in the SAME
 	// captured-output surface the post-exit assertions read (the terminal
@@ -451,7 +451,7 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 		// Confirms the daemon itself came up; the process crash happens
 		// concurrently with (just after) supervisor start, so this does not run
 		// past the window we're testing.
-		waitForAPI(t, addr, 10*time.Second)
+		waitForAPI(t, addr, apiReadyTimeout)
 
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so

@@ -35,7 +35,7 @@ Start all processes:
 prox up
 ```
 
-You'll see aggregated logs from all processes with color-coded prefixes.
+In a terminal this opens the [interactive TUI](#interactive-tui), showing every process and its logs live. Piped, redirected, or in CI it streams aggregated logs from all processes with color-coded prefixes instead; `prox up --no-tui` asks for that on a terminal too.
 
 ## Check Status
 
@@ -76,13 +76,22 @@ prox logs --process api
 
 ## Interactive TUI
 
-Start with the interactive terminal UI:
+A foreground `prox up` already gives you the interactive terminal UI — that is what you saw when you ran it above:
 
 ```bash
-prox up --tui
+prox up
 ```
 
-Note: The `--tui` flag works in foreground mode only, is mutually exclusive with `--detach`, and requires an interactive terminal (it errors under pipes or redirection). For background + TUI workflow, use `prox up -d` then `prox attach`. Either way it is the same TUI: `prox up --tui` runs it against the process's own API, exactly as `prox attach` does against a daemon — the only difference is that quitting `up --tui` stops your processes, while quitting `attach` leaves the daemon running.
+It opens whenever the terminal can host one, and quietly streams plain logs instead when it cannot: under a pipe or a redirect, in CI, with `TERM` unset or `dumb`, or in a backgrounded `prox up &`. To stream plain logs on a normal terminal too, pass `--no-tui` (or set `PROX_TUI=0` for the whole shell); to insist on the TUI and get an error rather than a fallback, pass `--tui`.
+
+Quitting with `q` stops your processes, exactly as Ctrl-C does — the foreground `prox up` is their supervisor. To keep them running and watch them whenever you like, start detached and attach:
+
+```bash
+prox up -d
+prox attach
+```
+
+It is the same TUI either way: `prox up` runs it against the process's own API, exactly as `prox attach` does against a daemon. The only difference is ownership — quitting `attach` leaves the daemon running, and the footer says which mode you are in (`q stop` vs `q quit`).
 
 The TUI provides:
 
@@ -92,7 +101,7 @@ The TUI provides:
 - Search with `/` and filter query language with `s` (Filter menu via `f`)
 - Process restart with `r`
 - Mouse: wheel scroll, row/chip clicks, double-click request rows for detail
-- Press `?` for help, `q` to quit
+- Press `?` for help, `q` to quit (stopping the processes under `prox up`, detaching under `prox attach`)
 
 ## Background Mode
 

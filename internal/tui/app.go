@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"time"
@@ -127,6 +128,41 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 	cancel()
 
 	return err
+}
+
+// IsCleanExit reports whether an error returned by RunClient describes an
+// ORDERLY end of the session rather than a failure — a quit the caller should
+// treat exactly as it treats `q`.
+//
+// It lives here, next to the one p.Run() call in the codebase, because it
+// encodes version-specific bubbletea internals (verified against the vendored
+// v1.3.10, tea.go):
+//
+//   - A normal quit (QuitMsg — `q`, ctrl+c in raw mode, opts.ShutdownCh, and an
+//     external SIGTERM caught by bubbletea's own handler) returns nil.
+//   - An external SIGINT caught by bubbletea's signal handler becomes an
+//     InterruptMsg, which ends the event loop with ErrInterrupted; Run then
+//     wraps it as `ErrProgramKilled: ErrInterrupted`. BOTH prox and bubbletea
+//     handle SIGINT, so which one gets there first is a race — this is the
+//     identifier that keeps a plain Ctrl-C/`kill -INT` from being reported as a
+//     TUI failure.
+//   - ErrProgramKilled BARE (identity, not errors.Is) is the Kill()/cancelled-
+//     context path, likewise an orderly end. errors.Is is deliberately NOT used
+//     for it: Run wraps EVERY killing error as `ErrProgramKilled: <cause>`
+//     (including `ErrProgramKilled: ErrProgramPanic` for a recovered panic), so
+//     an errors.Is check here would swallow real failures.
+func IsCleanExit(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, tea.ErrProgramPanic) {
+		return false
+	}
+	//nolint:errorlint // identity is the point: see the doc comment.
+	if err == tea.ErrProgramKilled {
+		return true
+	}
+	return errors.Is(err, tea.ErrInterrupted)
 }
 
 // runClientStreams runs one reconnect loop per attach-mode stream and blocks
