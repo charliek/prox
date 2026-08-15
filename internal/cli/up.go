@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -161,6 +162,38 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			}
 		}()
 	}
+
+	// Route every unintended diagnostic in this process through one switchable
+	// sink so a TUI session can render it instead of having its frame corrupted
+	// by it (see stdio_sink.go for the full audit and the concurrency protocol).
+	// This covers all 17 stdlib log.Printf sites AND every http.Server here,
+	// none of which sets ErrorLog — so net/http's TLS handshake errors and
+	// handler-panic dumps land in the sink too.
+	//
+	// A `-d` child's diagnostics reach .prox/prox.log rather than the /dev/null
+	// its real fd 2 points at, because the sink resolves os.Stderr at WRITE
+	// time and daemon.SetupLogging above reassigned that variable. Until now
+	// those lines were lost outright. (Construction order does NOT matter for
+	// that — lazy resolution is what makes it work — but the DEFER order does:
+	// see below.)
+	//
+	// Outside a TUI window the sink is a synchronous pass-through to stderr, so
+	// plain `prox up`, `-d` and CI behave exactly as before.
+	sink := newStdioSink()
+	restoreStdio := installStdioSink(sink)
+	// This install MUST stay below `defer logFile.Close()` above. Defers are
+	// LIFO, so registering the restore later makes it run EARLIER — its final
+	// flush to os.Stderr therefore lands in the daemon log file while that file
+	// is still open. Move this block above the SetupLogging block and the
+	// teardown diagnostics of every `-d` session are silently written to a
+	// closed descriptor.
+	//
+	// The restore itself is a backstop ONLY, for a panic or an early return:
+	// the owner-mode TUI path below restores explicitly and synchronously the
+	// moment RunClient returns, because this defer fires after performShutdown
+	// has already closed the log manager (see stdioSink.RestoreStderr's doc
+	// comment). Restoring twice is a no-op.
+	defer restoreStdio()
 
 	// Load config
 	cfg, err := config.Load(configPath)
@@ -436,7 +469,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
 		var proxyErr error
-		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime)
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink)
 		if proxyErr != nil {
 			return proxyErr
 		}
@@ -573,13 +606,27 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			tuiOpts.ProxyHTTPSPort = cfg.Proxy.HTTPSPort
 			tuiOpts.ProxyHTTPPort = cfg.Proxy.HTTPPort
 		}
-		if err := tui.RunClient(client, tuiOpts); err != nil {
+		// For the length of the alt-screen session, unintended diagnostics
+		// become "system" entries in the log pane instead of bytes written over
+		// a rendered frame. The route is asynchronous by necessity — a
+		// synchronous adapter deadlocks inside logs.Manager the first time a
+		// subscriber overflows (see stdio_sink.go).
+		sink.RouteToLogManager(logMgr)
+		runErr := tui.RunClient(client, tuiOpts)
+		// Restore EXPLICITLY and synchronously here, not via a runUp-scoped
+		// defer: that defer runs after performShutdown closes logMgr, so every
+		// teardown-era line — the shared-daemon "lost connection" line most of
+		// all — would be written into a manager with no subscribers that is
+		// about to be discarded, while the terminal showed nothing. This call
+		// is the barrier + drain + join back to stderr.
+		sink.RestoreStderr()
+		if runErr != nil {
 			// Printed now for the interactive user, and retained: a session
 			// whose TUI failed must not exit 0 just because shutdown went
 			// cleanly — scripted callers need to tell the two apart
 			// (CodeRabbit, PR #88). Folded into the exit contract below.
-			tuiErr = fmt.Errorf("TUI error: %w", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			tuiErr = fmt.Errorf("TUI error: %w", runErr)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", runErr)
 		}
 	} else {
 		// Log subscription + consumer were already started above, before the
@@ -1053,7 +1100,7 @@ func captureDiskBudget(cfg *config.Config) int64 {
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, *proxy.Service, error) {
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, logOut io.Writer) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
 	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt)
 	if ok {
@@ -1068,7 +1115,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// configured, so a create/start failure here is fatal (D1): `prox up` must
 	// never start a project with the proxy silently disabled. --no-proxy is the
 	// escape hatch (named in the returned error).
-	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers)
+	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1207,12 +1254,28 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 // `prox up` exits non-zero rather than continuing with the proxy silently
 // disabled. The returned error carries the proxyStartError hint (port-conflict
 // detail plus the --no-proxy escape hatch).
-func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxy.Service, error) {
+//
+// logOut is where the service's slog handler writes, and it is required. It is
+// threaded in rather than hard-wired to os.Stderr because proxy.Service's
+// ErrorHandler logs once per FAILED UPSTREAM REQUEST — the "backend has not
+// bound its port yet" window — which is mid-session output that would otherwise
+// shred a TUI frame. Deliberately NOT nil-tolerant: a nil-means-os.Stderr
+// default would let a future call site silently bypass the sink, which is the
+// exact frame corruption this plumbing exists to prevent.
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, logOut io.Writer) (*proxy.Service, error) {
+	// Fail here rather than at the first log record. slog would accept a nil
+	// writer and only panic when the ErrorHandler fires — i.e. mid-session, on
+	// the first failed upstream request, taking the whole daemon down long
+	// after the mistake was made (codex review finding).
+	if logOut == nil {
+		return nil, fmt.Errorf("internal: startStandaloneProxy requires a log destination")
+	}
+
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level}))
 
 	proxyService, err := proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
 	if err != nil {
