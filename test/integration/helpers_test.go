@@ -74,7 +74,7 @@ func buildBinary(t *testing.T) string {
 // become ready within 10s" across unrelated tests, which reads exactly like a
 // real regression and is not one. See ptyWaitTimeout in tui_pty_test.go for the
 // same problem on the pty side.
-const apiReadyTimeout = 30 * time.Second
+const apiReadyTimeout = 20 * time.Second
 
 // waitForAPI waits for the API to be ready
 func waitForAPI(t *testing.T, addr string, timeout time.Duration) {

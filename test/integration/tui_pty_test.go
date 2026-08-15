@@ -50,7 +50,7 @@ var tuiPTYWinsize = &pty.Winsize{Rows: 40, Cols: 120}
 // the only thing a larger budget costs is how long a genuine failure takes to
 // report.
 //
-// It was 15s, which is not survivable under `go test ./...`. That builds and
+// It was 15s, which is not survivable under `go test ./...`. 25s is deliberate headroom rather than a large number: a budget big enough to absorb load but small enough that a WAVE of failures still fits inside the package timeout. That builds and
 // runs every package CONCURRENTLY, so the whole unit suite — including the
 // deliberately slow race and deadlock tests added by plan 026 — competes with
 // these pty tests for the same cores, and `prox up` can easily take longer than
@@ -59,7 +59,7 @@ var tuiPTYWinsize = &pty.Winsize{Rows: 40, Cols: 120}
 // exactly like a real regression and is not one; it also predates plan 026
 // (reproduced on the C6 tree). CI runs `go test -v ./...` on two-core hosted
 // runners, where the squeeze is worse than on a dev machine.
-const ptyWaitTimeout = 45 * time.Second
+const ptyWaitTimeout = 25 * time.Second
 
 // altScreenEnter is the DEC private-mode sequence bubbletea writes when it
 // takes over the screen (tea.WithAltScreen). Its presence in the raw pty stream
