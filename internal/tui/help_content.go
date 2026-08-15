@@ -102,10 +102,9 @@ func (b *BaseModel) logsHelpSections() []helpSection {
 		},
 		{
 			title: "Actions",
-			rows: []helpKeyRow{
+			rows: append([]helpKeyRow{
 				{key: "r", desc: "Restart soloed process"},
-				{key: "q/Ctrl+C", desc: b.helpQuit()},
-			},
+			}, b.helpQuitRows()...),
 		},
 		{
 			title: "Mouse",
@@ -174,9 +173,7 @@ func (b *BaseModel) requestsHelpSections() []helpSection {
 		},
 		{
 			title: "Actions",
-			rows: []helpKeyRow{
-				{key: "q/Ctrl+C", desc: b.helpQuit()},
-			},
+			rows:  b.helpQuitRows(),
 		},
 		{
 			title: "Mouse",
@@ -212,15 +209,14 @@ func (b *BaseModel) detailHelpSections() []helpSection {
 		},
 		{
 			title: "View & chrome",
-			rows: []helpKeyRow{
+			rows: append([]helpKeyRow{
 				{key: "p", desc: "Toggle process panel"},
 				{key: "T", desc: "Toggle timestamps in log lines"},
 				{key: "w", desc: "Toggle soft-wrap"},
 				{key: "m", desc: "Toggle menu bar"},
 				{key: "t", desc: "Cycle theme"},
 				{key: "?", desc: "This help"},
-				{key: "q/Ctrl+C", desc: b.helpQuit()},
-			},
+			}, b.helpQuitRows()...),
 		},
 		{
 			title: "Mouse",

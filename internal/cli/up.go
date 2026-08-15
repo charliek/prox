@@ -653,7 +653,18 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		// re-read from ~/.prox/token.
 		client := NewClientWithToken(dialableAPIURL(cfg.API.Host, boundAPIPort(apiListener, cfg.API.Port)), token)
 		tuiOpts := tui.ClientOptions{
-			Help:        tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
+			// Owner-mode wording. `q` behaves exactly as it always has —
+			// RunClient returning falls through into the shutdown sequence
+			// below — but this TUI is pixel-for-pixel the attach TUI, where the
+			// same key leaves a daemon running, so the label is what keeps the
+			// two apart (plan 026 §3.2). The note names the supported way to
+			// keep processes alive past quit, since Model A has no detach key.
+			Help: tui.HelpConfig{
+				TitleSuffix: "",
+				QuitMessage: "Quit (stops processes)",
+				QuitNote:    "To keep processes running, start with 'prox up -d' and use 'prox attach'",
+				QuitHint:    "stop",
+			},
 			ShutdownCh:  coordinator.TriggerCh(),
 			ProjectName: tui.ConfigPathProjectName(absConfigPath),
 			// The startup lines this run printed to a terminal the alt screen is

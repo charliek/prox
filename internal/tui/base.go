@@ -69,12 +69,28 @@ const maxRequestHistory = constants.MaxProxyRequests
 // maxErrorDisplayLen is the maximum length of error messages in the status bar
 const maxErrorDisplayLen = 60
 
-// HelpConfig configures the help view for different modes
+// HelpConfig carries the per-mode wording for quitting: the help modal's title
+// suffix and quit line, and the footer strip's quit hint. The two callers of
+// this one TUI mean OPPOSITE things by `q` — `prox up` owns the processes and
+// takes them down with it, `prox attach` leaves a daemon running — while the
+// screens are otherwise identical, so this wording is the only thing that tells
+// a user which of the two they are looking at (plan 026 §3.2).
 type HelpConfig struct {
 	// TitleSuffix is appended to "Prox - Process Manager" (e.g., "(Client Mode)")
 	TitleSuffix string
-	// QuitMessage describes what happens on quit (e.g., "Quit" or "Quit (daemon continues running)")
+	// QuitMessage describes what happens on quit (e.g., "Quit (stops processes)"
+	// or "Quit (daemon continues running)")
 	QuitMessage string
+	// QuitNote is an optional second help-modal line under the quit binding,
+	// rendered in the description column. Owner mode names `prox up -d` +
+	// `prox attach` there as the way to keep processes running past quit;
+	// attach mode leaves it empty, having nothing to qualify.
+	QuitNote string
+	// QuitHint is the footer strip's label for the q key, rendered as
+	// `q <QuitHint>`. Empty → "quit". Owner mode passes "stop": the footer is
+	// always on screen, so it is where the two modes have to be distinguishable
+	// without opening help.
+	QuitHint string
 }
 
 // BaseModel contains shared fields for both Model and ClientModel
@@ -2852,7 +2868,7 @@ func (b *BaseModel) statusBar(msg footerMsg) string {
 	countPlain := fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	countStyled := styles.FooterLabel.Render(countPlain)
 
-	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints())
+	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints(b.helpConfig.QuitHint))
 	// Leading pad + flush-right mid-pad between left and right (plan 024 F3).
 	leading := styles.FooterLabel.Render(" ")
 	return singleFrameLine(padFooterRow(leading+left, right, b.width))
@@ -2964,6 +2980,19 @@ func (b *BaseModel) helpQuit() string {
 		return b.helpConfig.QuitMessage
 	}
 	return "Quit"
+}
+
+// helpQuitRows is the quit binding as it appears in every help section that
+// lists it: the binding itself, plus HelpConfig.QuitNote as a keyless
+// continuation line when the caller supplied one (owner mode). Keyless rows
+// render in the description column — the same idiom the filter sections use for
+// their query examples.
+func (b *BaseModel) helpQuitRows() []helpKeyRow {
+	rows := []helpKeyRow{{key: "q/Ctrl+C", desc: b.helpQuit()}}
+	if note := b.helpConfig.QuitNote; note != "" {
+		rows = append(rows, helpKeyRow{key: "", desc: note})
+	}
+	return rows
 }
 
 // containsIgnoreCase performs a case-insensitive substring search
