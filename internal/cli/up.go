@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -566,7 +567,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		if err := apiServer.Serve(apiListener); err != nil {
 			// Server closed is expected on shutdown
 			if !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
+				// Through the stdlib logger (and therefore the stdio sink), not
+				// straight to stderr: this fires on a DETACHED goroutine for the
+				// whole life of the session, so a permanent listener error would
+				// otherwise be written over the TUI's alt screen. log.SetFlags(0)
+				// keeps the plain-mode line byte-identical to the old write.
+				log.Printf("API server error: %v", err)
 			}
 		}
 	}()

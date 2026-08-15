@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -506,4 +509,178 @@ func TestInstallStdioSink_RestoresLogger(t *testing.T) {
 
 	assert.Same(t, prevOut, log.Writer())
 	assert.Equal(t, prevFlags, log.Flags())
+}
+
+// TestConvertedDiagnostics_RouteThroughTheSink pins plan 026 C2 part 1: the
+// mid-session writers that used to go straight to os.Stderr now go through the
+// stdlib logger, which is what puts them behind the sink.
+//
+// The four SSE parsers are the sharpest case in the audit — they run on the
+// TUI's OWN stream goroutines, so before this conversion a malformed frame wrote
+// itself across a rendered alt-screen frame. up.go's "API server error" site is
+// the same conversion on a detached goroutine; it is inline in runUp's Serve
+// closure and is not separately drivable from a unit test.
+func TestConvertedDiagnostics_RouteThroughTheSink(t *testing.T) {
+	t.Run("SSE parse warnings reach the log manager, not the terminal", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+		mgr := logs.NewManager(logs.DefaultManagerConfig())
+		defer mgr.Close()
+
+		sink := newStdioSink()
+		installSinkForTest(t, sink)
+		sink.RouteToLogManager(mgr)
+
+		// Every payload is malformed JSON, so each parser takes its warning
+		// branch and reports failure to its caller exactly as before.
+		_, ok := parseSSELogEntry("{not json")
+		assert.False(t, ok)
+		_, ok = parseSSEHandshake("{not json")
+		assert.False(t, ok)
+		_, ok = parseSSEProxyRequest("{not json")
+		assert.False(t, ok)
+		_, ok = parseSSEProcessList("{not json")
+		assert.False(t, ok)
+
+		sink.RestoreStderr()
+
+		lines := managerLines(t, mgr)
+		require.Len(t, lines, 4, "one entry per warning — the sink splits on newlines")
+		for i, want := range []string{
+			"warning: failed to parse SSE log entry: ",
+			"warning: failed to parse SSE handshake: ",
+			"warning: failed to parse SSE proxy request: ",
+			"warning: failed to parse SSE process snapshot: ",
+		} {
+			// Prefix, not Contains: log.SetFlags(0) must leave the line with no
+			// stdlib date/time prefix, so plain-mode output stays byte-identical
+			// to the fmt.Fprintf these replaced.
+			assert.True(t, strings.HasPrefix(lines[i], want),
+				"line %d = %q, want prefix %q", i, lines[i], want)
+		}
+		assert.Empty(t, readStderr(),
+			"nothing may reach the terminal while a TUI owns the screen")
+	})
+
+	t.Run("with no sink installed the warnings still reach stderr", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+
+		// The stdlib logger's default destination is captured at package init,
+		// so point it at the redirected os.Stderr for this subtest.
+		prevOut, prevFlags := log.Writer(), log.Flags()
+		log.SetOutput(os.Stderr)
+		log.SetFlags(0)
+		t.Cleanup(func() {
+			log.SetOutput(prevOut)
+			log.SetFlags(prevFlags)
+		})
+
+		_, ok := parseSSEHandshake("{not json")
+		assert.False(t, ok)
+
+		assert.Contains(t, readStderr(), "warning: failed to parse SSE handshake: ",
+			"outside a TUI session the diagnostic must remain visible")
+	})
+}
+
+// TestRunBufferedStdioSession pins plan 026 C2 part 2: the attach-mode wiring.
+//
+// runAttach itself needs a live API server and a terminal, so the wiring helper
+// is what is exercised here; runAttach's only job is to call it around
+// tui.RunClient.
+// TestReportStdioDrops pins that lost diagnostics are announced rather than
+// silently swallowed. The buffer and queue targets are both capped, and silent
+// truncation is the worst outcome for a diagnostic channel: the user sees a
+// clean exit and never learns that lines went missing (codex review finding).
+func TestReportStdioDrops(t *testing.T) {
+	t.Run("drops are reported once and the counter is consumed", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+		sink := newStdioSink()
+
+		// Wedge the drain so the queue fills and records are dropped.
+		release := make(chan struct{})
+		sink.routeAsync(1, func(stdioRecord) { <-release })
+		for range 50 {
+			_, _ = sink.Write([]byte("diagnostic\n"))
+		}
+		require.NotZero(t, sink.Drops(), "the wedged drain should have forced drops")
+
+		reportStdioDrops(sink)
+		assert.Contains(t, readStderr(), "diagnostic line(s) were dropped")
+		assert.Zero(t, sink.Drops(), "TakeDrops must consume the count so a backstop cannot double-report")
+
+		// A second report is silent — nothing new was lost.
+		before := readStderr()
+		reportStdioDrops(sink)
+		assert.Equal(t, before, readStderr())
+
+		close(release)
+		sink.RestoreStderr()
+	})
+
+	t.Run("a clean session reports nothing", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+		sink := newStdioSink()
+		reportStdioDrops(sink)
+		assert.Empty(t, readStderr())
+	})
+}
+
+func TestRunBufferedStdioSession(t *testing.T) {
+	t.Run("diagnostics are withheld during the session and replayed after", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+
+		err := runBufferedStdioSession(func() error {
+			// Stands in for the shared SSE-parse sites, which attach reaches
+			// through the very same client.go code owner mode uses.
+			_, ok := parseSSEProcessList("{not json")
+			assert.False(t, ok)
+			log.Print("prox: lost connection to shared proxy daemon")
+
+			assert.Empty(t, readStderr(),
+				"the attach TUI still owns the alt screen — nothing may be written to it")
+			return nil
+		})
+		require.NoError(t, err)
+
+		// Accepted limitation (plan 026 §9): attach has no log manager, so its
+		// diagnostics become visible only once the screen is released. That is
+		// deliberate, and strictly better than corrupting the frame.
+		out := readStderr()
+		assert.Contains(t, out, "warning: failed to parse SSE process snapshot: ")
+		assert.Contains(t, out, "prox: lost connection to shared proxy daemon\n")
+	})
+
+	t.Run("the session error is returned unchanged", func(t *testing.T) {
+		redirectStderr(t)
+
+		sentinel := errors.New("bubbletea failed")
+		err := runBufferedStdioSession(func() error { return sentinel })
+		assert.ErrorIs(t, err, sentinel)
+	})
+
+	t.Run("the stdlib logger is restored when the session ends", func(t *testing.T) {
+		readStderr := redirectStderr(t)
+		prevOut, prevFlags := log.Writer(), log.Flags()
+
+		var inSession io.Writer
+		require.NoError(t, runBufferedStdioSession(func() error {
+			inSession = log.Writer()
+			return nil
+		}))
+
+		_, isSink := inSession.(*stdioSink)
+		assert.True(t, isSink, "the session must route the stdlib logger at its sink")
+		assert.Same(t, prevOut, log.Writer(), "the previous writer must be restored")
+		assert.Equal(t, prevFlags, log.Flags())
+
+		// And the restored logger writes through: nothing is left buffered.
+		log.SetOutput(os.Stderr)
+		log.SetFlags(0)
+		t.Cleanup(func() {
+			log.SetOutput(prevOut)
+			log.SetFlags(prevFlags)
+		})
+		log.Print("after the session")
+		assert.Contains(t, readStderr(), "after the session\n")
+	})
 }

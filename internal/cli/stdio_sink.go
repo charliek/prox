@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -235,6 +236,13 @@ func (s *stdioSink) Write(p []byte) (int, error) {
 // incomplete rather than leaving the gap silent.
 func (s *stdioSink) Drops() uint64 {
 	return s.drops.Load()
+}
+
+// TakeDrops returns the drop count and resets it to zero, so a caller that
+// reports drops cannot report the same ones twice (runBufferedStdioSession
+// reports both explicitly and from its panic backstop).
+func (s *stdioSink) TakeDrops() uint64 {
+	return s.drops.Swap(0)
 }
 
 // RouteToLogManager points the sink at mgr for the duration of an owner-mode
@@ -477,5 +485,66 @@ func installStdioSink(sink *stdioSink) func() {
 		sink.RestoreStderr()
 		log.SetOutput(prevOut)
 		log.SetFlags(prevFlags)
+	}
+}
+
+// runBufferedStdioSession runs run with the stdlib logger held in the
+// deferred-buffer target, replaying everything to stderr the moment run returns.
+//
+// This is the ATTACH-mode counterpart to the owner-mode wiring in runUp. Attach
+// runs the same bubbletea alt screen through tui.RunClient and shares the four
+// SSE-parse warning sites in client.go with owner mode, but it owns no
+// logs.Manager, so there is nowhere to render a redirected line. The remaining
+// choice is "corrupt the frame now" or "print it once the screen is released",
+// and the buffer takes the second: nothing is lost, nothing is interleaved into
+// a frame.
+//
+// ACCEPTED LIMITATION (plan 026 §9): attach-mode diagnostics become visible only
+// AFTER the TUI exits. A live in-TUI notice channel is deliberately out of scope.
+//
+// The restore is EXPLICIT and synchronous immediately after run returns, for the
+// same reason runUp's is (see RestoreStderr): a function-scoped defer would fire
+// later than the transition it is describing. The defer is retained only as a
+// panic/early-return backstop — restoring twice is a no-op.
+//
+// The backstop drains the BUFFER as well as the logger, so a panic inside run
+// still replays what was captured. Those buffered lines are the most likely
+// explanation of the panic, and dropping them is worst exactly when they matter
+// most.
+//
+// KNOWN LIMITATION, not currently reachable: this is not nesting-safe. The
+// buffer replays straight to os.Stderr rather than through whatever writer was
+// installed before, so running this inside another live session would write
+// into that session's alt screen. Nothing in the current call graph nests TUI
+// sessions — runAttach is the only caller and it is a terminal command (codex
+// review finding).
+func runBufferedStdioSession(run func() error) error {
+	sink := newStdioSink()
+	restore := installStdioSink(sink)
+	defer func() {
+		sink.RestoreStderr()
+		reportStdioDrops(sink)
+		restore()
+	}()
+
+	sink.RouteToBuffer()
+	err := run()
+	sink.RestoreStderr()
+	reportStdioDrops(sink)
+	return err
+}
+
+// reportStdioDrops tells the user when buffered diagnostics were lost. The
+// buffer target is capped (stdioSinkBufferCap), and silent truncation is the
+// worst possible outcome for a diagnostic channel: a peer emitting malformed
+// frames can fill the buffer, and without this the last line is simply cut and
+// everything after it disappears with no indication that anything is missing
+// (codex review finding).
+//
+// Idempotent: the counter is consumed, so the explicit call and the deferred
+// backstop cannot both report the same drops.
+func reportStdioDrops(sink *stdioSink) {
+	if n := sink.TakeDrops(); n > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d diagnostic line(s) were dropped while the TUI held the screen\n", n)
 	}
 }

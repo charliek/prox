@@ -676,7 +676,15 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		ProjectName:     tui.StatusProjectName(status.ProjectDir),
 		ShutdownCh:      nil,
 	}
-	if err := tui.RunClient(client, opts); err != nil {
+	// Attach owns no log manager, so its alt screen gets the deferred-buffer
+	// target: mid-session diagnostics (the shared SSE-parse warnings in
+	// client.go, an http.Server dump, anything else reaching the stdlib logger)
+	// accumulate and replay verbatim to stderr the instant RunClient returns
+	// rather than being written over a rendered frame. See
+	// runBufferedStdioSession.
+	if err := runBufferedStdioSession(func() error {
+		return tui.RunClient(client, opts)
+	}); err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}
 	return nil

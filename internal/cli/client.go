@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -427,7 +427,12 @@ func (c *Client) addAuthHeader(req *http.Request) {
 func parseSSELogEntry(data string) (api.LogEntryResponse, bool) {
 	var entry api.LogEntryResponse
 	if err := json.Unmarshal([]byte(data), &entry); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE log entry: %v\n", err)
+		// log.Printf, not a direct stderr write: these parsers run on the TUI's
+		// OWN stream goroutines, so a raw fd-2 write lands in the middle of a
+		// rendered alt-screen frame. Routed through the stdlib logger they go
+		// wherever the session's stdio sink points (stdio_sink.go). log.SetFlags(0)
+		// means the emitted line is byte-identical to the old fmt.Fprintf.
+		log.Printf("warning: failed to parse SSE log entry: %v", err)
 		return entry, false
 	}
 	if entry.Process == "" && entry.Line == "" && entry.Seq == 0 {
@@ -447,7 +452,7 @@ const sseHandshakeEvent = "handshake"
 func parseSSEHandshake(data string) (api.HandshakeResponse, bool) {
 	var hs api.HandshakeResponse
 	if err := json.Unmarshal([]byte(data), &hs); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE handshake: %v\n", err)
+		log.Printf("warning: failed to parse SSE handshake: %v", err)
 		return hs, false
 	}
 	return hs, true
@@ -458,7 +463,7 @@ func parseSSEHandshake(data string) (api.HandshakeResponse, bool) {
 func parseSSEProxyRequest(data string) (api.ProxyRequestResponse, bool) {
 	var req api.ProxyRequestResponse
 	if err := json.Unmarshal([]byte(data), &req); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE proxy request: %v\n", err)
+		log.Printf("warning: failed to parse SSE proxy request: %v", err)
 		return req, false
 	}
 	return req, true
@@ -473,7 +478,7 @@ func parseSSEProxyRequest(data string) (api.ProxyRequestResponse, bool) {
 func parseSSEProcessList(data string) (api.ProcessListResponse, bool) {
 	var resp api.ProcessListResponse
 	if err := json.Unmarshal([]byte(data), &resp); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to parse SSE process snapshot: %v\n", err)
+		log.Printf("warning: failed to parse SSE process snapshot: %v", err)
 		return resp, false
 	}
 	return resp, true
