@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -198,6 +200,81 @@ func TestPerformShutdown_CleanReturnsNil(t *testing.T) {
 		t.Fatal("performShutdown must Complete the coordinator even on a clean stop")
 	}
 	assert.Nil(t, coord.Outcome())
+}
+
+// TestPrintShutdownSummary pins plan 026 C5: the terminal-visible verdict a TUI
+// session prints once RunClient has returned and performShutdown has produced
+// its outcome. Per-survivor detail otherwise reaches only SystemLog -- a stream
+// that has just disappeared along with the TUI -- so this is the only copy a TUI
+// user ever sees of it.
+func TestPrintShutdownSummary(t *testing.T) {
+	t.Run("clean stop prints one confirmation line and nothing to stderr", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		printShutdownSummary(nil, &out, &errOut)
+
+		assert.Equal(t, "All processes stopped cleanly.\n", out.String(),
+			"the common case must stay a single quiet line")
+		assert.Empty(t, errOut.String())
+	})
+
+	t.Run("unclean stop names each survivor on stderr and writes nothing to stdout", func(t *testing.T) {
+		outcome := &domain.ProcessStopError{Failures: []domain.ProcessStopFailure{
+			{Name: "api", Err: domain.ErrProcessGroupNotReaped},
+			{Name: "web", Err: errors.New("boom")},
+		}}
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+
+		assert.Empty(t, out.String(), "survivor detail must not land on stdout")
+		assert.Contains(t, errOut.String(), "api: "+domain.ErrProcessGroupNotReaped.Error())
+		assert.Contains(t, errOut.String(), "web: boom")
+	})
+
+	t.Run("integrates with performShutdown's real verdict on a leaked group", func(t *testing.T) {
+		sup, logMgr := newStartedSupervisor(t, map[string]*fakeStopProcess{
+			"web": newFakeStopProcess(4291, true),
+		})
+		outcome := performShutdown(shutdownDeps{
+			sup:          sup,
+			coordinator:  newShutdownCoordinator(),
+			logMgr:       logMgr,
+			stageTimeout: teardownStageTimeout,
+		})
+		require.NotNil(t, outcome, "a surviving group must yield a non-nil outcome")
+
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+
+		assert.Empty(t, out.String())
+		assert.Contains(t, errOut.String(), "web: ")
+
+		// The exit contract itself (errors.Is/As through the wrap) is unchanged by
+		// C5 -- pinned already by TestPerformShutdown_SurvivorNamesProcess -- so this
+		// only re-confirms printShutdownSummary is a side channel, not a replacement:
+		// the same outcome still wraps and unwraps correctly after being printed.
+		wrapped := fmt.Errorf("shutdown incomplete: %w", outcome)
+		var agg *domain.ProcessStopError
+		require.ErrorAs(t, wrapped, &agg)
+		assert.Same(t, outcome, agg)
+	})
+
+	t.Run("clean integration: performShutdown's nil verdict prints the confirmation", func(t *testing.T) {
+		sup, logMgr := newStartedSupervisor(t, map[string]*fakeStopProcess{
+			"web": newFakeStopProcess(4292, false),
+		})
+		outcome := performShutdown(shutdownDeps{
+			sup:          sup,
+			coordinator:  newShutdownCoordinator(),
+			logMgr:       logMgr,
+			stageTimeout: teardownStageTimeout,
+		})
+		require.Nil(t, outcome)
+
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+		assert.Equal(t, "All processes stopped cleanly.\n", out.String())
+		assert.Empty(t, errOut.String())
+	})
 }
 
 // TestPerformShutdown_NilDepsNoPanic: nil proxy/API/coordinator deps are all

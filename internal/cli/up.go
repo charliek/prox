@@ -725,6 +725,19 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// early-error cleanup defer (registered above) stays a no-op.
 	proxyService = nil
 
+	// TUI-only: the alt screen is down and sink.RestoreStderr() above already
+	// pointed output back at the real terminal, so this is the first point after
+	// the verdict lands where a human is looking at the primary screen. Gated on
+	// tuiEnabled, not on outcome or drops, so plain mode's output stays exactly
+	// what the integration suite already asserts byte-for-byte.
+	if tuiEnabled {
+		printShutdownSummary(outcome, os.Stdout, os.Stderr)
+		// C2's stdio sink counts drops on the manager route this session used
+		// (RouteToLogManager above); reuse reportStdioDrops rather than
+		// re-deriving the same "n diagnostic line(s) were dropped" report.
+		reportStdioDrops(sink)
+	}
+
 	// Foreground exit contract: a surviving process group makes `prox up` exit
 	// non-zero (cobra maps a non-nil RunE error to exit 1). Intentional split:
 	// per-process detail already went to the log stream via SystemLog inside
@@ -1012,6 +1025,37 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	}
 
 	return outcome
+}
+
+// printShutdownSummary tells a TUI user, on the now-restored primary screen,
+// what happened during shutdown -- detail that performShutdown otherwise sends
+// only into SystemLog, a log stream the alt screen has hidden for the whole
+// session and that has now disappeared along with the TUI itself (plan 026 C5,
+// §3.4).
+//
+// Call ONLY for a TUI session (runUp gates this on tuiEnabled). In plain mode
+// the log stream was on the terminal the whole time and performShutdown's own
+// SystemLog lines were already visible there, so a second copy here would be
+// duplicate noise and would change today's byte-for-byte-asserted plain-mode
+// output (test/integration/up_test.go, api_test.go).
+//
+// outcome is performShutdown's verdict: nil means a clean stop, printed as one
+// short confirmation line so the common case stays quiet. A non-nil outcome
+// names each survivor -- still true and still actionable, since the group holds
+// whatever ports it bound. The per-survivor lines use the same `name: err` shape
+// as `prox stop`'s failure output (commands.go) rather than repeating the
+// header's "did not stop cleanly" on every row. out and errOut are threaded in
+// (rather than hard-wired to os.Stdout/os.Stderr) so a unit test can capture
+// both without a pty.
+func printShutdownSummary(outcome *domain.ProcessStopError, out, errOut io.Writer) {
+	if outcome == nil {
+		fmt.Fprintln(out, "All processes stopped cleanly.")
+		return
+	}
+	fmt.Fprintln(errOut, "Some processes did not stop cleanly (their process groups may still hold ports):")
+	for _, f := range outcome.Failures {
+		fmt.Fprintf(errOut, "  %s: %v\n", f.Name, f.Err)
+	}
 }
 
 // proxDir returns the prox config directory path (~/.prox)
