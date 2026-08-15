@@ -47,6 +47,7 @@ const (
 // Up command flags
 var (
 	useTUI        bool
+	noTUI         bool
 	noProxy       bool
 	apiPort       int
 	httpPort      int
@@ -80,6 +81,7 @@ func init() {
 	rootCmd.AddCommand(upCmd)
 
 	upCmd.Flags().BoolVar(&useTUI, "tui", false, "Enable interactive TUI mode")
+	upCmd.Flags().BoolVar(&noTUI, "no-tui", false, "Disable interactive TUI mode for this run (overrides PROX_TUI)")
 	upCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "Disable proxy even if configured")
 	upCmd.Flags().IntVarP(&apiPort, "api-port", "p", 0, "Override API server port (otherwise dynamic)")
 	upCmd.Flags().IntVar(&httpPort, "http-port", 0, "Override proxy HTTP port")
@@ -97,9 +99,33 @@ func completeProcessNames(cmd *cobra.Command, args []string, toComplete string) 
 func runUp(cmd *cobra.Command, args []string) (err error) {
 	processes := args
 
-	// Validate mutually exclusive flags
-	if useTUI && detach {
-		return fmt.Errorf("--tui and --detach are mutually exclusive")
+	// Resolve how this invocation wants the TUI, FIRST, before any other work:
+	// explicit flag > PROX_TUI > terminal capability (see tui_mode.go). This
+	// pure step subsumes the old `useTUI && detach` conflict check, with the
+	// same message; the terminal probe it used to sit next to happens a few
+	// lines below, deliberately after the capture check.
+	//
+	// The wiring is the one line the pure matrix cannot cover, so read it
+	// carefully: Changed() answers "was it typed", the flag var answers "what
+	// did it parse to", and swapping the two is exactly the bug that would
+	// break `prox up -d --tui=false`.
+	envTUI, envTUIPresent := os.LookupEnv(proxTUIEnvVar)
+	tuiWantMode, tuiWarnings, err := resolveTUIMode(tuiModeInputs{
+		TUISet:     cmd.Flags().Changed("tui"),
+		TUIVal:     useTUI,
+		NoTUISet:   cmd.Flags().Changed("no-tui"),
+		NoTUIVal:   noTUI,
+		Detach:     detach,
+		Env:        envTUI,
+		EnvPresent: envTUIPresent,
+		// AutoDefault stays false here: plan 026 C3 lands the machinery with
+		// today's semantics exactly preserved (no flag, no env → plain
+		// streaming). C7 is the commit that flips this to true and makes the
+		// TUI the default for a foreground `prox up`.
+		AutoDefault: false,
+	})
+	if err != nil {
+		return err
 	}
 	// captureOverrideSet/captureOverrideEnabled resolve once here (before cfg is
 	// even loaded) so the mutual-exclusivity error surfaces immediately, mirroring
@@ -109,15 +135,34 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// A TUI needs a keyboard and a screen. Refuse here — before the supervisor,
+	// A TUI needs a keyboard, a screen, a TERM it can draw with, and the
+	// terminal's foreground process group. Probe here — before the supervisor,
 	// proxy, or API server exist — so a piped or non-interactive invocation
 	// (`prox up --tui | tee log`, CI, an agent harness) fails fast instead of
 	// starting everything and then handing bubbletea a screen nobody can read and a
 	// keyboard nobody can press — a run that can then only be ended by signal.
 	// Ordered AFTER the flag-conflict checks above so a genuine misuse of flags
 	// reports the conflict rather than the terminal.
-	if useTUI && !isInteractiveStdio() {
-		return fmt.Errorf("--tui requires an interactive terminal")
+	//
+	// required (an explicit --tui) errors; preferred (PROX_TUI=1, and after C7
+	// the default) degrades silently to plain streaming, with no stderr note —
+	// a note on every non-interactive `prox up` would pollute CI output forever
+	// for a mode change the caller never asked about.
+	tuiEnabled := tuiWantMode != tuiModePlain
+	if tuiEnabled {
+		if hostErr := terminalHostable(); hostErr != nil {
+			if tuiWantMode == tuiModeRequired {
+				return hostErr
+			}
+			tuiEnabled = false
+		}
+	}
+	// The single warning call site. C4 replaces this body with the
+	// TUI-visible preamble path (a warning written to stderr before bubbletea
+	// enters the alt screen is invisible for the whole session); keeping it to
+	// one obvious place is what makes that change small.
+	for _, w := range tuiWarnings {
+		fmt.Fprintln(os.Stderr, w)
 	}
 
 	// Get working directory for state files
@@ -500,8 +545,8 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// buffered and Send is a non-blocking select (subscription.go), so
 	// subscribing before the consumer goroutine runs is safe.
 	//
-	// Gated on !useTUI (known well before this point, checked at flag-parse
-	// time): a TUI session must have NO terminal log subscriber, since nothing
+	// Gated on !tuiEnabled (resolved at the very top of runUp, long before this
+	// point): a TUI session must have NO terminal log subscriber, since nothing
 	// would ever drain it, guaranteeing an overflow (which permanently closes
 	// the subscription, subscription.go) and a spurious "subscription
 	// overflowed" line every TUI session.
@@ -511,7 +556,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// first overflow, so subscribing early and only later getting around to
 	// draining it would itself risk losing the subscription before it is read.
 	var logCh <-chan domain.LogEntry
-	if !useTUI {
+	if !tuiEnabled {
 		var subErr error
 		logCh, subErr = subscribeLogPrinter(logMgr)
 		if subErr != nil {
@@ -580,7 +625,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.
 	var tuiErr error
-	if useTUI {
+	if tuiEnabled {
 		// `up --tui` runs the SAME API-client TUI as `prox attach` (plan 018), just
 		// pointed at the API server this process started a few lines above instead of
 		// another project's daemon. One model, one set of streams, one set of key

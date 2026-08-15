@@ -65,8 +65,38 @@ func tuiFixtureConfig(t *testing.T, dir string) string {
 // must never stop: an undrained master fills its kernel buffer and blocks
 // every subsequent write the child makes, wedging the whole test. Skips
 // (rather than failing) the test if this sandbox refuses to allocate a pty.
+// It pins TERM to a capable value -- see startPTYWithTERM.
 func startPTY(t *testing.T, cmd *exec.Cmd) (*os.File, *syncBuffer) {
 	t.Helper()
+	return startPTYWithTERM(t, cmd, "xterm-256color")
+}
+
+// startPTYWithTERM is startPTY with an explicit TERM, for the tests that want
+// an incapable terminal.
+//
+// TERM is pinned rather than inherited (plan 026 C3). Terminal hostability now
+// requires a TERM that is set and not "dumb", and GitHub's ubuntu-latest and
+// macos-latest runners -- where CI runs this whole suite, with no -short -- set
+// no TERM at all. Inheriting would make every `--tui` test here pass on a
+// developer's terminal and fail in CI, and would equally let a developer's
+// TERM leak into a test that wants a specific one. So any inherited TERM is
+// REMOVED first and the requested value appended: `os.Environ()` carrying
+// TERM=xterm-256color plus a later TERM=dumb is resolved by exec to the last
+// occurrence, which is subtle enough to be worth not relying on.
+func startPTYWithTERM(t *testing.T, cmd *exec.Cmd, term string) (*os.File, *syncBuffer) {
+	t.Helper()
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ() // nil means "inherit"; materialize it so we can edit
+	}
+	filtered := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "TERM=") {
+			filtered = append(filtered, kv)
+		}
+	}
+	cmd.Env = append(filtered, "TERM="+term)
+
 	ptmx, err := pty.StartWithSize(cmd, tuiPTYWinsize)
 	if err != nil {
 		t.Skipf("PTY unavailable: %v", err)
@@ -398,5 +428,51 @@ func TestUpTUI_StdinDevNullRefused(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before any state is written, but .prox exists (stat err=%v)", err)
+	}
+}
+
+// TestUpTUI_TermDumbRefused pins terminal-hostability condition 2 (plan 026
+// C3): isatty says yes on a pty whose TERM is "dumb", but bubbletea has no
+// capabilities to draw with there, so a REQUIRED TUI (an explicit `--tui`)
+// must refuse. The message has to name TERM rather than reuse condition 1's
+// "requires an interactive terminal" -- on a real pty that would be flatly
+// untrue and would send the user hunting for the wrong problem.
+//
+// This is the negative case startPTY's TERM pin exists to keep separable.
+func TestUpTUI_TermDumbRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY-driven TUI tests are unix-only")
+	}
+	skipShort(t)
+
+	binary := buildBinary(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "launched.marker")
+	cfg := filepath.Join(dir, "prox.yaml")
+	cfgBody := "api:\n  host: 127.0.0.1\n\nprocesses:\n  marker:\n    cmd: touch " + marker + " && sleep 30\n"
+	if err := os.WriteFile(cfg, []byte(cfgBody), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cmd := exec.Command(binary, "up", "--tui", "-c", cfg)
+	cmd.Dir = dir
+
+	ptmx, buf := startPTYWithTERM(t, cmd, "dumb")
+	defer ptmx.Close()
+	defer killProx(cmd)
+
+	if err := waitCmdExit(t, cmd, 15*time.Second); err == nil {
+		t.Fatalf("expected a non-zero exit with TERM=dumb, got nil error; output:\n%s", buf.String())
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "TERM=dumb") {
+		t.Errorf("expected an error naming TERM, got:\n%s", out)
+	}
+	if strings.Contains(out, "requires an interactive terminal") {
+		t.Errorf("stdin/stdout ARE a terminal here; condition 1's message would be misleading. Got:\n%s", out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("the TERM guard must refuse before starting processes, but the marker exists (stat err=%v)", err)
 	}
 }

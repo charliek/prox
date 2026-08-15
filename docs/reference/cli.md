@@ -42,7 +42,8 @@ prox up [processes...]
 | Flag | Description |
 |------|-------------|
 | `--detach, -d` | Run in background (daemon mode) |
-| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`; requires an interactive terminal on stdin and stdout) |
+| `--tui` | Enable interactive TUI mode (foreground only, mutually exclusive with `--detach`; requires a terminal that can host it — see below) |
+| `--no-tui` | Never open the interactive TUI for this run. Overrides `PROX_TUI`; mutually exclusive with `--tui` |
 | `--api-port, -p` | Override API server port (otherwise dynamic) |
 | `--http-port` | Override proxy HTTP port |
 | `--https-port` | Override proxy HTTPS port |
@@ -68,6 +69,9 @@ prox up --tui
 # Start specific processes with TUI
 prox up --tui web api
 
+# Opt out of the TUI (overrides PROX_TUI=1)
+prox up --no-tui
+
 # Override API port
 prox up --api-port 6000
 
@@ -92,6 +96,20 @@ prox up --no-capture
 When no port is specified (via `--api-port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
 
 **`-d`/`--detach` readiness:** the parent process no longer exits `0` the instant it forks the child. It polls for up to 15s for the child to write a PID-matched `.prox/prox.state` and answer `GET /health`, then prints `prox started (pid N, api http://host:port)` and exits `0` — a truthful signal that the daemon is actually accepting requests. If the child dies during startup (bad config, port bind failure), `prox up -d` exits `1` and prints the last ~20 lines of `.prox/prox.log`. If the child never becomes ready within 15s, `prox up -d` prints the same diagnostics, sends SIGTERM to the child (SIGKILL after a 5s grace if it doesn't exit), and exits `1`.
+
+**TUI mode resolution.** Whether `prox up` opens the interactive TUI is decided by, in order of precedence: an explicit flag, then the `PROX_TUI` environment variable, then whether the terminal can host it. Today the TUI only opens when something asks for it — a bare `prox up` streams plain logs.
+
+| Source | Effect |
+|--------|--------|
+| `--tui` | Open the TUI, and **fail** if the terminal cannot host one — an explicit request is an assertion |
+| `--no-tui`, `--tui=false` | Never open the TUI |
+| `PROX_TUI=1` (also `true`, `yes`, `on`) | Prefer the TUI. Falls back to plain log streaming — silently, without an error — when the terminal cannot host one |
+| `PROX_TUI=0` (also `false`, `no`, `off`) | Never open the TUI |
+| neither | Plain log streaming |
+
+`PROX_TUI` values are matched case-insensitively and trimmed of surrounding whitespace; any other value (including an empty one) is reported as a warning and ignored. An explicit flag wins over `PROX_TUI` outright — when a flag is present the variable is not consulted at all, so a bad value next to a flag produces no warning. `--detach` short-circuits the whole decision: a daemon has no terminal, so `PROX_TUI` is not read and `prox up -d` is unaffected by it.
+
+**A terminal can host the TUI when** stdin *and* stdout are both terminals, `TERM` is set to something other than `dumb`, and the process is in the terminal's foreground process group (so a backgrounded `prox up &` is excluded — reading the keyboard from a background job raises `SIGTTIN` and stops it). `--tui` reports which of the three conditions failed.
 
 **Shared-proxy version mismatch:** when this project's proxy would join the per-user shared daemon and the daemon's version doesn't match this `prox` binary's version, `prox up` no longer falls back to a proxy-less standalone start. If the daemon still has registered projects, `prox up` fails hard, naming both versions and the registered project directories, with remediation (`prox proxy stop --force`, then `prox up`/`prox restart` in each listed project). If the daemon is idle, prox auto-replaces it with a fresh daemon of the current version and prints a one-line notice.
 
