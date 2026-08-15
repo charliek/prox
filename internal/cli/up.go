@@ -157,13 +157,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			tuiEnabled = false
 		}
 	}
-	// The single warning call site. C4 replaces this body with the
-	// TUI-visible preamble path (a warning written to stderr before bubbletea
-	// enters the alt screen is invisible for the whole session); keeping it to
-	// one obvious place is what makes that change small.
-	for _, w := range tuiWarnings {
-		fmt.Fprintln(os.Stderr, w)
-	}
+	// Everything this run prints about itself is collected here as well as
+	// printed, so a TUI session can render it on a screen the user can actually
+	// see (see preamble.go). Disabled — and therefore free — in plain mode.
+	preamble := newStartupPreamble(tuiEnabled)
+	// The single warning call site (see reportTUIWarnings).
+	reportTUIWarnings(tuiWarnings, preamble, tuiEnabled, os.Stderr)
 
 	// Get working directory for state files
 	cwd, err := os.Getwd()
@@ -435,6 +434,13 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		supConfig.ShutdownTimeout = globalShutdownTimeout
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supConfig)
+	// Attach the preamble's second path now that there is a supervisor to log
+	// through: every preamble line also becomes a system log entry, so `prox
+	// logs`, the daemon log and any other subscriber get it too. SystemLog is
+	// safe before sup.Start, and the sup construction here precedes every
+	// preamble site below — the warnings recorded above are flushed by this
+	// call.
+	preamble.logTo(sup.SystemLog)
 
 	// Create the shutdown coordinator. Its Trigger()/TriggerCh() replace the raw
 	// shutdownCh (a bare close was a latent double-close panic on a second POST
@@ -515,7 +521,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
 		var proxyErr error
-		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink)
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink, preamble)
 		if proxyErr != nil {
 			return proxyErr
 		}
@@ -566,26 +572,26 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	// Start supervisor
-	fmt.Printf("Starting prox with config: %s\n", configPath)
+	preamble.printf("Starting prox with config: %s", configPath)
 	if isLocalhost(cfg.API.Host) {
 		if authEnabled {
-			fmt.Printf("API server: http://%s (local only, auth enabled)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (local only, auth enabled)", apiServer.Addr())
 		} else {
-			fmt.Printf("API server: http://%s (local only, no auth)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (local only, no auth)", apiServer.Addr())
 		}
 	} else {
 		if authEnabled {
-			fmt.Printf("API server: http://%s (network accessible, auth enabled)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (network accessible, auth enabled)", apiServer.Addr())
 		} else {
-			fmt.Printf("API server: http://%s (network accessible, no auth)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (network accessible, no auth)", apiServer.Addr())
 		}
 	}
 	if authEnabled {
-		fmt.Printf("Auth token saved to: %s\n", tokenPath())
+		preamble.printf("Auth token saved to: %s", tokenPath())
 	}
 
 	if len(processes) > 0 {
-		fmt.Printf("Starting processes: %s\n", strings.Join(processes, ", "))
+		preamble.printf("Starting processes: %s", strings.Join(processes, ", "))
 		result, err := sup.StartProcesses(ctx, processes)
 		if err != nil {
 			return fmt.Errorf("failed to start processes: %w", err)
@@ -650,6 +656,10 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			Help:        tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
 			ShutdownCh:  coordinator.TriggerCh(),
 			ProjectName: tui.ConfigPathProjectName(absConfigPath),
+			// The startup lines this run printed to a terminal the alt screen is
+			// about to hide — pinned in the log pane so the proxy URL survives a
+			// startup chatty enough to have evicted them from the log ring.
+			Preamble: preamble.Lines(),
 		}
 		// Ports feed curl-copy only; pass them when a proxy is actually
 		// listening (disabled/--no-proxy → port-less https://<host><url>).
@@ -1151,9 +1161,16 @@ func captureDiskBudget(cfg *config.Config) int64 {
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, logOut io.Writer) (*proxyd.Client, *proxy.Service, error) {
+//
+// pre collects the "Proxy (…)" / "Registered domains" lines for the TUI. It is
+// threaded IN rather than having these functions return their lines: the lines
+// are produced at four points spread across two functions with three error
+// paths between them, and printing them where they happen is what keeps the
+// terminal output byte- and order-identical to before (preamble.printf prints
+// exactly what the fmt.Printf it replaced printed, at the same moment).
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, logOut io.Writer, pre *startupPreamble) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
-	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt)
+	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt, pre)
 	if ok {
 		return client, nil, nil
 	}
@@ -1166,7 +1183,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// configured, so a create/start failure here is fatal (D1): `prox up` must
 	// never start a project with the proxy silently disabled. --no-proxy is the
 	// escape hatch (named in the returned error).
-	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut)
+	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut, pre)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1178,7 +1195,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 // Returns (client, true, nil) on success, (nil, false, nil) when daemon is
 // unavailable (fall back to standalone), (nil, false, error) when daemon is
 // running but registration failed (don't fall back, fail the command).
-func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, bool, error) {
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, pre *startupPreamble) (*proxyd.Client, bool, error) {
 	// Check if we can access the daemon directory
 	if err := proxyd.EnsureDaemonDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
@@ -1263,10 +1280,10 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
 	}
 	if len(proxyAddrs) > 0 {
-		fmt.Printf("Proxy (shared daemon): %s\n", strings.Join(proxyAddrs, ", "))
+		pre.printf("Proxy (shared daemon): %s", strings.Join(proxyAddrs, ", "))
 	}
 	if len(resp.Registered) > 0 {
-		fmt.Printf("Registered domains: %s\n", strings.Join(resp.Registered, ", "))
+		pre.printf("Registered domains: %s", strings.Join(resp.Registered, ", "))
 	}
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
@@ -1313,7 +1330,7 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 // shred a TUI frame. Deliberately NOT nil-tolerant: a nil-means-os.Stderr
 // default would let a future call site silently bypass the sink, which is the
 // exact frame corruption this plumbing exists to prevent.
-func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, logOut io.Writer) (*proxy.Service, error) {
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, logOut io.Writer, pre *startupPreamble) (*proxy.Service, error) {
 	// Fail here rather than at the first log record. slog would accept a nil
 	// writer and only panic when the ErrorHandler fires — i.e. mid-session, on
 	// the first failed upstream request, taking the whole daemon down long
@@ -1344,7 +1361,7 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
 	}
 	if len(proxyAddrs) > 0 {
-		fmt.Printf("Proxy (standalone): %s\n", strings.Join(proxyAddrs, ", "))
+		pre.printf("Proxy (standalone): %s", strings.Join(proxyAddrs, ", "))
 	}
 	handlers.SetRequestManager(proxyService.RequestManager())
 	handlers.SetCaptureManager(proxyService.CaptureManager())

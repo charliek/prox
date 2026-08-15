@@ -14,13 +14,38 @@ import (
 	"github.com/charliek/prox/internal/stream"
 )
 
+// systemProcessName is the process column every synthetic, prox-generated log
+// line is filed under — here and in the supervisor's SystemLog, which is where
+// the same lines reach `prox logs`. It is deliberately the one name shared by
+// both, so a line looks identical whichever path delivered it.
+const systemProcessName = "system"
+
 // systemLogEntry builds the synthetic "system" log line the TUI uses to show
-// itself a message in the log pane.
+// itself a message in the log pane. Stderr, so it carries the ERR badge: every
+// caller is a warning or a failure notice.
 func systemLogEntry(line string) domain.LogEntry {
 	return domain.LogEntry{
 		Timestamp: time.Now(),
-		Process:   "system",
+		Process:   systemProcessName,
 		Stream:    domain.StreamStderr,
+		Line:      line,
+	}
+}
+
+// preambleLogEntry builds one line of the caller's startup preamble
+// (ClientOptions.Preamble).
+//
+// Field-for-field what supervisor.SystemLog writes for the same line — system
+// process, stdout stream — because they ARE the same line arriving by a second
+// route: the pane must not render prox's own session info two different ways
+// depending on whether the log ring still held it. Stdout (no ERR badge) is what
+// separates this from systemLogEntry above, and the neutral "system" process
+// column is what separates it from supervised process output.
+func preambleLogEntry(line string) domain.LogEntry {
+	return domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   systemProcessName,
+		Stream:    domain.StreamStdout,
 		Line:      line,
 	}
 }
