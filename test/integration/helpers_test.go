@@ -104,9 +104,11 @@ const pollRequestTimeout = 5 * time.Second
 func pollGetWithinDeadline(url string, deadline time.Time) (*http.Response, context.CancelFunc, error) {
 	budget := min(time.Until(deadline), pollRequestTimeout)
 	if budget <= 0 {
-		// Out of time: let the request fail immediately rather than start one
-		// the caller has already stopped waiting for.
-		budget = time.Millisecond
+		// The budget ran out between the caller's loop check and here. Do not
+		// start a request at all: a very short one could still succeed and let
+		// the helper report readiness AFTER its deadline (CodeRabbit, PR #106).
+		// Returning the error lets the loop's own condition end the wait.
+		return nil, nil, context.DeadlineExceeded
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
