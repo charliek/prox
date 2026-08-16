@@ -416,7 +416,24 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// deliberately NOT touched here: it is derived from stream health
 		// alone, and the OK transition that precedes the first snapshot has
 		// already cleared it.
+		//
+		// THE RELAYOUT IS LOAD-BEARING (plan 028 C4). The dead-stack banner is
+		// the first chrome row whose height changes on a DATA message: until
+		// now only WindowSizeMsg and the visibility toggles could change
+		// chromeAbove, and they are the only callers of relayout (see its doc
+		// comment). Without this the viewport keeps its pre-banner height and
+		// overflows the frame by exactly one row — the class of bug plan 024
+		// spent a whole batch fixing. It must fire in BOTH directions: a
+		// `prox restart` that revives the stack has to give the row back.
+		bannerBefore := m.showDeadStackBanner()
 		m.processes = []domain.ProcessInfo(msg)
+		if m.showDeadStackBanner() != bannerBefore {
+			m.relayout()
+			// Same order WindowSizeMsg uses: geometry first, then re-render
+			// content against it (the empty-state hints are sized to
+			// viewport.Height, so a stale render would be a row off).
+			m.updateViewport()
+		}
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process

@@ -362,8 +362,17 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 }
 
 // chromeAbove is the number of rows above the viewport (menu bar + process
-// panel). Derived from ACTUAL enabled chrome — not fixed reservations (Codex #8).
+// panel + dead-stack banner). Derived from ACTUAL enabled chrome — not fixed
+// reservations (Codex #8).
 func (b *BaseModel) chromeAbove() int {
+	return b.fixedChromeAbove() + b.deadStackBannerRows()
+}
+
+// fixedChromeAbove is the settings-driven part of chromeAbove: the rows that
+// change only on a WindowSizeMsg or a visibility toggle. Split out because the
+// dead-stack banner's own room check (showDeadStackBanner) needs the chrome
+// around it and would otherwise recurse through chromeAbove into itself.
+func (b *BaseModel) fixedChromeAbove() int {
 	h := 0
 	if b.settings.MenuBar {
 		h++ // menu bar row
@@ -466,7 +475,10 @@ func (b *BaseModel) isFooterY(y int) bool {
 // WindowSizeMsg, every visibility toggle (a toggle emits no resize, so
 // without this the viewport keeps stale geometry — Codex #8), and view-mode
 // switches (C11 requests header changes viewport height). C4 flips
-// ProcessPanel and calls relayout the same way. Panel border (C7) insets the
+// ProcessPanel and calls relayout the same way. Plan 028 C4 adds the one DATA
+// -driven caller: the dead-stack banner appears and disappears on a
+// ProcessesMsg, so that handler compares showDeadStackBanner across the
+// assignment and relayouts when it flips. Panel border (C7) insets the
 // viewport by panelBorder() rows/cols when contentRect is large enough; the
 // requests header (C11) further shrinks height and shifts YPosition.
 func (b *BaseModel) relayout() {
@@ -2902,6 +2914,14 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		if CurrentTheme().FullFill {
 			lines = append(lines, padFrameRow("", b.width))
 		}
+	}
+
+	// Dead-stack banner (plan 028 C4): between the process panel and the panel
+	// top border, counted in chromeAbove so the viewport is one row shorter
+	// while it is up. Its own band fill (styles.Err) spans the frame, so no
+	// padFrameRow wrapping — that would re-pad an already exact-width row.
+	if b.showDeadStackBanner() {
+		lines = append(lines, singleFrameLine(b.renderDeadStackBanner(b.width)))
 	}
 
 	drawPanel := b.canDrawPanel()
