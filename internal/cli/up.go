@@ -779,15 +779,51 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			}
 		}
 	}
+	// deadVerdict is the dead-stack watcher's verdict, latched only if it fired
+	// (plan 028 C3, #96). It survives the block below to reach the exit contract.
+	var deadVerdict *settleVerdict
 	if !tuiEnabled {
 		// Log subscription + consumer were already started above, before the
 		// supervisor started any process (D2, #92) — or, for a preferred-mode
 		// TUI that failed, a moment ago with the ring replayed behind it.
 
+		// A foreground session with every process dead used to wait here
+		// forever: the trigger channel is closed by signals, POST /shutdown and
+		// a TUI quit, and by nothing a process does (#96). The watcher supplies
+		// the missing wake — and the reason for it, which the coordinator does
+		// not carry — so a stack that is entirely down ends the session and
+		// exits non-zero.
+		//
+		// NOT in the detached daemon child: `--detach` short-circuits TUI
+		// resolution to plain mode, so it runs this very block, and a watcher
+		// here would kill the daemon `prox up -d` just promised was still
+		// running. See dead_stack.go.
+		//
+		// Started here rather than beside sup.Start so that sequential startup
+		// can never present a transient "nothing live" window, and so the
+		// mid-run TUI-failure fallback above (which flips tuiEnabled and falls
+		// into this block) is covered by the same call.
+		var deadWatcher *deadStackWatcher
+		if !daemon.IsDaemonChild() {
+			deadWatcher = startDeadStackWatcher(sup, coordinator.TriggerWith, coordinator.TriggerCh())
+		}
+
 		// Wait for shutdown. Both a signal (via forwardShutdownSignal above, which
 		// also logs it) and an API/TUI-quit trigger arrive as a coordinator trigger,
 		// so this selects on the one channel.
 		<-coordinator.TriggerCh()
+
+		if deadWatcher != nil {
+			// Stopped BEFORE performShutdown, not merely deferred to runUp's
+			// return: teardown drives every process to stopped, and a watcher
+			// still running through that would see a crashed-plus-stopped stack
+			// and latch a verdict for a shutdown the user asked for. stop()
+			// joins the goroutine, so the read below is of a finished decision.
+			deadWatcher.stop()
+			if v, fired := deadWatcher.latchedVerdict(); fired {
+				deadVerdict = &v
+			}
+		}
 		fmt.Println() // Print newline (past any echoed ^C)
 	}
 
@@ -829,6 +865,18 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		reportStdioDrops(sink)
 	}
 
+	// The dead-stack half of the exit contract (plan 028 C3, #96). Printed here,
+	// after teardown, so it is the LAST thing on the terminal rather than a line
+	// the shutdown log stream scrolls away — and printed through the same
+	// formatter `prox up -d`, `start` and `restart` use, so a crash reads
+	// identically whichever command reports it. Only ever non-nil in plain,
+	// non-daemon-child mode.
+	var deadStackErr error
+	if deadVerdict != nil {
+		deadVerdict.writeTo(os.Stderr, deadStackHint)
+		deadStackErr = deadVerdict.err()
+	}
+
 	// Foreground exit contract: a surviving process group makes `prox up` exit
 	// non-zero (cobra maps a non-nil RunE error to exit 1). Intentional split:
 	// per-process detail already went to the log stream via SystemLog inside
@@ -839,11 +887,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Breaking change: foreground `prox up` previously always exited 0 (CHANGELOG
 	// in C5).
 	if outcome != nil {
-		// errors.Join keeps a TUI failure visible alongside the shutdown
-		// verdict; either alone still makes `up` exit non-zero.
-		return errors.Join(tuiErr, fmt.Errorf("shutdown incomplete: %w", outcome))
+		// errors.Join keeps a TUI failure — and a dead stack — visible alongside
+		// the shutdown verdict; any one alone still makes `up` exit non-zero.
+		return errors.Join(tuiErr, deadStackErr, fmt.Errorf("shutdown incomplete: %w", outcome))
 	}
-	return tuiErr
+	// errors.Join of all-nil is nil, so an ordinary Ctrl-C still exits 0.
+	return errors.Join(tuiErr, deadStackErr)
 }
 
 // dialableAPIURL builds the base URL a process uses to reach its OWN in-process

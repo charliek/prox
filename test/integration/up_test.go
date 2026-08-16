@@ -546,11 +546,6 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 		// bug the old manual t.Cleanup workaround guarded against).
 		run := f.Start(t, binary, "up", "-c", f.configPath)
 
-		// Confirms the daemon itself came up; the process crash happens
-		// concurrently with (just after) supervisor start, so this does not run
-		// past the window we're testing.
-		waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
-
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so
 		// nothing will ever produce the line later -- if it isn't here within the
@@ -562,12 +557,14 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 			out = run.Output()
 		}
 
-		// Shut down before asserting, so a failed iteration doesn't leak the
-		// daemon (and its port) into the next one.
-		_ = stopProx(t, run.Addr())
-		if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
-			t.Logf("iteration %d: prox up did not exit cleanly: %v", i, err)
-		}
+		// No shutdown request, and no readiness probe before it: since plan 028
+		// C3 (#96) this session ends BY ITSELF. `ghost` is the only process and
+		// it crashes, so the whole stack is dead and `prox up` tears it down and
+		// exits non-zero. Asking the API to shut down (or even polling it for
+		// readiness) now races the daemon's own exit and would fail this test for
+		// a reason that has nothing to do with log visibility.
+		_ = run.WaitExit(t, within(t, processExitTimeout))
+		out = run.Output()
 
 		if !strings.Contains(out, marker) || !strings.Contains(out, "ghost") {
 			t.Fatalf("iteration %d: crash reason missing from terminal output; wanted \"ghost\" + %q, got:\n%s", i, marker, out)
