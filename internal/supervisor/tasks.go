@@ -272,7 +272,6 @@ func (s *Supervisor) executeTask(mp *ManagedProcess, node *taskNode, runCtx, sup
 		Type:      EventTypeProcessStarted,
 		Process:   mp.Name(),
 		Timestamp: time.Now(),
-		Info:      mp.Info(),
 	})
 
 	if inst == nil {

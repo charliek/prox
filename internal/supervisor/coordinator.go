@@ -243,7 +243,6 @@ func (s *Supervisor) orchestrate(mp *ManagedProcess, targets []string, gen uint6
 		Type:      EventTypeProcessStarted,
 		Process:   mp.Name(),
 		Timestamp: time.Now(),
-		Info:      mp.Info(),
 	})
 }
 
@@ -521,7 +520,6 @@ func (s *Supervisor) restartProcessGated(ctx context.Context, mp *ManagedProcess
 		Type:      EventTypeProcessStarted,
 		Process:   mp.Name(),
 		Timestamp: time.Now(),
-		Info:      mp.Info(),
 	})
 	return nil
 }

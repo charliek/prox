@@ -219,7 +219,6 @@ type SupervisorEvent struct {
 	Type      EventType
 	Process   string
 	Timestamp time.Time
-	Info      domain.ProcessInfo
 }
 
 // EventType defines the type of supervisor event
@@ -758,7 +757,6 @@ func (s *Supervisor) startProcessesConcurrently(result *StartResult) {
 					Type:      EventTypeProcessStarted,
 					Process:   name,
 					Timestamp: time.Now(),
-					Info:      mp.Info(),
 				})
 				resultMu.Lock()
 				result.Started = append(result.Started, name)
@@ -1020,7 +1018,6 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 					Type:      evt,
 					Process:   mp.Name(),
 					Timestamp: time.Now(),
-					Info:      mp.Info(),
 				})
 			}
 			// A non-clean stop (anything but nil/ErrProcessNotRunning) is logged once
@@ -1182,7 +1179,6 @@ func (s *Supervisor) StartProcess(ctx context.Context, name string) error {
 			Type:      EventTypeProcessStarted,
 			Process:   name,
 			Timestamp: time.Now(),
-			Info:      mp.Info(),
 		})
 	}
 	return err
@@ -1213,7 +1209,6 @@ func (s *Supervisor) StopProcess(ctx context.Context, name string) error {
 			Type:      evt,
 			Process:   name,
 			Timestamp: time.Now(),
-			Info:      mp.Info(),
 		})
 	}
 	return err
@@ -1285,7 +1280,6 @@ func (s *Supervisor) RestartProcess(ctx context.Context, name string) error {
 			Type:      EventTypeProcessStarted,
 			Process:   name,
 			Timestamp: time.Now(),
-			Info:      mp.Info(),
 		})
 	}
 	return err
