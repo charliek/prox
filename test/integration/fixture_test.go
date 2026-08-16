@@ -315,17 +315,19 @@ func (f *proxFixture) StartWith(t *testing.T, binary string, opts []startOpt, ar
 
 	cmd, l := buildLaunch(t, binary, f.dir, opts, args...)
 
+	launchedAt := time.Now()
 	if err := l.start(cmd); err != nil {
 		t.Fatalf("failed to start prox: %v", err)
 	}
 
 	r := &proxRun{
-		t:         t,
-		cmd:       cmd,
-		dir:       f.dir,
-		out:       l.out,
-		exited:    make(chan struct{}),
-		watchStop: make(chan struct{}),
+		t:          t,
+		cmd:        cmd,
+		dir:        f.dir,
+		out:        l.out,
+		exited:     make(chan struct{}),
+		watchStop:  make(chan struct{}),
+		launchedAt: launchedAt,
 	}
 	// The ONE Wait for this process, started here and never called again from
 	// anywhere else. waitErr is written before exited is closed, so every
@@ -422,6 +424,12 @@ func tryStartDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args 
 	// Start + Wait here is the one and only Wait for the launcher, and it is
 	// safe to make it inline because the launcher is short-lived by construction
 	// -- unlike a foreground run, there is nothing to observe while it lives.
+	//
+	// launchedAt is taken before the start, and it is load-bearing for a
+	// DETACHED launch specifically: nothing this launch causes can have written
+	// a state file before this instant, so anything older in the directory is a
+	// previous generation's and must not be adopted (acceptDaemonPID).
+	r.launchedAt = time.Now()
 	if err := l.start(cmd); err != nil {
 		close(r.exited)
 		return r, fmt.Errorf("failed to start detached prox %v: %w", args, err)
@@ -488,6 +496,10 @@ type proxRun struct {
 	waitErr   error         // written before exited is closed
 	detached  bool          // true for `up -d`: cmd is the launcher, not the daemon
 	watchStop chan struct{} // closed by teardown to stop watchIdentity
+	// launchedAt is read immediately BEFORE the launcher starts, so any daemon
+	// this launch causes reports a started_at at or after it. It is what
+	// acceptDaemonPID uses to refuse a state file that predates the launch.
+	launchedAt time.Time
 
 	mu      sync.Mutex
 	ident   daemonIdentity // the daemon, memoized once the state file names it
@@ -681,8 +693,8 @@ func (r *proxRun) tryDaemonIdentity() (daemonIdentity, bool) {
 	return id, true
 }
 
-// acceptDaemonPID decides whether a pid found in this run's state file is this
-// launch's daemon.
+// acceptDaemonPID decides whether the daemon a state file describes is this
+// launch's.
 //
 // Foreground: the state pid IS the launched process, and requiring the match
 // makes staleness unrepresentable. A fixture directory can host more than one
@@ -693,10 +705,26 @@ func (r *proxRun) tryDaemonIdentity() (daemonIdentity, bool) {
 // to answer.
 //
 // Detached: the launcher is not the daemon and has already exited, so the pid to
-// accept is a DIFFERENT, live one -- the child `up -d` waited for before exiting
-// (it refuses to report success until state.PID equals that child, so a leftover
-// file from an earlier generation cannot be what we read here).
-func (r *proxRun) acceptDaemonPID(pid int) bool {
+// accept is a DIFFERENT, live one. "Different and live" alone is NOT enough,
+// which is the whole reason startedAt is checked here. A launch that FAILS never
+// writes a state file, so whatever is in the directory predates it -- and a pid
+// in an old file may since have been recycled by the OS onto somebody's editor.
+// Adopting it would capture that innocent process's genuinely valid start token,
+// after which every pid+token check downstream passes on the wrong process and
+// teardown signals a bystander.
+//
+// FRESHNESS IS DECIDED BY started_at, NOT BY THE FILE'S MODTIME. Two reasons.
+// It is written by the daemon itself at the instant it claims the directory
+// (internal/cli/up.go: time.Now() immediately after the PID file is locked), so
+// it describes the GENERATION rather than the file, and it survives anything
+// that rewrites the file without a new daemon. And it carries full clock
+// precision, where mtime granularity is a filesystem property -- 1s on HFS+ --
+// so an mtime comparison could round a genuinely fresh file back before the
+// launch and reject a daemon we really did start. The comparison is strict (no
+// tolerance) on purpose: reap_orphans_test.go starts a second daemon in the
+// first one's directory seconds later, so any slack here would readmit exactly
+// the stale generation this rejects.
+func (r *proxRun) acceptDaemonPID(pid int, startedAt time.Time) bool {
 	if pid <= 0 {
 		return false
 	}
@@ -704,7 +732,12 @@ func (r *proxRun) acceptDaemonPID(pid int) bool {
 	if !r.detached {
 		return launcher != 0 && pid == launcher
 	}
-	return pid != launcher && daemon.ProcessExists(pid)
+	if pid == launcher || !daemon.ProcessExists(pid) {
+		return false
+	}
+	// A state file with no started_at at all is unattributable, and therefore
+	// not ours: real prox always writes one.
+	return !startedAt.IsZero() && !startedAt.Before(r.launchedAt)
 }
 
 // watchIdentity resolves the daemon identity in the background until it appears,

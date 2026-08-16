@@ -49,6 +49,18 @@ import (
 // A bare pid comparison is a promise to eventually SIGKILL an innocent process
 // after pid reuse; daemon.IsProcessAlive(pid, token) makes that unrepresentable
 // (internal/daemon/liveness.go).
+//
+// A token is NECESSARY but not SUFFICIENT for the cross-run sweep (layer 3),
+// which is the only layer that signals pids recorded by a test binary that is
+// already dead. There the record can be hours old, so pid+token proves only
+// "some process by that name is alive", and it proves even that weakly:
+// IsProcessAlive also answers "alive" when the CURRENT token cannot be read.
+// Before that layer signals anything it therefore requires POSITIVE
+// IDENTIFICATION -- the process must answer prox's own API at the recorded
+// address AND report the project directory the record names (confirmProxDaemon
+// below). A stranger who inherited the pid does not serve prox's API there. An
+// unidentifiable row is REPORTED and left alone: a visible stray daemon is
+// strictly better than a dead bystander on a developer's machine.
 
 // Budgets for teardown, named by the role each one plays. Every one of them
 // bounds a wait that either completes early or means something is wrong, so
@@ -76,6 +88,12 @@ const (
 	// daemon is gone. For a foreground run they are the same process, so this
 	// only ever absorbs the gap between exit and wait4.
 	launcherExitBudget = 5 * time.Second
+	// daemonIdentifyBudget bounds the GET /api/v1/status that positively
+	// identifies a recorded pid as our prox before the cross-run sweep signals
+	// it. Short on purpose: this runs before every test in the package, against
+	// a loopback address, and its failure mode is benign -- an unidentified row
+	// is reported and left alone rather than killed.
+	daemonIdentifyBudget = 3 * time.Second
 )
 
 // daemonStateFileName / daemonStateDirName live in fixture_test.go.
@@ -97,6 +115,26 @@ func (d daemonIdentity) alive() bool {
 	return d.PID > 0 && daemon.IsProcessAlive(d.PID, d.StartToken)
 }
 
+// killableAcrossRuns is alive() plus the one guarantee alive() cannot make:
+// that the pid is still THIS process and not a stranger who inherited it.
+//
+// daemon.IsProcessAlive deliberately answers "alive" when the token is 0 --
+// meaning ProcessStartTime could not be read when the identity was captured --
+// so alive() degrades to a bare pid check in that case. Within a single run
+// that is fine: the process was launched seconds ago by this test binary, and
+// the teardown is aimed at something we are still holding.
+//
+// Across runs it is not fine. The cross-run sweep signals pids recorded by a
+// test binary that is already dead, so the record can be minutes or hours old
+// and the pid long since recycled by the OS into somebody's editor. A bare pid
+// check there is the difference between reaping our own leak and SIGKILLing an
+// unrelated process on a developer's machine. So a tokenless record is never
+// signalled -- it is reported instead, which turns an invisible risk into a
+// visible, actionable leak.
+func (d daemonIdentity) killableAcrossRuns() bool {
+	return d.StartToken != 0 && d.alive()
+}
+
 func (d daemonIdentity) String() string {
 	return fmt.Sprintf("pid=%d token=%d dir=%s", d.PID, d.StartToken, d.StateDir)
 }
@@ -106,6 +144,11 @@ type daemonStateSnapshot struct {
 	PID  int    `json:"pid"`
 	Port int    `json:"port"`
 	Host string `json:"host"`
+	// StartedAt is the daemon's own time.Now() from the moment it wrote this
+	// file (internal/cli/up.go, just after the PID file is locked). It is how a
+	// launch tells the state file IT caused from one a previous generation left
+	// behind in the same directory; see identityFromStateDir.
+	StartedAt time.Time `json:"started_at"`
 }
 
 // readDaemonState reads and parses <stateDir>/prox.state.
@@ -126,16 +169,23 @@ func readDaemonState(stateDir string) (daemonStateSnapshot, bool) {
 }
 
 // identityFromStateDir turns the state file in stateDir into a daemon identity,
-// accepting it only if accept(pid) vouches that the recorded pid belongs to the
-// launch asking.
+// accepting it only if accept vouches that the recorded pid AND the moment the
+// daemon recorded it belong to the launch asking.
 //
 // accept is what keeps a STALE state file from being adopted: a fixture
 // directory can host more than one daemon generation (reap_orphans_test.go
 // starts a second prox in the first one's directory), and a generation killed
 // with SIGKILL leaves its state file behind.
-func identityFromStateDir(stateDir string, accept func(pid int) bool) (daemonIdentity, bool) {
+//
+// The started-at timestamp is passed alongside the pid because a pid alone
+// cannot express freshness. A detached launch cannot check "is this pid the one
+// I started" -- the whole point of `up -d` is that it is not -- so without a
+// freshness test a launch that FAILED could adopt a dead generation's file whose
+// pid the OS has since recycled, capture that innocent process's genuinely valid
+// start token, and hand cleanup a bystander to signal.
+func identityFromStateDir(stateDir string, accept func(pid int, startedAt time.Time) bool) (daemonIdentity, bool) {
 	st, ok := readDaemonState(stateDir)
-	if !ok || !accept(st.PID) {
+	if !ok || !accept(st.PID, st.StartedAt) {
 		return daemonIdentity{}, false
 	}
 	host := st.Host
@@ -210,9 +260,22 @@ func awaitIdentityGone(id daemonIdentity, budget time.Duration) bool {
 //
 // The re-verification is not paranoia about a race that cannot happen: between
 // deciding to kill and signalling, the daemon may exit on its own and its pid be
-// handed to something unrelated. Checking pid AND token right before the syscall
-// is the only thing standing between this helper and killing a stranger's
-// process. It reports whether it actually signalled.
+// handed to something unrelated. Checking pid AND token immediately before the
+// syscall shrinks that window to as little as this can portably make it.
+//
+// It does NOT close it. Verify-then-kill is two syscalls with no portable way to
+// fuse them: Linux has pidfd_send_signal, macOS -- a CI target here and the
+// platform this suite is developed on -- has no equivalent, so a pid can in
+// principle be freed and reused between the check and the kill(2). What remains
+// after the caller's own guards is a race that requires ALL of: the daemon
+// exiting in that microsecond window, the OS recycling its pid immediately
+// (pids are handed out cyclically, so this means wrapping the whole pid space),
+// and -- for the cross-run sweep, the only caller that signals a process this
+// binary did not start -- that same recycled pid having ALREADY answered prox's
+// API at the recorded address and claimed the recorded project directory
+// (confirmProxDaemon). Nothing here should be read as claiming atomicity.
+//
+// It reports whether it actually signalled.
 func terminateDaemon(id daemonIdentity) bool {
 	if !id.alive() {
 		return false
@@ -268,6 +331,117 @@ func stopDaemon(id daemonIdentity, logf func(string, ...any)) {
 	terminateDaemon(id)
 }
 
+// --- positive identification --------------------------------------------------
+
+// proxStatusIdentity is the subset of api.StatusResponse that answers the only
+// question this file asks a daemon: "are you the prox for the directory my
+// record names?".
+//
+// ProjectDir is the field that genuinely proves it. It is the daemon's own cwd
+// -- the directory whose .prox/prox.state it wrote (internal/api/handlers.go
+// GetStatus, internal/cli/up.go) -- so it ties the LIVE process at this address
+// back to the recorded state directory. ConfigFile does not: `prox up -c
+// ../shared/prox.yaml` lets two project roots share one config, so a matching
+// config path would let either one claim the other. APIVersion is checked only
+// to reject a non-prox server that happens to return 200 and valid JSON.
+type proxStatusIdentity struct {
+	ProjectDir string `json:"project_dir"`
+	APIVersion string `json:"api_version"`
+}
+
+// confirmProxDaemon reports whether the process holding id's pid really is the
+// prox daemon that wrote id.StateDir, by asking it.
+//
+// This is the guarantee pid+token cannot make, and the reason it exists is that
+// pid+token is a claim about an ARBITRARILY OLD record. The cross-run sweep acts
+// on ledgers written by test binaries that are already dead; by the time it
+// runs, the recorded pid may belong to a developer's editor, and
+// daemon.IsProcessAlive would still say "alive" whenever the current token
+// happens to be unreadable (internal/daemon/liveness.go biases toward alive by
+// design, so that a live process is never falsely reaped -- the opposite of the
+// bias wanted here).
+//
+// An HTTP round trip against the recorded address is far stronger: a stranger
+// who merely inherited the pid does not serve prox's API there, and a DIFFERENT
+// prox that happens to hold the port reports a different project directory. The
+// second failure explains itself, which is what the caller prints.
+func confirmProxDaemon(id daemonIdentity) (bool, string) {
+	if id.Addr == "" {
+		return false, "no API address was recorded for it, so it cannot be identified as prox"
+	}
+	if id.StateDir == "" {
+		return false, "no state directory was recorded for it, so there is nothing to match its identity against"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), daemonIdentifyBudget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, id.Addr+"/api/v1/status", nil)
+	if err != nil {
+		return false, fmt.Sprintf("its recorded address %s is unusable: %v", id.Addr, err)
+	}
+	resp, err := ctxBoundClient.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("nothing answered prox's API at %s: %v", id.Addr, err)
+	}
+	defer resp.Body.Close()
+	// Bounded read: whatever is listening on that port need not be prox, and a
+	// hostile or merely chatty server must not be able to stream forever inside
+	// the request budget.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return false, fmt.Sprintf("reading the status response from %s failed: %v", id.Addr, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("%s answered HTTP %d rather than a prox status", id.Addr, resp.StatusCode)
+	}
+
+	var st proxStatusIdentity
+	if json.Unmarshal(body, &st) != nil || st.APIVersion == "" {
+		return false, fmt.Sprintf("whatever is listening on %s does not answer as prox", id.Addr)
+	}
+	if st.ProjectDir == "" {
+		return false, fmt.Sprintf("the prox at %s reports no project directory, so it cannot be tied to %s",
+			id.Addr, id.StateDir)
+	}
+	want := filepath.Dir(id.StateDir)
+	if !samePath(st.ProjectDir, want) {
+		return false, fmt.Sprintf("the prox at %s serves project %s, not %s", id.Addr, st.ProjectDir, want)
+	}
+	return true, ""
+}
+
+// samePath reports whether two paths name the same directory, preferring the
+// inode over the spelling.
+//
+// String comparison is not enough here: on macOS a project directory under
+// $TMPDIR is spelled /var/folders/... while a daemon started there reports its
+// own cwd as the resolved /private/var/folders/... (verified against a real
+// daemon's GET /status). Treating those as different would make every
+// identification fail on that platform -- turning the safety check into a
+// blanket refusal to reap. Mirrors internal/cli/root.go samePath, which compares
+// the same two values for the same reason.
+//
+// When a path no longer exists the fallback is a plain string comparison, which
+// can only produce "not the same" for the two spellings above -- i.e. the sweep
+// reports the row instead of signalling it. That is the safe direction, and the
+// case barely arises: the run this reaper cleans up after was SIGKILLed, so its
+// t.TempDir cleanups never ran and its project directories are still on disk.
+func samePath(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr == nil && berr == nil {
+		return os.SameFile(ai, bi)
+	}
+	return cleanAbsPath(a) == cleanAbsPath(b)
+}
+
+func cleanAbsPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return filepath.Clean(p)
+}
+
 // --- cross-run ledger -------------------------------------------------------
 //
 // LOCAL-ONLY VALUE, by construction: CI runners get a fresh TMPDIR (and a fresh
@@ -276,8 +450,23 @@ func stopDaemon(id daemonIdentity, logf func(string, ...any)) {
 // loop, where run N+1 runs minutes after run N was SIGKILLed on the same box.
 
 // ledgerDirName is the directory under ${TMPDIR} holding one JSONL file per
-// test-binary run, named <owner pid>.jsonl.
+// test-binary run, named <owner pid>-<owner start token>.jsonl.
 const ledgerDirName = "prox-integration-runs"
+
+// ledgerFileName names the ledger belonging to one run GENERATION.
+//
+// The start token is in the NAME, not just in the rows, so that a run whose pid
+// the OS has recycled cannot append to its predecessor's file. With <pid>.jsonl
+// alone it could: the new run skips the old ledger at startup (its owner "looks
+// alive" -- it IS alive, it is us) and then writes its own rows into it. A
+// concurrent sweeper reading that file would take the owner identity from the
+// first row, decide the owner is dead, and act on EVERY row -- including the
+// live run's, whose daemons it would then reap out from under it. Two
+// generations in one file is the whole bug; a token in the name makes it
+// unrepresentable.
+func ledgerFileName(ownerPID int, ownerToken int64) string {
+	return strconv.Itoa(ownerPID) + "-" + strconv.FormatInt(ownerToken, 10) + ".jsonl"
+}
 
 // ledgerEntry is one line of a run ledger: the daemon this run started, plus
 // the identity of the run that owns it.
@@ -318,7 +507,7 @@ func newRunLedger(dir string, ownerPID int) *runLedger {
 	token, _ := daemon.ProcessStartTime(ownerPID)
 	return &runLedger{
 		dir:        dir,
-		path:       filepath.Join(dir, strconv.Itoa(ownerPID)+".jsonl"),
+		path:       filepath.Join(dir, ledgerFileName(ownerPID, token)),
 		ownerPID:   ownerPID,
 		ownerToken: token,
 	}
@@ -420,29 +609,51 @@ func reapStaleLedgers(dir string, selfPID int, w io.Writer) int {
 		if name.IsDir() {
 			continue
 		}
-		ownerPID, ok := ledgerOwnerFromName(name.Name())
+		// The FILE NAME is the sole authority on which run generation owns this
+		// ledger, so the owner identity is read from it -- never from the rows,
+		// which is what let a reused owner pid mix two runs into one file.
+		ownerPID, ownerToken, ok := ledgerOwnerFromName(name.Name())
 		if !ok || ownerPID == selfPID {
 			continue
 		}
 		path := filepath.Join(dir, name.Name())
 
-		entries := readLedgerFile(path, ownerPID)
+		entries := readLedgerFile(path, ownerPID, ownerToken)
 
 		// Owner liveness decides everything. A live owner is a test run in
 		// progress (this suite is routinely run from two terminals at once), and
 		// killing ITS daemons would be a far worse bug than the leak this
 		// reaper exists to fix -- so a live owner means hands off the whole file.
-		ownerToken := int64(0)
-		if len(entries) > 0 {
-			ownerToken = entries[0].OwnerStartToken
-		}
 		if daemon.IsProcessAlive(ownerPID, ownerToken) {
 			continue
 		}
 
 		for _, e := range entries {
 			id := e.identity()
-			if !id.alive() {
+			if id.StartToken == 0 && id.PID > 0 && daemon.ProcessExists(id.PID) {
+				// Deliberately NOT killed: without a start token this pid
+				// cannot be proven to still be the daemon we recorded, and the
+				// owner of this ledger is already dead, so the record may be
+				// arbitrarily old. Say so rather than either killing blind or
+				// staying silent.
+				fmt.Fprintf(w, "prox integration: NOT reaping pid %d from dead test run %d: "+
+					"no start token was captured, so it cannot be distinguished from an unrelated "+
+					"process that inherited the pid. If it is a stray prox, stop it manually.\n",
+					id.PID, ownerPID)
+				continue
+			}
+			if !id.killableAcrossRuns() {
+				continue
+			}
+			// pid+token got us this far; nothing is signalled until the process
+			// itself confirms, over prox's own API, that it is the daemon this
+			// row describes. Everything above is a claim about a record written
+			// by a test binary that is already dead.
+			if ok, why := confirmProxDaemon(id); !ok {
+				fmt.Fprintf(w, "prox integration: NOT reaping pid %d from dead test run %d: %s. "+
+					"It cannot be proven to be the daemon that run recorded, and a wrong signal here "+
+					"would land on an unrelated process. If it is a stray prox, stop it manually.\n",
+					id.PID, ownerPID, why)
 				continue
 			}
 			fmt.Fprintf(w, "prox integration: reaping leaked daemon %s from dead test run %d\n", id, ownerPID)
@@ -458,28 +669,45 @@ func reapStaleLedgers(dir string, selfPID int, w io.Writer) int {
 	return reaped
 }
 
-// ledgerOwnerFromName parses "<pid>.jsonl". Anything else in the directory is
-// somebody else's business and is left alone.
-func ledgerOwnerFromName(name string) (int, bool) {
+// ledgerOwnerFromName parses "<pid>-<start token>.jsonl" into the run
+// generation that owns it. Anything else in the directory -- including a
+// bare "<pid>.jsonl" written by an older build of this suite, which names a pid
+// but no generation -- is somebody else's business and is left strictly alone.
+func ledgerOwnerFromName(name string) (int, int64, bool) {
 	base, ok := strings.CutSuffix(name, ".jsonl")
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
-	pid, err := strconv.Atoi(base)
+	pidPart, tokenPart, ok := strings.Cut(base, "-")
+	if !ok {
+		return 0, 0, false
+	}
+	pid, err := strconv.Atoi(pidPart)
 	if err != nil || pid <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return pid, true
+	// A zero token is legitimate: it is what a platform with no
+	// ProcessStartTime implementation records, and the sweep already degrades
+	// safely there (IsProcessAlive falls back to bare pid existence for the
+	// owner, and every tokenless ROW is reported rather than signalled).
+	token, err := strconv.ParseInt(tokenPart, 10, 64)
+	if err != nil || token < 0 {
+		return 0, 0, false
+	}
+	return pid, token, true
 }
 
 // readLedgerFile parses the entries a ledger file holds.
 //
 // A run that was SIGKILLed mid-write leaves a truncated last line, and that is
 // the NORMAL case for the files this reaper reads -- so a malformed line is
-// skipped, never fatal. Entries whose owner_pid disagrees with the filename are
-// dropped too: the file's name is the authority on who owns it, and a row that
-// contradicts it cannot be trusted to name a pid worth signalling.
-func readLedgerFile(path string, ownerPID int) []ledgerEntry {
+// skipped, never fatal. Entries whose owner identity disagrees with the
+// filename's are dropped too, on BOTH the pid and the start token: the file's
+// name is the authority on which run generation owns it, and a row that
+// contradicts it cannot be trusted to name a pid worth signalling. The token
+// half is what makes a mixed ledger inert as well as unlikely -- a file that
+// somehow contains two generations' rows acts on neither.
+func readLedgerFile(path string, ownerPID int, ownerToken int64) []ledgerEntry {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -494,7 +722,7 @@ func readLedgerFile(path string, ownerPID int) []ledgerEntry {
 		if json.Unmarshal([]byte(line), &e) != nil {
 			continue
 		}
-		if e.PID <= 0 || e.OwnerPID != ownerPID {
+		if e.PID <= 0 || e.OwnerPID != ownerPID || e.OwnerStartToken != ownerToken {
 			continue
 		}
 		entries = append(entries, e)
@@ -546,14 +774,16 @@ func installSignalTeardown(w io.Writer) {
 // Liveness, not file existence: an abandoned .prox/prox.state whose pid is dead
 // (or has been reused by something unrelated) must NOT print anything. prox.state
 // records no start token, so the confirmation here is the daemon's own API
-// answering on the address the file names -- a stronger check than a token, since
-// a reused pid does not serve prox's API.
+// answering on the address the file names AND claiming the repo root as its
+// project directory -- confirmProxDaemon, the same positive identification the
+// cross-run sweep requires before it signals anything.
 func warnOnRepoRootDaemon(w io.Writer) bool {
 	root, err := repoRootDir()
 	if err != nil {
 		return false
 	}
-	st, ok := readDaemonState(filepath.Join(root, daemonStateDirName))
+	stateDir := filepath.Join(root, daemonStateDirName)
+	st, ok := readDaemonState(stateDir)
 	if !ok || !daemon.ProcessExists(st.PID) {
 		return false
 	}
@@ -563,19 +793,7 @@ func warnOnRepoRootDaemon(w io.Writer) bool {
 		host = "127.0.0.1"
 	}
 	addr := "http://" + net.JoinHostPort(host, strconv.Itoa(st.Port))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, addr+"/api/v1/status", nil)
-	if err != nil {
-		return false
-	}
-	resp, err := ctxBoundClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	if ok, _ := confirmProxDaemon(daemonIdentity{PID: st.PID, StateDir: stateDir, Addr: addr}); !ok {
 		return false
 	}
 
