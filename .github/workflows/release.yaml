@@ -18,6 +18,11 @@ jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
+    # Deliberately generous: this job runs the full gate AND uploads release
+    # artifacts. A release killed mid-upload is a painful partial-failure to
+    # recover from (see RELEASING.md), so this is a runaway backstop against
+    # GitHub's 6-hour default, not a performance budget.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout

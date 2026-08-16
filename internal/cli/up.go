@@ -201,8 +201,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 		// The parent owns wait-and-report (D2): it never runs the supervisor
 		// itself. It returns here — nil (exit 0) once the child is confirmed
-		// ready, or an error (exit 1) on early death / never-ready timeout.
-		return awaitDaemonStartup(&execChild{cmd: child}, cwd, defaultDaemonStartupOps())
+		// ready AND its processes have been watched for the settle window
+		// without any of them reaching a terminal-failed state (#94), or an
+		// error (exit 1) on early death, never-ready timeout, or a process
+		// that started and immediately died.
+		return startDetachedDaemon(&execChild{cmd: child}, cwd, defaultDaemonStartupOps())
 	}
 
 	// If we're the daemon child, set up logging

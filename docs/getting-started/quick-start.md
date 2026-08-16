@@ -49,10 +49,15 @@ Output:
 
 ```
 NAME     STATUS    PID    UPTIME     RESTARTS  HEALTH
-web      running   12345  5m30s      0         unknown
-api      running   12346  5m30s      0         healthy
-worker   running   12347  5m30s      1         unknown
+web      running   12345  5m30s      0         -
+api      running   12346  5m30s      0         -
+worker   running   12347  5m30s      1         -
 ```
+
+`HEALTH` is `-` because none of these processes declares a
+[`healthcheck`](../reference/configuration.md#health-check-fields) — prox had nothing
+to run, so it reports nothing. Once you add one, the column shows `healthy` or
+`unhealthy`, or `unknown` while a configured check has yet to report.
 
 ## View Logs
 

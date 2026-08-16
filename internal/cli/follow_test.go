@@ -160,10 +160,16 @@ func TestRunLogs_FollowReconnectsAfterMidStreamDrop(t *testing.T) {
 	}
 }
 
-// TestRunLogs_FollowInitialConnectFailureFailsFast pins the UNCHANGED
-// behavior for a failed FIRST connect (plan 017 C13 requirement 1): no
-// reconnect loop ever engages, and the error text/hint are byte-for-byte what
-// `prox logs --follow` returned before this landed.
+// TestRunLogs_FollowInitialConnectFailureFailsFast pins the fail-fast contract
+// for a failed FIRST connect (plan 017 C13 requirement 1): no reconnect loop
+// ever engages, and the daemon's own error is returned verbatim.
+//
+// It is ALSO the regression test for #95 (plan 027 C11). It used to assert the
+// opposite — that a 500 from this live httptest daemon came back with "Is prox
+// running? Try 'prox up' first." appended — i.e. it encoded the bug: the
+// daemon plainly IS running here (it just answered 500), so the hint asserted
+// something the test itself disproves. The hint is now attached only to errors
+// that positively say nothing is listening (hintFits), so it must NOT appear.
 func TestRunLogs_FollowInitialConnectFailureFailsFast(t *testing.T) {
 	resetLogsFollowFlags(t)
 
@@ -183,9 +189,12 @@ func TestRunLogs_FollowInitialConnectFailureFailsFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error from a failed initial connect")
 	}
-	const wantText = "server error: the prox daemon encountered an internal error\nIs prox running? Try 'prox up' first."
+	const wantText = "server error: the prox daemon encountered an internal error"
 	if err.Error() != wantText {
 		t.Errorf("expected fail-fast error %q, got %q", wantText, err.Error())
+	}
+	if strings.Contains(err.Error(), "Is prox running") {
+		t.Errorf("a daemon that answered 500 is running; the hint must not be attached: %q", err.Error())
 	}
 }
 

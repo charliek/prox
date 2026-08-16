@@ -158,7 +158,7 @@ List all processes.
       "pid": 0,
       "uptime_seconds": 9,
       "restarts": 0,
-      "health": "unknown",
+      "health": "none",
       "kind": "task"
     }
   ]
@@ -167,7 +167,7 @@ List all processes.
 
 **Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`, `waiting`, `blocked`, `completed` (task exited `0`)
 
-**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured — always `unknown` for a task)
+**Health values:** `healthy`, `unhealthy`, `unknown`, `none`. `none` = no `healthcheck:` configured, so nothing was ever run (CLI table shows `-`); `unknown` = a check **is** configured but has not reported yet (stopped, crashed, not yet launched, or still inside `start_period`). Do not read `unknown` as "the check failed". Treat the list as open — fall through to a neutral rendering for a value you do not recognize.
 
 | Field | Description |
 |-------|-------------|
@@ -204,6 +204,8 @@ Get detailed process info.
   "stop_timeout": "30s"
 }
 ```
+
+The `healthcheck` block is present only when one is configured — a process reporting `"health": "none"` omits it. Its `enabled` field reports whether the check loop is currently running: `false` once the process is stopped, or before it has ever been launched, which is when `health` reads `unknown`.
 
 `stop_timeout` is the effective SIGTERM→SIGKILL escalation budget in force for this process (its own `stop_timeout`, else the global `shutdown_timeout`, else the `10s` default), as a duration string. It is the budget governing a `POST /processes/{name}/stop` or `POST /processes/{name}/restart`. See [Stop Timeout](configuration.md#stop-timeout).
 

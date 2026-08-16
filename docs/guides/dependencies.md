@@ -117,6 +117,12 @@ check.
 `Dependencies:` section listing every configured dependency's resolution
 state.
 
+The HEALTH column is independent of all of this. It reads `-` when a process
+or task declares no [`healthcheck`](../reference/configuration.md#health-check-fields)
+— the `register` task below never has one — and `unknown` only when a
+configured check has yet to report, which is the normal state for a gated
+process still sitting in `waiting` or `blocked`.
+
 Mid-resolution, right after `prox up -d`:
 
 ```text
@@ -129,7 +135,7 @@ NAME      STATUS               PID    UPTIME  RESTARTS  HEALTH
 ----      ------               ---    ------  --------  ------
 api       waiting(postgres, redis)  -      0s      0         unknown
 worker    waiting(postgres, redis, restate, register)  -  0s  0  unknown
-register  waiting(restate)     -      0s      0         unknown
+register  waiting(restate)     -      0s      0         -
 
 Dependencies:
 NAME      STATE     CHECK                          DETAIL
@@ -151,7 +157,7 @@ NAME      STATUS     PID    UPTIME  RESTARTS  HEALTH
 ----      ------     ---    ------  --------  ------
 api       running    41213  6s      0         healthy
 worker    running    41240  2s      0         healthy
-register  completed  -      9s      0         unknown
+register  completed  -      9s      0         -
 
 Dependencies:
 NAME      STATE    CHECK                          DETAIL
@@ -210,7 +216,7 @@ process or task gated on it goes `blocked`:
 $ prox status
 NAME      STATUS      PID  UPTIME  RESTARTS  HEALTH
 ----      ------      ---  ------  --------  ------
-register  crashed     -    -       0         unknown
+register  crashed     -    -       0         -
 worker    blocked(register)  -     0s        0    unknown
 
 Crashed: register — check 'prox logs register'.

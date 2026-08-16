@@ -144,7 +144,115 @@ func TestManagedProcess_Info(t *testing.T) {
 	assert.Equal(t, "echo hello", info.Cmd)
 	assert.Equal(t, "bar", info.Env["FOO"])
 	assert.Equal(t, domain.ProcessStateStopped, info.State)
-	assert.Equal(t, domain.HealthStatusUnknown, info.Health)
+	// No healthcheck configured: "none", not "unknown" (#100). "unknown" reads as
+	// a check that ran and could not reach a verdict; nothing was ever run here.
+	assert.Equal(t, domain.HealthStatusNone, info.Health)
+	assert.Nil(t, info.HealthDetails, "a process with no healthcheck must carry no health detail block")
+}
+
+// TestManagedProcess_Info_HealthSituations pins the three-way distinction from
+// #100: Info() derives Health from the CONFIG, not from whether a checker
+// object currently exists. Keying on p.healthChecker cannot tell "never
+// configured" apart from "configured but stopped/crashed/not yet launched",
+// which is exactly the conflation that made an unconfigured process report
+// "unknown".
+func TestManagedProcess_Info_HealthSituations(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	defer logMgr.Close()
+
+	t.Run("no healthcheck configured reports none", func(t *testing.T) {
+		mp := NewManagedProcess(domain.ProcessConfig{
+			Name: "web",
+			Cmd:  "sleep 30",
+		}, nil, NewExecRunner(), logMgr)
+
+		info := mp.Info()
+		assert.Equal(t, domain.HealthStatusNone, info.Health)
+		assert.Nil(t, info.HealthDetails)
+	})
+
+	// A healthcheck block whose Cmd is empty is the same as no healthcheck at
+	// all: launch skips checker creation on the same condition, so nothing would
+	// ever run.
+	t.Run("healthcheck with empty cmd reports none", func(t *testing.T) {
+		mp := NewManagedProcess(domain.ProcessConfig{
+			Name:        "web",
+			Cmd:         "sleep 30",
+			Healthcheck: &domain.HealthConfig{},
+		}, nil, NewExecRunner(), logMgr)
+
+		assert.Equal(t, domain.HealthStatusNone, mp.Info().Health)
+	})
+
+	t.Run("configured but not yet launched reports unknown", func(t *testing.T) {
+		mp := NewManagedProcess(domain.ProcessConfig{
+			Name:        "web",
+			Cmd:         "sleep 30",
+			Healthcheck: &domain.HealthConfig{Cmd: "true"},
+		}, nil, NewExecRunner(), logMgr)
+
+		info := mp.Info()
+		require.Equal(t, domain.ProcessStateStopped, info.State)
+		assert.Equal(t, domain.HealthStatusUnknown, info.Health)
+		// The detail block is present and says the loop is dormant, so a client can
+		// tell "configured, waiting to run" from "configured and actively checking".
+		require.NotNil(t, info.HealthDetails)
+		assert.False(t, info.HealthDetails.Enabled)
+		assert.Equal(t, domain.HealthStatusUnknown, info.HealthDetails.Status)
+	})
+
+	t.Run("configured but crashed reports unknown", func(t *testing.T) {
+		mp := NewManagedProcess(domain.ProcessConfig{
+			Name:        "web",
+			Cmd:         "sleep 30",
+			Healthcheck: &domain.HealthConfig{Cmd: "true"},
+		}, nil, NewExecRunner(), logMgr)
+
+		// A crash leaves the process terminal; a later Stop discards the checker.
+		// Either way the configured check has reported nothing, so: unknown.
+		mp.mu.Lock()
+		mp.state = domain.ProcessStateCrashed
+		mp.healthChecker = nil
+		mp.mu.Unlock()
+
+		info := mp.Info()
+		assert.Equal(t, domain.ProcessStateCrashed, info.State)
+		assert.Equal(t, domain.HealthStatusUnknown, info.Health,
+			"a configured check on a crashed process must stay unknown, not collapse to none")
+	})
+
+	// A live checker owns the verdict, and reports Enabled=true only while its
+	// loop is actually running.
+	t.Run("live checker owns the status", func(t *testing.T) {
+		mp := NewManagedProcess(domain.ProcessConfig{
+			Name:        "web",
+			Cmd:         "sleep 30",
+			Healthcheck: &domain.HealthConfig{Cmd: "true"},
+		}, nil, NewExecRunner(), logMgr)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// The explicit cancel below is the SUBJECT of this test, but it is not
+		// reached if an assertion before it fails -- and then the checker's loop
+		// would outlive the test, shelling out on its interval for as long as the
+		// package keeps running. The deferred cancel is the backstop; cancelling
+		// twice is a no-op.
+		defer cancel()
+		checker := NewHealthChecker("web", domain.HealthConfig{Cmd: "true"}, nil)
+		checker.Start(ctx)
+		mp.mu.Lock()
+		mp.healthChecker = checker
+		mp.mu.Unlock()
+
+		info := mp.Info()
+		assert.Equal(t, domain.HealthStatusUnknown, info.Health, "no check has completed yet")
+		require.NotNil(t, info.HealthDetails)
+		assert.True(t, info.HealthDetails.Enabled, "a running check loop reports enabled")
+
+		// Cancelling the instance context stops the loop; Enabled must follow it
+		// down rather than staying hardcoded true (#100 panel finding).
+		cancel()
+		assert.False(t, mp.Info().HealthDetails.Enabled)
+	})
 }
 
 // TestManagedProcess_Info_WaitingReportsNoPID pins the plan 013 D5 fix: a gated

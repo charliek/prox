@@ -75,13 +75,17 @@ func (h *HealthChecker) Stop() {
 	h.mu.Unlock()
 }
 
-// State returns the current health state
+// State returns the current health state. Enabled reports whether the check
+// loop is actually running -- h.ctx is set by Start and is done once the
+// instance context is canceled -- rather than the hardcoded true it used to be
+// (#100). h.ctx is written under h.mu in Start, so reading it here under the
+// read lock is race-free.
 func (h *HealthChecker) State() domain.HealthState {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	return domain.HealthState{
-		Enabled:             true,
+		Enabled:             h.ctx != nil && h.ctx.Err() == nil,
 		Status:              h.status,
 		LastCheck:           h.lastCheck,
 		LastOutput:          h.lastOutput,

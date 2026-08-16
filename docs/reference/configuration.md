@@ -358,6 +358,12 @@ needed for the fields below.
 
 Duration fields use Go's duration syntax (e.g. `500ms`, `30s`, `1m30s`). An invalid or negative duration makes `prox up` fail at startup with a clear error naming the field (e.g. `processes.api.healthcheck.interval: invalid duration "3x"`). Omitting a field — or setting it to `0` — uses the default shown above.
 
+A process with **no** `healthcheck:` block reports health `none` on the API and
+renders as `-` in the `prox status` table — prox never had a check to run.
+`unknown` is reserved for a *configured* check that has not reported a verdict
+yet: the process is stopped, crashed, not yet launched, or still inside its
+`start_period`. See [Health values](api.md#get-processes).
+
 ## Environment Variable Precedence
 
 Environment variables are loaded in this order (later values override earlier):
@@ -391,7 +397,7 @@ When prox is running (in either foreground or daemon mode), runtime state is sto
 | `.prox/prox.pid` | Process ID with file locking to prevent multiple instances |
 | `.prox/prox.log` | Daemon logs (stdout/stderr redirected here in background mode) |
 
-When running in daemon mode (`prox up -d`), all output that would normally go to stdout/stderr is redirected to `.prox/prox.log`. This is useful for debugging startup issues or reviewing daemon activity.
+When running in daemon mode (`prox up -d`), all output that would normally go to stdout/stderr is redirected to `.prox/prox.log`. This is useful for debugging startup issues or reviewing daemon activity. The file is opened for append and never truncated or rotated, so it accumulates across every run; each run writes a `--- run <time> pid=<pid> ---` marker as its first line, which `prox up -d` failure diagnostics use to show only the failing run's own output rather than the whole file's history.
 
 **State File Format:**
 

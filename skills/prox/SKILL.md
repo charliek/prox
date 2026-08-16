@@ -30,7 +30,13 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 
 **Editing `prox.yaml`?** `prox restart <name>` (or `prox start <name>` after `prox stop <name>`) re-reads the file and applies that process's current `cmd`, `healthcheck`, `stop_timeout`, and `env`/`env_file` — no full `prox stop` + `prox up` needed. Adding/removing/renaming processes or changing `services`/`proxy` still requires `prox up`.
 
-**Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block. `prox up -d` now confirms real readiness: it exits non-zero with a `.prox/prox.log` tail if the daemon never becomes healthy (trust the exit code), and fails hard with remediation on a daemon/CLI version mismatch instead of silently degrading.
+**Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block. `prox up -d` exits `0` only when **the daemon is up AND no process was in a terminal-failed state** — it waits for readiness and then watches the processes for 500ms. Trust the exit code:
+
+- exit non-zero **with a `.prox/prox.log` tail** → the daemon never came up (bad config, port bind failure); nothing is running.
+- exit non-zero **with a `Crashed: <name>` line and a pointer to `prox down`** → the daemon IS up, but a process died on launch. Read `prox logs <name>`, fix it, and `prox down` when you want to stop the daemon.
+- a daemon/CLI version mismatch still fails hard with remediation instead of silently degrading.
+
+`prox start <name>` and `prox restart <name>` follow the same rule: non-zero means the process did not survive its first 500ms, and the `Started process: …` line is not printed. The flip side is that this is a 500ms observation, not a verified end state — a process that dies later needs `prox status` to spot, and every successful `start`/`restart` pays that 500ms.
 
 **Foreground `prox up` now opens the interactive TUI** when it is run in a real terminal. This does not change what you should do — keep using `-d` — and it does not change what you get: an agent's shell is not an interactive terminal, so a bare `prox up` still streams plain logs and still blocks. The TUI is only reached when stdin *and* stdout are a terminal, `TERM` is set and not `dumb`, and the process is in the terminal's foreground process group; otherwise prox falls back to log streaming silently, with no error. `--no-tui` or `PROX_TUI=0` force plain streaming, and `--tui` demands the TUI and fails if the terminal cannot host one — but if you find yourself reaching for any of them, you probably wanted `-d`.
 
@@ -93,8 +99,8 @@ Key rules: names must be unique across `processes`/`dependencies`/`tasks`; a `de
 
 ```text
 NAME    STATUS                  PID  UPTIME  RESTARTS  HEALTH
-api     waiting(redis)          -    0s      0         unknown
-migrate blocked(postgres)       -    0s      0         unknown
+api     waiting(redis)          -    0s      0         -
+migrate blocked(postgres)       -    0s      0         -
 
 Blocked: migrate(postgres)
 
@@ -105,6 +111,7 @@ redis     polling  tcp localhost:6379
 ```
 
 - `waiting(x, y)` — still resolving those targets; `blocked(x)` — a required target failed and this process/task will never launch on its own.
+- **HEALTH `-` is not a problem.** It means no `healthcheck:` is configured (`"health": "none"` in JSON), so prox never had a check to run. `unknown` means a check *is* configured and has not reported yet (stopped, crashed, not yet launched, or still inside its `start_period`) — it is not a failed check either. Only `unhealthy` is a real signal.
 - A **task** that exits `0` lands in `completed` (PID `-`, uptime frozen) and runs only **once per `prox up` lifetime** — a dependent's restart does not re-run it.
 - **Re-demand a blocked dependency:** `prox start <name>` on a blocked, gated process resets only its *failed* targets (healthy/warned ones keep their cached result) and re-resolves.
 - **Re-run a task:** `prox restart <task>` (or `prox stop <task>` + `prox start <task>`).

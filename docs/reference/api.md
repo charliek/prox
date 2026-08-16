@@ -158,7 +158,7 @@ List all processes.
       "pid": 0,
       "uptime_seconds": 9,
       "restarts": 0,
-      "health": "unknown",
+      "health": "none",
       "kind": "task"
     }
   ]
@@ -167,7 +167,7 @@ List all processes.
 
 **Status values:** `running`, `stopped`, `starting`, `stopping`, `crashed`, `waiting` (a gated process/task whose `depends_on` targets are still resolving), `blocked` (a gated process/task left terminal when a required target failed), `completed` (a task that exited `0`)
 
-**Health values:** `healthy`, `unhealthy`, `unknown` (no healthcheck configured — always `unknown` for a task)
+**Health values:** `healthy`, `unhealthy`, `unknown`, `none`. `none` means **no `healthcheck:` is configured**, so prox never had a check to run — the `prox status` table renders it as `-`. `unknown` means a check **is** configured but has not reported a verdict yet: the process is stopped, crashed, not yet launched, or still inside its `start_period`. A task with no healthcheck reports `none` (the `api` and `migrate` entries above show the two cases side by side). Treat the list as open — a future prox may add a value, so clients should fall through to a neutral rendering rather than rejecting one they do not recognize.
 
 | Field | Description |
 |-------|-------------|
@@ -204,6 +204,8 @@ Get detailed process info.
   "stop_timeout": "30s"
 }
 ```
+
+The `healthcheck` block is present only when a `healthcheck:` **is** configured; a process reporting `"health": "none"` omits it entirely. Its `enabled` field reports whether the check loop is currently running: `false` once the process is stopped, or before it has ever been launched, in which case `health` is `unknown` because the configured check has produced no verdict.
 
 `stop_timeout` is the effective SIGTERM→SIGKILL escalation budget in force for this process (its own `stop_timeout`, else the global `shutdown_timeout`, else the `10s` default), as a duration string. It is the budget governing a `POST /processes/{name}/stop` or `POST /processes/{name}/restart`. See [Stop Timeout](configuration.md#stop-timeout).
 

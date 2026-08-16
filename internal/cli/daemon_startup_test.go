@@ -3,7 +3,9 @@ package cli
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -60,8 +62,11 @@ func fastStartupOps() daemonStartupOps {
 	return daemonStartupOps{
 		loadState: func(string) (*daemon.State, error) { return nil, errors.New("no state") },
 		healthOK:  func(string) bool { return false },
-		logTail:   func(string, int) string { return "" },
-		sleep:     func(time.Duration) {},
+		logTail:   func(string, int, int) string { return "" },
+		// Default: nothing failed within the settle window (plan 027 C13).
+		// Tests that care about the post-readiness verdict override it.
+		settle: func(string) (settleVerdict, error) { return settleVerdict{}, nil },
+		sleep:  func(time.Duration) {},
 
 		readyTimeout: 40 * time.Millisecond,
 		pollInterval: time.Millisecond,
@@ -87,10 +92,153 @@ func TestAwaitDaemonStartup_Success(t *testing.T) {
 		return true
 	}
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	addr, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:12345", addr,
+		"the resolved address must be returned: the settle check that follows has no other way to reach the daemon")
 	assert.Equal(t, 1, healthCalls, "health should be probed once")
 	assert.Empty(t, child.sentSignals(), "a ready child must not be signaled")
+}
+
+// readyStartupOps returns fastStartupOps for a child that becomes ready
+// immediately, so a test can concentrate on what happens AFTER readiness.
+func readyStartupOps(pid int) daemonStartupOps {
+	ops := fastStartupOps()
+	ops.loadState = func(string) (*daemon.State, error) {
+		return &daemon.State{PID: pid, Host: "127.0.0.1", Port: 12345}, nil
+	}
+	ops.healthOK = func(string) bool { return true }
+	return ops
+}
+
+// TestStartDetachedDaemon_SuccessPrintsHeadlineAfterSettle: a ready daemon whose
+// processes survive the settle window exits 0 and prints the started line — and
+// prints it only ONCE the settle step has run, which is the ordering the whole
+// commit turns on.
+func TestStartDetachedDaemon_SuccessPrintsHeadlineAfterSettle(t *testing.T) {
+	child := newFakeChild(5000)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5000)
+	settled := false
+	var gotAddr string
+	ops.settle = func(addr string) (settleVerdict, error) {
+		settled = true
+		gotAddr = addr
+		return settleVerdict{}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.NoError(t, err)
+	assert.True(t, settled, "the settle step must run before success is declared")
+	assert.Equal(t, "127.0.0.1:12345", gotAddr)
+	assert.Contains(t, stdout, "prox started (pid 5000, api http://127.0.0.1:12345)")
+	assert.Empty(t, stderr)
+}
+
+// TestStartDetachedDaemon_CrashedProcessExitsNonZero is the #94 contract itself:
+// the daemon is up, a process is crashed, and `prox up -d` must NOT report
+// success. The success headline must be absent (printing it and then exiting
+// non-zero is the same lie in a new place), the crashed process must be named
+// with the same sentence `prox status` uses, and `prox down` must be offered —
+// because a non-zero exit here does not mean nothing started.
+func TestStartDetachedDaemon_CrashedProcessExitsNonZero(t *testing.T) {
+	child := newFakeChild(5001)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5001)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{crashed: []string{"web", "worker"}}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "2 process(es) crashed", err.Error(),
+		"the sentinel must be the one `prox status` returns, not a second vocabulary")
+	assert.NotContains(t, stdout, "prox started", "no success headline may precede a non-zero exit")
+	assert.Contains(t, stderr, "Crashed: web, worker — check 'prox logs web'.")
+	assert.Contains(t, stderr, "prox down")
+	assert.Contains(t, stderr, "pid 5001", "the failure still has to say what IS running")
+}
+
+// TestStartDetachedDaemon_BlockedProcessExitsNonZero: blocked shares the exit
+// contract and the formatter with crashed, so the two paths cannot drift.
+func TestStartDetachedDaemon_BlockedProcessExitsNonZero(t *testing.T) {
+	child := newFakeChild(5002)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5002)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{blocked: []settleProcess{{Name: "gated", Status: "blocked", BlockedOn: []string{"pg"}}}}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "1 process(es) blocked on failed dependencies", err.Error())
+	assert.NotContains(t, stdout, "prox started")
+	assert.Contains(t, stderr, "Blocked: gated(pg)")
+}
+
+// TestStartDetachedDaemon_UnverifiableStateKeepsExitCode: when the VERIFICATION
+// fails (transport error, daemon shut down mid-poll, malformed body), readiness
+// was still established — so the command keeps its pre-existing exit code and
+// says once that the state could not be confirmed. A flaky follow-up request
+// must never invent a failure.
+func TestStartDetachedDaemon_UnverifiableStateKeepsExitCode(t *testing.T) {
+	child := newFakeChild(5003)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5003)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{}, errors.New("connection refused")
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.NoError(t, err, "a failed verification must not turn a ready daemon into a failed start")
+	assert.Contains(t, stdout, "prox started (pid 5003")
+	assert.Contains(t, stderr, "could not confirm process state")
+	assert.Equal(t, 1, strings.Count(stderr, "Warning:"), "exactly one warning, not one per poll")
+}
+
+// TestStartDetachedDaemon_NeverReadySkipsSettle: a daemon that never became
+// ready fails on readiness alone. The settle step must not run at all — there
+// is nothing to ask, and asking would only replace a precise diagnostic with a
+// transport error.
+func TestStartDetachedDaemon_NeverReadySkipsSettle(t *testing.T) {
+	child := newFakeChild(5004)
+	child.exitOn[syscall.SIGTERM] = true
+
+	ops := fastStartupOps()
+	settled := false
+	ops.settle = func(string) (settleVerdict, error) {
+		settled = true
+		return settleVerdict{}, nil
+	}
+
+	var err error
+	captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to become ready")
+	assert.False(t, settled, "readiness failed; there is nothing to settle")
 }
 
 // TestAwaitDaemonStartup_EarlyDeath: the child exits (non-zero) before becoming
@@ -100,13 +248,19 @@ func TestAwaitDaemonStartup_EarlyDeath(t *testing.T) {
 	child.exit(&exitStatusError{code: 1}) // dead before we start polling
 
 	tailUsed := false
+	var gotPid int
 	ops := fastStartupOps()
-	ops.logTail = func(string, int) string { tailUsed = true; return "boom: config invalid" }
+	ops.logTail = func(_ string, pid int, _ int) string {
+		tailUsed = true
+		gotPid = pid
+		return "boom: config invalid"
+	}
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to start")
 	assert.True(t, tailUsed, "log tail should be gathered for diagnostics")
+	assert.Equal(t, child.Pid(), gotPid, "log tail must be scoped to the failed child's own pid")
 	assert.Empty(t, child.sentSignals(), "a dead child must not be signaled")
 }
 
@@ -121,7 +275,7 @@ func TestAwaitDaemonStartup_NeverReadyTimeout(t *testing.T) {
 	ops := fastStartupOps()
 
 	start := time.Now()
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to become ready")
 	assert.GreaterOrEqual(t, time.Since(start), ops.readyTimeout, "must poll until the deadline")
@@ -138,7 +292,7 @@ func TestAwaitDaemonStartup_TermSuffices(t *testing.T) {
 	child := newFakeChild(4245)
 	child.exitOn[syscall.SIGTERM] = true
 
-	err := awaitDaemonStartup(child, t.TempDir(), fastStartupOps())
+	_, err := awaitDaemonStartup(child, t.TempDir(), fastStartupOps())
 	require.Error(t, err)
 
 	sigs := child.sentSignals()
@@ -162,7 +316,7 @@ func TestAwaitDaemonStartup_StaleStateIgnored(t *testing.T) {
 	healthCalls := 0
 	ops.healthOK = func(string) bool { healthCalls++; return true }
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to become ready")
 	assert.Zero(t, healthCalls, "stale state (wrong PID) must not advance to the health probe")
@@ -174,3 +328,109 @@ func TestAwaitDaemonStartup_StaleStateIgnored(t *testing.T) {
 type exitStatusError struct{ code int }
 
 func (e *exitStatusError) Error() string { return "exit status " + strconv.Itoa(e.code) }
+
+// --- bounded log diagnostics (plan 027 C16, M3) -------------------------------
+
+// writeDaemonLog writes content as dir's .prox/prox.log and returns dir.
+func writeDaemonLog(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := daemon.LogPath(dir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	return dir
+}
+
+// TestReadLogTail_ReadsAtMostTheLimit is the M3 regression at its source.
+// .prox/prox.log is never truncated, so reading it whole (os.ReadFile, as this
+// did) makes the memory cost of REPORTING a startup failure a function of every
+// run that ever wrote to that project's log.
+func TestReadLogTail_ReadsAtMostTheLimit(t *testing.T) {
+	var b strings.Builder
+	for b.Len() < 3*daemonLogReadLimit {
+		b.WriteString("a log line that is here purely to make the file large\n")
+	}
+	full := b.String()
+	dir := writeDaemonLog(t, full)
+
+	got, err := readLogTail(daemon.LogPath(dir), daemonLogReadLimit)
+	require.NoError(t, err)
+
+	require.LessOrEqual(t, len(got), daemonLogReadLimit,
+		"read more than the byte cap from a %d-byte log", len(full))
+	require.NotEmpty(t, got)
+	assert.True(t, strings.HasSuffix(full, got), "the window must be the END of the file")
+	// The window opens mid-line; that fragment must be dropped rather than
+	// handed on as if it were a whole line (a half-written run marker read as a
+	// damaged one would be one we manufactured ourselves).
+	assert.Equal(t, byte('\n'), full[len(full)-len(got)-1],
+		"the returned window must start at a line boundary")
+}
+
+// TestReadLogTail_SmallFileIsReadWhole keeps the ordinary case exact: a log
+// under the cap is returned byte for byte, first line included.
+func TestReadLogTail_SmallFileIsReadWhole(t *testing.T) {
+	const content = "--- run 2026-08-15T09:00:00Z pid=100 ---\nboom\n"
+	dir := writeDaemonLog(t, content)
+
+	got, err := readLogTail(daemon.LogPath(dir), daemonLogReadLimit)
+	require.NoError(t, err)
+	assert.Equal(t, content, got)
+}
+
+// TestDaemonLogTail_CapsLinesAndSaysSo pins the other half of M3: a run that
+// logged more than the cap is reported as capped. Printing its last N lines
+// under a bare "Last lines of ..." heading would present a fragment of the run
+// as the whole of it -- the same class of quiet misstatement #99 was about.
+func TestDaemonLogTail_CapsLinesAndSaysSo(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("--- run 2026-08-15T09:00:00Z pid=4242 ---\n")
+	for i := 0; i < daemon.MaxRunTailLines+50; i++ {
+		b.WriteString("chatty line " + strconv.Itoa(i) + "\n")
+	}
+	dir := writeDaemonLog(t, b.String())
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	lines := strings.Split(got, "\n")
+
+	assert.Contains(t, got, "earlier lines of this run omitted",
+		"a capped tail must say it was capped")
+	assert.Len(t, lines, daemon.MaxRunTailLines+1, "notice plus exactly the capped line count")
+	assert.Equal(t, "chatty line "+strconv.Itoa(daemon.MaxRunTailLines+49), lines[len(lines)-1],
+		"the NEWEST lines are the ones worth keeping")
+}
+
+// TestDaemonLogTail_ShortRunIsVerbatim: nothing above is allowed to change the
+// ordinary case, which is a short run reported exactly as it was logged.
+func TestDaemonLogTail_ShortRunIsVerbatim(t *testing.T) {
+	dir := writeDaemonLog(t, "--- run 2026-08-15T09:00:00Z pid=4242 ---\nboom: config invalid\n")
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	assert.Equal(t, "boom: config invalid", got)
+	assert.NotContains(t, got, "omitted")
+}
+
+// TestDaemonLogTail_DamagedCurrentMarkerFallsBack is M4 seen from the CLI: the
+// current run crashed partway through writing its marker and an OLDER run had
+// the same pid. The scoped tail must refuse rather than hand the old run's
+// output to a message that calls it this run's; the fallback that takes over
+// claims nothing about which run it came from.
+func TestDaemonLogTail_DamagedCurrentMarkerFallsBack(t *testing.T) {
+	dir := writeDaemonLog(t, ""+
+		"--- run 2026-08-15T08:00:00Z pid=4242 ---\n"+
+		"OLD RUN OUTPUT\n"+
+		"--- run 2026-08-15T09:00:00Z pid=42")
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	// The fallback (last n lines) still shows the file's end, torn marker and
+	// all -- what it must NOT do is present the old segment as scoped to pid.
+	assert.Contains(t, got, "--- run 2026-08-15T09:00:00Z pid=42",
+		"the fallback shows the raw end of the log")
+	assert.Contains(t, got, "--- run 2026-08-15T08:00:00Z pid=4242 ---",
+		"the fallback is unscoped: it includes the old marker line itself")
+}
+
+// TestDaemonLogTail_MissingLogIsEmpty keeps the no-log case at "".
+func TestDaemonLogTail_MissingLogIsEmpty(t *testing.T) {
+	assert.Empty(t, daemonLogTail(t.TempDir(), 4242, daemonLogFallbackLines))
+}

@@ -374,10 +374,12 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		State:        p.state,
 		Kind:         p.kind,
 		RestartCount: p.restartCount,
-		Health:       domain.HealthStatusUnknown,
-		Cmd:          p.config.Cmd,
-		Env:          p.env,
-		StopTimeout:  p.shutdownTimeout,
+		// Health is resolved from p.config below; this is only a placeholder so
+		// the field is never left as the empty string.
+		Health:      domain.HealthStatusNone,
+		Cmd:         p.config.Cmd,
+		Env:         p.env,
+		StopTimeout: p.shutdownTimeout,
 	}
 
 	// PID is only meaningful while the process is actively running/starting/
@@ -413,8 +415,26 @@ func (p *ManagedProcess) Info() domain.ProcessInfo {
 		info.BlockedOn = slices.Clone(p.blockedBy)
 	}
 
-	// Include health check state if checker exists
-	if p.healthChecker != nil {
+	// Health is derived from the CONFIG, not from whether a checker object
+	// happens to exist right now (#100). p.healthChecker is created only at
+	// launch and discarded on stop, so keying on it conflates three distinct
+	// situations; only the config can tell "never configured" from "configured
+	// but not reporting".
+	switch {
+	case p.config.Healthcheck == nil || p.config.Healthcheck.Cmd == "":
+		// No healthcheck configured: nothing was ever run, so there is no verdict
+		// to be unsure about. No HealthDetails either -- there is no check to
+		// describe.
+		info.Health = domain.HealthStatusNone
+	case p.healthChecker == nil:
+		// Configured, but no live checker: stopped, or not yet launched. The check
+		// exists and simply has not reported, which is exactly what unknown means.
+		info.Health = domain.HealthStatusUnknown
+		info.HealthDetails = &domain.HealthState{
+			Enabled: false,
+			Status:  domain.HealthStatusUnknown,
+		}
+	default:
 		state := p.healthChecker.State()
 		info.Health = state.Status
 		info.HealthDetails = &state

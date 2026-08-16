@@ -93,7 +93,24 @@ prox up --no-capture
 
 When no port is specified (via `--api-port` or `api.port` in config), prox automatically finds an available port. The port is stored in `.prox/prox.state` and auto-discovered by CLI commands.
 
-**`-d`/`--detach` readiness:** the parent process no longer exits `0` the instant it forks the child. It polls for up to 15s for the child to write a PID-matched `.prox/prox.state` and answer `GET /health`, then prints `prox started (pid N, api http://host:port)` and exits `0` — a truthful signal that the daemon is actually accepting requests. If the child dies during startup (bad config, port bind failure), `prox up -d` exits `1` and prints the last ~20 lines of `.prox/prox.log`. If the child never becomes ready within 15s, `prox up -d` prints the same diagnostics, sends SIGTERM to the child (SIGKILL after a 5s grace if it doesn't exit), and exits `1`.
+**`-d`/`--detach` exit contract:** the parent process no longer exits `0` the instant it forks the child, and readiness alone is no longer enough to call the start a success. Exit `0` means **the daemon is up *and* no process was observed in a terminal-failed state**.
+
+It gets there in two steps:
+
+1. **Readiness.** It polls for up to 15s for the child to write a PID-matched `.prox/prox.state` and answer `GET /health`. If the child dies during startup (bad config, port bind failure), `prox up -d` exits `1` and prints diagnostics from `.prox/prox.log`. If the child never becomes ready within 15s, it prints the same diagnostics, sends SIGTERM to the child (SIGKILL after a 5s grace if it doesn't exit), and exits `1`.
+2. **Settling.** It then watches `GET /processes` for **500ms**. If any process is `crashed` or `blocked` in that window, it names it with the same `Crashed:`/`Blocked:` line `prox status` prints and exits `1` — *without* printing `prox started`. Otherwise it prints `prox started (pid N, api http://host:port)` and exits `0`.
+
+A non-zero exit from step 2 means something different from one from step 1: **the daemon is up and stays up**; only its processes failed. Nothing is rolled back (that would destroy the logs you need), so the message points you at `prox down`. Investigate with `prox logs <name>`, then stop the daemon with `prox down` when you're done.
+
+!!! warning "What the 500ms window does and does not promise"
+
+    The guarantee is *"no terminal failure was observed within 500ms"* — **not** "the resulting state is verified". A process that crashes at 501ms still exits `0`. The window is a heuristic aimed at the overwhelmingly common failure (a process that execs and dies immediately: missing binary, bad flag, port already bound) and is deliberately not extended to chase certainty, which no window size can buy. Use `prox status` for the current state at any later moment.
+
+    It also costs those 500ms on the *success* path, because concluding that nothing failed means running the window out.
+
+    `blocked` is included for completeness but is near-unobservable here: a gated process only reaches it after its dependency exhausts a budget measured in tens of seconds, so a 500ms window will essentially never see it. A `waiting` process — still gated, still scheduled to launch — is not a failure and does not affect the exit code.
+
+`.prox/prox.log` is never truncated — it accumulates across every run — but the printed diagnostics are scoped to the failed run alone: each daemon child writes a `--- run <time> pid=<pid> ---` marker to the log as its first line, and the failure diagnostic tails only the content after that run's own marker, not the whole file. So iterating on a broken config never buries the current failure under every past one. This scoping needs a marker to key off; a legacy log with no markers, or a failure so early the child never reached the point of writing one, falls back to the last ~20 lines of the file instead.
 
 **TUI mode resolution.** Whether `prox up` opens the interactive TUI is decided by, in order of precedence: a flag that asserts something, then the `PROX_TUI` environment variable, then whether the terminal can host it. A bare foreground `prox up` **prefers the TUI**: it opens on a terminal that can host one and falls back to plain log streaming everywhere else, without an error.
 
@@ -197,6 +214,8 @@ prox logs --pattern "GET|POST" --regex
 prox logs -f --json | jq .
 ```
 
+**Unknown process names are an error (breaking change).** The positional argument and `--process` are validated against the running daemon's process list before the request is sent, in both normal and `--follow` mode. A name the daemon does not have now exits non-zero with `unknown process "<name>"` plus either the closest real name (`Did you mean "web"?`) or the full list of valid names — where a typo previously produced an empty result set, no output, and exit `0`, which was indistinguishable from a process that had simply logged nothing. A name that *does* match behaves exactly as before, including printing nothing (and exiting `0`) for a process with no log entries: only a wrong **name** is an error. If the daemon cannot be asked for its process list, the check is skipped and the command proceeds as it always did.
+
 ### start
 
 Start a stopped process.
@@ -206,6 +225,12 @@ prox start <process>
 ```
 
 Like `restart`, `start` re-reads `prox.yaml` and launches the process with its **current** config (see [Config reload on (re)start](#config-reload-on-restart) below). Editing a process's `cmd` and running `prox stop <process>` + `prox start <process>` applies the change, just as `prox restart <process>` does.
+
+**Exit contract.** `start` and `restart` report the resulting state of the process, not just that the daemon accepted the request. After the daemon acks, the CLI watches `GET /processes/<name>` for **500ms**; if the process lands in `crashed` (or `blocked`), the command prints the same `Crashed:`/`Blocked:` line `prox status` uses, suppresses its `Started process: …`/`Restarted process: …` headline, and exits `1`. Otherwise it prints the headline and exits `0`. The same honesty limits as [`up -d`](#up) apply: the promise is "no terminal failure observed within 500ms", a clean run pays those 500ms, and a process that dies later is only visible to `prox status`.
+
+**Unknown process names.** `start`, `stop`, and `restart` name the process that was asked for and either the closest real name (`Did you mean "web"?`) or the full list, instead of the bare `PROCESS_NOT_FOUND: process not found` earlier versions printed. The valid names come from the running daemon, so they are the names it will actually accept.
+
+**The "Is prox running?" hint.** Every client command appends `Is prox running? Try 'prox up' first.` only when the failure positively says nothing is listening (a refused or reset connection). An error the daemon itself produced — any HTTP status, or an unparseable response body — no longer carries it: prox had just answered, so the advice was false. Timeouts, cancellations, and unrecognized failures do not carry it either, since none of them establishes that the daemon is gone.
 
 **Examples:**
 

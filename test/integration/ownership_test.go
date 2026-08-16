@@ -34,8 +34,9 @@ import (
 func runProxIn(t *testing.T, binary, dir string, args ...string) (string, int) {
 	t.Helper()
 
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = dir
+	ctx, cancel := cliContext(t)
+	defer cancel()
+	cmd := boundedCommand(ctx, dir, binary, args...)
 	out, err := cmd.CombinedOutput()
 
 	exitCode := 0
@@ -51,26 +52,20 @@ func runProxIn(t *testing.T, binary, dir string, args ...string) (string, int) {
 }
 
 // startDaemonIn starts a detached prox in dir with the given extra args and
-// returns the API address it bound. It registers a best-effort shutdown so a
-// failing assertion never strands a daemon.
+// returns the API address it bound.
+//
+// Teardown comes from the harness (startDetachedIn): it targets the DAEMON the
+// launcher left behind, waits for a waited shutdown, and escalates to signals
+// only on expiry. The `t.Cleanup(func() { _ = stopProx(t, addr) })` this used to
+// register was fire-and-forget against a process it never identified, so a
+// daemon that did not answer was simply left running.
 func startDaemonIn(t *testing.T, binary, dir string, args ...string) string {
 	t.Helper()
 
 	full := append([]string{"up", "-d"}, args...)
-	cmd := exec.Command(binary, full...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon in %s: %v\noutput: %s", dir, err, out)
-	}
-
-	statePath := filepath.Join(dir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-	addr := "http://" + net.JoinHostPort(readStateHost(t, statePath), strconv.Itoa(readStatePort(t, statePath)))
-	waitForAPI(t, addr, apiReadyTimeout)
-
-	t.Cleanup(func() { _ = stopProx(t, addr) })
-	return addr
+	run := startDetachedIn(t, binary, dir, nil, full...)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	return run.Addr()
 }
 
 // projectState is the subset of daemon.State these tests read, decoded without
@@ -94,17 +89,6 @@ func readState(t *testing.T, path string) projectState {
 		t.Fatalf("parsing state file %s: %v", path, err)
 	}
 	return st
-}
-
-func readStatePort(t *testing.T, path string) int { return readState(t, path).Port }
-
-func readStateHost(t *testing.T, path string) string {
-	t.Helper()
-	host := readState(t, path).Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return host
 }
 
 // writeState writes a hand-built .prox/prox.state into dir. Tests use it to
@@ -154,7 +138,7 @@ func daemonPID(t *testing.T, dir string) int {
 func processPID(t *testing.T, addr, name string) int {
 	t.Helper()
 
-	resp, err := http.Get(addr + "/api/v1/processes")
+	resp, err := apiClient.Get(addr + "/api/v1/processes")
 	if err != nil {
 		t.Fatalf("fetching processes from %s: %v", addr, err)
 	}
@@ -178,6 +162,7 @@ func processPID(t *testing.T, addr, name string) int {
 // client command run from B must refuse, name A as the owner, and — the real
 // assertion — leave A's daemon and processes untouched.
 func TestOwnership_StaleStateRefusesAndOwnerSurvives(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -250,6 +235,7 @@ func TestOwnership_StaleStateRefusesAndOwnerSurvives(t *testing.T) {
 // identity basis would let each control the other. The project directory is
 // authoritative, so B must still be refused.
 func TestOwnership_SharedConfigTwoRootsCannotControlEachOther(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -288,6 +274,7 @@ func TestOwnership_SharedConfigTwoRootsCannotControlEachOther(t *testing.T) {
 // run with no -c at all. Those two never see the same config string, which is
 // exactly why identity is the project directory and not the config path.
 func TestOwnership_ExplicitConfigFormsAllowed(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -309,6 +296,7 @@ func TestOwnership_ExplicitConfigFormsAllowed(t *testing.T) {
 // the client is not — another config-form divergence the project-directory
 // basis makes irrelevant.
 func TestOwnership_ProxYmlAllowed(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -327,6 +315,7 @@ func TestOwnership_ProxYmlAllowed(t *testing.T) {
 // through a symlinked root. The daemon records one path form, the client's cwd
 // resolves to another; os.SameFile must collapse them.
 func TestOwnership_SymlinkedProjectRootAllowed(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -349,6 +338,7 @@ func TestOwnership_SymlinkedProjectRootAllowed(t *testing.T) {
 // The daemon is started from a shell-style $PWD of /tmp/... while the client is
 // run via exec.Cmd{Dir: ...}, whose os.Getwd() reports /private/tmp/...
 func TestOwnership_TmpVsPrivateTmpAllowed(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	if runtime.GOOS != "darwin" {
 		t.Skip("/tmp is a symlink to /private/tmp only on Darwin")
@@ -363,17 +353,8 @@ func TestOwnership_TmpVsPrivateTmpAllowed(t *testing.T) {
 	writeProjectConfig(t, dir, "prox.yaml")
 
 	// Start the daemon with $PWD pinned to the /tmp form, the way a shell would.
-	cmd := exec.Command(binary, "up", "-d")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PWD="+dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("starting daemon: %v\n%s", err, out)
-	}
-	statePath := filepath.Join(dir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-	addr := "http://" + net.JoinHostPort(readStateHost(t, statePath), strconv.Itoa(readStatePort(t, statePath)))
-	waitForAPI(t, addr, apiReadyTimeout)
-	t.Cleanup(func() { _ = stopProx(t, addr) })
+	run := startDetachedIn(t, binary, dir, []startOpt{withEnv("PWD=" + dir)}, "up", "-d")
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// The client gets no $PWD, so its cwd resolves to /private/tmp/...
 	out, code := runProxIn(t, binary, dir, "status")
@@ -388,6 +369,7 @@ func TestOwnership_TmpVsPrivateTmpAllowed(t *testing.T) {
 // its own — including for `attach`, which used to check local daemon state and
 // bail with "prox is not running" BEFORE it ever looked at --addr.
 func TestOwnership_ExplicitAddrBypassesEveryClientCommand(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -451,6 +433,7 @@ func TestOwnership_ExplicitAddrBypassesEveryClientCommand(t *testing.T) {
 // state file. `prox down --addr` must not then wait on THAT directory's files
 // and turn a clean remote stop into a bogus "shutdown incomplete".
 func TestOwnership_ExplicitAddrDownFromForeignDir(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -493,6 +476,7 @@ func TestOwnership_ExplicitAddrDownFromForeignDir(t *testing.T) {
 // running prox instance" — the latter sends the user off debugging their own
 // project instead of the service holding the port.
 func TestOwnership_UnrelatedServiceIsNamedNotAProx(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -533,6 +517,7 @@ func TestOwnership_UnrelatedServiceIsNamedNotAProx(t *testing.T) {
 // to a live prox), but when nothing answers there the user gets the ordinary
 // "not running" outcome rather than a raw dial error.
 func TestOwnership_DeadPIDStateFile(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -572,6 +557,7 @@ func TestOwnership_DeadPIDStateFile(t *testing.T) {
 // rests on: GET /status reports project_dir, and it is the directory the daemon
 // wrote .prox/prox.state into.
 func TestOwnership_StatusReportsProjectDir(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -579,7 +565,7 @@ func TestOwnership_StatusReportsProjectDir(t *testing.T) {
 	writeProjectConfig(t, dir, "prox.yaml")
 	addr := startDaemonIn(t, binary, dir)
 
-	resp, err := http.Get(addr + "/api/v1/status")
+	resp, err := apiClient.Get(addr + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("GET /status: %v", err)
 	}

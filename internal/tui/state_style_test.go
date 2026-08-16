@@ -106,6 +106,9 @@ func TestHealthDot(t *testing.T) {
 		// red-green color-blind readers must still tell the states apart.
 		{"unhealthy", domain.HealthStatusUnhealthy, styles.UnhealthyDot.Render(" ✗")},
 		{"unknown", domain.HealthStatusUnknown, ""},
+		// No healthcheck configured (#100): the panel adds nothing, exactly as it
+		// did when this case reported "unknown" — the TUI needed no change.
+		{"none", domain.HealthStatusNone, ""},
 		{"unset", domain.HealthStatus(""), ""},
 	}
 	for _, tc := range tests {

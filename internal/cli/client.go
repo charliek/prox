@@ -101,8 +101,19 @@ func (c *Client) GetStatusWithContext(ctx context.Context) (*api.StatusResponse,
 
 // GetProcesses gets all processes
 func (c *Client) GetProcesses() (*api.ProcessListResponse, error) {
+	return c.GetProcessesWithContext(context.Background())
+}
+
+// GetProcessesWithContext is GetProcesses with a caller-supplied context.
+//
+// The post-start settle check (plan 027 C13, #94) needs it: that check observes
+// the daemon's processes for a 500ms window, and the client's own 30s timeout
+// would let ONE request overrun that window by 60x — the whole poll loop would
+// then be bounded by a deadline it silently blew past. With a context the
+// caller's window is authoritative.
+func (c *Client) GetProcessesWithContext(ctx context.Context) (*api.ProcessListResponse, error) {
 	var resp api.ProcessListResponse
-	if err := c.get("/api/v1/processes", &resp); err != nil {
+	if err := c.getCtx(ctx, "/api/v1/processes", &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -110,8 +121,15 @@ func (c *Client) GetProcesses() (*api.ProcessListResponse, error) {
 
 // GetProcess gets a single process
 func (c *Client) GetProcess(name string) (*api.ProcessDetailResponse, error) {
+	return c.GetProcessWithContext(context.Background(), name)
+}
+
+// GetProcessWithContext is GetProcess with a caller-supplied context, for the
+// same reason as GetProcessesWithContext: `prox start`/`prox restart` poll this
+// endpoint inside a bounded settle window (plan 027 C13, #94).
+func (c *Client) GetProcessWithContext(ctx context.Context, name string) (*api.ProcessDetailResponse, error) {
 	var resp api.ProcessDetailResponse
-	if err := c.get("/api/v1/processes/"+url.PathEscape(name), &resp); err != nil {
+	if err := c.getCtx(ctx, "/api/v1/processes/"+url.PathEscape(name), &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -338,6 +356,41 @@ func (e *APIError) Error() string {
 func (e *APIError) StatusCode() int   { return e.Status }
 func (e *APIError) ErrorCode() string { return e.Code }
 
+// responseError marks an error that arose AFTER the daemon answered: the round
+// trip completed, a response (headers and all) was in hand, and the failure
+// happened while reading or interpreting its body.
+//
+// It exists because that fact cannot be recovered by inspecting the wrapped
+// error. A 2xx whose body is cut off by a connection reset surfaces from the
+// decode step as a *net.OpError carrying ECONNRESET — indistinguishable, by
+// shape, from the reset of a dial. hintFits (client_error.go) used to classify
+// such an error by elimination and concluded "nothing is listening", printing
+// "Is prox running?" about a daemon that had just replied. That is the same
+// defect class #95 exists to kill, so the cure is the same: make "we got a
+// response" a POSITIVE, typed fact recorded where the response is provably in
+// hand, rather than another rung on an elimination ladder.
+//
+// It unwraps to the underlying error, so every existing errors.Is/As check
+// (including *APIError traversal in the TUI and --follow reconnect policies)
+// still reaches through it.
+type responseError struct{ err error }
+
+func (e *responseError) Error() string { return e.err.Error() }
+func (e *responseError) Unwrap() error { return e.err }
+
+// afterResponse tags err as having occurred after a response was received. Call
+// it at every site that reads or decodes a body from a completed round trip;
+// nil passes through so it can wrap a call's result directly.
+//
+// Non-2xx responses need no tag: they already return *APIError, which is itself
+// a typed statement that the daemon answered.
+func afterResponse(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &responseError{err: err}
+}
+
 // httpStatusError builds the *APIError for a non-2xx response. errResp is nil
 // when the body was absent or unparseable.
 func httpStatusError(statusCode int, errResp *api.ErrorResponse) *APIError {
@@ -378,7 +431,10 @@ func (c *Client) doRequestWith(ctx context.Context, client *http.Client, method,
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-		return fmt.Errorf("decoding response: %w", err)
+		// afterResponse, not a bare wrap: whatever went wrong here — malformed
+		// JSON, a truncated body, a mid-body reset — happened to a response the
+		// daemon had already sent us. See responseError.
+		return afterResponse(fmt.Errorf("decoding response: %w", err))
 	}
 	return nil
 }
@@ -573,7 +629,8 @@ func dialSSE(ctx context.Context, c *Client, path string) (*sseStream, error) {
 	if mt, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err != nil || mt != sseContentType {
 		ct := resp.Header.Get("Content-Type")
 		stream.close()
-		return nil, fmt.Errorf("unexpected content type %q from %s (want %s)", ct, path, sseContentType)
+		return nil, afterResponse(
+			fmt.Errorf("unexpected content type %q from %s (want %s)", ct, path, sseContentType))
 	}
 
 	return stream, nil
@@ -616,7 +673,11 @@ func readSSE[T any](ctx context.Context, s *sseStream, parse func(string) (T, bo
 			if ctx.Err() != nil {
 				return nil
 			}
-			return err
+			// The stream was established (dialSSE validated status and content
+			// type), so a read failure here is a response-side failure however
+			// network-shaped it looks — a hung-up or reset stream must never be
+			// reported as "nothing is listening". See responseError.
+			return afterResponse(err)
 		}
 
 		line = strings.TrimSpace(line)

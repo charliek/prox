@@ -7,11 +7,33 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charliek/prox/internal/daemon"
 )
+
+// waitForRunOutputContains polls a proxRun's captured combined output until it
+// contains substr, or fails the test at deadline.
+func waitForRunOutputContains(t *testing.T, run *proxRun, substr string, deadline time.Time) {
+	t.Helper()
+
+	start := time.Now()
+	var last string
+	for time.Now().Before(deadline) {
+		last = run.Output()
+		if strings.Contains(last, substr) {
+			return
+		}
+		time.Sleep(pollInterval)
+	}
+	// Final sample: the marker may have arrived during the last sleep.
+	if last = run.Output(); strings.Contains(last, substr) {
+		return
+	}
+	t.Fatalf("output did not contain %q %s; captured output: %s", substr, waitedFor(start, deadline), last)
+}
 
 type StatusResponse struct {
 	Status        string `json:"status"`
@@ -32,20 +54,21 @@ type ProcessListResponse struct {
 }
 
 func TestUpCommand_StartsProcesses(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Give processes time to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify status endpoint
-	resp, err := http.Get(testAPIAddr + "/api/v1/status")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/status")
 	requireNoError(t, err, "failed to get status")
 	defer resp.Body.Close()
 
@@ -64,17 +87,18 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 }
 
 func TestUpCommand_ProcessList(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(testAPIAddr + "/api/v1/processes")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -103,33 +127,23 @@ func TestUpCommand_ProcessList(t *testing.T) {
 }
 
 func TestUpCommand_GracefulShutdown(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Request shutdown via API
-	err := stopProx(t, testAPIAddr)
+	err := stopProx(t, run.Addr())
 	requireNoError(t, err, "failed to request shutdown")
 
-	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	select {
-	case err := <-done:
-		// Process exited - check that it was graceful
-		if err != nil {
-			t.Logf("process exited with error (may be expected): %v", err)
-		}
-	case <-time.After(15 * time.Second):
-		killProx(cmd)
-		t.Fatal("process did not shut down within timeout")
+	// Wait for process to exit - check that it was graceful
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
+		t.Logf("process exited with error (may be expected): %v", err)
 	}
 }
 
@@ -137,16 +151,17 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 // foreground daemon: it must wait for the outcome, exit 0, print a stopped
 // summary, and the daemon's state + PID files must be gone afterward (#36, D4).
 func TestStopCommand_WaitsForCleanExit(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
-	out, exitCode := runProx(t, binary, "stop", "-c", configPath("integration"))
+	out, exitCode := f.Run(t, binary, "stop", "-c", f.configPath)
 	if exitCode != 0 {
 		t.Fatalf("prox stop exited %d, want 0\noutput:\n%s", exitCode, out)
 	}
@@ -155,14 +170,17 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	}
 
 	// The foreground daemon must have exited cleanly as part of the waited stop.
-	if err := waitCmdExit(t, cmd, 10*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("foreground prox up should exit 0 on a clean stop, got %v", err)
 	}
 
-	// State + PID files must be cleaned up.
-	root := projectRoot(t)
-	for _, name := range []string{".prox/prox.state", ".prox/prox.pid"} {
-		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+	// State + PID files must be cleaned up. This assertion is only meaningful
+	// because the fixture's .prox is private to this test -- in the old
+	// repo-root layout any other daemon could leave these files behind and mask
+	// a real failure here.
+	stateDir := run.StateDir()
+	for _, name := range []string{"prox.state", "prox.pid"} {
+		if _, err := os.Stat(filepath.Join(stateDir, name)); !os.IsNotExist(err) {
 			t.Errorf("expected %s to be gone after stop, stat err=%v", name, err)
 		}
 	}
@@ -172,24 +190,25 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 // /shutdown (no wait param) still returns an immediate 200 while the daemon tears
 // down in the background.
 func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	start := time.Now()
-	if err := stopProx(t, testAPIAddr); err != nil {
+	if err := stopProx(t, run.Addr()); err != nil {
 		t.Fatalf("async shutdown POST failed: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Errorf("async POST /shutdown should return promptly, took %v", elapsed)
 	}
 
-	if err := waitCmdExit(t, cmd, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("foreground prox up should exit 0 after an async clean stop, got %v", err)
 	}
 }
@@ -199,13 +218,14 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 // the second invocation must exit sanely (a waited result, a connection-refused
 // unknown-outcome path, or a not-running message) rather than crashing.
 func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Fire the first stop in the background; it waits for the drain. Capture its
@@ -214,13 +234,13 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	var exit1 int
 	firstDone := make(chan struct{})
 	go func() {
-		out1, exit1 = runProx(t, binary, "stop", "-c", configPath("integration"))
+		out1, exit1 = f.Run(t, binary, "stop", "-c", f.configPath)
 		close(firstDone)
 	}()
 
 	// A moment later, fire a second stop that races/follows the first.
 	time.Sleep(200 * time.Millisecond)
-	out2, exit2 := runProx(t, binary, "stop", "-c", configPath("integration"))
+	out2, exit2 := f.Run(t, binary, "stop", "-c", f.configPath)
 
 	select {
 	case <-firstDone:
@@ -230,12 +250,12 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 
 	// The daemon does a clean stop (reapable processes), so the foreground exits 0
 	// regardless of how many stop clients connected.
-	if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("daemon should exit 0 on a clean double stop, got %v", err)
 	}
 
 	// The daemon must not have panicked.
-	if daemonOut := prox.Output(); strings.Contains(daemonOut, "panic:") {
+	if daemonOut := run.Output(); strings.Contains(daemonOut, "panic:") {
 		t.Errorf("daemon panicked during double stop:\n%s", daemonOut)
 	}
 
@@ -278,18 +298,19 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 }
 
 func TestUpCommand_SpecificProcesses(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
+	f := newFixture(t, "integration")
 	// Start only the 'long' process
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"), "long")
-	defer killProx(cmd)
+	run := f.Start(t, binary, "up", "-c", f.configPath, "long")
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(testAPIAddr + "/api/v1/processes")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -317,45 +338,32 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 // processes (like Python spawned via shell) is captured during graceful shutdown.
 // This is the key feature that manual pipes (vs cmd.StdoutPipe) enables.
 func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	// Use a different API address for this test to avoid port conflicts
-	grandchildAPIAddr := "http://127.0.0.1:15556"
-
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("grandchild"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "grandchild")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, grandchildAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Wait until the grandchild's startup marker is visible in the SAME
 	// captured-output surface the post-exit assertions read (the terminal
 	// echo subscription starts after process launch, so the logs API is not
 	// an equivalent surface). This 15s startup deadline is independent of
 	// the 15s shutdown wait below.
-	waitForOutputContains(t, prox, "PROCESS_STARTED_PID=", 15*time.Second)
+	waitForRunOutputContains(t, run, "PROCESS_STARTED_PID=", within(t, logAppearTimeout))
 
 	// Request graceful shutdown via API
-	err := stopProx(t, grandchildAPIAddr)
+	err := stopProx(t, run.Addr())
 	requireNoError(t, err, "failed to request shutdown")
 
 	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- prox.cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-		// Process exited
-	case <-time.After(15 * time.Second):
-		killProx(prox.cmd)
-		t.Fatal("process did not shut down within timeout")
-	}
+	_ = run.WaitExit(t, within(t, processExitTimeout))
 
 	// Verify the output contains the grandchild's shutdown messages
-	output := prox.Output()
+	output := run.Output()
 
 	// The Python script prints these distinctive markers during shutdown
 	expectedMarkers := []string{
@@ -379,6 +387,7 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 // (the never-ready/timeout half is covered by unit-level fakes with injectable
 // timings in internal/cli).
 func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -388,8 +397,9 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 	dir := t.TempDir()
 	badCfg := filepath.Join(dir, "does-not-exist.yaml")
 
-	cmd := exec.Command(binary, "up", "-d", "-c", badCfg)
-	cmd.Dir = dir
+	ctx, cancel := cliContext(t)
+	defer cancel()
+	cmd := boundedCommand(ctx, dir, binary, "up", "-d", "-c", badCfg)
 	out, err := cmd.CombinedOutput()
 
 	var ee *exec.ExitError
@@ -401,6 +411,101 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "failed to start") {
 		t.Errorf("expected failure diagnostics mentioning 'failed to start', got:\n%s", out)
+	}
+}
+
+// TestDaemonLogTail_ScopedToSecondRun is the user-visible regression test for
+// #99 (plan 027 C12): .prox/prox.log is opened O_APPEND and never truncated,
+// so before this fix every failed `prox up -d` diagnostic tailed the last ~20
+// lines of the WHOLE accumulated log — a user iterating on a broken prox.yaml
+// saw every past failure stacked up with the current one buried last, exactly
+// when the diagnostic mattered most.
+//
+// This runs `prox up -d` against the same broken config TWICE, back to back
+// in one fixture directory (so the log genuinely accumulates both runs'
+// content), and asserts the second run's printed diagnostics contain ONLY the
+// second run's failure line. Both runs fail identically (same bad path, same
+// underlying "no such file" error), so their "Error: failed to load config:
+// ..." lines are byte-identical — counting occurrences in the second run's
+// output is therefore an unambiguous check: 2 occurrences would mean the
+// first run's content leaked through, which is precisely the bug #99 exists
+// to kill.
+//
+// What this test does NOT cover, verified by reintroduction rather than
+// assumed: it still passes if the tail rule is weakened to "last marker wins,
+// ignoring pid". Here the second child always reaches SetupLogging and writes
+// its own marker, so the last marker IS this run's and the naive rule happens
+// to agree. The dangerous window -- the child dying BEFORE it writes a marker,
+// where a last-marker rule would print the PREVIOUS run's output as this
+// run's diagnostics -- is not reachable from a test, because SetupLogging runs
+// before anything that can fail this way.
+//
+// The guard for that rule is the table test in
+// internal/daemon/log_marker_test.go, whose "marker for a different pid
+// present" and "multiple markers" cases DO fail against the naive rule
+// (confirmed: ok = true, want false). This test proves the end-to-end wiring;
+// that one proves the scoping rule. Do not mistake this for the regression
+// test.
+func TestDaemonLogTail_ScopedToSecondRun(t *testing.T) {
+	startTest(t, defaultTestBudget)
+	skipShort(t)
+
+	binary := buildBinary(t)
+
+	// Isolated working dir, shared by both runs so .prox/prox.log genuinely
+	// accumulates across them (that accumulation, via O_APPEND, is by design
+	// and out of scope to change — see CLAUDE.md/issue #99: rotation is
+	// explicitly not part of this fix).
+	dir := t.TempDir()
+	badCfg := filepath.Join(dir, "does-not-exist.yaml")
+
+	runOnce := func() string {
+		t.Helper()
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "-d", "-c", badCfg)
+		out, err := cmd.CombinedOutput()
+
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", err, out)
+		}
+		if ee.ExitCode() != 1 {
+			t.Fatalf("expected exit code 1, got %d\nOutput:\n%s", ee.ExitCode(), out)
+		}
+		return string(out)
+	}
+
+	const failureLine = "failed to load config"
+
+	out1 := runOnce()
+	if !strings.Contains(out1, failureLine) {
+		t.Fatalf("first run: expected failure diagnostics mentioning %q, got:\n%s", failureLine, out1)
+	}
+
+	out2 := runOnce()
+	if !strings.Contains(out2, failureLine) {
+		t.Fatalf("second run: expected failure diagnostics mentioning %q, got:\n%s", failureLine, out2)
+	}
+
+	if occurrences := strings.Count(out2, failureLine); occurrences != 1 {
+		t.Errorf("second run's diagnostics contain %d occurrences of %q, want 1 -- "+
+			"the first run's content leaked into the second run's diagnostics "+
+			"(the log tail was not scoped to the second run's own marker):\n"+
+			"--- run 1 output ---\n%s\n--- run 2 output ---\n%s",
+			occurrences, failureLine, out1, out2)
+	}
+
+	// The log file on disk must still hold BOTH runs' history: O_APPEND and no
+	// rotation are unchanged by this fix (#99 explicitly excludes rotation).
+	// This is the fix's other half -- scoping the printed diagnostic must not
+	// come at the cost of actually truncating or losing anything on disk.
+	logData, err := os.ReadFile(daemon.LogPath(dir))
+	if err != nil {
+		t.Fatalf("read daemon log: %v", err)
+	}
+	if got := strings.Count(string(logData), "--- run "); got != 2 {
+		t.Errorf("expected 2 run markers preserved on disk, got %d:\n%s", got, string(logData))
 	}
 }
 
@@ -427,47 +532,40 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 // roughly half the time and proves nothing (verified manually: see the C1
 // commit report).
 func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
+	f := newFixture(t, "instant_crash")
 	const iterations = 20
-	const addr = "http://127.0.0.1:15558"
 	const marker = "exited unexpectedly"
 
 	for i := range iterations {
-		prox := startProxWithOutput(t, binary, "up", "-c", configPath("instant_crash"))
-
-		// Backstop the orderly shutdown below: startProxWithOutput registers no
-		// cleanup of its own, and waitForAPI/t.Fatalf can abandon the loop before
-		// stopProx runs, stranding a child that holds port 15558 and poisons every
-		// later test (codex review finding). Kill is a no-op once the process has
-		// already exited normally.
-		t.Cleanup(func() {
-			if prox.cmd.Process != nil {
-				_ = prox.cmd.Process.Kill()
-			}
-		})
+		// f.Start registers its own t.Cleanup(run.Kill), so a failed or aborted
+		// iteration can no longer strand a daemon that poisons a later test (the
+		// bug the old manual t.Cleanup workaround guarded against).
+		run := f.Start(t, binary, "up", "-c", f.configPath)
 
 		// Confirms the daemon itself came up; the process crash happens
 		// concurrently with (just after) supervisor start, so this does not run
 		// past the window we're testing.
-		waitForAPI(t, addr, apiReadyTimeout)
+		waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so
 		// nothing will ever produce the line later -- if it isn't here within the
 		// window, it was lost.
 		deadline := time.Now().Add(3 * time.Second)
-		out := prox.Output()
+		out := run.Output()
 		for time.Now().Before(deadline) && !strings.Contains(out, marker) {
 			time.Sleep(20 * time.Millisecond)
-			out = prox.Output()
+			out = run.Output()
 		}
 
 		// Shut down before asserting, so a failed iteration doesn't leak the
 		// daemon (and its port) into the next one.
-		_ = stopProx(t, addr)
-		if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+		_ = stopProx(t, run.Addr())
+		if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 			t.Logf("iteration %d: prox up did not exit cleanly: %v", i, err)
 		}
 
@@ -484,54 +582,39 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 // under `go test` the child's stdout/stderr are pipes, which is exactly the
 // non-interactive shape a CI runner or `| tee` produces.
 func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 
 	// Isolated working dir: nothing here touches the repo root's .prox, and the
-	// process the config would have launched leaves a marker file we can look for.
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "launched.marker")
-	cfg := filepath.Join(dir, "prox.yaml")
-	cfgBody := "api:\n  host: 127.0.0.1\n\nprocesses:\n  marker:\n    cmd: touch " + marker + " && sleep 30\n"
-	if err := os.WriteFile(cfg, []byte(cfgBody), 0644); err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+	// process the config would have launched leaves a marker file we can look
+	// for. The marker path is relative because a prox process inherits the
+	// daemon's cwd, i.e. the fixture directory.
+	f := newInlineFixture(t, tuiMarkerFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "--tui", "-c", cfg)
-	cmd.Dir = dir
-
-	done := make(chan struct{})
-	var out []byte
-	var runErr error
-	go func() {
-		out, runErr = cmd.CombinedOutput()
-		close(done)
-	}()
-
-	// The guard runs before any startup work, so this is near-instant; the budget
-	// is generous only to absorb a loaded CI machine.
-	select {
-	case <-done:
-	case <-time.After(20 * time.Second):
-		killProx(cmd)
-		t.Fatal("prox up --tui did not exit; the non-TTY guard should refuse immediately")
-	}
+	// The guard runs before any startup work, so this exits near-instantly; the
+	// budget is generous only to absorb a loaded CI machine. WaitExit observes
+	// the run's single Cmd.Wait rather than racing a second one, which is what
+	// the old CombinedOutput-in-a-goroutine plus killProx-on-timeout pair did.
+	run := f.Start(t, binary, "up", "--tui", "-c", f.configPath)
+	runErr := run.WaitExit(t, within(t, processExitTimeout))
+	out := run.Output()
 
 	var ee *exec.ExitError
 	if !errors.As(runErr, &ee) {
 		t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", runErr, out)
 	}
-	if !strings.Contains(string(out), "--tui requires an interactive terminal") {
+	if !strings.Contains(out, "--tui requires an interactive terminal") {
 		t.Errorf("expected the interactive-terminal guard message, got:\n%s", out)
 	}
 
 	// Nothing may have started: no marker from the configured process, and no
 	// state directory (the guard fires before EnsureStateDir).
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.dir, tuiMarkerName)); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before starting processes, but the marker exists (stat err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.dir, ".prox")); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before any state is written, but .prox exists (stat err=%v)", err)
 	}
 }
@@ -571,46 +654,22 @@ func upTUIFixture(t *testing.T) (string, string) {
 	return dir, cfg
 }
 
-// shutdownDaemonIn stops a detached daemon started in dir by reading the port
-// it recorded in .prox/prox.state and posting /shutdown. Best-effort cleanup:
-// the assertions live in the tests, not here.
-func shutdownDaemonIn(t *testing.T, dir string) {
-	t.Helper()
-	statePath := filepath.Join(dir, ".prox", "prox.state")
-	stateData, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Logf("cleanup: no state file at %s: %v", statePath, err)
-		return
-	}
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Logf("cleanup: unparseable state file: %v", err)
-		return
-	}
-	addr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	req, _ := http.NewRequest("POST", addr+"/api/v1/shutdown", nil)
-	if resp, err := http.DefaultClient.Do(req); err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
-}
-
 // TestUpTUIFlags_Conflicts pins the two flag combinations that must be refused
 // and the false-valued forms that must NOT be, through real process
 // invocations. `-d --tui=false` is the load-bearing row: cobra reports
 // Changed("tui") for it, so a conflict predicate that forgets to also check the
 // parsed value breaks a command line that is valid today.
 func TestUpTUIFlags_Conflicts(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 
 	t.Run("--tui --no-tui is refused", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "--tui", "--no-tui", "-c", cfg)
-		cmd.Dir = dir
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "--tui", "--no-tui", "-c", cfg)
 		out, err := cmd.CombinedOutput()
 
 		var ee *exec.ExitError
@@ -627,8 +686,9 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 
 	t.Run("-d --tui is refused", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--tui", "-c", cfg)
-		cmd.Dir = dir
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "-d", "--tui", "-c", cfg)
 		// No cleanup needed: the conflict is reported before daemonization, so
 		// there is no child to stop and no state file to find.
 		out, err := cmd.CombinedOutput()
@@ -644,52 +704,39 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 
 	t.Run("-d --tui=false is accepted", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--tui=false", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		// startDetachedIn fails the test if the launcher exits non-zero, which
+		// is the assertion here: Changed("tui") is true for `--tui=false`, so a
+		// conflict predicate that ignores the parsed VALUE rejects this line.
+		// It also registers the daemon teardown, which the fire-and-forget
+		// `defer shutdownDaemonIn(t, dir)` this replaced could not do reliably.
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "--tui=false", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d --tui=false` must succeed (Changed(\"tui\") is true for it, but no TUI was asserted): %v\noutput:\n%s", err, out)
+		if strings.Contains(run.Output(), "mutually exclusive") {
+			t.Errorf("no conflict may be reported for --tui=false, got:\n%s", run.Output())
 		}
-		if strings.Contains(string(out), "mutually exclusive") {
-			t.Errorf("no conflict may be reported for --tui=false, got:\n%s", out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 
 	t.Run("-d --no-tui is accepted", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--no-tui", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "--no-tui", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d --no-tui` must succeed: %v\noutput:\n%s", err, out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 
 	t.Run("plain -d still succeeds", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d` must succeed with no flag-conflict error: %v\noutput:\n%s", err, out)
+		if strings.Contains(run.Output(), "mutually exclusive") {
+			t.Errorf("a bare `up -d` must never report a flag conflict, got:\n%s", run.Output())
 		}
-		if strings.Contains(string(out), "mutually exclusive") {
-			t.Errorf("a bare `up -d` must never report a flag conflict, got:\n%s", out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 }
@@ -701,30 +748,17 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 // cobra registration and that the flag is not rejected, which an unregistered
 // flag would fail instantly and loudly.
 func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "--no-tui", "-c", cfg)
-	cmd.Dir = dir
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.Start(t, binary, "up", "--no-tui", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`up --no-tui` did not reach the startup preamble; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if strings.Contains(buf.String(), "unknown flag") {
-		t.Fatalf("--no-tui must be a registered flag; output:\n%s", buf.String())
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
+	if strings.Contains(run.Output(), "unknown flag") {
+		t.Fatalf("--no-tui must be a registered flag; output:\n%s", run.Output())
 	}
 }
 
@@ -734,31 +768,17 @@ func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
 // (C4 moves this warning onto the TUI-visible path; the wording assertion here
 // is deliberately loose so that move does not have to touch this test.)
 func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "-c", cfg)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PROX_TUI=banana")
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=banana")}, "up", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`up` with a bad PROX_TUI did not start; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !strings.Contains(buf.String(), "PROX_TUI") || !strings.Contains(buf.String(), "banana") {
-		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", buf.String())
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
+	if out := run.Output(); !strings.Contains(out, "PROX_TUI") || !strings.Contains(out, "banana") {
+		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", out)
 	}
 }
 
@@ -768,33 +788,21 @@ func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
 // booby-trap every piped `prox up` in that shell) nor print a note (that would
 // pollute CI output forever for a mode change nobody asked about).
 func TestUpTUIEnv_RecognizedValueIsSilent(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "-c", cfg)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PROX_TUI=1")
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=1")}, "up", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`PROX_TUI=1 up` under pipes must stream plain logs, not fail; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Reaching the preamble at all is the "must not fail" half of the assertion.
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
+	out := run.Output()
+	if strings.Contains(out, "PROX_TUI") {
+		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", out)
 	}
-	if strings.Contains(buf.String(), "PROX_TUI") {
-		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", buf.String())
-	}
-	if strings.Contains(buf.String(), "requires an interactive terminal") {
-		t.Errorf("PROX_TUI=1 is a preference, not an assertion; it must never hard-error, got:\n%s", buf.String())
+	if strings.Contains(out, "requires an interactive terminal") {
+		t.Errorf("PROX_TUI=1 is a preference, not an assertion; it must never hard-error, got:\n%s", out)
 	}
 }

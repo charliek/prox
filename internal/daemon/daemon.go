@@ -90,6 +90,17 @@ func SetupLogging(dir string) (*os.File, error) {
 		return nil, fmt.Errorf("opening log file: %w", err)
 	}
 
+	// Write a run marker BEFORE redirecting stdout/stderr below, so a failure
+	// diagnostic (internal/cli's printDaemonFailure) can tail only this run's
+	// output rather than the whole never-truncated history of the log (#99).
+	// This process's own pid is exactly the pid the parent's daemonChild
+	// tracks: Daemonize starts this process directly (no double-fork), so
+	// os.Getpid() here equals child.Pid() in the parent.
+	if err := WriteRunMarker(logFile, os.Getpid()); err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("writing run marker: %w", err)
+	}
+
 	// Redirect stdout and stderr
 	os.Stdout = logFile
 	os.Stderr = logFile

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,7 +15,7 @@ import (
 // a closure that runs `prox status` (table or --json) in the project dir,
 // returning stdout, stderr, and exit code separately. Mirrors status_test.go's
 // crashed-child harness (plan 013 D5).
-func depStatusRunner(t *testing.T, binary, config string) (tmpDir string, runStatus func(extra ...string) (string, string, int)) {
+func depStatusRunner(t *testing.T, binary, config string) (tmpDir string, runStatus statusRunner) {
 	t.Helper()
 	tmpDir = t.TempDir()
 
@@ -25,32 +24,60 @@ func depStatusRunner(t *testing.T, binary, config string) (tmpDir string, runSta
 		t.Fatalf("write config: %v", err)
 	}
 
-	up := exec.Command(binary, "up", "-d", "--no-proxy", "-c", configPath)
-	up.Dir = tmpDir
-	if out, err := up.CombinedOutput(); err != nil {
-		t.Fatalf("start daemon: %v\noutput: %s", err, out)
-	}
-	t.Cleanup(func() {
-		stop := exec.Command(binary, "stop", "-c", configPath)
-		stop.Dir = tmpDir
-		_, _ = stop.CombinedOutput()
-		time.Sleep(300 * time.Millisecond)
-	})
+	// Not StartDetached: several of these configs describe a process or task that
+	// is MEANT to fail, and since plan 027 C13 (#94) `up -d` exits non-zero when a
+	// process reaches a terminal-failed state inside the settle window. That
+	// non-zero exit means "the daemon is up, its processes are not" -- the
+	// daemon this runner then queries is running either way.
+	//
+	// Teardown comes from the harness: it targets the DAEMON the launcher left
+	// behind, asks it to stop and WAITS for the answer, and escalates to signals
+	// only on expiry.
+	startDaemonAllowingProcessFailure(t, binary, tmpDir, "start daemon", "up", "-d", "--no-proxy", "-c", configPath)
 
-	waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), 10*time.Second)
+	waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), within(t, stateFileTimeout))
 
-	runStatus = func(extra ...string) (string, string, int) {
-		t.Helper()
-		args := append([]string{"status", "-c", configPath}, extra...)
-		cmd := exec.Command(binary, args...)
-		cmd.Dir = tmpDir
-		var stdout, stderr strings.Builder
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		return stdout.String(), stderr.String(), exitCodeOf(t, err)
+	return tmpDir, runStatusIn(t, binary, tmpDir, configPath)
+}
+
+// startDaemonAllowingProcessFailure is StartDetached for a `prox up -d` whose
+// config deliberately contains a process or task that fails.
+//
+// Since plan 027 C13 (#94) the launcher reports the resulting STATE, not just
+// that the daemon accepted the request: a process that reaches crashed (or
+// blocked) inside the settle window makes `up -d` exit 1 even though the daemon
+// itself is up and stays up. StartDetached fails a test on ANY non-zero exit,
+// which here is the very condition the test was written to produce. Exit 0 and
+// exit 1 are therefore both accepted; anything else (a signal, a config error, a
+// failure to launch at all) still fails the test.
+//
+// It goes through the harness rather than running the CLI itself (CodeRabbit, PR
+// #108). A bare boundedCommand creates no proxRun, so nothing records the daemon
+// in the cross-run ledger: neither reapOwn nor the next run's sweep could find
+// it, and the only teardown it had was the fire-and-forget `stop` + 300ms sleep
+// that plan 027 C5 replaced everywhere else. `up -d` detaches, so that "cleanup"
+// recovered nothing whenever the daemon did not answer.
+//
+// The run handle is returned so callers get the daemon's address and output as
+// well as its teardown.
+func startDaemonAllowingProcessFailure(t *testing.T, binary, dir, what string, args ...string) *proxRun {
+	t.Helper()
+
+	run, err := tryStartDetachedIn(t, binary, dir, nil, args...)
+	if err != nil {
+		// ExitCode fails the test itself if the launcher died without an exit
+		// status (a signal, or a failure to start at all).
+		if code := run.ExitCode(t); code != 1 {
+			t.Fatalf("%s: unexpected exit code %d\noutput:\n%s", what, code, run.Output())
+		}
 	}
-	return tmpDir, runStatus
+
+	// Resolve the daemon identity NOW, not at teardown. tryStartDetachedIn skips
+	// this on the error path (a genuinely failed launch has no daemon to
+	// resolve), and the identity is what puts the daemon in the run ledger --
+	// i.e. what makes it reapable if this run dies before its cleanups run.
+	run.DaemonIdentity()
+	return run
 }
 
 // statusJSONPayload is the subset of `prox status --json` this suite asserts on.
@@ -73,24 +100,85 @@ type statusJSONPayload struct {
 	} `json:"status"`
 }
 
-// pollStatusJSON polls `prox status --json` until match returns true or the
-// deadline elapses, returning the last decoded payload.
-func pollStatusJSON(t *testing.T, runStatus func(...string) (string, string, int), timeout time.Duration, match func(statusJSONPayload) bool) statusJSONPayload {
+// statusRunner runs `prox status` with extra args and returns stdout, stderr
+// and the exit code.
+//
+// It takes a deadline because the command it runs is a real subprocess talking
+// to a real daemon over HTTP: without one it is unbounded, and an unbounded
+// step inside a bounded poll loop makes the loop's bound a decoration. The
+// deadline (rather than a duration) is what lets awaitStatusJSON hand each
+// invocation only what is left of the loop's own budget.
+type statusRunner func(deadline time.Time, extra ...string) (string, string, int)
+
+// runStatusIn builds the statusRunner for a project directory: `prox status
+// -c <config>` run in dir, bounded by the shorter of the caller's deadline and
+// the CLI ceiling.
+func runStatusIn(t *testing.T, binary, dir, configPath string) statusRunner {
+	return func(deadline time.Time, extra ...string) (string, string, int) {
+		t.Helper()
+		ctx, cancel := boundedContext(deadline, cliCommandTimeout)
+		defer cancel()
+
+		args := append([]string{"status", "-c", configPath}, extra...)
+		cmd := boundedCommand(ctx, dir, binary, args...)
+		var stdout, stderr strings.Builder
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), exitCodeOf(t, err)
+	}
+}
+
+// pollStatusJSON polls `prox status --json` until match returns true, and fails
+// the test if the deadline arrives first.
+//
+// Two defects, both fixed here (plan 027 C6):
+//
+//   - it shelled out with a bare cmd.Run() and NO timeout, so one hung `prox
+//     status` hung the loop that existed to bound it;
+//   - on expiry it RETURNED THE LAST PAYLOAD instead of failing. Every caller
+//     then re-checked the same predicate and reported something like "gated
+//     never converged to running; got \"waiting\"" -- a statement about process
+//     state, for what was actually a timeout. The real failure surfaced as a
+//     confusing downstream assertion, one level away from the thing that
+//     actually went wrong.
+func pollStatusJSON(t *testing.T, runStatus statusRunner, deadline time.Time, match func(statusJSONPayload) bool) statusJSONPayload {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	p, err := awaitStatusJSON(runStatus, deadline, match)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// awaitStatusJSON is pollStatusJSON without the t.Fatal, so bounding_test.go
+// can point it at a subprocess that never exits and assert that it comes back
+// anyway -- and that the elapsed time it claims is the elapsed time that really
+// passed.
+func awaitStatusJSON(runStatus statusRunner, deadline time.Time, match func(statusJSONPayload) bool) (statusJSONPayload, error) {
+	start := time.Now()
 	var last statusJSONPayload
+	var decoded bool
 	for time.Now().Before(deadline) {
-		stdout, _, _ := runStatus("--json")
+		// The loop's own deadline goes to each invocation, which bounds itself
+		// by the SHORTER of that and the CLI ceiling -- so a stalled `prox
+		// status` cannot push the loop past its own deadline.
+		stdout, _, _ := runStatus(deadline, "--json")
+
 		var p statusJSONPayload
 		if json.Unmarshal([]byte(stdout), &p) == nil {
-			last = p
+			last, decoded = p, true
 			if match(p) {
-				return p
+				return p, nil
 			}
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	return last
+	if !decoded {
+		return last, fmt.Errorf("`prox status --json` never produced a decodable payload %s", waitedFor(start, deadline))
+	}
+	return last, fmt.Errorf("`prox status --json` never satisfied the predicate %s; last payload: %+v",
+		waitedFor(start, deadline), last)
 }
 
 func procState(p statusJSONPayload, name string) (status string, waitingOn, blockedOn []string, ok bool) {
@@ -115,6 +203,7 @@ func depState(p statusJSONPayload, name string) (state string, ok bool) {
 // against the real binary. Subtests share one built binary but each runs its own
 // isolated --no-proxy daemon.
 func TestDependenciesStatus(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	binary := buildBinary(t)
 
@@ -129,14 +218,14 @@ tasks:
     cmd: "sh -c 'exit 0'"
     timeout: 30s
 `)
-		p := pollStatusJSON(t, runStatus, 15*time.Second, func(p statusJSONPayload) bool {
+		p := pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			s, _, _, ok := procState(p, "migrate")
 			return ok && s == "completed"
 		})
 		if s, _, _, ok := procState(p, "migrate"); !ok || s != "completed" {
 			t.Fatalf("task migrate never completed; got %q (ok=%v)", s, ok)
 		}
-		stdout, stderr, code := runStatus()
+		stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 		if code != 0 {
 			t.Fatalf("exit = %d, want 0 for a completed task; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 		}
@@ -156,11 +245,11 @@ tasks:
     cmd: "sh -c 'exit 1'"
     timeout: 30s
 `)
-		pollStatusJSON(t, runStatus, 15*time.Second, func(p statusJSONPayload) bool {
+		pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			s, _, _, ok := procState(p, "migrate")
 			return ok && s == "crashed"
 		})
-		stdout, stderr, code := runStatus()
+		stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 		if code != 1 {
 			t.Fatalf("exit = %d, want 1 for a crashed task; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 		}
@@ -192,7 +281,7 @@ dependencies:
     on_failure: fail
 `)
 
-		p := pollStatusJSON(t, runStatus, 15*time.Second, func(p statusJSONPayload) bool {
+		p := pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			s, _, _, ok := procState(p, "gated")
 			return ok && s == "blocked"
 		})
@@ -204,7 +293,7 @@ dependencies:
 			t.Fatalf("dependency pg state = %q (ok=%v), want failed", ds, ok)
 		}
 
-		stdout, stderr, code := runStatus()
+		stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 		if code != 1 {
 			t.Fatalf("exit = %d, want 1 for a blocked process; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 		}
@@ -236,14 +325,14 @@ dependencies:
     on_failure: warn
 `)
 
-		p := pollStatusJSON(t, runStatus, 15*time.Second, func(p statusJSONPayload) bool {
+		p := pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			s, _, _, ok := procState(p, "web")
 			return ok && s == "running"
 		})
 		if ds, ok := depState(p, "flaky"); !ok || ds != "warned" {
 			t.Fatalf("dependency flaky state = %q (ok=%v), want warned", ds, ok)
 		}
-		stdout, stderr, code := runStatus()
+		stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 		if code != 0 {
 			t.Fatalf("exit = %d, want 0 when only a warn dependency failed; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 		}
@@ -270,12 +359,12 @@ dependencies:
     on_failure: fail
 `)
 
-		pollStatusJSON(t, runStatus, 15*time.Second, func(p statusJSONPayload) bool {
+		pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			cs, _, _, cok := procState(p, "crasher")
 			gs, _, _, gok := procState(p, "gated")
 			return cok && cs == "crashed" && gok && gs == "blocked"
 		})
-		stdout, stderr, code := runStatus()
+		stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 		if code != 1 {
 			t.Fatalf("exit = %d, want 1; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 		}
@@ -331,23 +420,19 @@ dependencies:
 		}
 
 		start := time.Now()
-		up := exec.Command(binary, "up", "-d", "--no-proxy", "-c", configPath)
-		up.Dir = tmpDir
-		if out, err := up.CombinedOutput(); err != nil {
-			t.Fatalf("start daemon: %v\noutput: %s", err, out)
-		}
+		// startDetachedIn, not a bare CLI invocation: `up -d` leaves a daemon
+		// behind, and only the harness records it in the run ledger and tears the
+		// DAEMON (rather than the already-exited launcher) down.
+		startDetachedIn(t, binary, tmpDir, nil, "up", "-d", "--no-proxy", "-c", configPath)
 		elapsed := time.Since(start)
+		// Registered after the harness's own teardown, so LIFO runs it FIRST:
+		// self-release the barrier so the start helper's loop exits even if the
+		// test failed before the release step — otherwise the loop would spin on
+		// unfailingly at 10Hz while the daemon is being stopped.
 		t.Cleanup(func() {
-			// Self-release the barrier so the start helper's loop exits even if
-			// the test failed before the release step or `stop` cannot reach the
-			// daemon — otherwise the loop would spin on unfailingly at 10Hz.
 			_ = os.WriteFile(release, nil, 0644)
-			stop := exec.Command(binary, "stop", "-c", configPath)
-			stop.Dir = tmpDir
-			_, _ = stop.CombinedOutput()
-			time.Sleep(300 * time.Millisecond)
 		})
-		waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), 10*time.Second)
+		waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), within(t, stateFileTimeout))
 		// Detached start returns without waiting for the dependency.
 		if elapsed > 5*time.Second {
 			t.Errorf("`up -d` took %v; it must return promptly while the dependency resolves", elapsed)
@@ -356,25 +441,15 @@ dependencies:
 		// The dependency's start command touches this the moment it actually
 		// launches, proving the start: command ran (not just that it was
 		// scheduled).
-		waitForStateFile(t, invoked, 10*time.Second)
+		waitForStateFile(t, invoked, within(t, stateFileTimeout))
 
-		runStatus := func(extra ...string) (string, string, int) {
-			t.Helper()
-			args := append([]string{"status", "-c", configPath}, extra...)
-			cmd := exec.Command(binary, args...)
-			cmd.Dir = tmpDir
-			var stdout, stderr strings.Builder
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-			err := cmd.Run()
-			return stdout.String(), stderr.String(), exitCodeOf(t, err)
-		}
+		runStatus := runStatusIn(t, binary, tmpDir, configPath)
 
 		// Observe gated waiting on slow via JSON. The dependency cannot become
 		// ready before the test writes the release marker below, so this
 		// observation is race-free by construction; the deadline is generous
 		// headroom, not a load-bearing bound.
-		waiting := pollStatusJSON(t, runStatus, 10*time.Second, func(p statusJSONPayload) bool {
+		waiting := pollStatusJSON(t, runStatus, within(t, processStateTimeout), func(p statusJSONPayload) bool {
 			s, w, _, ok := procState(p, "gated")
 			return ok && s == "waiting" && len(w) == 1 && w[0] == "slow"
 		})
@@ -389,14 +464,14 @@ dependencies:
 		}
 
 		// Then it converges to running once the dependency becomes ready.
-		converged := pollStatusJSON(t, runStatus, 30*time.Second, func(p statusJSONPayload) bool {
+		converged := pollStatusJSON(t, runStatus, within(t, dependencyReadyTimeout), func(p statusJSONPayload) bool {
 			s, _, _, ok := procState(p, "gated")
 			return ok && s == "running"
 		})
 		if s, _, _, ok := procState(converged, "gated"); !ok || s != "running" {
 			t.Fatalf("gated never converged to running; got %q", s)
 		}
-		_, _, code := runStatus()
+		_, _, code := runStatus(within(t, cliCommandTimeout))
 		if code != 0 {
 			t.Errorf("exit = %d, want 0 once the dependency is healthy", code)
 		}

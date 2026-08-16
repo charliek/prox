@@ -19,17 +19,39 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Hard backstop. Without this a job inherits GitHub's 6-HOUR default, so a
+    # deadlocked test -- or a hung child process holding the job's stdout pipe
+    # open, which Go's own -timeout cannot interrupt -- burns runner minutes and
+    # blocks the queue until someone notices. The suite takes ~140s locally;
+    # hosted runners are slower and have fewer cores, so this is generous
+    # against observed cost while still bounded.
+    timeout-minutes: 25
     steps:
+      # persist-credentials: false — actions/checkout otherwise leaves the job
+      # token in .git/config, and the very next step runs `go test ./...`, i.e.
+      # this repo's code AND every dependency's test code, with a writable
+      # credential sitting on disk. Nothing here talks to the API, so there is
+      # nothing to keep it for. (docs.yml and docs-pr.yml already set this.)
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
-      - run: go test -v ./...
+      # -timeout must match the Makefile's, or a local pass and a CI pass do not
+      # mean the same thing: with no flag, `go test` uses its 10m default, so a
+      # run that passes under `make test` (20m) could die on a CI panic-dump.
+      - run: go test -timeout 20m -v ./...
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      # See the test job: the linter loads and analyses the same third-party
+      # code, so the token has no business being on disk here either.
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
@@ -41,10 +63,15 @@ jobs:
   # publishing anything. Catches broken nfpm config before it hits a real tag.
   release-snapshot:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
+          # GoReleaser needs the full history to compute a snapshot version;
+          # it does not need (and this job never uses) the job token, so the
+          # credential is dropped while the depth is kept.
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
