@@ -13,6 +13,29 @@ import (
 	"time"
 )
 
+// waitForRunOutputContains polls a proxRun's captured combined output until it
+// contains substr, or fails the test after timeout. Mirrors
+// waitForOutputContains (helpers_test.go), which stays keyed on the older
+// *proxWithOutput type for push_data_plane_test.go's still-unmigrated use.
+func waitForRunOutputContains(t *testing.T, run *proxRun, substr string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		last = run.Output()
+		if strings.Contains(last, substr) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Final sample: the marker may have arrived during the last sleep.
+	if last = run.Output(); strings.Contains(last, substr) {
+		return
+	}
+	t.Fatalf("output did not contain %q within %v; captured output: %s", substr, timeout, last)
+}
+
 type StatusResponse struct {
 	Status        string `json:"status"`
 	UptimeSeconds int64  `json:"uptime_seconds"`
@@ -35,17 +58,17 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 	// Give processes time to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify status endpoint
-	resp, err := http.Get(testAPIAddr + "/api/v1/status")
+	resp, err := http.Get(run.Addr() + "/api/v1/status")
 	requireNoError(t, err, "failed to get status")
 	defer resp.Body.Close()
 
@@ -67,14 +90,14 @@ func TestUpCommand_ProcessList(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(testAPIAddr + "/api/v1/processes")
+	resp, err := http.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -106,30 +129,19 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Request shutdown via API
-	err := stopProx(t, testAPIAddr)
+	err := stopProx(t, run.Addr())
 	requireNoError(t, err, "failed to request shutdown")
 
-	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	select {
-	case err := <-done:
-		// Process exited - check that it was graceful
-		if err != nil {
-			t.Logf("process exited with error (may be expected): %v", err)
-		}
-	case <-time.After(15 * time.Second):
-		killProx(cmd)
-		t.Fatal("process did not shut down within timeout")
+	// Wait for process to exit - check that it was graceful
+	if err := run.WaitExit(t, 15*time.Second); err != nil {
+		t.Logf("process exited with error (may be expected): %v", err)
 	}
 }
 
@@ -140,13 +152,13 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
-	out, exitCode := runProx(t, binary, "stop", "-c", configPath("integration"))
+	out, exitCode := f.Run(t, binary, "stop", "-c", f.configPath)
 	if exitCode != 0 {
 		t.Fatalf("prox stop exited %d, want 0\noutput:\n%s", exitCode, out)
 	}
@@ -155,14 +167,17 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	}
 
 	// The foreground daemon must have exited cleanly as part of the waited stop.
-	if err := waitCmdExit(t, cmd, 10*time.Second); err != nil {
+	if err := run.WaitExit(t, 10*time.Second); err != nil {
 		t.Errorf("foreground prox up should exit 0 on a clean stop, got %v", err)
 	}
 
-	// State + PID files must be cleaned up.
-	root := projectRoot(t)
-	for _, name := range []string{".prox/prox.state", ".prox/prox.pid"} {
-		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+	// State + PID files must be cleaned up. This assertion is only meaningful
+	// because the fixture's .prox is private to this test -- in the old
+	// repo-root layout any other daemon could leave these files behind and mask
+	// a real failure here.
+	stateDir := run.StateDir()
+	for _, name := range []string{"prox.state", "prox.pid"} {
+		if _, err := os.Stat(filepath.Join(stateDir, name)); !os.IsNotExist(err) {
 			t.Errorf("expected %s to be gone after stop, stat err=%v", name, err)
 		}
 	}
@@ -175,21 +190,21 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	start := time.Now()
-	if err := stopProx(t, testAPIAddr); err != nil {
+	if err := stopProx(t, run.Addr()); err != nil {
 		t.Fatalf("async shutdown POST failed: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Errorf("async POST /shutdown should return promptly, took %v", elapsed)
 	}
 
-	if err := waitCmdExit(t, cmd, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, 15*time.Second); err != nil {
 		t.Errorf("foreground prox up should exit 0 after an async clean stop, got %v", err)
 	}
 }
@@ -202,10 +217,10 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Fire the first stop in the background; it waits for the drain. Capture its
@@ -214,13 +229,13 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	var exit1 int
 	firstDone := make(chan struct{})
 	go func() {
-		out1, exit1 = runProx(t, binary, "stop", "-c", configPath("integration"))
+		out1, exit1 = f.Run(t, binary, "stop", "-c", f.configPath)
 		close(firstDone)
 	}()
 
 	// A moment later, fire a second stop that races/follows the first.
 	time.Sleep(200 * time.Millisecond)
-	out2, exit2 := runProx(t, binary, "stop", "-c", configPath("integration"))
+	out2, exit2 := f.Run(t, binary, "stop", "-c", f.configPath)
 
 	select {
 	case <-firstDone:
@@ -230,12 +245,12 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 
 	// The daemon does a clean stop (reapable processes), so the foreground exits 0
 	// regardless of how many stop clients connected.
-	if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, 15*time.Second); err != nil {
 		t.Errorf("daemon should exit 0 on a clean double stop, got %v", err)
 	}
 
 	// The daemon must not have panicked.
-	if daemonOut := prox.Output(); strings.Contains(daemonOut, "panic:") {
+	if daemonOut := run.Output(); strings.Contains(daemonOut, "panic:") {
 		t.Errorf("daemon panicked during double stop:\n%s", daemonOut)
 	}
 
@@ -281,15 +296,15 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
+	f := newFixture(t, "integration")
 	// Start only the 'long' process
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"), "long")
-	defer killProx(cmd)
+	run := f.Start(t, binary, "up", "-c", f.configPath, "long")
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(testAPIAddr + "/api/v1/processes")
+	resp, err := http.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -320,42 +335,28 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	// Use a different API address for this test to avoid port conflicts
-	grandchildAPIAddr := "http://127.0.0.1:15556"
-
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("grandchild"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "grandchild")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, grandchildAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 	// Wait until the grandchild's startup marker is visible in the SAME
 	// captured-output surface the post-exit assertions read (the terminal
 	// echo subscription starts after process launch, so the logs API is not
 	// an equivalent surface). This 15s startup deadline is independent of
 	// the 15s shutdown wait below.
-	waitForOutputContains(t, prox, "PROCESS_STARTED_PID=", 15*time.Second)
+	waitForRunOutputContains(t, run, "PROCESS_STARTED_PID=", 15*time.Second)
 
 	// Request graceful shutdown via API
-	err := stopProx(t, grandchildAPIAddr)
+	err := stopProx(t, run.Addr())
 	requireNoError(t, err, "failed to request shutdown")
 
 	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- prox.cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-		// Process exited
-	case <-time.After(15 * time.Second):
-		killProx(prox.cmd)
-		t.Fatal("process did not shut down within timeout")
-	}
+	_ = run.WaitExit(t, 15*time.Second)
 
 	// Verify the output contains the grandchild's shutdown messages
-	output := prox.Output()
+	output := run.Output()
 
 	// The Python script prints these distinctive markers during shutdown
 	expectedMarkers := []string{
@@ -430,44 +431,36 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
+	f := newFixture(t, "instant_crash")
 	const iterations = 20
-	const addr = "http://127.0.0.1:15558"
 	const marker = "exited unexpectedly"
 
 	for i := range iterations {
-		prox := startProxWithOutput(t, binary, "up", "-c", configPath("instant_crash"))
-
-		// Backstop the orderly shutdown below: startProxWithOutput registers no
-		// cleanup of its own, and waitForAPI/t.Fatalf can abandon the loop before
-		// stopProx runs, stranding a child that holds port 15558 and poisons every
-		// later test (codex review finding). Kill is a no-op once the process has
-		// already exited normally.
-		t.Cleanup(func() {
-			if prox.cmd.Process != nil {
-				_ = prox.cmd.Process.Kill()
-			}
-		})
+		// f.Start registers its own t.Cleanup(run.Kill), so a failed or aborted
+		// iteration can no longer strand a daemon that poisons a later test (the
+		// bug the old manual t.Cleanup workaround guarded against).
+		run := f.Start(t, binary, "up", "-c", f.configPath)
 
 		// Confirms the daemon itself came up; the process crash happens
 		// concurrently with (just after) supervisor start, so this does not run
 		// past the window we're testing.
-		waitForAPI(t, addr, apiReadyTimeout)
+		waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so
 		// nothing will ever produce the line later -- if it isn't here within the
 		// window, it was lost.
 		deadline := time.Now().Add(3 * time.Second)
-		out := prox.Output()
+		out := run.Output()
 		for time.Now().Before(deadline) && !strings.Contains(out, marker) {
 			time.Sleep(20 * time.Millisecond)
-			out = prox.Output()
+			out = run.Output()
 		}
 
 		// Shut down before asserting, so a failed iteration doesn't leak the
 		// daemon (and its port) into the next one.
-		_ = stopProx(t, addr)
-		if err := waitCmdExit(t, prox.cmd, 15*time.Second); err != nil {
+		_ = stopProx(t, run.Addr())
+		if err := run.WaitExit(t, 15*time.Second); err != nil {
 			t.Logf("iteration %d: prox up did not exit cleanly: %v", i, err)
 		}
 

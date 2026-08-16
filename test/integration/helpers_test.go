@@ -317,28 +317,6 @@ func projectRoot(t *testing.T) string {
 	return filepath.Join(wd, "..", "..")
 }
 
-// runProx runs a prox subcommand to completion in the repo root and returns its
-// combined output and exit code. Used to exercise the real CLI (e.g. `prox stop`)
-// rather than poking the API directly.
-func runProx(t *testing.T, binary string, args ...string) (string, int) {
-	t.Helper()
-
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = projectRoot(t)
-	out, err := cmd.CombinedOutput()
-
-	exitCode := 0
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			exitCode = ee.ExitCode()
-		} else {
-			t.Fatalf("failed to run prox %v: %v", args, err)
-		}
-	}
-	return string(out), exitCode
-}
-
 // waitCmdExit waits for a started command to exit within timeout and returns the
 // exit error from Cmd.Wait (nil on a clean exit). On timeout it kills the process
 // directly (not via killProx, which would call Cmd.Wait a second time and race
