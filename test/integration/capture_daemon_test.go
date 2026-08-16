@@ -100,19 +100,20 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	client := proxyd.NewClient(socketPath)
 	waitDaemonReady(t, client)
 
-	// One HTTP listener; A and B share the port with distinct domains.
-	proxyPort := freePort(t)
-	if _, err := client.Register(proxyd.RegisterRequest{
-		ProjectDir:     "/projects/a",
-		PID:            os.Getpid(),
-		Version:        "test",
-		Domain:         "a.local.test",
-		Services:       map[string]proxyd.ServiceTarget{"app": {Host: hostA, Port: portA}},
-		HTTPPort:       proxyPort,
-		CaptureEnabled: true,
-	}); err != nil {
-		t.Fatalf("Register A: %v", err)
-	}
+	// One HTTP listener; A and B share the port with distinct domains. A's
+	// registration is the one that binds it, so it is the one that retries.
+	proxyPort := registerOnFreePort(t, func(port int) error {
+		_, err := client.Register(proxyd.RegisterRequest{
+			ProjectDir:     "/projects/a",
+			PID:            os.Getpid(),
+			Version:        "test",
+			Domain:         "a.local.test",
+			Services:       map[string]proxyd.ServiceTarget{"app": {Host: hostA, Port: portA}},
+			HTTPPort:       port,
+			CaptureEnabled: true,
+		})
+		return err
+	})
 	if _, err := client.Register(proxyd.RegisterRequest{
 		ProjectDir:     "/projects/b",
 		PID:            os.Getpid(),
@@ -274,14 +275,24 @@ func shortSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "d.sock")
 }
 
-func freePort(t *testing.T) int {
+// freePort reserves an ephemeral port and returns it with the reservation
+// STILL OPEN. The caller closes the listener immediately before handing the
+// port to whatever will bind it.
+//
+// The previous version closed the listener itself and returned a bare number,
+// which is a window, not a reservation: anything on the machine could take the
+// port in between, and something did -- TestInFlight_EndToEnd failed with
+// "bind: address already in use" under -race. Holding the listener does not
+// close that window (the port must be free when the real listener binds), but
+// it narrows it to a single statement and makes the handoff point explicit.
+// Callers that can retry should go through registerOnFreePort.
+func freePort(t *testing.T) (int, net.Listener) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve free port: %v", err)
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	return l.Addr().(*net.TCPAddr).Port, l
 }
 
 func waitDaemonReady(t *testing.T, client *proxyd.Client) {

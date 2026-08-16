@@ -67,20 +67,20 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	defer backend.Close()
 	host, port := splitHostPort(t, backend.URL)
 
-	proxyPort := freePort(t)
 	const projectDir = "/projects/inflight"
 	const hostname = "app.inflight.local.test"
-	if _, err := topo.client.Register(proxyd.RegisterRequest{
-		ProjectDir:     projectDir,
-		PID:            os.Getpid(),
-		Version:        "test",
-		Domain:         "inflight.local.test",
-		Services:       map[string]proxyd.ServiceTarget{"app": {Host: host, Port: port}},
-		HTTPPort:       proxyPort,
-		CaptureEnabled: true,
-	}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	proxyPort := registerOnFreePort(t, func(proxyPort int) error {
+		_, err := topo.client.Register(proxyd.RegisterRequest{
+			ProjectDir:     projectDir,
+			PID:            os.Getpid(),
+			Version:        "test",
+			Domain:         "inflight.local.test",
+			Services:       map[string]proxyd.ServiceTarget{"app": {Host: host, Port: port}},
+			HTTPPort:       proxyPort,
+			CaptureEnabled: true,
+		})
+		return err
+	})
 
 	// Project-side bridge (the daemon stream is backfill-plus-live, so start it
 	// before driving traffic and confirm it is live).
@@ -207,20 +207,20 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	defer backend.Close()
 	host, port := splitHostPort(t, backend.URL)
 
-	proxyPort := freePort(t)
 	const projectDir = "/projects/gap"
 	const hostname = "app.gap.local.test"
-	if _, err := topo.client.Register(proxyd.RegisterRequest{
-		ProjectDir:     projectDir,
-		PID:            os.Getpid(),
-		Version:        "test",
-		Domain:         "gap.local.test",
-		Services:       map[string]proxyd.ServiceTarget{"app": {Host: host, Port: port}},
-		HTTPPort:       proxyPort,
-		CaptureEnabled: true,
-	}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	proxyPort := registerOnFreePort(t, func(proxyPort int) error {
+		_, err := topo.client.Register(proxyd.RegisterRequest{
+			ProjectDir:     projectDir,
+			PID:            os.Getpid(),
+			Version:        "test",
+			Domain:         "gap.local.test",
+			Services:       map[string]proxyd.ServiceTarget{"app": {Host: host, Port: port}},
+			HTTPPort:       proxyPort,
+			CaptureEnabled: true,
+		})
+		return err
+	})
 
 	localRM := proxy.NewRequestManager(constants.DefaultProxyRequestBufferSize)
 

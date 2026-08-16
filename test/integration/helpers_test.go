@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -365,6 +366,51 @@ func killProx(cmd *exec.Cmd) {
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
+}
+
+// freePortAttempts bounds how many ports registerOnFreePort will try before
+// giving up. Losing the reserve/bind race once is plausible; losing it three
+// times running means the machine is out of ephemeral ports or something is
+// scanning them, and neither is worth retrying through.
+const freePortAttempts = 3
+
+// registerOnFreePort reserves an ephemeral port, releases the reservation, and
+// calls register(port) -- the call that makes the shared daemon actually bind
+// it -- retrying with a fresh port if something else took it in between.
+//
+// It returns the port that was successfully bound.
+func registerOnFreePort(t *testing.T, register func(port int) error) int {
+	t.Helper()
+
+	var lastErr error
+	for attempt := 1; attempt <= freePortAttempts; attempt++ {
+		port, reservation := freePort(t)
+		if err := reservation.Close(); err != nil {
+			t.Fatalf("release reserved port %d: %v", port, err)
+		}
+		err := register(port)
+		if err == nil {
+			return port
+		}
+		if !isAddrInUse(err) {
+			t.Fatalf("register on port %d: %v", port, err)
+		}
+		lastErr = err
+		t.Logf("port %d was taken between reservation and bind (attempt %d/%d): %v",
+			port, attempt, freePortAttempts, err)
+	}
+	t.Fatalf("no free port survived reservation in %d attempts; last error: %v", freePortAttempts, lastErr)
+	return 0 // unreachable; t.Fatalf stops the test
+}
+
+// isAddrInUse reports whether err is an EADDRINUSE, including when it arrived
+// as text: these binds happen inside the proxy daemon and come back over its
+// socket as a string, so the typed errno does not survive the trip.
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(err.Error(), "address already in use")
 }
 
 // waitForProcessState waits for a process to reach a specific state
