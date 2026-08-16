@@ -84,7 +84,44 @@ const apiReadyTimeout = 20 * time.Second
 // eventually dies on go test's timeout instead of failing one assertion
 // (CodeRabbit, PR #106). The per-request budget is deliberately much shorter
 // than the surrounding poll loop, since every attempt is retried anyway.
-var pollClient = &http.Client{Timeout: 5 * time.Second}
+var pollClient = &http.Client{Timeout: pollRequestTimeout}
+
+// pollRequestTimeout caps a single poll. It is a ceiling, not the budget —
+// pollGetWithinDeadline shortens it to whatever is left of the caller's own
+// deadline.
+const pollRequestTimeout = 5 * time.Second
+
+// pollGetWithinDeadline issues one poll bounded by BOTH the per-request ceiling
+// and the caller's remaining budget, returning a cancel the caller must run
+// after closing the body.
+//
+// The client timeout alone bounds a stalled call but not the operation: a
+// request that starts just before the deadline may still run the full ceiling
+// past it, so a helper given a 5s budget could take ~10s and then report a
+// timeout "within 5s" (CodeRabbit, PR #106). A timeout message that misstates
+// its own budget is exactly the kind of misleading signal that makes these
+// failures expensive to diagnose.
+func pollGetWithinDeadline(url string, deadline time.Time) (*http.Response, context.CancelFunc, error) {
+	budget := min(time.Until(deadline), pollRequestTimeout)
+	if budget <= 0 {
+		// Out of time: let the request fail immediately rather than start one
+		// the caller has already stopped waiting for.
+		budget = time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	resp, err := pollClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
+}
 
 // waitForAPI waits for the API to be ready
 func waitForAPI(t *testing.T, addr string, timeout time.Duration) {
@@ -92,10 +129,12 @@ func waitForAPI(t *testing.T, addr string, timeout time.Duration) {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := pollClient.Get(addr + "/api/v1/status")
+		resp, cancel, err := pollGetWithinDeadline(addr+"/api/v1/status", deadline)
 		if err == nil {
+			ok := resp.StatusCode == http.StatusOK
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			cancel()
+			if ok {
 				return
 			}
 		}
@@ -336,17 +375,19 @@ func waitForProcessState(t *testing.T, addr, name, expectedStatus string, timeou
 	deadline := time.Now().Add(timeout)
 	var lastStatus string
 	for time.Now().Before(deadline) {
-		resp, err := pollClient.Get(fmt.Sprintf("%s/api/v1/processes/%s", addr, name))
+		resp, cancel, err := pollGetWithinDeadline(fmt.Sprintf("%s/api/v1/processes/%s", addr, name), deadline)
 		if err == nil {
 			var proc ProcessInfo
+			matched := false
 			if err := json.NewDecoder(resp.Body).Decode(&proc); err == nil {
 				lastStatus = proc.Status
-				if proc.Status == expectedStatus {
-					resp.Body.Close()
-					return proc
-				}
+				matched = proc.Status == expectedStatus
 			}
 			resp.Body.Close()
+			cancel()
+			if matched {
+				return proc
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
