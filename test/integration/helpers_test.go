@@ -31,30 +31,74 @@ import (
 // cmd.Env as well, so they do not silently depend on this.)
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv("PROX_TUI")
-	os.Exit(m.Run())
+	code := m.Run()
+	// The shared binary outlives every t.TempDir(), so it is removed here.
+	if sharedBinary.dir != "" {
+		_ = os.RemoveAll(sharedBinary.dir)
+	}
+	os.Exit(code)
 }
 
-// buildBinary builds the prox binary and returns its path
+// buildBinary returns the path to a prox binary built once for the whole
+// package run.
+//
+// It used to build into t.TempDir(), i.e. once per test: 61 builds per run,
+// each producing a BRAND NEW binary on disk. That is not free even with a warm
+// build cache. On macOS the first execution of a freshly written binary costs
+// 0.22-0.40s of code-signing/security evaluation, against 0.00s for a binary
+// that has been run before (measured, plan 027 C4 gate), and 61 concurrent
+// `go build` invocations also contend for the build cache lock while the ~1500
+// unit tests in other packages run in parallel.
+//
+// Sharing one binary does NOT reintroduce the shared-resource problem this
+// plan removes: the binary is read-only and identical for every test, whereas
+// the resources that made this suite unreliable -- one .prox state directory
+// and one API port -- were mutable and contended. The per-test isolation that
+// matters lives in proxFixture, not here.
+//
+// The binary lives in a package-scoped temp dir removed by TestMain after
+// m.Run(), since t.TempDir() is per-test and would delete it while other tests
+// still need it.
 func buildBinary(t *testing.T) string {
 	t.Helper()
 
-	// Get project root (two directories up from test/integration)
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
+	sharedBinary.once.Do(func() {
+		dir, err := os.MkdirTemp("", "prox-integration-bin-")
+		if err != nil {
+			sharedBinary.err = fmt.Errorf("creating shared binary dir: %w", err)
+			return
+		}
+		sharedBinary.dir = dir
+
+		binary := filepath.Join(dir, "prox")
+		cmd := exec.Command("go", "build", "-o", binary, "./cmd/prox")
+		cmd.Dir = projectRoot(t)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			sharedBinary.err = fmt.Errorf("building prox: %w\n%s", err, out)
+			return
+		}
+
+		// Pay the first-exec cost once, here, rather than letting whichever
+		// test happens to run first absorb it inside its own readiness budget.
+		if out, err := exec.Command(binary, "--version").CombinedOutput(); err != nil {
+			sharedBinary.err = fmt.Errorf("warming prox binary: %w\n%s", err, out)
+			return
+		}
+		sharedBinary.path = binary
+	})
+
+	if sharedBinary.err != nil {
+		t.Fatalf("failed to build binary: %v", sharedBinary.err)
 	}
-	projectRoot := filepath.Join(wd, "..", "..")
+	return sharedBinary.path
+}
 
-	binary := filepath.Join(t.TempDir(), "prox")
-
-	cmd := exec.Command("go", "build", "-o", binary, "./cmd/prox")
-	cmd.Dir = projectRoot
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to build binary: %v\n%s", err, output)
-	}
-
-	return binary
+// sharedBinary holds the one prox build shared by every test in this package.
+var sharedBinary struct {
+	once sync.Once
+	path string
+	dir  string
+	err  error
 }
 
 // apiReadyTimeout is the standard budget for "has the daemon's API come up
