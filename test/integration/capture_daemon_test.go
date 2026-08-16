@@ -154,9 +154,13 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	}
 
 	// --- Assert via the ForwardRequests bridge (project-side view) ---
-	echoRec := waitForRecord(t, localRMA, func(r proxy.RequestRecord) bool { return r.URL == "/echo" })
-	largeRec := waitForRecord(t, localRMA, func(r proxy.RequestRecord) bool { return r.URL == "/large" })
-	bRec := waitForRecord(t, localRMB, func(r proxy.RequestRecord) bool { return r.URL == "/" })
+	echoRec := waitForRecord(t, localRMA, capturedRecord("/echo"))
+	largeRec := waitForRecord(t, localRMA, capturedRecord("/large"))
+	// B has capture disabled, so its completion record carries no Details --
+	// only the in-flight phase has to be excluded here.
+	bRec := waitForRecord(t, localRMB, func(r proxy.RequestRecord) bool {
+		return r.URL == "/" && !r.InFlight
+	})
 
 	// A: small POST carries inline request + response bodies that round-trip.
 	if echoRec.Details == nil || echoRec.Details.RequestBody == nil || echoRec.Details.ResponseBody == nil {
@@ -213,16 +217,18 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	}
 
 	// --- Assert via the daemon /api/v1/requests?project= endpoint ---
-	aRecs := daemonGetRequests(t, socketPath, "/projects/a")
-	if findRecord(aRecs, "/echo") == nil {
-		t.Errorf("daemon /requests for A missing /echo record")
+	// Poll: this endpoint is a snapshot of the same two-phase ring, so a single
+	// fetch can land between the in-flight and completion publishes.
+	aRecs := waitForDaemonRequests(t, socketPath, "/projects/a", func(recs []proxy.RequestRecord) bool {
+		return findRecord(recs, capturedRecord("/echo")) != nil &&
+			findRecord(recs, capturedRecord("/large")) != nil
+	})
+	if r := findRecord(aRecs, capturedRecord("/echo")); r == nil {
+		t.Errorf("daemon /requests for A missing completed /echo record")
+	} else if r.Details.RequestBody == nil || string(r.Details.RequestBody.Data) != "hello small" {
+		t.Errorf("daemon /requests A /echo body not captured: %+v", r.Details)
 	}
-	if r := findRecord(aRecs, "/echo"); r != nil {
-		if r.Details == nil || r.Details.RequestBody == nil || string(r.Details.RequestBody.Data) != "hello small" {
-			t.Errorf("daemon /requests A /echo body not captured: %+v", r.Details)
-		}
-	}
-	if r := findRecord(aRecs, "/large"); r == nil || r.Details == nil || r.Details.ResponseBody == nil || r.Details.ResponseBody.FilePath == "" {
+	if r := findRecord(aRecs, capturedRecord("/large")); r == nil || r.Details.ResponseBody == nil || r.Details.ResponseBody.FilePath == "" {
 		t.Errorf("daemon /requests A /large not disk-backed as expected")
 	}
 	for _, r := range aRecs {
@@ -231,8 +237,12 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 		}
 	}
 
-	bRecs := daemonGetRequests(t, socketPath, "/projects/b")
-	if r := findRecord(bRecs, "/"); r == nil {
+	// B has capture disabled: wait for the completion phase only (no Details).
+	completedB := func(r proxy.RequestRecord) bool { return r.URL == "/" && !r.InFlight }
+	bRecs := waitForDaemonRequests(t, socketPath, "/projects/b", func(recs []proxy.RequestRecord) bool {
+		return findRecord(recs, completedB) != nil
+	})
+	if r := findRecord(bRecs, completedB); r == nil {
 		t.Errorf("daemon /requests for B missing record")
 	} else if r.Details != nil {
 		t.Errorf("daemon /requests B record should be metadata-only, got Details")
@@ -307,6 +317,21 @@ func waitDaemonReady(t *testing.T, client *proxyd.Client) {
 	t.Fatal("daemon socket did not become ready")
 }
 
+// driveProxyTimeout bounds one request driven through the proxy listener, and
+// daemonRequestTimeout bounds one fetch from the daemon's unix socket. Both are
+// ceilings, not budgets: these are localhost round trips that normally finish in
+// milliseconds. They exist so a stalled backend or daemon fails the assertion
+// that is waiting on it instead of hanging to go test's package timeout, where
+// the failure names the whole package and not the call that hung.
+const (
+	driveProxyTimeout    = 15 * time.Second
+	daemonRequestTimeout = 5 * time.Second
+)
+
+// driveProxyClient is bounded; http.DefaultClient (used here before) has no
+// Timeout at all.
+var driveProxyClient = &http.Client{Timeout: driveProxyTimeout}
+
 // driveProxy sends one request through the proxy listener with the given Host
 // header and returns the response body as a string.
 func driveProxy(t *testing.T, port int, hostname, method, path string, body []byte) string {
@@ -320,7 +345,7 @@ func driveProxy(t *testing.T, port int, hostname, method, path string, body []by
 		t.Fatalf("new request: %v", err)
 	}
 	req.Host = hostname
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := driveProxyClient.Do(req)
 	if err != nil {
 		t.Fatalf("drive %s %s: %v", method, path, err)
 	}
@@ -369,24 +394,72 @@ func waitForRecord(t *testing.T, rm *proxy.RequestManager, match func(proxy.Requ
 	}
 }
 
-func findRecord(recs []proxy.RequestRecord, urlPath string) *proxy.RequestRecord {
+// capturedRecord matches the COMPLETION record for a path on a capture-enabled
+// project.
+//
+// The proxy publishes each request twice under one ID
+// (internal/proxyd/dynamic_proxy.go): phase 1 at header time, InFlight with
+// Details == nil, and phase 2 in a defer that runs only after rp.ServeHTTP
+// returns and FinalizeResponse has spilled the body to disk. The client's last
+// byte does NOT order those two — a request can be fully read by the client
+// while the handler is still returning, so the ring legitimately holds the
+// in-flight record with a nil Details. Matching on the URL alone therefore
+// picks up that record and every Details assertion nil-panics or fails
+// (issue #101). Every capture assertion wants phase 2, so say so.
+func capturedRecord(urlPath string) func(proxy.RequestRecord) bool {
+	return func(r proxy.RequestRecord) bool {
+		return r.URL == urlPath && !r.InFlight && r.Details != nil
+	}
+}
+
+func findRecord(recs []proxy.RequestRecord, match func(proxy.RequestRecord) bool) *proxy.RequestRecord {
 	for i := range recs {
-		if recs[i].URL == urlPath {
+		if match(recs[i]) {
 			return &recs[i]
 		}
 	}
 	return nil
 }
 
+// waitForDaemonRequests polls the daemon's /api/v1/requests endpoint until the
+// returned snapshot satisfies want, then returns that snapshot.
+//
+// The endpoint reads the same two-phase ring the SSE bridge does, so a single
+// unpolled fetch has the identical race as a URL-only waitForRecord: it can
+// land between phase 1 and phase 2 and hand back an in-flight record.
+func waitForDaemonRequests(t *testing.T, socketPath, project string, want func([]proxy.RequestRecord) bool) []proxy.RequestRecord {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		recs := daemonGetRequests(t, socketPath, project)
+		if want(recs) {
+			return recs
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for daemon /requests?project=%s to satisfy predicate (%d records)", project, len(recs))
+		case <-tick.C:
+		}
+	}
+}
+
 // daemonGetRequests fetches records for a project from the daemon's unix-socket
 // /api/v1/requests endpoint.
 func daemonGetRequests(t *testing.T, socketPath, project string) []proxy.RequestRecord {
 	t.Helper()
-	client := &http.Client{Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	// Bounded: a daemon that accepts the connection and then stalls would
+	// otherwise hang this call forever (no client Timeout), so the package dies
+	// on go test's timeout instead of failing this one assertion.
+	client := &http.Client{
+		Timeout: daemonRequestTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
 		},
-	}}
+	}
 	reqURL := fmt.Sprintf("http://proxyd/api/v1/requests?project=%s", url.QueryEscape(project))
 	resp, err := client.Get(reqURL)
 	if err != nil {
