@@ -197,6 +197,8 @@ prox logs --pattern "GET|POST" --regex
 prox logs -f --json | jq .
 ```
 
+**Unknown process names are an error (breaking change).** The positional argument and `--process` are validated against the running daemon's process list before the request is sent, in both normal and `--follow` mode. A name the daemon does not have now exits non-zero with `unknown process "<name>"` plus either the closest real name (`Did you mean "web"?`) or the full list of valid names — where a typo previously produced an empty result set, no output, and exit `0`, which was indistinguishable from a process that had simply logged nothing. A name that *does* match behaves exactly as before, including printing nothing (and exiting `0`) for a process with no log entries: only a wrong **name** is an error. If the daemon cannot be asked for its process list, the check is skipped and the command proceeds as it always did.
+
 ### start
 
 Start a stopped process.
@@ -206,6 +208,10 @@ prox start <process>
 ```
 
 Like `restart`, `start` re-reads `prox.yaml` and launches the process with its **current** config (see [Config reload on (re)start](#config-reload-on-restart) below). Editing a process's `cmd` and running `prox stop <process>` + `prox start <process>` applies the change, just as `prox restart <process>` does.
+
+**Unknown process names.** `start`, `stop`, and `restart` name the process that was asked for and either the closest real name (`Did you mean "web"?`) or the full list, instead of the bare `PROCESS_NOT_FOUND: process not found` earlier versions printed. The valid names come from the running daemon, so they are the names it will actually accept.
+
+**The "Is prox running?" hint.** Every client command appends `Is prox running? Try 'prox up' first.` only when the failure positively says nothing is listening (a refused or reset connection). An error the daemon itself produced — any HTTP status, or an unparseable response body — no longer carries it: prox had just answered, so the advice was false. Timeouts, cancellations, and unrecognized failures do not carry it either, since none of them establishes that the daemon is gone.
 
 **Examples:**
 

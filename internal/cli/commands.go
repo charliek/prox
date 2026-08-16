@@ -392,6 +392,15 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 	client := NewClient(apiAddr)
 
+	// Reject a process name the daemon does not have BEFORE the request, for
+	// both input paths (positional and --process) and both modes (--follow
+	// branches away below). An unknown name is otherwise silently reduced to a
+	// filter that matches nothing: no output, exit 0. Best-effort by design —
+	// see validateLogProcesses.
+	if err := validateLogProcesses(client, params.Process); err != nil {
+		return err
+	}
+
 	printer := NewLogPrinter()
 
 	if logsFollow {
@@ -455,7 +464,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		processName := args[0]
 		if err := client.StopProcess(processName); err != nil {
-			return clientError(err, "Is prox running? Try 'prox up' first.")
+			return processClientError(client, processName, err, "Is prox running? Try 'prox up' first.")
 		}
 		fmt.Printf("Stopped process: %s\n", processName)
 		return nil
@@ -608,7 +617,7 @@ func runStartProcess(cmd *cobra.Command, args []string) error {
 	client := NewClient(apiAddr)
 
 	if err := client.StartProcess(processName); err != nil {
-		return clientError(err, "Is prox running? Try 'prox up' first.")
+		return processClientError(client, processName, err, "Is prox running? Try 'prox up' first.")
 	}
 
 	fmt.Printf("Started process: %s\n", processName)
@@ -636,7 +645,7 @@ func runRestart(cmd *cobra.Command, args []string) error {
 	client := NewClient(apiAddr)
 
 	if err := client.RestartProcess(processName); err != nil {
-		return clientError(err, "Is prox running? Try 'prox up' first.")
+		return processClientError(client, processName, err, "Is prox running? Try 'prox up' first.")
 	}
 
 	fmt.Printf("Restarted process: %s\n", processName)
@@ -1136,15 +1145,6 @@ func commandContext(cmd *cobra.Command) context.Context {
 		return ctx
 	}
 	return context.Background()
-}
-
-// clientError wraps an error with an optional hint for the user.
-// This provides consistent error messages for client commands.
-func clientError(err error, hint string) error {
-	if hint != "" {
-		return fmt.Errorf("%w\n%s", err, hint)
-	}
-	return err
 }
 
 // formatDuration formats a duration nicely

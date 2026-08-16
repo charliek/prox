@@ -115,6 +115,13 @@ func TestRunLogs_FilterParsing(t *testing.T) {
 	var receivedProcess, receivedPattern, receivedRegex, receivedLines string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// `prox logs` validates its process filter against the daemon's own
+		// process list before fetching (plan 027 C11, #95), so this stand-in
+		// daemon has to answer that call too — with a list containing the name
+		// the filter asks for, or the fetch never happens.
+		if serveProcessList(w, r, "web") {
+			return
+		}
 		receivedProcess = r.URL.Query().Get("process")
 		receivedPattern = r.URL.Query().Get("pattern")
 		receivedRegex = r.URL.Query().Get("regex")
@@ -171,6 +178,9 @@ func TestRunLogs_ProcessAsPositionalArg(t *testing.T) {
 	var receivedProcess string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveProcessList(w, r, "web") {
+			return
+		}
 		receivedProcess = r.URL.Query().Get("process")
 
 		w.Header().Set("Content-Type", "application/json")
