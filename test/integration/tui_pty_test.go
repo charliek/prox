@@ -371,31 +371,13 @@ func TestAttach_QuitDetachesLeavesDaemonRunning(t *testing.T) {
 	binary := buildBinary(t)
 	f := newInlineFixture(t, tuiFixtureConfig)
 
-	// Start the daemon (prox up -d) in the background. This one stays a
-	// run-to-completion CLI invocation rather than a proxRun: for `-d` the
-	// launched process is a short-lived parent that exits once its child is
-	// ready, so there is nothing to hold a run handle for -- and the state file
-	// records the CHILD's pid, which is why the daemon address is read from disk
-	// here instead of via proxRun.Addr.
-	daemonOut, code := f.Run(t, binary, "up", "-d", "-c", f.configPath)
-	if code != 0 {
-		t.Fatalf("failed to start daemon (exit %d)\noutput: %s", code, daemonOut)
-	}
-	t.Cleanup(func() {
-		_, _ = f.Run(t, binary, "stop", "-c", f.configPath)
-	})
-
-	statePath := filepath.Join(f.dir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-	stateData, err := os.ReadFile(statePath)
-	requireNoError(t, err, "reading state file")
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Fatalf("failed to parse state file: %v", err)
-	}
-	addr := fmt.Sprintf("http://127.0.0.1:%d", state.Port)
+	// Start the daemon (prox up -d) in the background. StartDetached tracks the
+	// CHILD the launcher leaves behind -- for `-d` the launched process is a
+	// short-lived parent that exits once its child is ready -- so Addr comes from
+	// that daemon's own state file and teardown targets the daemon rather than
+	// the corpse of the launcher.
+	daemonRun := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
+	addr := daemonRun.Addr()
 	waitForAPI(t, addr, apiReadyTimeout)
 	daemonPID := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
 

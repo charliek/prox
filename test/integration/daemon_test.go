@@ -2,9 +2,8 @@ package integration
 
 import (
 	"encoding/json"
-	"net/http"
+	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,93 +11,55 @@ import (
 	"time"
 )
 
+// Every detached launch below goes through f.StartDetached, which records the
+// DAEMON's identity (the child `up -d` leaves behind, not the launcher that has
+// already exited) and registers the waited teardown for it. The teardown these
+// tests used to hand-roll -- a fire-and-forget POST /api/v1/shutdown followed by
+// `time.Sleep(500ms)` -- recovered nothing when the daemon did not answer, and
+// the 500ms sleep was a guess rather than a wait. See leakguard_test.go.
+
+// detachedFixtureConfig is the trivial config most of these tests need: one
+// long-lived process and nothing else. The `api:` block is dropped by the
+// fixture, so each daemon binds a dynamic port and reports it in its own private
+// .prox/prox.state.
+const detachedFixtureConfig = `
+processes:
+  test: "sleep 60"
+`
+
 func TestDaemonMode_StartsInBackground(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
-
-	// Create a simple config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
+	f := newInlineFixture(t, `
 processes:
   test: "while true; do echo hello; sleep 1; done"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+`)
 
-	// Start daemon
-	cmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd.Dir = tmpDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
 	// Output should indicate daemon started
-	if !strings.Contains(string(output), "prox started (pid") {
-		t.Errorf("expected daemon start message, got: %s", output)
+	if !strings.Contains(run.Output(), "prox started (pid") {
+		t.Errorf("expected daemon start message, got: %s", run.Output())
 	}
 
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-
-	// Read state file to get port
-	stateData, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("failed to read state file: %v", err)
-	}
-
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Fatalf("failed to parse state: %v", err)
-	}
+	// The state file exists by construction (the launcher waits for it), and
+	// Addr reads the port back out of it.
+	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
 
 	// Verify API is accessible
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, apiReadyTimeout)
-
-	// Clean up: stop the daemon
-	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-	resp, err := http.DefaultClient.Do(stopReq)
-	if err == nil && resp != nil {
-		resp.Body.Close()
-	}
-
-	// Wait for cleanup
-	time.Sleep(500 * time.Millisecond)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 }
 
 func TestDaemonMode_CreatesStateFile(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
+	f := newInlineFixture(t, detachedFixtureConfig)
 
-	// Create a simple config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
-	// Start daemon
-	cmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd.Dir = tmpDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
-
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
 	waitForStateFile(t, statePath, 10*time.Second)
 
 	// Verify state file exists and read it
@@ -127,8 +88,14 @@ processes:
 		t.Error("state Host is empty")
 	}
 
+	// The recorded pid is the DAEMON, not the launcher that started it: `up -d`
+	// forks and exits, so the two are never the same process.
+	if daemonPID := run.DaemonIdentity().PID; state.PID != daemonPID {
+		t.Errorf("state PID %d should be the daemon the harness tracks (%d)", state.PID, daemonPID)
+	}
+
 	// Verify PID file exists
-	pidPath := filepath.Join(tmpDir, ".prox", "prox.pid")
+	pidPath := filepath.Join(run.StateDir(), "prox.pid")
 	pidData, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatalf("PID file not found: %v", err)
@@ -143,128 +110,45 @@ processes:
 	if pid != state.PID {
 		t.Errorf("PID mismatch: file has %d, state has %d", pid, state.PID)
 	}
-
-	// Clean up
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-	resp, err := http.DefaultClient.Do(stopReq)
-	if err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
 }
 
 func TestDaemonMode_RejectsSecondInstance(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
-
-	// Create a simple config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+	f := newInlineFixture(t, detachedFixtureConfig)
 
 	// Start first daemon
-	cmd1 := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd1.Dir = tmpDir
-	output1, err := cmd1.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start first daemon: %v\noutput: %s", err, output1)
-	}
-
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
+	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
 
 	// Try to start second daemon - should fail
-	cmd2 := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd2.Dir = tmpDir
-	output2, err := cmd2.CombinedOutput()
+	output, code := f.Run(t, binary, "up", "-d", "-c", f.configPath)
 
-	// Should fail
-	if err == nil {
-		t.Fatalf("expected second daemon to fail, but it succeeded\noutput: %s", output2)
+	if code == 0 {
+		t.Fatalf("expected second daemon to fail, but it succeeded\noutput: %s", output)
 	}
 
 	// Should mention already running
-	if !strings.Contains(string(output2), "already running") {
-		t.Errorf("expected 'already running' error, got: %s", output2)
+	if !strings.Contains(output, "already running") {
+		t.Errorf("expected 'already running' error, got: %s", output)
 	}
-
-	// Clean up: read state and stop
-	stateData, _ := os.ReadFile(filepath.Join(tmpDir, ".prox", "prox.state"))
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Logf("warning: failed to parse state for cleanup: %v", err)
-	}
-	if state.Port > 0 {
-		apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-		stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-		resp, err := http.DefaultClient.Do(stopReq)
-		if err == nil && resp != nil {
-			resp.Body.Close()
-		}
-	}
-	time.Sleep(500 * time.Millisecond)
 }
 
 func TestDaemonMode_GracefulShutdown(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
+	f := newInlineFixture(t, detachedFixtureConfig)
 
-	// Create a simple config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
-
-	// Start daemon
-	cmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd.Dir = tmpDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
-
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
+	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
 	waitForStateFile(t, statePath, 10*time.Second)
 
-	// Read state
-	stateData, err := os.ReadFile(filepath.Join(tmpDir, ".prox", "prox.state"))
-	if err != nil {
-		t.Fatalf("failed to read state file: %v", err)
-	}
-
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Fatalf("failed to parse state: %v", err)
-	}
-
-	// Stop daemon
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-	resp, err := http.DefaultClient.Do(stopReq)
-	if err != nil {
-		t.Fatalf("failed to send shutdown request: %v", err)
-	}
-	resp.Body.Close()
+	// Stop the daemon and WAIT for it to report the outcome. The bare POST this
+	// used to send returns as soon as the daemon has been asked, so the file
+	// assertions below were racing its cleanup rather than checking it.
+	run.Shutdown(t)
 
 	// Wait for shutdown - poll for state file removal
 	deadline := time.Now().Add(10 * time.Second)
@@ -281,7 +165,7 @@ processes:
 	}
 
 	// Verify PID file is cleaned up
-	pidPath := filepath.Join(tmpDir, ".prox", "prox.pid")
+	pidPath := filepath.Join(run.StateDir(), "prox.pid")
 	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 		t.Error("PID file should have been removed after shutdown")
 	}
@@ -291,36 +175,19 @@ func TestDaemonMode_DynamicPort(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
 
-	// Create config WITHOUT api.port - should use dynamic port
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+	// Config WITHOUT api.port - should use dynamic port.
+	f := newInlineFixture(t, detachedFixtureConfig)
 
-	// Start daemon
-	cmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd.Dir = tmpDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
 	waitForStateFile(t, statePath, 10*time.Second)
 
-	// Read state
 	stateData, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatalf("failed to read state file: %v", err)
 	}
-
 	var state struct {
 		Port int `json:"port"`
 	}
@@ -334,56 +201,60 @@ processes:
 	}
 
 	// Verify API is accessible on the dynamic port
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 	t.Logf("Daemon using dynamic port: %d", state.Port)
-
-	// Clean up
-	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-	resp, err := http.DefaultClient.Do(stopReq)
-	if err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
 }
 
 func TestDaemonMode_ConfiguredPort(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
 
-	// Create config WITH specific api.port
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-api:
-  port: 16666
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
+	// Config WITH a specific api.port. The number used to be hardcoded (16666),
+	// which is the shared-resource shape the rest of this suite just removed:
+	// two runs on one machine, or a developer's own service on that port, and
+	// the daemon fails to bind. What is under test is that a CONFIGURED port is
+	// honoured, not which number it is, so an ephemeral port reserved and
+	// released here is just as good a subject.
+	//
+	// Releasing the reservation does leave a window in which something else can
+	// take the port before the daemon binds it -- the bind-and-close TOCTOU that
+	// produced a real failure in this plan's baseline measurement
+	// (TestInFlight_EndToEnd, "bind: address already in use"). So, like every
+	// other dynamic-port consumer here, this retries on that specific error
+	// rather than reporting it as a broken assertion about configured ports.
+	var (
+		port int
+		run  *proxRun
+		f    *proxFixture
+	)
+	for attempt := 1; ; attempt++ {
+		var reservation net.Listener
+		port, reservation = freePort(t)
+		if err := reservation.Close(); err != nil {
+			t.Fatalf("release reserved api port %d: %v", port, err)
+		}
+		f = newInlineFixture(t, detachedFixtureConfig, withAPIPort(port))
+
+		var err error
+		run, err = f.TryStartDetached(t, binary, "up", "-d", "-c", f.configPath)
+		if err == nil {
+			break
+		}
+		if attempt >= freePortAttempts || !isAddrInUse(err) {
+			t.Fatalf("start daemon on configured port %d: %v", port, err)
+		}
+		t.Logf("configured port %d was taken between reservation and bind; retrying", port)
 	}
 
-	// Start daemon
-	cmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	cmd.Dir = tmpDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
-
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
 	waitForStateFile(t, statePath, 10*time.Second)
 
-	// Read state
 	stateData, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatalf("failed to read state file: %v", err)
 	}
-
 	var state struct {
 		Port int `json:"port"`
 	}
@@ -392,174 +263,37 @@ processes:
 	}
 
 	// Port should be the configured value
-	if state.Port != 16666 {
-		t.Errorf("expected port 16666, got %d", state.Port)
+	if state.Port != port {
+		t.Errorf("expected configured port %d, got %d", port, state.Port)
 	}
 
 	// Verify API is accessible on the configured port
-	apiAddr := "http://127.0.0.1:16666"
-	waitForAPI(t, apiAddr, apiReadyTimeout)
-
-	// Clean up
-	stopReq, _ := http.NewRequest("POST", apiAddr+"/api/v1/shutdown", nil)
-	resp, err := http.DefaultClient.Do(stopReq)
-	if err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
+	waitForAPI(t, "http://127.0.0.1:"+strconv.Itoa(port), apiReadyTimeout)
 }
 
 func TestDaemonMode_CLIAutoDiscovery(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
+	f := newInlineFixture(t, detachedFixtureConfig)
 
-	// Create config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-processes:
-  test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
-
-	// Start daemon
-	startCmd := exec.Command(binary, "up", "-d", "-c", configPath)
-	startCmd.Dir = tmpDir
-	output, err := startCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, output)
-	}
-
-	// Wait for state file to contain valid port (retry for partial writes)
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	var state struct {
-		Port int `json:"port"`
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		stateData, err := os.ReadFile(statePath)
-		if err == nil {
-			if json.Unmarshal(stateData, &state) == nil && state.Port != 0 {
-				break
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if state.Port == 0 {
-		t.Fatalf("failed to get valid port from state file")
-	}
+	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
 	// Wait for API to be ready before running CLI command
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	waitForAPI(t, apiAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 	// Run status command without specifying --addr
 	// It should auto-discover the API address from .prox/prox.state
-	statusCmd := exec.Command(binary, "status", "-c", configPath)
-	statusCmd.Dir = tmpDir
-	statusOutput, err := statusCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("status command failed: %v\noutput: %s", err, statusOutput)
+	statusOutput, code := f.Run(t, binary, "status", "-c", f.configPath)
+	if code != 0 {
+		t.Fatalf("status command failed (exit %d)\noutput: %s", code, statusOutput)
 	}
 
 	// Should show running status
-	if !strings.Contains(string(statusOutput), "running") {
+	if !strings.Contains(statusOutput, "running") {
 		t.Errorf("expected 'running' in status output, got: %s", statusOutput)
 	}
 
-	// Clean up - also using auto-discovery
-	stopCmd := exec.Command(binary, "stop", "-c", configPath)
-	stopCmd.Dir = tmpDir
-	stopCmd.CombinedOutput()
-	time.Sleep(500 * time.Millisecond)
-}
-
-func TestUpCommand_ForegroundDynamicPort(t *testing.T) {
-	skipShort(t)
-
-	binary := buildBinary(t)
-
-	// Config WITHOUT api.port - should use dynamic port.
-	f := newInlineFixture(t, `
-processes:
-  test: "sleep 60"
-`)
-
-	// Start foreground mode (no -d flag). The run handle owns the single
-	// Cmd.Wait and kills the process at test end.
-	run := f.Start(t, binary, "up", "-c", f.configPath)
-
-	// Addr reads the port back out of this run's own state file, so a non-zero
-	// dynamic port having been written IS the precondition for it returning.
-	apiAddr := run.Addr()
-	waitForAPI(t, apiAddr, apiReadyTimeout)
-
-	t.Logf("Foreground mode using dynamic port: %s", apiAddr)
-}
-
-func TestUpCommand_ForegroundCreatesStateFile(t *testing.T) {
-	skipShort(t)
-
-	binary := buildBinary(t)
-
-	// The port this config used to pin (16667) was incidental -- the test is
-	// about the state and PID files existing, not about which port they name --
-	// and the fixture strips api: so each run gets its own dynamic one.
-	f := newInlineFixture(t, `
-processes:
-  test: "sleep 60"
-`)
-
-	// Start foreground mode
-	run := f.Start(t, binary, "up", "-c", f.configPath)
-
-	// Wait for state file to be created
-	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
-	waitForStateFile(t, statePath, 10*time.Second)
-
-	// Verify state file exists
-	if _, err := os.Stat(statePath); os.IsNotExist(err) {
-		t.Fatal("state file not created in foreground mode")
-	}
-
-	// Verify PID file exists
-	pidPath := filepath.Join(run.StateDir(), "prox.pid")
-	if _, err := os.Stat(pidPath); os.IsNotExist(err) {
-		t.Fatal("PID file not created in foreground mode")
-	}
-}
-
-func TestUpCommand_ForegroundRejectsSecondInstance(t *testing.T) {
-	skipShort(t)
-
-	binary := buildBinary(t)
-
-	// No pinned api.port (this test used to hardcode 16668): the second instance
-	// is refused by the PID-file lock in the shared .prox directory, which has
-	// nothing to do with the port.
-	f := newInlineFixture(t, `
-processes:
-  test: "sleep 60"
-`)
-
-	// Start first instance
-	run := f.Start(t, binary, "up", "-c", f.configPath)
-
-	// Wait for state file to be created (indicates PID file is also locked)
-	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
-
-	// Try to start second instance - should fail
-	output, code := f.Run(t, binary, "up", "-c", f.configPath)
-
-	if code == 0 {
-		t.Fatalf("expected second instance to fail, but it succeeded\noutput: %s", output)
-	}
-
-	// Should mention already running
-	if !strings.Contains(output, "already running") {
-		t.Errorf("expected 'already running' error, got: %s", output)
-	}
+	// No cleanup here: the `prox stop` this test used to fire and forget asserted
+	// nothing, and the harness now stops the daemon with a waited shutdown.
 }

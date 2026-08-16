@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -546,32 +545,6 @@ func upTUIFixture(t *testing.T) (string, string) {
 	return dir, cfg
 }
 
-// shutdownDaemonIn stops a detached daemon started in dir by reading the port
-// it recorded in .prox/prox.state and posting /shutdown. Best-effort cleanup:
-// the assertions live in the tests, not here.
-func shutdownDaemonIn(t *testing.T, dir string) {
-	t.Helper()
-	statePath := filepath.Join(dir, ".prox", "prox.state")
-	stateData, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Logf("cleanup: no state file at %s: %v", statePath, err)
-		return
-	}
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Logf("cleanup: unparseable state file: %v", err)
-		return
-	}
-	addr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
-	req, _ := http.NewRequest("POST", addr+"/api/v1/shutdown", nil)
-	if resp, err := http.DefaultClient.Do(req); err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
-}
-
 // TestUpTUIFlags_Conflicts pins the two flag combinations that must be refused
 // and the false-valued forms that must NOT be, through real process
 // invocations. `-d --tui=false` is the load-bearing row: cobra reports
@@ -619,52 +592,39 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 
 	t.Run("-d --tui=false is accepted", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--tui=false", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		// startDetachedIn fails the test if the launcher exits non-zero, which
+		// is the assertion here: Changed("tui") is true for `--tui=false`, so a
+		// conflict predicate that ignores the parsed VALUE rejects this line.
+		// It also registers the daemon teardown, which the fire-and-forget
+		// `defer shutdownDaemonIn(t, dir)` this replaced could not do reliably.
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "--tui=false", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d --tui=false` must succeed (Changed(\"tui\") is true for it, but no TUI was asserted): %v\noutput:\n%s", err, out)
+		if strings.Contains(run.Output(), "mutually exclusive") {
+			t.Errorf("no conflict may be reported for --tui=false, got:\n%s", run.Output())
 		}
-		if strings.Contains(string(out), "mutually exclusive") {
-			t.Errorf("no conflict may be reported for --tui=false, got:\n%s", out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 
 	t.Run("-d --no-tui is accepted", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--no-tui", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "--no-tui", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d --no-tui` must succeed: %v\noutput:\n%s", err, out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 
 	t.Run("plain -d still succeeds", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "-c", cfg)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		defer shutdownDaemonIn(t, dir)
+		run := startDetachedIn(t, binary, dir, nil, "up", "-d", "-c", cfg)
 
-		if err != nil {
-			t.Fatalf("`up -d` must succeed with no flag-conflict error: %v\noutput:\n%s", err, out)
+		if strings.Contains(run.Output(), "mutually exclusive") {
+			t.Errorf("a bare `up -d` must never report a flag conflict, got:\n%s", run.Output())
 		}
-		if strings.Contains(string(out), "mutually exclusive") {
-			t.Errorf("a bare `up -d` must never report a flag conflict, got:\n%s", out)
-		}
-		if !strings.Contains(string(out), "prox started (pid") {
-			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		if !strings.Contains(run.Output(), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", run.Output())
 		}
 	})
 }

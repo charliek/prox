@@ -29,9 +29,27 @@ import (
 // tests assert on. Tests that mean to exercise the variable set it explicitly on
 // cmd.Env, which is unaffected by this. (The pty helpers filter it out of
 // cmd.Env as well, so they do not silently depend on this.)
+//
+// It also installs the run-level halves of the leak guard (plan 027 C5,
+// leakguard_test.go): a SIGINT/SIGTERM trap so an interrupted run still stops
+// its daemons, a sweep of ledgers left by runs that died before they could, and
+// an informational banner when a daemon is running in the repo root.
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv("PROX_TUI")
+
+	installSignalTeardown(os.Stderr)
+	warnOnRepoRootDaemon(os.Stderr)
+	reapStaleLedgers(packageLedger.dir, os.Getpid(), os.Stderr)
+
 	code := m.Run()
+
+	// Anything this run started and did not stop is a teardown bug; kill it
+	// before reporting, so a leak can never outlive the process that made it.
+	if packageLedger.reapOwn(os.Stderr) > 0 && code == 0 {
+		fmt.Fprintln(os.Stderr, "prox integration: the run leaked daemons that survived their tests' teardown")
+	}
+	packageLedger.remove()
+
 	// The shared binary outlives every t.TempDir(), so it is removed here.
 	if sharedBinary.dir != "" {
 		_ = os.RemoveAll(sharedBinary.dir)

@@ -1,9 +1,9 @@
 package integration
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"net"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/charliek/prox/internal/daemon"
 )
 
 // This file is the isolated integration harness (plan 027 workstream A).
@@ -281,6 +283,23 @@ func withEnv(kv ...string) startOpt {
 	}
 }
 
+// withAPIPort puts an `api: {port: N}` block back into a config after rendering
+// stripped it, for the one test whose subject IS that key. Everything else wants
+// the dynamic port rendering gives it.
+func withAPIPort(port int) fixtureOpt {
+	return func(t *testing.T, f *proxFixture, body *yaml.Node) {
+		t.Helper()
+		dropMappingKey(body, "api")
+		body.Content = append(body.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "api"},
+			&yaml.Node{Kind: yaml.MappingNode, Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Value: "port"},
+				{Kind: yaml.ScalarNode, Value: strconv.Itoa(port)},
+			}},
+		)
+	}
+}
+
 // Start launches prox in this fixture's directory and returns the run handle.
 func (f *proxFixture) Start(t *testing.T, binary string, args ...string) *proxRun {
 	t.Helper()
@@ -293,8 +312,133 @@ func (f *proxFixture) Start(t *testing.T, binary string, args ...string) *proxRu
 func (f *proxFixture) StartWith(t *testing.T, binary string, opts []startOpt, args ...string) *proxRun {
 	t.Helper()
 
+	cmd, l := buildLaunch(t, binary, f.dir, opts, args...)
+
+	if err := l.start(cmd); err != nil {
+		t.Fatalf("failed to start prox: %v", err)
+	}
+
+	r := &proxRun{
+		t:         t,
+		cmd:       cmd,
+		dir:       f.dir,
+		out:       l.out,
+		exited:    make(chan struct{}),
+		watchStop: make(chan struct{}),
+	}
+	// The ONE Wait for this process, started here and never called again from
+	// anywhere else. waitErr is written before exited is closed, so every
+	// reader that reads it after receiving from the channel is ordered behind
+	// this write.
+	go func() {
+		r.waitErr = cmd.Wait()
+		close(r.exited)
+	}()
+
+	// Registered after t.TempDir()'s own cleanup, so LIFO ordering tears the
+	// daemon down before the directory it is running in is removed.
+	t.Cleanup(r.teardown)
+
+	// Resolve (and ledger) the daemon identity in the background, so that a run
+	// nobody ever calls Addr on is still recorded before it can be leaked.
+	go r.watchIdentity()
+
+	return r
+}
+
+// StartDetached runs a DETACHING prox launch -- `up -d` -- to completion in this
+// fixture's directory and returns a handle whose daemon identity is the child
+// the launcher left behind.
+//
+// It exists so that no test has to hand-roll this. `prox up -d` forks a child
+// and the parent CLI exits as soon as that child is ready (internal/cli/
+// daemon_startup.go awaitDaemonStartup), so by the time any cleanup runs the
+// launched process is a corpse and the daemon is a pid in .prox/prox.state.
+// Every hand-rolled version of this in the suite therefore "cleaned up" by
+// posting a fire-and-forget shutdown and sleeping 500ms, which recovers nothing
+// when the daemon does not answer.
+//
+// The returned handle's Output() is the LAUNCHER's combined output (which is
+// where "prox started (pid ...)" appears); the daemon's own output goes to
+// .prox/prox.log.
+func (f *proxFixture) StartDetached(t *testing.T, binary string, args ...string) *proxRun {
+	t.Helper()
+	return startDetachedIn(t, binary, f.dir, nil, args...)
+}
+
+// TryStartDetached is StartDetached for the one caller that must inspect a
+// startup failure instead of failing the test on it: the configured-port test
+// reserves an ephemeral port and can legitimately lose it to another process
+// between releasing the reservation and the daemon's bind, and must retry
+// rather than report that as a broken assertion about configured ports.
+func (f *proxFixture) TryStartDetached(t *testing.T, binary string, args ...string) (*proxRun, error) {
+	t.Helper()
+	return tryStartDetachedIn(t, binary, f.dir, nil, args...)
+}
+
+// startDetachedIn is StartDetached for a directory that is not a proxFixture --
+// the several tests that build their own project directory by hand and then
+// start a daemon in it. They get the same two-identity teardown and the same
+// ledger entry; nothing about leak-proofing should depend on how the config got
+// written.
+func startDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args ...string) *proxRun {
+	t.Helper()
+	r, err := tryStartDetachedIn(t, binary, dir, opts, args...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return r
+}
+
+// tryStartDetachedIn is startDetachedIn that returns the startup failure rather
+// than ending the test with it. Teardown and the ledger entry are registered
+// either way, so a launcher that fails AFTER its daemon came up still cannot
+// leak it.
+func tryStartDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args ...string) (*proxRun, error) {
+	t.Helper()
+
+	cmd, l := buildLaunch(t, binary, dir, opts, args...)
+
+	r := &proxRun{
+		t:         t,
+		cmd:       cmd,
+		dir:       dir,
+		out:       l.out,
+		exited:    make(chan struct{}),
+		watchStop: make(chan struct{}),
+		detached:  true,
+	}
+	// Registered BEFORE the launcher runs: if the daemon comes up and the
+	// launcher then reports a failure, the daemon still gets torn down.
+	t.Cleanup(r.teardown)
+
+	// Start + Wait here is the one and only Wait for the launcher, and it is
+	// safe to make it inline because the launcher is short-lived by construction
+	// -- unlike a foreground run, there is nothing to observe while it lives.
+	if err := l.start(cmd); err != nil {
+		close(r.exited)
+		return nil, fmt.Errorf("failed to start detached prox %v: %w", args, err)
+	}
+	r.waitErr = cmd.Wait()
+	close(r.exited)
+	if r.waitErr != nil {
+		return nil, fmt.Errorf("failed to start detached prox %v: %w\noutput:\n%s", args, r.waitErr, r.Output())
+	}
+
+	// The launcher only exits 0 after the state file names its child AND that
+	// child's /health answers, so this resolves on the first read.
+	r.DaemonIdentity()
+	return r, nil
+}
+
+// buildLaunch assembles the exec.Cmd and the launch description shared by every
+// start in this harness: the working directory, the one combined output buffer,
+// and whatever the opts change before the process runs.
+func buildLaunch(t *testing.T, binary, dir string, opts []startOpt, args ...string) (*exec.Cmd, *launch) {
+	t.Helper()
+
 	cmd := exec.Command(binary, args...)
-	cmd.Dir = f.dir
+	cmd.Dir = dir
 	// One buffer for both streams: what a test asserts on is what the terminal
 	// would have shown, and interleaving is what a pty gives anyway, so the two
 	// wirings produce comparable output.
@@ -306,32 +450,7 @@ func (f *proxFixture) StartWith(t *testing.T, binary string, opts []startOpt, ar
 	for _, opt := range opts {
 		opt(t, l)
 	}
-
-	if err := l.start(cmd); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-
-	r := &proxRun{
-		t:       t,
-		cmd:     cmd,
-		fixture: f,
-		out:     l.out,
-		exited:  make(chan struct{}),
-	}
-	// The ONE Wait for this process, started here and never called again from
-	// anywhere else. waitErr is written before exited is closed, so every
-	// reader that reads it after receiving from the channel is ordered behind
-	// this write.
-	go func() {
-		r.waitErr = cmd.Wait()
-		close(r.exited)
-	}()
-
-	// Registered after t.TempDir()'s own cleanup, so LIFO ordering kills the
-	// process before the directory it is running in is removed.
-	t.Cleanup(r.Kill)
-
-	return r
+	return cmd, l
 }
 
 // proxRun is a launched prox process whose Cmd.Wait is owned by exactly one
@@ -346,16 +465,28 @@ func (f *proxFixture) StartWith(t *testing.T, binary string, opts []startOpt, ar
 // not reachable at all. TestProxRun_KillDuringWaitExitIsRaceFree holds that
 // line: it reproduces the old shape and fails, under -race and on its own
 // assertion, the moment a second Wait comes back.
+//
+// A run also carries the SECOND identity this harness needs: the daemon. For a
+// foreground `prox up` the launched process is the daemon, so the two coincide;
+// for a detached `up -d` the launcher exits immediately and the daemon is the
+// child recorded in .prox/prox.state. Cleanup targets the daemon in both cases
+// (see teardown), which is the only version of cleanup that means anything for a
+// detached launch.
 type proxRun struct {
-	t       *testing.T
-	cmd     *exec.Cmd
-	fixture *proxFixture
-	out     *syncBuffer   // combined stdout+stderr, or the drained pty master
-	exited  chan struct{} // closed by the single waiter goroutine
-	waitErr error         // written before exited is closed
+	t         *testing.T
+	cmd       *exec.Cmd
+	dir       string        // the launch's working directory; .prox/ lives here
+	out       *syncBuffer   // combined stdout+stderr, or the drained pty master
+	exited    chan struct{} // closed by the single waiter goroutine
+	waitErr   error         // written before exited is closed
+	detached  bool          // true for `up -d`: cmd is the launcher, not the daemon
+	watchStop chan struct{} // closed by teardown to stop watchIdentity
 
-	mu   sync.Mutex
-	addr string // memoized by Addr
+	mu      sync.Mutex
+	ident   daemonIdentity // the daemon, memoized once the state file names it
+	identOK bool
+
+	stopOnce sync.Once
 }
 
 // WaitExit waits for the process to exit within timeout and returns the error
@@ -402,6 +533,23 @@ func (r *proxRun) Kill() {
 // the whole package.
 const killReapTimeout = 10 * time.Second
 
+// Shutdown asks this run's daemon to stop and WAITS for it to report the
+// outcome, failing the test if the request itself fails.
+//
+// Tests that assert on what a shutdown leaves behind use this rather than a bare
+// POST: /api/v1/shutdown without ?wait=true returns as soon as the daemon has
+// been ASKED (see the async-return test in up_test.go), so anything asserted
+// straight after a bare 200 is a race against the daemon's own cleanup.
+func (r *proxRun) Shutdown(t *testing.T) {
+	t.Helper()
+	id := r.DaemonIdentity()
+	ctx, cancel := context.WithTimeout(context.Background(), daemonShutdownBudget)
+	defer cancel()
+	if err := requestWaitedShutdown(ctx, id.Addr); err != nil {
+		t.Fatalf("waited shutdown of %s failed: %v\noutput:\n%s", id, err, r.Output())
+	}
+}
+
 // Output returns the combined stdout and stderr captured so far.
 func (r *proxRun) Output() string {
 	return r.out.String()
@@ -423,78 +571,196 @@ func (r *proxRun) Signal(t *testing.T, sig os.Signal) {
 
 // StateDir returns this run's private .prox directory.
 func (r *proxRun) StateDir() string {
-	return filepath.Join(r.fixture.dir, daemonStateDirName)
+	return filepath.Join(r.dir, daemonStateDirName)
 }
 
-// Addr returns the API base URL, read from this run's own state file.
+// Addr returns the API base URL of this run's daemon, read from this run's own
+// state file.
 //
 // The state file is the only race-free source. A bind-and-close probe for a
 // "free" port would reintroduce exactly the TOCTOU this harness exists to
 // remove; here prox picks the port, writes it down, and the test reads what
 // prox actually chose. TestDaemonMode_DynamicPort already relies on this.
 //
-// The result is memoized because the daemon deletes its state file on
-// shutdown, so a late caller (a post-shutdown assertion, say) must still get
-// the address rather than a timeout.
+// The result is memoized (with the rest of the daemon identity) because the
+// daemon deletes its state file on shutdown, so a late caller (a post-shutdown
+// assertion, say) must still get the address rather than a timeout.
 func (r *proxRun) Addr() string {
 	r.t.Helper()
+	return r.DaemonIdentity().Addr
+}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.addr != "" {
-		return r.addr
-	}
+// DaemonIdentity returns this run's daemon {pid, startToken, stateDir, addr},
+// waiting up to apiReadyTimeout for the state file to name it, and failing the
+// test if it never does.
+func (r *proxRun) DaemonIdentity() daemonIdentity {
+	r.t.Helper()
 
 	statePath := filepath.Join(r.StateDir(), daemonStateFileName)
 	deadline := time.Now().Add(apiReadyTimeout)
 	for {
-		// The state file is written with O_TRUNC rather than a rename, so a
-		// read can legitimately catch it half-written; treat any parse failure
-		// or zero port as "not yet" and retry.
-		if data, err := os.ReadFile(statePath); err == nil {
-			var state struct {
-				PID  int    `json:"pid"`
-				Port int    `json:"port"`
-				Host string `json:"host"`
-			}
-			// Require the state file to belong to THIS process, not merely to
-			// be parseable. A fixture directory can host more than one daemon
-			// generation (reap_orphans_test.go starts a second prox in the
-			// first one's dir), and a generation killed with SIGKILL leaves its
-			// state file behind: daemon.State.Write truncates in place rather
-			// than renaming, so a read between generations can return the DEAD
-			// generation's port, which then fails to answer. Matching the pid
-			// makes staleness unrepresentable instead of something each caller
-			// has to notice.
-			//
-			// This is the foreground contract: for `prox up` the state pid is
-			// the launched process. A detached `up -d` records its CHILD's pid
-			// instead, so a detached proxRun needs the separate daemon identity
-			// C5 introduces -- there are no detached f.Start callers today.
-			if json.Unmarshal(data, &state) == nil && state.Port > 0 &&
-				r.cmd.Process != nil && state.PID == r.cmd.Process.Pid {
-				host := state.Host
-				if host == "" {
-					host = "127.0.0.1"
-				}
-				r.addr = "http://" + net.JoinHostPort(host, strconv.Itoa(state.Port))
-				return r.addr
-			}
+		if id, ok := r.tryDaemonIdentity(); ok {
+			return id
 		}
 
 		// Report the real failure rather than waiting out the full budget and
 		// then blaming the API: if prox is already gone it is never going to
-		// write the file, and its output says why.
-		select {
-		case <-r.exited:
-			r.t.Fatalf("prox exited (%v) before writing %s; output:\n%s", r.waitErr, statePath, r.Output())
-		default:
+		// write the file, and its output says why. A detached launcher exits by
+		// design, so only a foreground run can fail this way.
+		if !r.detached {
+			select {
+			case <-r.exited:
+				r.t.Fatalf("prox exited (%v) before writing %s; output:\n%s", r.waitErr, statePath, r.Output())
+			default:
+			}
 		}
 
 		if !time.Now().Before(deadline) {
-			r.t.Fatalf("prox did not write %s within %v; output:\n%s", statePath, apiReadyTimeout, r.Output())
+			r.t.Fatalf("prox did not write a usable %s within %v; output:\n%s", statePath, apiReadyTimeout, r.Output())
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// tryDaemonIdentity makes ONE non-blocking attempt to resolve the daemon
+// identity, memoizing and ledgering it on first success.
+//
+// The ledger append happens here, at the single moment a daemon first exists to
+// be leaked, so it covers every launch -- including one whose test never asks
+// for the address.
+func (r *proxRun) tryDaemonIdentity() (daemonIdentity, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.identOK {
+		return r.ident, true
+	}
+
+	id, ok := identityFromStateDir(r.StateDir(), r.acceptDaemonPID)
+	if !ok {
+		return daemonIdentity{}, false
+	}
+	r.ident, r.identOK = id, true
+
+	if err := packageLedger.record(id); err != nil {
+		// Never fatal, and never t.Logf: this runs on a background goroutine
+		// that may outlive the test. A ledger this run cannot write only costs
+		// the NEXT run its chance to reap, which is strictly better than
+		// failing a test over a temp-directory problem.
+		fmt.Fprintf(os.Stderr, "prox integration: recording daemon %s in the run ledger: %v\n", id, err)
+	}
+	return id, true
+}
+
+// acceptDaemonPID decides whether a pid found in this run's state file is this
+// launch's daemon.
+//
+// Foreground: the state pid IS the launched process, and requiring the match
+// makes staleness unrepresentable. A fixture directory can host more than one
+// daemon generation (reap_orphans_test.go starts a second prox in the first
+// one's dir), and a generation killed with SIGKILL leaves its state file behind:
+// daemon.State.Write truncates in place rather than renaming, so a read between
+// generations can otherwise return the DEAD generation's port, which then fails
+// to answer.
+//
+// Detached: the launcher is not the daemon and has already exited, so the pid to
+// accept is a DIFFERENT, live one -- the child `up -d` waited for before exiting
+// (it refuses to report success until state.PID equals that child, so a leftover
+// file from an earlier generation cannot be what we read here).
+func (r *proxRun) acceptDaemonPID(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	launcher := r.launcherPID()
+	if !r.detached {
+		return launcher != 0 && pid == launcher
+	}
+	return pid != launcher && daemon.ProcessExists(pid)
+}
+
+// watchIdentity resolves the daemon identity in the background until it appears,
+// the process exits, teardown stops it, or the readiness budget expires.
+//
+// It must never touch *testing.T: it can still be running when the test that
+// started it finishes, and a t.Logf from there panics the run.
+func (r *proxRun) watchIdentity() {
+	deadline := time.Now().Add(apiReadyTimeout)
+	for {
+		if _, ok := r.tryDaemonIdentity(); ok {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		select {
+		case <-r.exited:
+			return
+		case <-r.watchStop:
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// teardown is the run's registered cleanup, and the ONLY teardown any test in
+// this package should need: ask the daemon to stop and WAIT for the answer, wait
+// for the launcher and the daemon to actually be gone, and escalate to signals
+// only on expiry -- aimed at the daemon identity, re-verified immediately before
+// each signal.
+//
+// It is idempotent and safe to reach concurrently with the signal handler and
+// the end-of-run sweep: every step is guarded by a liveness check that a
+// finished daemon fails.
+func (r *proxRun) teardown() {
+	r.stopOnce.Do(func() { close(r.watchStop) })
+
+	// One non-blocking attempt only. A launch that never produced a state file
+	// (a refused `up`, or the /bin/sh in the race-freedom test below) must not
+	// make every cleanup pay the readiness budget.
+	id, haveDaemon := r.tryDaemonIdentity()
+	if !haveDaemon {
+		// Nothing daemon-shaped ever appeared, so there is nothing to ask
+		// politely and nothing but the launched process to clean up.
+		r.Kill()
+		return
+	}
+
+	// Ask, wait, and escalate against the DAEMON identity (leakguard_test.go).
+	stopDaemon(id, r.t.Logf)
+
+	// Then the launcher. For a foreground run it IS the daemon and has already
+	// exited above, so this only absorbs the gap before wait4 reaps it; for a
+	// detached run it exited before this handle was even returned. A launcher
+	// still standing after all that gets the SIGKILL Kill has always sent.
+	if !r.awaitExit(launcherExitBudget) {
+		r.t.Logf("teardown: launcher pid %d outlived the daemon; killing it", r.launcherPID())
+		r.Kill()
+	}
+}
+
+// launcherPID is the pid of the process this handle started, or 0 if it never
+// started. It is NOT necessarily the daemon -- see DaemonIdentity.
+func (r *proxRun) launcherPID() int {
+	if r.cmd.Process == nil {
+		return 0
+	}
+	return r.cmd.Process.Pid
+}
+
+// awaitExit reports whether the launched process has exited within d.
+func (r *proxRun) awaitExit(d time.Duration) bool {
+	if d < 0 {
+		d = 0
+	}
+	select {
+	case <-r.exited:
+		return true
+	case <-time.After(d):
+		select {
+		case <-r.exited:
+			return true
+		default:
+			return false
+		}
 	}
 }
 
