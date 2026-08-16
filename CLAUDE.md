@@ -41,7 +41,7 @@ what you meant; and the `pymdownx.emoji` callables live in the
 ## Plans
 
 Panel-reviewed plans live OUTSIDE this repo, at
-`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 026). One plan → one
+`~/.claude/plans/prox/NNN-<slug>.md` (next free number: 028). One plan → one
 PR of small gated commits. The plan file is never committed here, so the PR
 body must carry the plan's substance — reviewers and future readers only
 have the PR, not the plan file.

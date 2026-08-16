@@ -6,6 +6,64 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`prox up -d`, `prox start` and `prox restart` now report the resulting
+  state, not just that the request was accepted** (plan 027, #94). They exit
+  non-zero when a process is `crashed` or `blocked` within 500ms of starting,
+  printing the same lines `prox status` does, so the two commands can no longer
+  disagree. Previously `prox up -d` exited 0 while `prox status` reported
+  `crashed` a second later.
+
+  **This changes exit codes.** A non-zero `prox up -d` now means "the daemon is
+  up, its processes are not" — it names the offending process and points at
+  `prox down`, since the daemon is still running and still needs stopping.
+  Scripts that treated a zero exit as "everything is running" were previously
+  being misled; scripts that treat a non-zero exit as "nothing started" now need
+  to distinguish the two cases.
+
+  The guarantee is deliberately modest: *no terminal failure observed within
+  500ms*, not verified state. A process that dies at 501ms still exits 0. Only
+  `crashed` and `blocked` count — `starting`, `stopping` and `waiting` are
+  transient, and `completed` is task success. `start` and `restart` take ~500ms
+  longer on success, because proving the absence of a failure means waiting the
+  window out.
+
+- **A process with no healthcheck configured now reports health `-` instead of
+  `unknown`** (plan 027, #100). `unknown` is reserved for a configured check
+  that has not reported yet, so the two are finally distinguishable — including
+  for a crashed process, which keeps `unknown` when it has a healthcheck.
+
+  **API change (additive):** `health` on `GET /processes` and
+  `GET /processes/{name}` gains the value `"none"`, which `prox status` renders
+  as `-`. `prox status --json` passes the raw value through, so a script
+  matching `"health":"unknown"` to find un-healthchecked processes must now
+  match `"none"`. `healthcheck.enabled` also stops being hardcoded `true` and
+  reports whether the check loop is actually running.
+
+- **`prox logs <unknown-process>` now fails instead of printing nothing**
+  (plan 027, #95). It exits 1 and names the process, suggesting the closest
+  match. Previously the name was silently used as a filter that matched no
+  records, so a typo produced empty output and exit 0. A *valid* name that has
+  logged nothing still prints nothing and exits 0 — silence is only an error
+  when the name is wrong. Applies to the positional argument, `--process`,
+  comma-separated lists, and `--follow`.
+
+### Fixed
+
+- **Errors no longer claim prox is down when it just answered** (plan 027,
+  #95). "Is prox running? Try 'prox up' first." was appended to every client
+  error unconditionally, so `prox stop <not-running>` printed the daemon's own
+  reply followed by advice to start the daemon that had produced it. The hint
+  now appears only when the daemon is positively unreachable. `PROCESS_NOT_FOUND`
+  also names the process and either suggests the closest match or lists the
+  valid ones, sourced from the running daemon rather than the local config file.
+
+- **`prox up -d` failure diagnostics no longer stack up across runs** (plan 027,
+  #99). `.prox/prox.log` is append-only and was tailed by a fixed line count, so
+  each failed attempt buried the current error further under previous ones —
+  worst exactly while iterating on a broken `prox.yaml`. Each daemon run now
+  writes a marker identifying itself, and the tail is scoped to the current run.
+  The log is still never truncated; history stays on disk.
+
 - **A foreground `prox up` now opens the interactive TUI** (plan 026).
   Previously it streamed plain logs and the TUI was reachable only behind an
   explicit `--tui`, or via `prox up -d` + `prox attach`; the best view was the

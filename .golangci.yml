@@ -12,8 +12,6 @@ linters:
   settings:
     errcheck:
       exclude-functions:
-        - (*os/exec.Cmd).Wait
-        - (*os/exec.Cmd).Process.Kill
         - io.Copy
   exclusions:
     presets:
