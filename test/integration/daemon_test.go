@@ -28,6 +28,7 @@ processes:
 `
 
 func TestDaemonMode_StartsInBackground(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -45,13 +46,14 @@ processes:
 
 	// The state file exists by construction (the launcher waits for it), and
 	// Addr reads the port back out of it.
-	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
+	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), within(t, stateFileTimeout))
 
 	// Verify API is accessible
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 }
 
 func TestDaemonMode_CreatesStateFile(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -60,7 +62,7 @@ func TestDaemonMode_CreatesStateFile(t *testing.T) {
 	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
 	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 
 	// Verify state file exists and read it
 	stateData, err := os.ReadFile(statePath)
@@ -113,6 +115,7 @@ func TestDaemonMode_CreatesStateFile(t *testing.T) {
 }
 
 func TestDaemonMode_RejectsSecondInstance(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -120,7 +123,7 @@ func TestDaemonMode_RejectsSecondInstance(t *testing.T) {
 
 	// Start first daemon
 	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
-	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
+	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), within(t, stateFileTimeout))
 
 	// Try to start second daemon - should fail
 	output, code := f.Run(t, binary, "up", "-d", "-c", f.configPath)
@@ -136,6 +139,7 @@ func TestDaemonMode_RejectsSecondInstance(t *testing.T) {
 }
 
 func TestDaemonMode_GracefulShutdown(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -143,7 +147,7 @@ func TestDaemonMode_GracefulShutdown(t *testing.T) {
 
 	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 
 	// Stop the daemon and WAIT for it to report the outcome. The bare POST this
 	// used to send returns as soon as the daemon has been asked, so the file
@@ -172,6 +176,7 @@ func TestDaemonMode_GracefulShutdown(t *testing.T) {
 }
 
 func TestDaemonMode_DynamicPort(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -182,7 +187,7 @@ func TestDaemonMode_DynamicPort(t *testing.T) {
 	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
 	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 
 	stateData, err := os.ReadFile(statePath)
 	if err != nil {
@@ -201,12 +206,13 @@ func TestDaemonMode_DynamicPort(t *testing.T) {
 	}
 
 	// Verify API is accessible on the dynamic port
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	t.Logf("Daemon using dynamic port: %d", state.Port)
 }
 
 func TestDaemonMode_ConfiguredPort(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -249,7 +255,7 @@ func TestDaemonMode_ConfiguredPort(t *testing.T) {
 	}
 
 	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 
 	stateData, err := os.ReadFile(statePath)
 	if err != nil {
@@ -268,10 +274,11 @@ func TestDaemonMode_ConfiguredPort(t *testing.T) {
 	}
 
 	// Verify API is accessible on the configured port
-	waitForAPI(t, "http://127.0.0.1:"+strconv.Itoa(port), apiReadyTimeout)
+	waitForAPI(t, "http://127.0.0.1:"+strconv.Itoa(port), within(t, apiReadyTimeout))
 }
 
 func TestDaemonMode_CLIAutoDiscovery(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -280,7 +287,7 @@ func TestDaemonMode_CLIAutoDiscovery(t *testing.T) {
 	run := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 
 	// Wait for API to be ready before running CLI command
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Run status command without specifying --addr
 	// It should auto-discover the API address from .prox/prox.state

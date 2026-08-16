@@ -16,6 +16,7 @@ import (
 // crashed state, and `prox status` then exits 1 (both table and JSON modes),
 // names the crashed process, and surfaces the sentinel on stderr.
 func TestStatus_CrashedChildExits1(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -33,46 +34,30 @@ processes:
 
 	// Start the daemon without the shared proxy so this test never touches the
 	// machine-wide daemon socket.
-	up := exec.Command(binary, "up", "-d", "--no-proxy", "-c", configPath)
-	up.Dir = tmpDir
-	if out, err := up.CombinedOutput(); err != nil {
-		t.Fatalf("failed to start daemon: %v\noutput: %s", err, out)
-	}
+	runCLI(t, binary, tmpDir, "failed to start daemon", "up", "-d", "--no-proxy", "-c", configPath)
 
 	// Always tear the daemon down so a wedged test never strands a daemon.
 	// Registered before the readiness wait so a failed wait still cleans up.
 	t.Cleanup(func() {
-		stop := exec.Command(binary, "stop", "-c", configPath)
-		stop.Dir = tmpDir
-		_, _ = stop.CombinedOutput()
+		stopCLIQuietly(binary, tmpDir, "stop", "-c", configPath)
 		time.Sleep(300 * time.Millisecond)
 	})
 
 	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 
 	// runStatus runs `prox status` (with optional extra args) in the project
 	// directory and returns its stdout, stderr, and exit code separately (the
 	// `Error:` sentinel lands on stderr, so keeping the streams apart lets the
 	// JSON on stdout parse cleanly).
-	runStatus := func(extra ...string) (string, string, int) {
-		t.Helper()
-		args := append([]string{"status", "-c", configPath}, extra...)
-		cmd := exec.Command(binary, args...)
-		cmd.Dir = tmpDir
-		var stdout, stderr strings.Builder
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		return stdout.String(), stderr.String(), exitCodeOf(t, err)
-	}
+	runStatus := runStatusIn(t, binary, tmpDir, configPath)
 
 	// Poll `prox status --json` until the child reports crashed. Bounded
 	// deadline, no fixed sleeps proportional to the crash timing.
 	deadline := time.Now().Add(15 * time.Second)
 	crashed := false
 	for time.Now().Before(deadline) {
-		stdout, _, _ := runStatus("--json")
+		stdout, _, _ := runStatus(within(t, cliCommandTimeout), "--json")
 		var payload struct {
 			Processes []struct {
 				Name   string `json:"name"`
@@ -97,7 +82,7 @@ processes:
 
 	// Table mode: exit 1, names the crashed process on stdout, and the sentinel
 	// appears on stderr at the real CLI boundary.
-	stdout, stderr, code := runStatus()
+	stdout, stderr, code := runStatus(within(t, cliCommandTimeout))
 	if code != 1 {
 		t.Errorf("`prox status` exit code = %d, want 1; stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
@@ -109,7 +94,7 @@ processes:
 	}
 
 	// JSON mode also exits 1.
-	_, _, jsonCode := runStatus("--json")
+	_, _, jsonCode := runStatus(within(t, cliCommandTimeout), "--json")
 	if jsonCode != 1 {
 		t.Errorf("`prox status --json` exit code = %d, want 1", jsonCode)
 	}

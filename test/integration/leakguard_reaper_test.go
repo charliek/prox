@@ -50,8 +50,12 @@ func startSleeper(t *testing.T) *sleeper {
 	s := &sleeper{cmd: cmd, pid: cmd.Process.Pid, done: make(chan struct{})}
 	s.token, _ = daemon.ProcessStartTime(s.pid)
 
-	// The ONE Wait, so a killed sleeper stops being a zombie immediately.
+	// The ONE Wait, so a killed sleeper stops being a zombie immediately. The
+	// hygiene rule's subject is proxRun's single-owner invariant for prox
+	// LAUNCHES; a sleeper is this file's own throwaway `sleep`, and this
+	// goroutine is its single owner, which mirrors that invariant exactly.
 	go func() {
+		//prox:allow-cmd-wait single owner of this file's own throwaway sleeper
 		_ = cmd.Wait()
 		close(s.done)
 	}()
@@ -158,6 +162,7 @@ func fileExists(t *testing.T, path string) bool {
 // reaper that killed a LIVE run's daemons would be far worse than the leak it
 // exists to fix.
 func TestReap_OwnerAliveLeavesLedgerAlone(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	owner := startSleeper(t)  // stands in for another test binary, still running
 	target := startSleeper(t) // its daemon
 
@@ -180,6 +185,7 @@ func TestReap_OwnerAliveLeavesLedgerAlone(t *testing.T) {
 // a previous run was SIGKILLed, so its per-test cleanups never ran and its
 // daemon is still up.
 func TestReap_DeadOwnerKillsRecordedDaemon(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	owner := startSleeper(t)
 	ownerID := owner.identity()
 	owner.kill(t) // the test binary died without cleaning up
@@ -209,6 +215,7 @@ func TestReap_DeadOwnerKillsRecordedDaemon(t *testing.T) {
 // recorded. With pid comparison alone, a dead run whose pid has been handed to
 // something else looks alive forever and its leaked daemon is never reaped.
 func TestReap_OwnerPIDReusedIsTreatedAsDead(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	requireTokens(t)
 
 	// A live process standing in for the unrelated program that inherited the
@@ -235,6 +242,7 @@ func TestReap_OwnerPIDReusedIsTreatedAsDead(t *testing.T) {
 // every kill re-verifies pid AND token: by the time a later run reads a ledger,
 // a recorded daemon pid may belong to something else entirely.
 func TestReap_TargetPIDReusedIsNotSignalled(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	requireTokens(t)
 
 	owner := startSleeper(t)
@@ -266,6 +274,7 @@ func TestReap_TargetPIDReusedIsNotSignalled(t *testing.T) {
 // TestReap_DeadTargetSignalsNothing: the ordinary case, where the previous run's
 // teardown DID work and the ledger is just bookkeeping to clear away.
 func TestReap_DeadTargetSignalsNothing(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	owner := startSleeper(t)
 	ownerID := owner.identity()
 	owner.kill(t)
@@ -290,6 +299,7 @@ func TestReap_DeadTargetSignalsNothing(t *testing.T) {
 // truncated last line, which is the NORMAL state of the files this reaper reads.
 // A malformed line must cost that line and nothing else.
 func TestLedger_MalformedLinesAreSkipped(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	owner := startSleeper(t)
 	ownerID := owner.identity()
 	owner.kill(t)
@@ -338,6 +348,7 @@ func TestLedger_MalformedLinesAreSkipped(t *testing.T) {
 // sweep the same directory. Neither may panic, double-signal a stranger, or
 // leave the file behind.
 func TestReap_ConcurrentSweepsAreIdempotent(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	owner := startSleeper(t)
 	ownerID := owner.identity()
 	owner.kill(t)
@@ -381,6 +392,7 @@ func TestReap_ConcurrentSweepsAreIdempotent(t *testing.T) {
 // TestReap_IgnoresOwnLedgerAndForeignFiles: the sweeper shares ${TMPDIR} with
 // this very run and with whatever else lives there.
 func TestReap_IgnoresOwnLedgerAndForeignFiles(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	self := startSleeper(t) // this run's "own" daemon
 	selfPID := os.Getpid()
 
@@ -407,6 +419,7 @@ func TestReap_IgnoresOwnLedgerAndForeignFiles(t *testing.T) {
 // TestLedger_RecordAppendsAndRemoveDeletes covers the write side: file mode,
 // one line per daemon, and a remove that is safe to repeat.
 func TestLedger_RecordAppendsAndRemoveDeletes(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	dir := filepath.Join(t.TempDir(), "runs")
 	l := newRunLedger(dir, os.Getpid())
 
@@ -461,6 +474,7 @@ func TestLedger_RecordAppendsAndRemoveDeletes(t *testing.T) {
 // TestLedger_ConcurrentRecordsAllLand: launches happen from parallel tests, so
 // the append path is contended.
 func TestLedger_ConcurrentRecordsAllLand(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	dir := filepath.Join(t.TempDir(), "runs")
 	l := newRunLedger(dir, os.Getpid())
 
@@ -488,6 +502,7 @@ func TestLedger_ConcurrentRecordsAllLand(t *testing.T) {
 // TestLedger_ReapOwnStopsSurvivors covers the end-of-run sweep: whatever a
 // test's own teardown missed dies before the process exits.
 func TestLedger_ReapOwnStopsSurvivors(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	dir := filepath.Join(t.TempDir(), "runs")
 	l := newRunLedger(dir, os.Getpid())
 
@@ -521,6 +536,7 @@ func TestLedger_ReapOwnStopsSurvivors(t *testing.T) {
 // (or whose API port has been taken over by something else) must not make
 // teardown hang -- it must fall through to signals.
 func TestReap_StopDaemonToleratesAnUnreachableAddr(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	target := startSleeper(t)
 	id := target.identity()
 	// A port nothing is listening on: the POST fails immediately with connection
@@ -544,6 +560,7 @@ func TestReap_StopDaemonToleratesAnUnreachableAddr(t *testing.T) {
 // state file left behind by a previous generation must not be adopted just
 // because it parses.
 func TestLedger_StateFileMismatchIsNotAdopted(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	stateDir := filepath.Join(t.TempDir(), daemonStateDirName)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatalf("mkdir state dir: %v", err)

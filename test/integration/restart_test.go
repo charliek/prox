@@ -15,16 +15,23 @@ import (
 )
 
 // logLines fetches the most recent log lines for a process via
-// GET /api/v1/logs. It returns nil (rather than failing the test) on a
+// GET /api/v1/logs, bounded by BOTH the per-request ceiling and the caller's
+// remaining budget. It returns nil (rather than failing the test) on a
 // transient request/decode error so callers can poll it in a retry loop.
-func logLines(t *testing.T, addr, process string) []string {
+//
+// The bound is not decoration: this used a bare http.Get, so a daemon that
+// accepted the connection and then stalled hung the poll loop that was supposed
+// to be timing it out, and the package died on go test's timeout instead of
+// failing this one assertion.
+func logLines(t *testing.T, addr, process string, deadline time.Time) []string {
 	t.Helper()
 
 	url := fmt.Sprintf("%s/api/v1/logs?process=%s&lines=1000", addr, process)
-	resp, err := http.Get(url)
+	resp, cancel, err := pollGetWithinDeadline(url, deadline)
 	if err != nil {
 		return nil
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	var parsed struct {
@@ -44,22 +51,33 @@ func logLines(t *testing.T, addr, process string) []string {
 }
 
 // waitForLogContains polls a process's logs until a line contains substr, or
-// fails the test after timeout.
-func waitForLogContains(t *testing.T, addr, process, substr string, timeout time.Duration) {
+// fails the test at deadline.
+func waitForLogContains(t *testing.T, addr, process, substr string, deadline time.Time) {
+	t.Helper()
+	if err := awaitLogContains(t, addr, process, substr, deadline); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// awaitLogContains is waitForLogContains without the t.Fatal, so the bounding
+// invariant can be asserted on instead of assumed -- see bounding_test.go,
+// which points it at a server that accepts and never answers.
+func awaitLogContains(t *testing.T, addr, process, substr string, deadline time.Time) error {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	var last []string
 	for time.Now().Before(deadline) {
-		last = logLines(t, addr, process)
+		last = logLines(t, addr, process, deadline)
 		for _, l := range last {
 			if strings.Contains(l, substr) {
-				return
+				return nil
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
-	t.Fatalf("process %q logs did not contain %q within %v; last lines: %v", process, substr, timeout, last)
+	return fmt.Errorf("process %q logs did not contain %q %s; last lines: %v",
+		process, substr, waitedFor(start, deadline), last)
 }
 
 // waitForMarkerValue polls a process's logs for a line containing prefix and
@@ -68,12 +86,12 @@ func waitForLogContains(t *testing.T, addr, process, substr string, timeout time
 // restart, to detect a genuinely *new* marker value such as a fresh
 // GRANDCHILD_PID (exclude=<old value>). Fails the test if no matching,
 // non-excluded marker appears within timeout.
-func waitForMarkerValue(t *testing.T, addr, process, prefix, exclude string, timeout time.Duration) string {
+func waitForMarkerValue(t *testing.T, addr, process, prefix, exclude string, deadline time.Time) string {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	for time.Now().Before(deadline) {
-		for _, l := range logLines(t, addr, process) {
+		for _, l := range logLines(t, addr, process, deadline) {
 			_, after, found := strings.Cut(l, prefix)
 			if !found {
 				continue
@@ -83,9 +101,10 @@ func waitForMarkerValue(t *testing.T, addr, process, prefix, exclude string, tim
 				return val
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
-	t.Fatalf("marker %q (excluding %q) not found in %q logs within %v", prefix, exclude, process, timeout)
+	t.Fatalf("marker %q (excluding %q) not found in %q logs %s",
+		prefix, exclude, process, waitedFor(start, deadline))
 	return ""
 }
 
@@ -118,14 +137,13 @@ func killIfAlive(pid int) {
 	}
 }
 
-// waitForPIDGone polls until pid is no longer alive, up to timeout. It returns
+// waitForPIDGone polls until pid is no longer alive, up to deadline. It returns
 // true once the pid is gone (or was never alive) and false if it is still alive
 // at the deadline, so each caller can craft its own context-specific failure
 // message.
-func waitForPIDGone(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+func waitForPIDGone(pid int, deadline time.Time) bool {
 	for time.Now().Before(deadline) && processAlive(pid) {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	return !processAlive(pid)
 }
@@ -135,6 +153,7 @@ func waitForPIDGone(pid int, timeout time.Duration) bool {
 // replacement to observe the new value -- proving env_file reload works
 // end-to-end through the real binary and API (D1).
 func TestRestart_ReloadsEnvFile(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -154,11 +173,11 @@ func TestRestart_ReloadsEnvFile(t *testing.T) {
 	f := newInlineFixture(t, cfgContent)
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Confirm the process is running with the initial value before mutating
 	// the env file out from under it.
-	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v1", 5*time.Second)
+	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v1", within(t, logAppearTimeout))
 
 	// Mutate the (mutable, t.TempDir-owned) env file -- never a committed
 	// fixture -- and restart.
@@ -171,7 +190,7 @@ func TestRestart_ReloadsEnvFile(t *testing.T) {
 
 	// The replacement instance must reload env_file from disk and observe
 	// the new value.
-	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v2", 5*time.Second)
+	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v2", within(t, logAppearTimeout))
 }
 
 // printerConfig renders a config whose single `printer` process echoes
@@ -191,14 +210,15 @@ func printerConfig(marker string) string {
 // edit->restart cycle proves reload is per-request (consecutive reloads each
 // pick up the latest file), exercising the real `prox up` + API path end to end.
 func TestRestart_ReloadsChangedCmd(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newInlineFixture(t, printerConfig("v1"))
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForLogContains(t, run.Addr(), "printer", "MARKER=v1", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForLogContains(t, run.Addr(), "printer", "MARKER=v1", within(t, logAppearTimeout))
 
 	// Two consecutive edit->restart cycles, each picking up the latest file.
 	for _, marker := range []string{"v2", "v3"} {
@@ -208,7 +228,7 @@ func TestRestart_ReloadsChangedCmd(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("restart (%s) failed: status=%d code=%s error=%s", marker, status, errResp.Code, errResp.Error)
 		}
-		waitForLogContains(t, run.Addr(), "printer", "MARKER="+marker, 5*time.Second)
+		waitForLogContains(t, run.Addr(), "printer", "MARKER="+marker, within(t, logAppearTimeout))
 	}
 }
 
@@ -217,6 +237,7 @@ func TestRestart_ReloadsChangedCmd(t *testing.T) {
 // restart of the removed process fail with PROCESS_NOT_IN_CONFIG (HTTP 409) and
 // leave the still-configured process running untouched.
 func TestRestart_RemovedProcessReturns409(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -229,13 +250,13 @@ func TestRestart_RemovedProcessReturns409(t *testing.T) {
 	f := newInlineFixture(t, twoProcs)
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForLogContains(t, run.Addr(), "alpha", "ALPHA", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForLogContains(t, run.Addr(), "alpha", "ALPHA", within(t, logAppearTimeout))
 
 	// Snapshot alpha's identity so we can prove the failed restart didn't
 	// stop-and-relaunch it (same PID, same restart count), not merely that
 	// something named alpha ended up running.
-	before := waitForProcessState(t, run.Addr(), "alpha", "running", 3*time.Second)
+	before := waitForProcessState(t, run.Addr(), "alpha", "running", within(t, processStateTimeout))
 
 	// Remove alpha from the file (beta remains so the file still validates).
 	onlyBeta := `processes:
@@ -254,7 +275,7 @@ func TestRestart_RemovedProcessReturns409(t *testing.T) {
 
 	// alpha must still be running, and it must be the SAME instance: identical
 	// PID and restart count, not a stop-and-relaunch.
-	after := waitForProcessState(t, run.Addr(), "alpha", "running", 3*time.Second)
+	after := waitForProcessState(t, run.Addr(), "alpha", "running", within(t, processStateTimeout))
 	if after.PID != before.PID || after.Restarts != before.Restarts {
 		t.Fatalf("alpha was disturbed by the failed restart: pid %d->%d restarts %d->%d",
 			before.PID, after.PID, before.Restarts, after.Restarts)
@@ -267,6 +288,7 @@ func TestRestart_RemovedProcessReturns409(t *testing.T) {
 // SIGKILL after the graceful window). This test is inherently slow (~the
 // graceful deadline, ~8s by default) because that escalation window is real.
 func TestStop_KillsStubbornGrandchild(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -276,14 +298,14 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
-	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", within(t, logAppearTimeout))
 	pid, err := strconv.Atoi(pidStr)
 	requireNoError(t, err, "parsing GRANDCHILD_PID")
 	grandchildPID = pid
 
-	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", within(t, logAppearTimeout))
 
 	start := time.Now()
 	status, errResp := stopProcess(t, run.Addr(), "worker")
@@ -296,7 +318,7 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 	// Stop() only returns after its finalization gate + verdict, so the
 	// grandchild should already be gone -- poll with a deadline as a
 	// robustness net rather than asserting instantaneously.
-	if !waitForPIDGone(grandchildPID, 15*time.Second) {
+	if !waitForPIDGone(grandchildPID, within(t, pidGoneTimeout)) {
 		t.Fatalf("grandchild pid %d still alive %v after stop returned (stop took %v)", grandchildPID, 15*time.Second, elapsed)
 	}
 }
@@ -307,6 +329,7 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 // port (no EADDRINUSE) -- proof the old listener genuinely released it since
 // SO_REUSEADDR is deliberately off in stubborn_listener.py.
 func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -319,12 +342,12 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 		killIfAlive(oldPID)
 	})
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
-	oldPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	oldPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", within(t, logAppearTimeout))
 	oldPID, err := strconv.Atoi(oldPIDStr)
 	requireNoError(t, err, "parsing initial GRANDCHILD_PID")
-	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", within(t, logAppearTimeout))
 
 	start := time.Now()
 	status, errResp := restartProcess(t, run.Addr(), "worker")
@@ -344,21 +367,21 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 	// after a successful bind+listen, so its mere presence proves the
 	// rebind succeeded -- a failed rebind would crash the python script
 	// before it ever printed GRANDCHILD_PID/LISTENING).
-	newPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", oldPIDStr, 10*time.Second)
+	newPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", oldPIDStr, within(t, logAppearTimeout))
 	newPID, err = strconv.Atoi(newPIDStr)
 	requireNoError(t, err, "parsing new GRANDCHILD_PID")
 	if newPID == oldPID {
 		t.Fatalf("expected a new grandchild pid distinct from %d, got the same pid", oldPID)
 	}
 
-	listeningPort := waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	listeningPort := waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", within(t, logAppearTimeout))
 	if wantPort := strconv.Itoa(f.StubbornPort()); listeningPort != wantPort {
 		t.Fatalf("expected grandchild to listen on port %s, got %q", wantPort, listeningPort)
 	}
 
 	// The replacement should have settled into "running" (not crashed on
 	// EADDRINUSE).
-	waitForProcessState(t, run.Addr(), "worker", "running", 3*time.Second)
+	waitForProcessState(t, run.Addr(), "worker", "running", within(t, processStateTimeout))
 }
 
 // TestFullStop_NoOrphanedGrandchild (A5): the same stubborn-grandchild
@@ -366,6 +389,7 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 // daemon process exits, no member of the original group -- in particular the
 // grandchild holding the port -- may remain.
 func TestFullStop_NoOrphanedGrandchild(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -375,22 +399,22 @@ func TestFullStop_NoOrphanedGrandchild(t *testing.T) {
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
-	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", within(t, logAppearTimeout))
 	pid, err := strconv.Atoi(pidStr)
 	requireNoError(t, err, "parsing GRANDCHILD_PID")
 	grandchildPID = pid
-	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", within(t, logAppearTimeout))
 
 	requireNoError(t, stopProx(t, run.Addr()), "requesting full shutdown")
 
 	// WaitExit blocks until the process exits, or fails the test (killing it
 	// first) on timeout -- mirrors the goroutine + select this replaces. The
 	// exit error itself is not asserted here, matching the original.
-	_ = run.WaitExit(t, 20*time.Second)
+	_ = run.WaitExit(t, within(t, processExitTimeout))
 
-	if !waitForPIDGone(grandchildPID, 5*time.Second) {
+	if !waitForPIDGone(grandchildPID, within(t, pidGoneTimeout)) {
 		t.Fatalf("grandchild pid %d still alive after full shutdown", grandchildPID)
 	}
 }

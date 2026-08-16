@@ -225,8 +225,9 @@ func (f *proxFixture) StubbornPort() int {
 func (f *proxFixture) Run(t *testing.T, binary string, args ...string) (string, int) {
 	t.Helper()
 
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = f.dir
+	ctx, cancel := cliContext(t)
+	defer cancel()
+	cmd := boundedCommand(ctx, f.dir, binary, args...)
 	out, err := cmd.CombinedOutput()
 
 	exitCode := 0
@@ -489,17 +490,18 @@ type proxRun struct {
 	stopOnce sync.Once
 }
 
-// WaitExit waits for the process to exit within timeout and returns the error
-// from its single Cmd.Wait (nil on a clean exit). On timeout it kills the
-// process and fails the test.
-func (r *proxRun) WaitExit(t *testing.T, timeout time.Duration) error {
+// WaitExit waits for the process to exit by deadline and returns the error from
+// its single Cmd.Wait (nil on a clean exit). On expiry it kills the process and
+// fails the test.
+func (r *proxRun) WaitExit(t *testing.T, deadline time.Time) error {
 	t.Helper()
+	start := time.Now()
 	select {
 	case <-r.exited:
 		return r.waitErr
-	case <-time.After(timeout):
+	case <-time.After(time.Until(deadline)):
 		r.Kill()
-		t.Fatalf("process did not exit within %v; output:\n%s", timeout, r.Output())
+		t.Fatalf("process did not exit %s; output:\n%s", waitedFor(start, deadline), r.Output())
 		return nil // unreachable; t.Fatalf stops the test
 	}
 }
@@ -597,7 +599,8 @@ func (r *proxRun) DaemonIdentity() daemonIdentity {
 	r.t.Helper()
 
 	statePath := filepath.Join(r.StateDir(), daemonStateFileName)
-	deadline := time.Now().Add(apiReadyTimeout)
+	start := time.Now()
+	deadline := start.Add(apiReadyTimeout)
 	for {
 		if id, ok := r.tryDaemonIdentity(); ok {
 			return id
@@ -616,7 +619,7 @@ func (r *proxRun) DaemonIdentity() daemonIdentity {
 		}
 
 		if !time.Now().Before(deadline) {
-			r.t.Fatalf("prox did not write a usable %s within %v; output:\n%s", statePath, apiReadyTimeout, r.Output())
+			r.t.Fatalf("prox did not write a usable %s %s; output:\n%s", statePath, waitedFor(start, deadline), r.Output())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -790,6 +793,7 @@ const (
 // ProcessState access, and the two observers disagree, since whichever Wait
 // loses gets "exec: Wait was already called" instead of the exit status.
 func TestProxRun_KillDuringWaitExitIsRaceFree(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("the /bin/sh probe below is unix-only")
 	}
@@ -809,7 +813,7 @@ func TestProxRun_KillDuringWaitExitIsRaceFree(t *testing.T) {
 		defer wg.Done()
 		// Generously bounded: this must observe the kill, not its own timeout,
 		// so that no t.Fatalf is reached from this non-test goroutine.
-		waitErr = run.WaitExit(t, 30*time.Second)
+		waitErr = run.WaitExit(t, within(t, processExitTimeout))
 	}()
 	go func() {
 		defer wg.Done()
@@ -822,7 +826,7 @@ func TestProxRun_KillDuringWaitExitIsRaceFree(t *testing.T) {
 	// writer.
 	// Identity, not equivalence, is the assertion: every observer must be handed
 	// the one stored result, so the values have to be the same error.
-	if second := run.WaitExit(t, time.Second); second != waitErr {
+	if second := run.WaitExit(t, within(t, processExitTimeout)); second != waitErr {
 		t.Fatalf("the two observers disagree: concurrent waiter got %v, later waiter got %v", waitErr, second)
 	}
 	if waitErr == nil {

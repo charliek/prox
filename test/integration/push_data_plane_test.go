@@ -18,9 +18,11 @@ package integration
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -50,13 +52,37 @@ type sseClient struct {
 	frames []sseFrame
 }
 
+// sseHTTPClient is how every SSE endpoint in this package is dialled, and it is
+// deliberately NOT apiClient.
+//
+// An SSE stream cannot carry a client-wide Timeout: http.Client.Timeout covers
+// reading the body too, so a 5s ceiling would tear down a perfectly healthy
+// long-lived stream 5s in. TestAPI_SSEHeartbeatsKeepIdleStreamsAlive below
+// legitimately holds a stream open through two 15s heartbeat intervals.
+//
+// So the two halves are bounded separately, and only the halves that can
+// legitimately be bounded at all:
+//
+//   - GETTING the stream -- dial and response headers -- is bounded here, since
+//     a server that accepts and never sends a status line is broken, not slow;
+//   - each individual FRAME wait is bounded by its caller's deadline, in
+//     waitForFrameCountAtLeast;
+//   - the stream as a whole gets no total timeout, because there is no honest
+//     value for one.
+var sseHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: streamFrameTimeout}).DialContext,
+		ResponseHeaderTimeout: streamFrameTimeout,
+	},
+}
+
 // dialSSE connects to url and, on a 200 text/event-stream response, starts
 // draining it in the background. It returns an error rather than failing the
 // test directly so callers that must tolerate a non-200 (e.g. a
 // proxy-requests stream on a config with no proxy configured) can decide what
 // to do with it.
 func dialSSE(url string) (*sseClient, error) {
-	resp, err := http.Get(url)
+	resp, err := sseHTTPClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -119,11 +145,15 @@ func (c *sseClient) Frames() []sseFrame {
 }
 
 // waitForFrameCountAtLeast polls c until it has collected at least n frames
-// matching event, or fails the test after timeout.
-func waitForFrameCountAtLeast(t *testing.T, c *sseClient, event string, n int, timeout time.Duration) []sseFrame {
+// matching event, or fails the test at deadline.
+//
+// This is the per-frame bound that stands in for the total stream timeout
+// sseHTTPClient deliberately does not set: the stream may live as long as it
+// likes, but no test ever waits unboundedly for the next frame on it.
+func waitForFrameCountAtLeast(t *testing.T, c *sseClient, event string, n int, deadline time.Time) []sseFrame {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	for time.Now().Before(deadline) {
 		var matched []sseFrame
 		for _, f := range c.Frames() {
@@ -136,7 +166,8 @@ func waitForFrameCountAtLeast(t *testing.T, c *sseClient, event string, n int, t
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("did not observe %d frame(s) for event %q within %v; got: %+v", n, event, timeout, c.Frames())
+	t.Fatalf("did not observe %d frame(s) for event %q %s; got: %+v",
+		n, event, waitedFor(start, deadline), c.Frames())
 	return nil
 }
 
@@ -165,14 +196,15 @@ func quietConfig() string {
 // so this test only confirms it correctly 503s here rather than holding it
 // open.
 func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newInlineFixture(t, quietConfig())
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForLogContains(t, run.Addr(), "quiet", "QUIET_START", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForLogContains(t, run.Addr(), "quiet", "QUIET_START", within(t, logAppearTimeout))
 
 	logsClient, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
@@ -184,7 +216,7 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 
 	// Confirm the requests stream correctly refuses without a proxy config,
 	// rather than holding it open (see doc comment above).
-	if resp, rerr := http.Get(run.Addr() + "/api/v1/proxy/requests/stream"); rerr == nil {
+	if resp, rerr := sseHTTPClient.Get(run.Addr() + "/api/v1/proxy/requests/stream"); rerr == nil {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Errorf("expected requests stream to 503 without a proxy config, got %d", resp.StatusCode)
@@ -214,7 +246,7 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("restart failed: status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
 	}
-	waitForFrameCountAtLeast(t, logsClient, "", before+1, 10*time.Second)
+	waitForFrameCountAtLeast(t, logsClient, "", before+1, within(t, streamFrameTimeout))
 }
 
 // TestAPI_ProcessesStreamServesSnapshots (plan 017 C14): connects to
@@ -225,20 +257,21 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 // it doesn't guarantee any particular snapshot count, so this scans forward
 // with a deadline rather than asserting on the Nth event).
 func TestAPI_ProcessesStreamServesSnapshots(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForProcessState(t, run.Addr(), "long", "running", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForProcessState(t, run.Addr(), "long", "running", within(t, processStateTimeout))
 
 	client, err := dialSSE(run.Addr() + "/api/v1/processes/stream")
 	requireNoError(t, err, "connecting to processes stream")
 	defer client.Close()
 
-	frames := waitForFrameCountAtLeast(t, client, "", 1, 5*time.Second)
+	frames := waitForFrameCountAtLeast(t, client, "", 1, within(t, streamFrameTimeout))
 
 	var initial ProcessListResponse
 	requireNoError(t, json.Unmarshal([]byte(frames[0].data), &initial), "decoding initial snapshot")
@@ -296,19 +329,20 @@ func TestAPI_ProcessesStreamServesSnapshots(t *testing.T) {
 // entries come back, tagged with the same stream_id the SSE handshake
 // reported.
 func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	client, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
 	defer client.Close()
 
-	handshakeFrames := waitForFrameCountAtLeast(t, client, "handshake", 1, 5*time.Second)
+	handshakeFrames := waitForFrameCountAtLeast(t, client, "handshake", 1, within(t, streamFrameTimeout))
 	var handshake struct {
 		StreamID string `json:"stream_id"`
 	}
@@ -319,7 +353,7 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 
 	// The "long" and "echo" processes both produce steady output, so a
 	// handful of plain data events should arrive quickly.
-	dataFrames := waitForFrameCountAtLeast(t, client, "", 5, 10*time.Second)
+	dataFrames := waitForFrameCountAtLeast(t, client, "", 5, within(t, streamFrameTimeout))
 
 	var seqs []uint64
 	for _, f := range dataFrames {
@@ -343,7 +377,7 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 	// stream_id.
 	mid := seqs[len(seqs)/2]
 
-	resp, err := http.Get(fmt.Sprintf("%s/api/v1/logs?since_seq=%d", run.Addr(), mid))
+	resp, err := apiClient.Get(fmt.Sprintf("%s/api/v1/logs?since_seq=%d", run.Addr(), mid))
 	requireNoError(t, err, "GET /api/v1/logs?since_seq")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -379,17 +413,18 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 // combined output never grows a chi-style access-log line for them, while
 // still containing genuine process log lines.
 func TestUpForeground_NoControlPlaneAccessLogs(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForRunOutputContains(t, run, "Still running...", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForRunOutputContains(t, run, "Still running...", within(t, logAppearTimeout))
 
 	for _, path := range []string{"/api/v1/status", "/api/v1/processes", "/api/v1/logs"} {
-		resp, err := http.Get(run.Addr() + path)
+		resp, err := apiClient.Get(run.Addr() + path)
 		requireNoError(t, err, "GET "+path)
 		resp.Body.Close()
 	}
@@ -424,14 +459,15 @@ func TestUpForeground_NoControlPlaneAccessLogs(t *testing.T) {
 // prompt HTTP shutdown chain: connected SSE clients must never wedge
 // shutdown.
 func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
-	waitForProcessState(t, run.Addr(), "long", "running", 5*time.Second)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
+	waitForProcessState(t, run.Addr(), "long", "running", within(t, processStateTimeout))
 
 	logsClient, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
@@ -444,14 +480,20 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	// Both streams must have completed their handshake/initial snapshot
 	// before we trigger shutdown, so this actually exercises live, connected
 	// clients rather than ones still mid-connect.
-	waitForFrameCountAtLeast(t, logsClient, "handshake", 1, 5*time.Second)
-	waitForFrameCountAtLeast(t, processesClient, "", 1, 5*time.Second)
+	waitForFrameCountAtLeast(t, logsClient, "handshake", 1, within(t, streamFrameTimeout))
+	waitForFrameCountAtLeast(t, processesClient, "", 1, within(t, streamFrameTimeout))
 
-	req, err := http.NewRequest(http.MethodPost, run.Addr()+"/api/v1/shutdown?wait=true", nil)
+	// The WAITED shutdown is the one request in this suite that legitimately
+	// blocks for a long time -- it returns only once every supervised process
+	// group has stopped -- so it is bounded by the teardown budget rather than
+	// by apiClient's one-request ceiling, which would abandon a healthy stop.
+	ctx, cancel := context.WithTimeout(context.Background(), daemonShutdownBudget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, run.Addr()+"/api/v1/shutdown?wait=true", nil)
 	requireNoError(t, err, "building shutdown request")
 
 	start := time.Now()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ctxBoundClient.Do(req)
 	requireNoError(t, err, "POST /api/v1/shutdown?wait=true")
 	resp.Body.Close()
 	t.Logf("waited shutdown responded after %v (status %d)", time.Since(start), resp.StatusCode)
@@ -459,7 +501,7 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	// Reuse the existing suite's shutdown budget (TestFullStop_NoOrphanedGrandchild
 	// uses the same 20s ceiling for a full-instance stop) rather than inventing a
 	// tighter one.
-	if err := run.WaitExit(t, 20*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("foreground prox up should exit cleanly with SSE clients connected, got %v", err)
 	}
 }

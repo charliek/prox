@@ -155,10 +155,16 @@ func identityFromStateDir(stateDir string, accept func(pid int) bool) (daemonIde
 	}, true
 }
 
-// shutdownClient issues the teardown shutdown. It carries no client-level
-// timeout on purpose: every call passes a context that bounds it, and a
-// client timeout would silently cap the caller's own, longer budget.
-var shutdownClient = &http.Client{}
+// ctxBoundClient is for requests whose budget is longer than apiClient's
+// one-request ceiling and is decided by the CALLER: a waited shutdown, a
+// process stop that has to sit through the SIGTERM grace, the repo-root
+// liveness probe.
+//
+// It carries no client-level Timeout on purpose. Every call passes a context
+// that bounds it, and a client Timeout would silently cap the caller's own,
+// longer budget -- which is how a healthy 12s stop turns into a 5s "context
+// deadline exceeded" that reads like a broken daemon.
+var ctxBoundClient = &http.Client{}
 
 // requestWaitedShutdown posts /api/v1/shutdown?wait=true and blocks, bounded by
 // ctx, until the daemon reports its stop verdict.
@@ -173,7 +179,7 @@ func requestWaitedShutdown(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := shutdownClient.Do(req)
+	resp, err := ctxBoundClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -563,7 +569,7 @@ func warnOnRepoRootDaemon(w io.Writer) bool {
 	if err != nil {
 		return false
 	}
-	resp, err := shutdownClient.Do(req)
+	resp, err := ctxBoundClient.Do(req)
 	if err != nil {
 		return false
 	}

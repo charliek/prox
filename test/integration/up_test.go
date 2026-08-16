@@ -13,24 +13,24 @@ import (
 )
 
 // waitForRunOutputContains polls a proxRun's captured combined output until it
-// contains substr, or fails the test after timeout.
-func waitForRunOutputContains(t *testing.T, run *proxRun, substr string, timeout time.Duration) {
+// contains substr, or fails the test at deadline.
+func waitForRunOutputContains(t *testing.T, run *proxRun, substr string, deadline time.Time) {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	var last string
 	for time.Now().Before(deadline) {
 		last = run.Output()
 		if strings.Contains(last, substr) {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	// Final sample: the marker may have arrived during the last sleep.
 	if last = run.Output(); strings.Contains(last, substr) {
 		return
 	}
-	t.Fatalf("output did not contain %q within %v; captured output: %s", substr, timeout, last)
+	t.Fatalf("output did not contain %q %s; captured output: %s", substr, waitedFor(start, deadline), last)
 }
 
 type StatusResponse struct {
@@ -52,6 +52,7 @@ type ProcessListResponse struct {
 }
 
 func TestUpCommand_StartsProcesses(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -59,13 +60,13 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Give processes time to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify status endpoint
-	resp, err := http.Get(run.Addr() + "/api/v1/status")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/status")
 	requireNoError(t, err, "failed to get status")
 	defer resp.Body.Close()
 
@@ -84,17 +85,18 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 }
 
 func TestUpCommand_ProcessList(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(run.Addr() + "/api/v1/processes")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -123,13 +125,14 @@ func TestUpCommand_ProcessList(t *testing.T) {
 }
 
 func TestUpCommand_GracefulShutdown(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Request shutdown via API
@@ -137,7 +140,7 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 	requireNoError(t, err, "failed to request shutdown")
 
 	// Wait for process to exit - check that it was graceful
-	if err := run.WaitExit(t, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Logf("process exited with error (may be expected): %v", err)
 	}
 }
@@ -146,13 +149,14 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 // foreground daemon: it must wait for the outcome, exit 0, print a stopped
 // summary, and the daemon's state + PID files must be gone afterward (#36, D4).
 func TestStopCommand_WaitsForCleanExit(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	out, exitCode := f.Run(t, binary, "stop", "-c", f.configPath)
@@ -164,7 +168,7 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	}
 
 	// The foreground daemon must have exited cleanly as part of the waited stop.
-	if err := run.WaitExit(t, 10*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("foreground prox up should exit 0 on a clean stop, got %v", err)
 	}
 
@@ -184,13 +188,14 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 // /shutdown (no wait param) still returns an immediate 200 while the daemon tears
 // down in the background.
 func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	start := time.Now()
@@ -201,7 +206,7 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 		t.Errorf("async POST /shutdown should return promptly, took %v", elapsed)
 	}
 
-	if err := run.WaitExit(t, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("foreground prox up should exit 0 after an async clean stop, got %v", err)
 	}
 }
@@ -211,13 +216,14 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 // the second invocation must exit sanely (a waited result, a connection-refused
 // unknown-outcome path, or a not-running message) rather than crashing.
 func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 	f := newFixture(t, "integration")
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Fire the first stop in the background; it waits for the drain. Capture its
@@ -242,7 +248,7 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 
 	// The daemon does a clean stop (reapable processes), so the foreground exits 0
 	// regardless of how many stop clients connected.
-	if err := run.WaitExit(t, 15*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Errorf("daemon should exit 0 on a clean double stop, got %v", err)
 	}
 
@@ -290,6 +296,7 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 }
 
 func TestUpCommand_SpecificProcesses(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -297,11 +304,11 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 	// Start only the 'long' process
 	run := f.Start(t, binary, "up", "-c", f.configPath, "long")
 
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
-	resp, err := http.Get(run.Addr() + "/api/v1/processes")
+	resp, err := apiClient.Get(run.Addr() + "/api/v1/processes")
 	requireNoError(t, err, "failed to get processes")
 	defer resp.Body.Close()
 
@@ -329,6 +336,7 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 // processes (like Python spawned via shell) is captured during graceful shutdown.
 // This is the key feature that manual pipes (vs cmd.StdoutPipe) enables.
 func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -336,21 +344,21 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for API to be ready
-	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 	// Wait until the grandchild's startup marker is visible in the SAME
 	// captured-output surface the post-exit assertions read (the terminal
 	// echo subscription starts after process launch, so the logs API is not
 	// an equivalent surface). This 15s startup deadline is independent of
 	// the 15s shutdown wait below.
-	waitForRunOutputContains(t, run, "PROCESS_STARTED_PID=", 15*time.Second)
+	waitForRunOutputContains(t, run, "PROCESS_STARTED_PID=", within(t, logAppearTimeout))
 
 	// Request graceful shutdown via API
 	err := stopProx(t, run.Addr())
 	requireNoError(t, err, "failed to request shutdown")
 
 	// Wait for process to exit
-	_ = run.WaitExit(t, 15*time.Second)
+	_ = run.WaitExit(t, within(t, processExitTimeout))
 
 	// Verify the output contains the grandchild's shutdown messages
 	output := run.Output()
@@ -377,6 +385,7 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 // (the never-ready/timeout half is covered by unit-level fakes with injectable
 // timings in internal/cli).
 func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -386,8 +395,9 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 	dir := t.TempDir()
 	badCfg := filepath.Join(dir, "does-not-exist.yaml")
 
-	cmd := exec.Command(binary, "up", "-d", "-c", badCfg)
-	cmd.Dir = dir
+	ctx, cancel := cliContext(t)
+	defer cancel()
+	cmd := boundedCommand(ctx, dir, binary, "up", "-d", "-c", badCfg)
 	out, err := cmd.CombinedOutput()
 
 	var ee *exec.ExitError
@@ -425,6 +435,7 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 // roughly half the time and proves nothing (verified manually: see the C1
 // commit report).
 func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -441,7 +452,7 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 		// Confirms the daemon itself came up; the process crash happens
 		// concurrently with (just after) supervisor start, so this does not run
 		// past the window we're testing.
-		waitForAPI(t, run.Addr(), apiReadyTimeout)
+		waitForAPI(t, run.Addr(), within(t, apiReadyTimeout))
 
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so
@@ -457,7 +468,7 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 		// Shut down before asserting, so a failed iteration doesn't leak the
 		// daemon (and its port) into the next one.
 		_ = stopProx(t, run.Addr())
-		if err := run.WaitExit(t, 15*time.Second); err != nil {
+		if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 			t.Logf("iteration %d: prox up did not exit cleanly: %v", i, err)
 		}
 
@@ -474,6 +485,7 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 // under `go test` the child's stdout/stderr are pipes, which is exactly the
 // non-interactive shape a CI runner or `| tee` produces.
 func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -489,7 +501,7 @@ func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
 	// the run's single Cmd.Wait rather than racing a second one, which is what
 	// the old CombinedOutput-in-a-goroutine plus killProx-on-timeout pair did.
 	run := f.Start(t, binary, "up", "--tui", "-c", f.configPath)
-	runErr := run.WaitExit(t, 20*time.Second)
+	runErr := run.WaitExit(t, within(t, processExitTimeout))
 	out := run.Output()
 
 	var ee *exec.ExitError
@@ -551,14 +563,16 @@ func upTUIFixture(t *testing.T) (string, string) {
 // Changed("tui") for it, so a conflict predicate that forgets to also check the
 // parsed value breaks a command line that is valid today.
 func TestUpTUIFlags_Conflicts(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
 
 	t.Run("--tui --no-tui is refused", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "--tui", "--no-tui", "-c", cfg)
-		cmd.Dir = dir
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "--tui", "--no-tui", "-c", cfg)
 		out, err := cmd.CombinedOutput()
 
 		var ee *exec.ExitError
@@ -575,8 +589,9 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 
 	t.Run("-d --tui is refused", func(t *testing.T) {
 		dir, cfg := upTUIFixture(t)
-		cmd := exec.Command(binary, "up", "-d", "--tui", "-c", cfg)
-		cmd.Dir = dir
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "-d", "--tui", "-c", cfg)
 		// No cleanup needed: the conflict is reported before daemonization, so
 		// there is no child to stop and no state file to find.
 		out, err := cmd.CombinedOutput()
@@ -636,6 +651,7 @@ func TestUpTUIFlags_Conflicts(t *testing.T) {
 // cobra registration and that the flag is not rejected, which an unregistered
 // flag would fail instantly and loudly.
 func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -643,7 +659,7 @@ func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
 
 	run := f.Start(t, binary, "up", "--no-tui", "-c", f.configPath)
 
-	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
 	if strings.Contains(run.Output(), "unknown flag") {
 		t.Fatalf("--no-tui must be a registered flag; output:\n%s", run.Output())
 	}
@@ -655,6 +671,7 @@ func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
 // (C4 moves this warning onto the TUI-visible path; the wording assertion here
 // is deliberately loose so that move does not have to touch this test.)
 func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -662,7 +679,7 @@ func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
 
 	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=banana")}, "up", "-c", f.configPath)
 
-	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
 	if out := run.Output(); !strings.Contains(out, "PROX_TUI") || !strings.Contains(out, "banana") {
 		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", out)
 	}
@@ -674,6 +691,7 @@ func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
 // booby-trap every piped `prox up` in that shell) nor print a note (that would
 // pollute CI output forever for a mode change nobody asked about).
 func TestUpTUIEnv_RecognizedValueIsSilent(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -682,7 +700,7 @@ func TestUpTUIEnv_RecognizedValueIsSilent(t *testing.T) {
 	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=1")}, "up", "-c", f.configPath)
 
 	// Reaching the preamble at all is the "must not fail" half of the assertion.
-	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	waitForRunOutputContains(t, run, "API server: ", within(t, apiReadyTimeout))
 	out := run.Output()
 	if strings.Contains(out, "PROX_TUI") {
 		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", out)

@@ -22,6 +22,7 @@ package integration
 // refuses to allocate a pty -- some CI/agent sandboxes forbid it.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -44,22 +45,8 @@ import (
 // for.
 var tuiPTYWinsize = &pty.Winsize{Rows: 40, Cols: 120}
 
-// ptyWaitTimeout is the budget for every "has it happened yet?" wait in this
-// file. It is deliberately generous, and it is not a performance assertion:
-// every use is polling for an event that either happens or the test fails, so
-// the only thing a larger budget costs is how long a genuine failure takes to
-// report.
-//
-// It was 15s, which is not survivable under `go test ./...`. 25s is deliberate headroom rather than a large number: a budget big enough to absorb load but small enough that a WAVE of failures still fits inside the package timeout. That builds and
-// runs every package CONCURRENTLY, so the whole unit suite — including the
-// deliberately slow race and deadlock tests added by plan 026 — competes with
-// these pty tests for the same cores, and `prox up` can easily take longer than
-// 15s to get as far as printing its API URL. The failure signature is a wave of
-// "not found in pty output within 15s" across unrelated tests, which reads
-// exactly like a real regression and is not one; it also predates plan 026
-// (reproduced on the C6 tree). CI runs `go test -v ./...` on two-core hosted
-// runners, where the squeeze is worse than on a dev machine.
-const ptyWaitTimeout = 25 * time.Second
+// ptyWaitTimeout, the budget for every "has it happened yet?" wait in this
+// file, now lives with the rest of the role budgets in helpers_test.go.
 
 // altScreenEnter is the DEC private-mode sequence bubbletea writes when it
 // takes over the screen (tea.WithAltScreen). Its presence in the raw pty stream
@@ -201,21 +188,21 @@ func ptyEnv(env []string, term string) []string {
 // after timeout. Deliberately a raw substring search, not a line scan: styled
 // text is wrapped in escape codes before/after, never split mid-word, so this is
 // safe and much simpler than trying to parse the terminal stream.
-func waitForPTYContains(t *testing.T, run *proxRun, substr string, timeout time.Duration) {
+func waitForPTYContains(t *testing.T, run *proxRun, substr string, deadline time.Time) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	var last string
 	for time.Now().Before(deadline) {
 		last = run.Output()
 		if strings.Contains(last, substr) {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	if last = run.Output(); strings.Contains(last, substr) {
 		return
 	}
-	t.Fatalf("pty output did not contain %q within %v; captured output:\n%s", substr, timeout, last)
+	t.Fatalf("pty output did not contain %q %s; captured output:\n%s", substr, waitedFor(start, deadline), last)
 }
 
 // waitForPTYAPIServerURL polls a run's output until the "API server: http://..."
@@ -223,10 +210,10 @@ func waitForPTYContains(t *testing.T, run *proxRun, substr string, timeout time.
 // BEFORE the alt-screen TUI takes over, so it always lands in the raw stream
 // ahead of any bubbletea output -- and returns the bare URL (no auth
 // annotation).
-func waitForPTYAPIServerURL(t *testing.T, run *proxRun, timeout time.Duration) string {
+func waitForPTYAPIServerURL(t *testing.T, run *proxRun, deadline time.Time) string {
 	t.Helper()
 	const marker = "API server: "
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	for {
 		out := run.Output()
 		if idx := strings.Index(out, marker); idx >= 0 {
@@ -236,9 +223,9 @@ func waitForPTYAPIServerURL(t *testing.T, run *proxRun, timeout time.Duration) s
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("API server URL not found in pty output within %v; captured:\n%s", timeout, out)
+			t.Fatalf("API server URL not found in pty output %s; captured:\n%s", waitedFor(start, deadline), out)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 }
 
@@ -255,6 +242,7 @@ func writeToPTY(t *testing.T, ptmx *os.File, s string) {
 // on `prox up --tui` stops the supervisor -- unlike `q` on `prox attach`,
 // which only detaches (TestAttach_QuitDetachesLeavesDaemonRunning below).
 func TestUpTUI_QuitStopsSupervisor(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -264,17 +252,17 @@ func TestUpTUI_QuitStopsSupervisor(t *testing.T) {
 	f := newInlineFixture(t, tuiFixtureConfig)
 	run, ptmx := startPTYRun(t, f, binary, "up", "--tui", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
-	pid := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
-	waitForPTYContains(t, run, "worker", ptyWaitTimeout)
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
+	pid := waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout)).PID
+	waitForPTYContains(t, run, "worker", within(t, ptyWaitTimeout))
 
 	writeToPTY(t, ptmx, "q")
 
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("up --tui should exit 0 after 'q', got %v", err)
 	}
-	if !waitForPIDGone(pid, 10*time.Second) {
+	if !waitForPIDGone(pid, within(t, pidGoneTimeout)) {
 		t.Errorf("worker pid %d should be gone after q-triggered shutdown", pid)
 	}
 }
@@ -285,6 +273,7 @@ func TestUpTUI_QuitStopsSupervisor(t *testing.T) {
 // stop has actually landed -- no deadlock between the handler blocking on the
 // coordinator and the coordinator's teardown needing the API server.
 func TestUpTUI_ShutdownEndpointQuitsAndStops(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -294,14 +283,19 @@ func TestUpTUI_ShutdownEndpointQuitsAndStops(t *testing.T) {
 	f := newInlineFixture(t, tuiFixtureConfig)
 	run, _ := startPTYRun(t, f, binary, "up", "--tui", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
-	pid := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
-	waitForPTYContains(t, run, "worker", ptyWaitTimeout)
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
+	pid := waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout)).PID
+	waitForPTYContains(t, run, "worker", within(t, ptyWaitTimeout))
 
-	req, err := http.NewRequest(http.MethodPost, addr+"/api/v1/shutdown?wait=true", nil)
+	// Bounded by the teardown budget, not apiClient's one-request ceiling: a
+	// waited shutdown blocks until every process group has stopped, so the
+	// short ceiling would abandon a perfectly healthy stop.
+	ctx, cancel := context.WithTimeout(context.Background(), daemonShutdownBudget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/api/v1/shutdown?wait=true", nil)
 	requireNoError(t, err, "building shutdown request")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ctxBoundClient.Do(req)
 	requireNoError(t, err, "POST /api/v1/shutdown?wait=true")
 	defer resp.Body.Close()
 
@@ -322,10 +316,10 @@ func TestUpTUI_ShutdownEndpointQuitsAndStops(t *testing.T) {
 		t.Errorf("expected success=true in the shutdown response, got %+v", shutdownResp)
 	}
 
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("up --tui should exit 0 after POST /shutdown?wait=true, got %v", err)
 	}
-	if !waitForPIDGone(pid, 10*time.Second) {
+	if !waitForPIDGone(pid, within(t, pidGoneTimeout)) {
 		t.Errorf("worker pid %d should be gone after the shutdown-endpoint stop", pid)
 	}
 }
@@ -334,6 +328,7 @@ func TestUpTUI_ShutdownEndpointQuitsAndStops(t *testing.T) {
 // non-interactive cousin -- e.g. a process manager stopping prox) quits the
 // TUI and stops the supervisor exactly like 'q' or the shutdown endpoint.
 func TestUpTUI_SigtermQuitsAndStops(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -343,17 +338,17 @@ func TestUpTUI_SigtermQuitsAndStops(t *testing.T) {
 	f := newInlineFixture(t, tuiFixtureConfig)
 	run, _ := startPTYRun(t, f, binary, "up", "--tui", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
-	pid := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
-	waitForPTYContains(t, run, "worker", ptyWaitTimeout)
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
+	pid := waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout)).PID
+	waitForPTYContains(t, run, "worker", within(t, ptyWaitTimeout))
 
 	run.Signal(t, syscall.SIGTERM)
 
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("up --tui should exit 0 after SIGTERM, got %v", err)
 	}
-	if !waitForPIDGone(pid, 10*time.Second) {
+	if !waitForPIDGone(pid, within(t, pidGoneTimeout)) {
 		t.Errorf("worker pid %d should be gone after the SIGTERM shutdown", pid)
 	}
 }
@@ -363,6 +358,7 @@ func TestUpTUI_SigtermQuitsAndStops(t *testing.T) {
 // the daemon and its processes must survive, since attach supervises nothing
 // (ShutdownCh is nil in the attach call site, internal/cli/commands.go).
 func TestAttach_QuitDetachesLeavesDaemonRunning(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -378,23 +374,23 @@ func TestAttach_QuitDetachesLeavesDaemonRunning(t *testing.T) {
 	// the corpse of the launcher.
 	daemonRun := f.StartDetached(t, binary, "up", "-d", "-c", f.configPath)
 	addr := daemonRun.Addr()
-	waitForAPI(t, addr, apiReadyTimeout)
-	daemonPID := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
+	waitForAPI(t, addr, within(t, apiReadyTimeout))
+	daemonPID := waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout)).PID
 
 	// Attach the client TUI under a PTY. No -c needed: attach discovers the
 	// daemon from cwd's .prox/prox.state (internal/cli/commands.go runAttach).
 	attachRun, ptmx := startPTYRun(t, f, binary, "attach")
 
-	waitForPTYContains(t, attachRun, "worker", ptyWaitTimeout)
+	waitForPTYContains(t, attachRun, "worker", within(t, ptyWaitTimeout))
 
 	writeToPTY(t, ptmx, "q")
 
-	if err := attachRun.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := attachRun.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("attach should exit 0 after 'q', got %v", err)
 	}
 
 	// The daemon must still be running: attach quitting is purely a detach.
-	resp, err := http.Get(addr + "/api/v1/status")
+	resp, err := apiClient.Get(addr + "/api/v1/status")
 	requireNoError(t, err, "GET /api/v1/status after attach quit")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -412,6 +408,7 @@ func TestAttach_QuitDetachesLeavesDaemonRunning(t *testing.T) {
 // TestUpTUI_NonInteractiveRefusesToStart in up_test.go covers the piped
 // stdout half; neither alone proves isInteractiveStdio checks BOTH streams.
 func TestUpTUI_StdinDevNullRefused(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -463,7 +460,7 @@ func TestUpTUI_StdinDevNullRefused(t *testing.T) {
 
 	// The guard runs before any startup work, so this is near-instant; the
 	// budget is generous only to absorb a loaded CI machine.
-	if err := run.WaitExit(t, ptyWaitTimeout); err == nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err == nil {
 		t.Fatalf("expected a non-zero exit with stdin=/dev/null, got nil error; output:\n%s", run.Output())
 	}
 
@@ -490,6 +487,7 @@ func TestUpTUI_StdinDevNullRefused(t *testing.T) {
 //
 // This is the negative case the pty helpers' TERM pin exists to keep separable.
 func TestUpTUI_TermDumbRefused(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -500,7 +498,7 @@ func TestUpTUI_TermDumbRefused(t *testing.T) {
 
 	run, _ := startPTYRunWithTERM(t, f, binary, "dumb", "up", "--tui", "-c", f.configPath)
 
-	if err := run.WaitExit(t, ptyWaitTimeout); err == nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err == nil {
 		t.Fatalf("expected a non-zero exit with TERM=dumb, got nil error; output:\n%s", run.Output())
 	}
 
@@ -543,6 +541,7 @@ func TestUpTUI_TermDumbRefused(t *testing.T) {
 // value that was never typed" row -- and this test remains the end-to-end
 // proof that the whole path works on a real terminal.
 func TestUpDetach_OnPTYStartsDaemon(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -564,7 +563,7 @@ func TestUpDetach_OnPTYStartsDaemon(t *testing.T) {
 	// here is already the readiness signal (docs/reference/cli.md). Its failure
 	// mode under the bug is instant and loud: "--tui and --detach are mutually
 	// exclusive", exit 1.
-	if err := run.WaitExit(t, 30*time.Second); err != nil {
+	if err := run.WaitExit(t, within(t, processExitTimeout)); err != nil {
 		t.Fatalf("prox up -d on a terminal must succeed, got %v; output:\n%s", err, run.Output())
 	}
 	if out := run.Output(); strings.Contains(out, "mutually exclusive") {
@@ -574,7 +573,7 @@ func TestUpDetach_OnPTYStartsDaemon(t *testing.T) {
 	// Belt and braces: the daemon really is up and supervising, not merely
 	// exited 0.
 	statePath := filepath.Join(f.dir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, statePath, within(t, stateFileTimeout))
 	stateData, err := os.ReadFile(statePath)
 	requireNoError(t, err, "reading state file")
 	var state struct {
@@ -584,8 +583,8 @@ func TestUpDetach_OnPTYStartsDaemon(t *testing.T) {
 		t.Fatalf("failed to parse state file: %v", err)
 	}
 	addr := fmt.Sprintf("http://127.0.0.1:%d", state.Port)
-	waitForAPI(t, addr, apiReadyTimeout)
-	waitForProcessState(t, addr, "worker", "running", 10*time.Second)
+	waitForAPI(t, addr, within(t, apiReadyTimeout))
+	waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout))
 }
 
 // TestUp_OnPTYOpensTUIByDefault is the flip itself: no --tui, no PROX_TUI, just
@@ -601,6 +600,7 @@ func TestUpDetach_OnPTYStartsDaemon(t *testing.T) {
 // TestUpTUI_QuitStopsSupervisor -- what is new here is that it happens with no
 // flag at all.
 func TestUp_OnPTYOpensTUIByDefault(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -610,19 +610,19 @@ func TestUp_OnPTYOpensTUIByDefault(t *testing.T) {
 	f := newInlineFixture(t, tuiFixtureConfig)
 	run, ptmx := startPTYRun(t, f, binary, "up", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
-	pid := waitForProcessState(t, addr, "worker", "running", 10*time.Second).PID
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
+	pid := waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout)).PID
 
-	waitForPTYContains(t, run, altScreenEnter, ptyWaitTimeout)
-	waitForPTYContains(t, run, "worker", ptyWaitTimeout)
+	waitForPTYContains(t, run, altScreenEnter, within(t, ptyWaitTimeout))
+	waitForPTYContains(t, run, "worker", within(t, ptyWaitTimeout))
 
 	writeToPTY(t, ptmx, "q")
 
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("bare `prox up` should exit 0 after 'q', got %v; output:\n%s", err, run.Output())
 	}
-	if !waitForPIDGone(pid, 10*time.Second) {
+	if !waitForPIDGone(pid, within(t, pidGoneTimeout)) {
 		t.Errorf("worker pid %d should be gone after the q-triggered shutdown", pid)
 	}
 }
@@ -632,6 +632,7 @@ func TestUp_OnPTYOpensTUIByDefault(t *testing.T) {
 // start on TERM=dumb; a bare `prox up` asked for nothing, so the same terminal
 // must silently give it plain log streaming instead of an error.
 func TestUp_TermDumbFallsBackToPlainLogs(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY-driven TUI tests are unix-only")
 	}
@@ -643,11 +644,11 @@ func TestUp_TermDumbFallsBackToPlainLogs(t *testing.T) {
 
 	run, _ := startPTYRunWithTERM(t, f, binary, "dumb", "up", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
 	// The process's own stdout reaching the terminal IS the plain log stream:
 	// nothing else prints it, and under a TUI it would be inside the alt screen.
-	waitForPTYContains(t, run, marker, ptyWaitTimeout)
+	waitForPTYContains(t, run, marker, within(t, ptyWaitTimeout))
 
 	out := run.Output()
 	if strings.Contains(out, altScreenEnter) {
@@ -658,7 +659,7 @@ func TestUp_TermDumbFallsBackToPlainLogs(t *testing.T) {
 	}
 
 	run.Signal(t, syscall.SIGTERM)
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("the plain fallback should exit 0 on SIGTERM, got %v; output:\n%s", err, run.Output())
 	}
 }
@@ -672,6 +673,7 @@ func TestUp_TermDumbFallsBackToPlainLogs(t *testing.T) {
 // flip is regression-tested broadly; this test states the requirement outright
 // rather than leaving it implicit in tests about other things.
 func TestUp_PipedStreamsPlainLogs(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -683,16 +685,16 @@ func TestUp_PipedStreamsPlainLogs(t *testing.T) {
 	// is a terminal.
 	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	addr := waitForPTYAPIServerURL(t, run, ptyWaitTimeout)
-	waitForAPI(t, addr, ptyWaitTimeout)
-	waitForPTYContains(t, run, marker, ptyWaitTimeout)
+	addr := waitForPTYAPIServerURL(t, run, within(t, ptyWaitTimeout))
+	waitForAPI(t, addr, within(t, ptyWaitTimeout))
+	waitForPTYContains(t, run, marker, within(t, ptyWaitTimeout))
 
 	if out := run.Output(); strings.Contains(out, altScreenEnter) {
 		t.Errorf("a piped `prox up` must never emit alt-screen chrome; output:\n%q", out)
 	}
 
 	run.Signal(t, syscall.SIGTERM)
-	if err := run.WaitExit(t, ptyWaitTimeout); err != nil {
+	if err := run.WaitExit(t, within(t, ptyWaitTimeout)); err != nil {
 		t.Errorf("a piped `prox up` should exit 0 on SIGTERM, got %v; output:\n%s", err, run.Output())
 	}
 }

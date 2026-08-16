@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
-	"time"
 )
 
 func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	binary := buildBinary(t)
@@ -29,13 +29,13 @@ func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
 	// aborts before the explicit Kill below still can't leak gen 1.
 	first := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, first.Addr(), apiReadyTimeout)
+	waitForAPI(t, first.Addr(), within(t, apiReadyTimeout))
 
-	pidStr := waitForMarkerValue(t, first.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	pidStr := waitForMarkerValue(t, first.Addr(), "worker", "GRANDCHILD_PID=", "", within(t, logAppearTimeout))
 	pid, err := strconv.Atoi(pidStr)
 	requireNoError(t, err, "parsing first GRANDCHILD_PID")
 	firstGrandchildPID = pid
-	waitForMarkerValue(t, first.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, first.Addr(), "worker", "LISTENING=", "", within(t, logAppearTimeout))
 
 	// SIGKILL the prox process. Its child group is in its own PGID, so SIGKILL does
 	// NOT cascade to it -- the leader shell + grandchild orphan and keep running.
@@ -66,11 +66,11 @@ func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
 	addr := second.Addr()
 
 	// Startup includes the reap grace window (~2s) before the supervisor starts.
-	waitForAPI(t, addr, 20*time.Second)
+	waitForAPI(t, addr, within(t, apiReadyTimeout))
 
 	// The first generation's orphaned group must be gone -- reaped from the ledger
 	// during gen-2 startup.
-	if !waitForPIDGone(firstGrandchildPID, 15*time.Second) {
+	if !waitForPIDGone(firstGrandchildPID, within(t, pidGoneTimeout)) {
 		t.Fatalf("first-generation grandchild pid %d still alive after generation-2 startup reap", firstGrandchildPID)
 	}
 
@@ -78,7 +78,7 @@ func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
 	// same port. The marker only prints after a successful bind+listen, so its mere
 	// presence proves the rebind succeeded (a failed rebind would crash the python
 	// script before printing GRANDCHILD_PID/LISTENING).
-	newPIDStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", pidStr, 15*time.Second)
+	newPIDStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", pidStr, within(t, logAppearTimeout))
 	newPID, err := strconv.Atoi(newPIDStr)
 	requireNoError(t, err, "parsing second GRANDCHILD_PID")
 	secondGrandchildPID = newPID
@@ -86,11 +86,11 @@ func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
 		t.Fatalf("expected a new grandchild pid distinct from %d, got the same pid", firstGrandchildPID)
 	}
 
-	listeningPort := waitForMarkerValue(t, addr, "worker", "LISTENING=", "", 5*time.Second)
+	listeningPort := waitForMarkerValue(t, addr, "worker", "LISTENING=", "", within(t, logAppearTimeout))
 	if listeningPort != stubbornPort {
 		t.Fatalf("expected the rebound grandchild to listen on port %s, got %q", stubbornPort, listeningPort)
 	}
 
 	// The replacement worker should be running (not crashed on EADDRINUSE).
-	waitForProcessState(t, addr, "worker", "running", 5*time.Second)
+	waitForProcessState(t, addr, "worker", "running", within(t, processStateTimeout))
 }

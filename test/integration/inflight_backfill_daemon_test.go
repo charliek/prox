@@ -34,6 +34,7 @@ import (
 //     Details populated (headers + body) — and the ring holds exactly one record
 //     for that ID (the completion replaced the in-flight row in place, no dup).
 func TestInFlight_EndToEnd(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	topo := newDaemonTopo(t)
@@ -88,7 +89,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go proxyd.ForwardRequests(ctx, topo.socketPath, projectDir, localRM, nil, nil)
-	waitBridgeLive(t, proxyPort, hostname, localRM)
+	waitBridgeLive(t, proxyPort, hostname, localRM, within(t, streamFrameTimeout))
 
 	// Drive the slow request in a background goroutine — it stays open until we
 	// release the backend. (Build the request by hand rather than via driveProxy,
@@ -105,7 +106,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 			return
 		}
 		req.Host = hostname
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := driveProxyClient.Do(req)
 		if err != nil {
 			resultCh <- driveResult{err: err}
 			return
@@ -119,7 +120,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	// with the real header-time status and no Details yet.
 	inflight := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.URL == "/slow" && r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 	if inflight.StatusCode != http.StatusOK {
 		t.Errorf("in-flight status = %d, want %d", inflight.StatusCode, http.StatusOK)
 	}
@@ -144,7 +145,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 	// The SAME ID now becomes final: in_flight false, real duration, Details.
 	final := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.ID == inflightID && !r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 	if final.StatusCode != http.StatusOK {
 		t.Errorf("final status = %d, want %d", final.StatusCode, http.StatusOK)
 	}
@@ -190,6 +191,7 @@ func TestInFlight_EndToEnd(t *testing.T) {
 //   - Records already present locally before the gap are not duplicated on
 //     reconnect (backfill re-delivery of a final record is a no-op).
 func TestBackfill_EndToEnd(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	topo := newDaemonTopo(t)
@@ -231,14 +233,14 @@ func TestBackfill_EndToEnd(t *testing.T) {
 		proxyd.ForwardRequests(ctx1, topo.socketPath, projectDir, localRM, nil, nil)
 		close(done1)
 	}()
-	waitBridgeLive(t, proxyPort, hostname, localRM)
+	waitBridgeLive(t, proxyPort, hostname, localRM, within(t, streamFrameTimeout))
 
 	if got := driveProxy(t, proxyPort, hostname, http.MethodPost, "/before", []byte("pre-gap")); got != "pre-gap" {
 		t.Fatalf("/before response = %q, want %q", got, "pre-gap")
 	}
 	beforeRec := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.URL == "/before" && !r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 	beforeID := beforeRec.ID
 
 	// --- Sever the bridge (forwarder down) while the daemon stays registered ---
@@ -276,13 +278,13 @@ func TestBackfill_EndToEnd(t *testing.T) {
 	// Gap records appear locally via backfill.
 	gap1 := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.URL == "/gap1" && !r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 	gap2 := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.URL == "/gap2" && !r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 	largeRec := waitForRecord(t, localRM, func(r proxy.RequestRecord) bool {
 		return r.URL == "/large" && !r.InFlight && r.Details != nil
-	})
+	}, within(t, streamFrameTimeout))
 
 	// The gap request bodies round-tripped (inline) via the backfilled records.
 	if gap1.Details == nil || gap1.Details.RequestBody == nil || string(gap1.Details.RequestBody.Data) != "g1" {
@@ -384,7 +386,7 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 	t.Cleanup(func() { _ = dynamicProxy.Shutdown(context.Background()) })
 
 	client := proxyd.NewClient(socketPath)
-	waitDaemonReady(t, client)
+	waitDaemonReady(t, client, within(t, apiReadyTimeout))
 
 	return daemonTopo{
 		socketPath:       socketPath,
@@ -396,9 +398,9 @@ func newDaemonTopo(t *testing.T) daemonTopo {
 // waitBridgeLive pings the given project through the proxy until its local
 // manager has observed at least one record, confirming the SSE subscription is
 // active (single-project variant of waitBridgesLive).
-func waitBridgeLive(t *testing.T, port int, hostname string, localRM *proxy.RequestManager) {
+func waitBridgeLive(t *testing.T, port int, hostname string, localRM *proxy.RequestManager, deadline time.Time) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	start := time.Now()
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -406,8 +408,8 @@ func waitBridgeLive(t *testing.T, port int, hostname string, localRM *proxy.Requ
 			return
 		}
 		select {
-		case <-deadline:
-			t.Fatalf("bridge did not go live (count=%d)", localRM.Count())
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("bridge did not go live %s (count=%d)", waitedFor(start, deadline), localRM.Count())
 		case <-tick.C:
 			_ = driveProxy(t, port, hostname, http.MethodGet, "/ping", nil)
 		}

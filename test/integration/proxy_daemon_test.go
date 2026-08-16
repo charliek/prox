@@ -55,6 +55,7 @@ func startDaemonServer(t *testing.T) (*proxyd.Client, func()) {
 }
 
 func TestProxyDaemon_SingleProject(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -111,6 +112,7 @@ func TestProxyDaemon_SingleProject(t *testing.T) {
 }
 
 func TestProxyDaemon_TwoProjectsSamePort(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -172,6 +174,7 @@ func TestProxyDaemon_TwoProjectsSamePort(t *testing.T) {
 }
 
 func TestProxyDaemon_DifferentPorts(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -212,6 +215,7 @@ func TestProxyDaemon_DifferentPorts(t *testing.T) {
 }
 
 func TestProxyDaemon_DomainConflict(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -245,6 +249,7 @@ func TestProxyDaemon_DomainConflict(t *testing.T) {
 }
 
 func TestProxyDaemon_ProtocolMismatch(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -278,6 +283,7 @@ func TestProxyDaemon_ProtocolMismatch(t *testing.T) {
 }
 
 func TestProxyDaemon_LastDeregisterStopsDaemon(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -343,6 +349,7 @@ func TestProxyDaemon_LastDeregisterStopsDaemon(t *testing.T) {
 }
 
 func TestProxyDaemon_VersionMismatch(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()
@@ -363,6 +370,7 @@ func TestProxyDaemon_VersionMismatch(t *testing.T) {
 }
 
 func TestProxyDaemon_ProxyStopProtected(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 	client, cleanup := startDaemonServer(t)
 	defer cleanup()

@@ -26,16 +26,17 @@ func startAPIFixture(t *testing.T) string {
 	run := fixture.Start(t, binary, "up", "-c", fixture.configPath)
 
 	addr := run.Addr()
-	waitForAPI(t, addr, apiReadyTimeout)
+	waitForAPI(t, addr, within(t, apiReadyTimeout))
 	return addr
 }
 
 func TestAPI_StatusEndpoint(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
 
-	resp, err := http.Get(addr + "/api/v1/status")
+	resp, err := apiClient.Get(addr + "/api/v1/status")
 	requireNoError(t, err, "failed to get status")
 	defer resp.Body.Close()
 
@@ -54,13 +55,14 @@ func TestAPI_StatusEndpoint(t *testing.T) {
 }
 
 func TestAPI_ProcessRestartEndpoint(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get initial PID
-	resp, err := http.Get(addr + "/api/v1/processes/long")
+	resp, err := apiClient.Get(addr + "/api/v1/processes/long")
 	requireNoError(t, err, "failed to get process")
 	defer resp.Body.Close()
 
@@ -74,7 +76,7 @@ func TestAPI_ProcessRestartEndpoint(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, addr+"/api/v1/processes/long/restart", nil)
 	requireNoError(t, err, "failed to create request")
 
-	resp2, err := http.DefaultClient.Do(req)
+	resp2, err := apiClient.Do(req)
 	requireNoError(t, err, "failed to restart")
 	resp2.Body.Close()
 
@@ -86,7 +88,7 @@ func TestAPI_ProcessRestartEndpoint(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Get new PID
-	resp3, err := http.Get(addr + "/api/v1/processes/long")
+	resp3, err := apiClient.Get(addr + "/api/v1/processes/long")
 	requireNoError(t, err, "failed to get process after restart")
 	defer resp3.Body.Close()
 
@@ -102,18 +104,19 @@ func TestAPI_ProcessRestartEndpoint(t *testing.T) {
 }
 
 func TestAPI_ProcessStopStartEndpoint(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
 
 	// Wait for process to be running before we try to stop it
-	waitForProcessState(t, addr, "long", "running", 5*time.Second)
+	waitForProcessState(t, addr, "long", "running", within(t, processStateTimeout))
 
 	// Stop the process
 	req, err := http.NewRequest(http.MethodPost, addr+"/api/v1/processes/long/stop", nil)
 	requireNoError(t, err, "failed to create stop request")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	requireNoError(t, err, "failed to stop")
 	resp.Body.Close()
 
@@ -122,7 +125,7 @@ func TestAPI_ProcessStopStartEndpoint(t *testing.T) {
 	}
 
 	// Wait for process to reach stopped state using polling
-	proc := waitForProcessState(t, addr, "long", "stopped", 5*time.Second)
+	proc := waitForProcessState(t, addr, "long", "stopped", within(t, processStateTimeout))
 	if proc.Status != "stopped" {
 		t.Errorf("expected stopped, got %s", proc.Status)
 	}
@@ -131,7 +134,7 @@ func TestAPI_ProcessStopStartEndpoint(t *testing.T) {
 	req2, err := http.NewRequest(http.MethodPost, addr+"/api/v1/processes/long/start", nil)
 	requireNoError(t, err, "failed to create start request")
 
-	resp3, err := http.DefaultClient.Do(req2)
+	resp3, err := apiClient.Do(req2)
 	requireNoError(t, err, "failed to start")
 	resp3.Body.Close()
 
@@ -140,13 +143,14 @@ func TestAPI_ProcessStopStartEndpoint(t *testing.T) {
 	}
 
 	// Wait for process to reach running state using polling
-	proc2 := waitForProcessState(t, addr, "long", "running", 5*time.Second)
+	proc2 := waitForProcessState(t, addr, "long", "running", within(t, processStateTimeout))
 	if proc2.Status != "running" {
 		t.Errorf("expected running, got %s", proc2.Status)
 	}
 }
 
 func TestAPI_LogsEndpoint(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
@@ -154,7 +158,7 @@ func TestAPI_LogsEndpoint(t *testing.T) {
 	// Wait for some logs to be generated
 	time.Sleep(2 * time.Second)
 
-	resp, err := http.Get(addr + "/api/v1/logs?limit=10")
+	resp, err := apiClient.Get(addr + "/api/v1/logs?limit=10")
 	requireNoError(t, err, "failed to get logs")
 	defer resp.Body.Close()
 
@@ -179,12 +183,13 @@ func TestAPI_LogsEndpoint(t *testing.T) {
 }
 
 func TestAPI_SSELogsStream(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
 
 	// Connect to SSE stream
-	resp, err := http.Get(addr + "/api/v1/logs/stream")
+	resp, err := sseHTTPClient.Get(addr + "/api/v1/logs/stream")
 	requireNoError(t, err, "failed to connect to SSE stream")
 	defer resp.Body.Close()
 
@@ -248,11 +253,12 @@ func TestAPI_SSELogsStream(t *testing.T) {
 }
 
 func TestAPI_NotFoundProcess(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	addr := startAPIFixture(t)
 
-	resp, err := http.Get(addr + "/api/v1/processes/nonexistent")
+	resp, err := apiClient.Get(addr + "/api/v1/processes/nonexistent")
 	requireNoError(t, err, "failed to get process")
 	defer resp.Body.Close()
 

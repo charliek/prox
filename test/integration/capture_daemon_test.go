@@ -37,6 +37,7 @@ import (
 //   - The disk-backed body file lives under the isolated HOME's .prox/capture and
 //     loads through proxy.LoadDecodedBody with that directory as the allowlist.
 func TestDaemonCapture_EndToEnd(t *testing.T) {
+	startTest(t, defaultTestBudget)
 	skipShort(t)
 
 	// Isolated HOME so the daemon capture dir (~/.prox/capture) is a temp dir and
@@ -98,7 +99,7 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	defer dynamicProxy.Shutdown(context.Background())
 
 	client := proxyd.NewClient(socketPath)
-	waitDaemonReady(t, client)
+	waitDaemonReady(t, client, within(t, apiReadyTimeout))
 
 	// One HTTP listener; A and B share the port with distinct domains. A's
 	// registration is the one that binds it, so it is the one that retries.
@@ -140,7 +141,7 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 
 	// Confirm both bridges are live by pinging until each side observes a record.
 	// (Guards against subscribing after the real traffic was already published.)
-	waitBridgesLive(t, proxyPort, hostnameA, hostnameB, localRMA, localRMB)
+	waitBridgesLive(t, proxyPort, hostnameA, hostnameB, localRMA, localRMB, within(t, streamFrameTimeout))
 
 	// Drive the scenario traffic once each.
 	if got := driveProxy(t, proxyPort, hostnameA, http.MethodPost, "/echo", []byte("hello small")); got != "hello small" {
@@ -154,13 +155,13 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	}
 
 	// --- Assert via the ForwardRequests bridge (project-side view) ---
-	echoRec := waitForRecord(t, localRMA, capturedRecord("/echo"))
-	largeRec := waitForRecord(t, localRMA, capturedRecord("/large"))
+	echoRec := waitForRecord(t, localRMA, capturedRecord("/echo"), within(t, streamFrameTimeout))
+	largeRec := waitForRecord(t, localRMA, capturedRecord("/large"), within(t, streamFrameTimeout))
 	// B has capture disabled, so its completion record carries no Details --
 	// only the in-flight phase has to be excluded here.
 	bRec := waitForRecord(t, localRMB, func(r proxy.RequestRecord) bool {
 		return r.URL == "/" && !r.InFlight
-	})
+	}, within(t, streamFrameTimeout))
 
 	// A: small POST carries inline request + response bodies that round-trip.
 	if echoRec.Details == nil || echoRec.Details.RequestBody == nil || echoRec.Details.ResponseBody == nil {
@@ -222,7 +223,7 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	aRecs := waitForDaemonRequests(t, socketPath, "/projects/a", func(recs []proxy.RequestRecord) bool {
 		return findRecord(recs, capturedRecord("/echo")) != nil &&
 			findRecord(recs, capturedRecord("/large")) != nil
-	})
+	}, within(t, streamFrameTimeout))
 	if r := findRecord(aRecs, capturedRecord("/echo")); r == nil {
 		t.Errorf("daemon /requests for A missing completed /echo record")
 	} else if r.Details.RequestBody == nil || string(r.Details.RequestBody.Data) != "hello small" {
@@ -241,7 +242,7 @@ func TestDaemonCapture_EndToEnd(t *testing.T) {
 	completedB := func(r proxy.RequestRecord) bool { return r.URL == "/" && !r.InFlight }
 	bRecs := waitForDaemonRequests(t, socketPath, "/projects/b", func(recs []proxy.RequestRecord) bool {
 		return findRecord(recs, completedB) != nil
-	})
+	}, within(t, streamFrameTimeout))
 	if r := findRecord(bRecs, completedB); r == nil {
 		t.Errorf("daemon /requests for B missing record")
 	} else if r.Details != nil {
@@ -305,16 +306,16 @@ func freePort(t *testing.T) (int, net.Listener) {
 	return l.Addr().(*net.TCPAddr).Port, l
 }
 
-func waitDaemonReady(t *testing.T, client *proxyd.Client) {
+func waitDaemonReady(t *testing.T, client *proxyd.Client, deadline time.Time) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	start := time.Now()
 	for time.Now().Before(deadline) {
 		if _, err := client.Health(); err == nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("daemon socket did not become ready")
+	t.Fatalf("daemon socket did not become ready %s", waitedFor(start, deadline))
 }
 
 // driveProxyTimeout bounds one request driven through the proxy listener, and
@@ -356,9 +357,9 @@ func driveProxy(t *testing.T, port int, hostname, method, path string, body []by
 
 // waitBridgesLive pings A and B through the proxy until each project-side manager
 // has observed at least one record, confirming both SSE subscriptions are active.
-func waitBridgesLive(t *testing.T, port int, hostnameA, hostnameB string, localRMA, localRMB *proxy.RequestManager) {
+func waitBridgesLive(t *testing.T, port int, hostnameA, hostnameB string, localRMA, localRMB *proxy.RequestManager, deadline time.Time) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	start := time.Now()
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -366,8 +367,8 @@ func waitBridgesLive(t *testing.T, port int, hostnameA, hostnameB string, localR
 			return
 		}
 		select {
-		case <-deadline:
-			t.Fatalf("bridges did not go live (A=%d, B=%d)", localRMA.Count(), localRMB.Count())
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("bridges did not go live %s (A=%d, B=%d)", waitedFor(start, deadline), localRMA.Count(), localRMB.Count())
 		case <-tick.C:
 			_ = driveProxy(t, port, hostnameA, http.MethodGet, "/ping", nil)
 			_ = driveProxy(t, port, hostnameB, http.MethodGet, "/ping", nil)
@@ -375,9 +376,9 @@ func waitBridgesLive(t *testing.T, port int, hostnameA, hostnameB string, localR
 	}
 }
 
-func waitForRecord(t *testing.T, rm *proxy.RequestManager, match func(proxy.RequestRecord) bool) proxy.RequestRecord {
+func waitForRecord(t *testing.T, rm *proxy.RequestManager, match func(proxy.RequestRecord) bool, deadline time.Time) proxy.RequestRecord {
 	t.Helper()
-	deadline := time.After(3 * time.Second)
+	start := time.Now()
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -387,8 +388,8 @@ func waitForRecord(t *testing.T, rm *proxy.RequestManager, match func(proxy.Requ
 			}
 		}
 		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for matching record")
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("no matching record %s", waitedFor(start, deadline))
 		case <-tick.C:
 		}
 	}
@@ -427,9 +428,9 @@ func findRecord(recs []proxy.RequestRecord, match func(proxy.RequestRecord) bool
 // The endpoint reads the same two-phase ring the SSE bridge does, so a single
 // unpolled fetch has the identical race as a URL-only waitForRecord: it can
 // land between phase 1 and phase 2 and hand back an in-flight record.
-func waitForDaemonRequests(t *testing.T, socketPath, project string, want func([]proxy.RequestRecord) bool) []proxy.RequestRecord {
+func waitForDaemonRequests(t *testing.T, socketPath, project string, want func([]proxy.RequestRecord) bool, deadline time.Time) []proxy.RequestRecord {
 	t.Helper()
-	deadline := time.After(3 * time.Second)
+	start := time.Now()
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -438,8 +439,8 @@ func waitForDaemonRequests(t *testing.T, socketPath, project string, want func([
 			return recs
 		}
 		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for daemon /requests?project=%s to satisfy predicate (%d records)", project, len(recs))
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("daemon /requests?project=%s did not satisfy the predicate %s (%d records)", project, waitedFor(start, deadline), len(recs))
 		case <-tick.C:
 		}
 	}
