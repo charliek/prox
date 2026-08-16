@@ -346,11 +346,27 @@ func TestTrustResolver_BadVerdictIsReAsked(t *testing.T) {
 		Stdout: mkcertCreatedNote + "\n" + mkcertSystemNote + "\n",
 	})
 	tr := NewTrustResolver()
+	// Drive the clock rather than sleep: re-probing a bad verdict is throttled
+	// by reProbeInterval so a broken machine does not shell out on every single
+	// registration (CodeRabbit, PR #110), and this test is about the re-ask
+	// happening at all, not about how long it waits.
+	clock := time.Now()
+	tr.now = func() time.Time { return clock }
 
 	v := tr.Resolve(context.Background())
 	require.NotNil(t, v.Warning, "precondition: the CA is reported untrusted")
 
-	// Still broken: prox keeps asking rather than trusting a stale verdict.
+	// Inside the throttle window the held verdict stands, and no subprocess
+	// runs -- the warning is still reported, just not re-derived.
+	before := len(fake.generationCalls(t))
+	v = tr.Resolve(context.Background())
+	require.NotNil(t, v.Warning, "the warning keeps being reported while throttled")
+	require.Equal(t, before, len(fake.generationCalls(t)),
+		"a re-ask inside the throttle window must not shell out")
+
+	// Past the window: still broken, so prox asks again rather than trusting a
+	// stale verdict.
+	clock = clock.Add(reProbeInterval + time.Second)
 	v = tr.Resolve(context.Background())
 	require.NotNil(t, v.Warning)
 	require.GreaterOrEqual(t, len(fake.generationCalls(t)), 2,
@@ -358,15 +374,18 @@ func TestTrustResolver_BadVerdictIsReAsked(t *testing.T) {
 
 	// The user runs `mkcert -install`: mkcert stops printing the note.
 	fake.setStdout(t, mkcertCreatedNote+"\n")
+	clock = clock.Add(reProbeInterval + time.Second)
 
 	v = tr.Resolve(context.Background())
 	require.True(t, v.Known)
 	assert.Nil(t, v.Warning, "the warning must be withdrawn once mkcert says the CA is installed")
 
-	// ...and having settled good, it stops probing.
-	before := len(fake.generationCalls(t))
+	// ...and having settled good, it stops probing -- even well past the
+	// throttle window, because a good verdict is final for the process.
+	clock = clock.Add(10 * reProbeInterval)
+	settled := len(fake.generationCalls(t))
 	require.Nil(t, tr.Resolve(context.Background()).Warning)
-	assert.Equal(t, before, len(fake.generationCalls(t)))
+	assert.Equal(t, settled, len(fake.generationCalls(t)))
 }
 
 // TestTrustResolver_ProbesAtMostOncePerProcess pins the latch. The probe is a

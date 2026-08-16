@@ -309,6 +309,13 @@ func TestStartDetachedDaemon_WarningsPrintOnAFailedStartToo(t *testing.T) {
 // running. A single fetch at that instant would return nothing.
 func TestAwaitDaemonWarnings_PollsUntilSealed(t *testing.T) {
 	ops := fastStartupOps()
+	// Generous, because this test is about the POLLING, not the budget: the
+	// default 40ms deadline is real wall-clock time, so a scheduling hiccup
+	// between fetches could expire it and end the loop early, making the
+	// assertion below fail for a reason that has nothing to do with the latch
+	// (CodeRabbit, PR #110). ops.sleep is a no-op, so a large budget costs
+	// nothing.
+	ops.warningsTimeout = time.Minute
 	fetches := 0
 	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
 		fetches++

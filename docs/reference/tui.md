@@ -122,16 +122,18 @@ The processes panel colour-codes each process name by its state, including the s
 
 **Colour is emphasis, not the only signal.** `crashed`/`blocked` share one colour role, as do `stopped`/`completed`, so those pairs are only colour-distinguishable — nothing at all once ANSI is stripped (piped output, `TERM=dumb`, a screenshot) or to a colour-blind reader. Every state but `running` therefore appends a parenthesized word to the process name, and that label is what actually survives stripping:
 
+Each suffix is appended after the process name, separated by a space.
+
 | State | Name suffix |
 | ----- | ------------ |
 | `running` | *(none)* |
-| `crashed` | ` (crashed)` |
-| `blocked` | ` (blocked)`, or ` (blocked on: <target>[, ...])` naming the failed `depends_on` targets |
-| `waiting` | ` (waiting)`, or ` (waiting on: <target>[, ...])` naming the still-resolving targets |
-| `completed` | ` (done)` |
-| `stopped` | ` (stopped)` |
-| `starting` | ` (starting)` |
-| `stopping` | ` (stopping)` |
+| `crashed` | `(crashed)` |
+| `blocked` | `(blocked)`, or `(blocked on: <target>[, ...])` naming the failed `depends_on` targets |
+| `waiting` | `(waiting)`, or `(waiting on: <target>[, ...])` naming the still-resolving targets |
+| `completed` | `(done)` |
+| `stopped` | `(stopped)` |
+| `starting` | `(starting)` |
+| `stopping` | `(stopping)` |
 
 A process with a [healthcheck](configuration.md#health-check-fields) shows a health dot after its name (and its state label): green `●` while healthy, red `✗` while unhealthy. A process with no healthcheck configured, or whose check has not reported yet, shows no dot.
 

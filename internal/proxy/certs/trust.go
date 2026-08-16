@@ -51,6 +51,13 @@ const trustProbeTimeout = 5 * time.Second
 // still took 60s to return.)
 const probeWaitDelay = 500 * time.Millisecond
 
+// mkcertGenerateTimeout bounds a real certificate generation. Generation runs
+// inside the daemon's register() under lifecycleMu, so an mkcert that hangs
+// would take every other project's registration down with it. Far more
+// generous than trustProbeTimeout because this one does real work a user is
+// waiting on, rather than answering a diagnostic question.
+const mkcertGenerateTimeout = 60 * time.Second
+
 // probeHostname is the name the probe asks mkcert to certify. It is under the
 // reserved .invalid TLD (RFC 2606), so the throwaway certificate can never be
 // valid for anything real, and the name cannot resolve.
@@ -159,14 +166,38 @@ type TrustResolver struct {
 	// probeMu serializes the probe itself. It is separate from mu so the state
 	// lock is never held across an exec, and probed (guarded by it) is what
 	// makes the probe at-most-once even if the first attempt fails.
-	probeMu sync.Mutex
-	probed  bool
+	probeMu   sync.Mutex
+	probed    bool
+	lastProbe time.Time
+
+	// now is time.Now, swappable in tests. Nothing else in this file reads the
+	// clock, so a test can drive the re-probe interval without sleeping.
+	now func() time.Time
 }
+
+// reProbeInterval is the floor between re-probes while the verdict is BAD.
+//
+// Re-asking is what lets a fixed machine stop being warned at (see Resolve),
+// but the probe runs inside the daemon's register() under lifecycleMu, so an
+// unthrottled one would make every registration on a broken machine pay for a
+// subprocess while every other project waits (CodeRabbit, PR #110). A user who
+// runs `mkcert -install` and re-runs `prox up` is not doing it twice within
+// this window, so the floor costs them nothing.
+const reProbeInterval = 30 * time.Second
 
 // NewTrustResolver returns a resolver with no verdict yet. Production code uses
 // SharedTrust; this exists so a test can have a resolver whose once-per-process
 // latch is its own.
-func NewTrustResolver() *TrustResolver { return &TrustResolver{} }
+func NewTrustResolver() *TrustResolver { return &TrustResolver{now: time.Now} }
+
+// clock reads the resolver's time source, defaulting to time.Now so a
+// zero-value TrustResolver stays usable.
+func (r *TrustResolver) clock() time.Time {
+	if r.now == nil {
+		return time.Now()
+	}
+	return r.now()
+}
 
 // sharedTrust is the process-wide resolver. Every production caller shares it,
 // which is what lets a real generation in one component answer for a probe that
@@ -235,7 +266,16 @@ func (r *TrustResolver) Resolve(ctx context.Context) TrustVerdict {
 	if !r.verdict().Known && r.probed {
 		return TrustVerdict{}
 	}
+	// Re-asking a BAD verdict is throttled: see reProbeInterval. Until the
+	// window elapses the held verdict stands, so the warning keeps being
+	// reported -- it just is not re-derived on every single registration.
+	if v := r.verdict(); v.Known && v.Warning != nil {
+		if !r.lastProbe.IsZero() && r.clock().Sub(r.lastProbe) < reProbeInterval {
+			return v
+		}
+	}
 	r.probed = true
+	r.lastProbe = r.clock()
 
 	lines, ok := probeCATrust(ctx)
 	if !ok {

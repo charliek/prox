@@ -4,6 +4,7 @@ package certs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -132,7 +133,19 @@ func (m *Manager) generateCerts(paths *CertPaths) ([]string, error) {
 	// Generate wildcard certificate for the domain
 	// mkcert -cert-file <cert> -key-file <key> "*.domain" "domain"
 	wildcardDomain := fmt.Sprintf("*.%s", m.domain)
-	cmd := exec.Command("mkcert",
+	// Bounded, because this runs inside register() while the daemon holds
+	// lifecycleMu: an mkcert that never returns would wedge every other
+	// project's registration and the shutdown barrier with it. The bound is
+	// deliberately generous -- issuing one certificate is sub-second, and this
+	// exists to break a hang, not to race a slow machine (CodeRabbit, PR #110;
+	// the unbounded exec predates plan 028).
+	//
+	// WaitDelay is NOT a substitute: it only bounds pipe cleanup AFTER the
+	// process exits, which is the separate hazard the capture below introduced.
+	// Both are needed, and they cover different failures.
+	ctx, cancel := context.WithTimeout(context.Background(), mkcertGenerateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mkcert",
 		"-cert-file", paths.CertFile,
 		"-key-file", paths.KeyFile,
 		wildcardDomain,

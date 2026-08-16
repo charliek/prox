@@ -122,7 +122,7 @@ A non-zero exit from step 2 means something different from one from step 1: **th
 
 **Warnings.** Advisories that are not failures — an untrusted mkcert CA, a registered hostname that does not resolve — print as `Warning: <message>` on stderr, with an indented hint line underneath when there is one:
 
-```
+```text
 Warning: Note: the local CA is not installed in the system trust store.
          run 'mkcert -install' and restart prox
 ```

@@ -130,9 +130,15 @@ func TestProcessState_IsLiveAndIsTerminalFailure(t *testing.T) {
 			assert.Equal(t, tt.wantTerminalFailure, state.IsTerminalFailure(), "IsTerminalFailure")
 
 			// The two predicates must never both be true for the same state: a
-			// state cannot be both "still changing on its own" and "definitively
-			// failed".
-			assert.False(t, tt.wantLive && tt.wantTerminalFailure, "state %q cannot be both live and a terminal failure", state)
+			// state cannot be both "still changing on its own" and
+			// "definitively failed".
+			//
+			// Asserted on the METHOD results, not on the table literals above.
+			// Reading tt.wantLive && tt.wantTerminalFailure here would only
+			// prove the table is self-consistent, and would pass against any
+			// implementation at all (CodeRabbit, PR #110).
+			assert.False(t, state.IsLive() && state.IsTerminalFailure(),
+				"state %q cannot be both live and a terminal failure", state)
 		})
 	}
 }
