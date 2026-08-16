@@ -447,6 +447,76 @@ func TestToProcessDetailResponse_StopTimeoutOmittedWhenUnset(t *testing.T) {
 	}
 }
 
+// TestHealthNoneReachesBothDTOs pins the #100 wire contract: the new "none"
+// health value survives conversion into BOTH the list and detail DTOs and
+// serializes as "health":"none", so a client can tell "no healthcheck
+// configured" from "configured but not reporting" without guessing.
+func TestHealthNoneReachesBothDTOs(t *testing.T) {
+	info := domain.ProcessInfo{
+		Name:   "web",
+		State:  domain.ProcessStateRunning,
+		PID:    4242,
+		Health: domain.HealthStatusNone,
+		Cmd:    "sleep 30",
+		// No HealthDetails: an unconfigured check has nothing to describe.
+	}
+
+	listJSON, err := json.Marshal(ToProcessResponse(info))
+	if err != nil {
+		t.Fatalf("marshal list DTO: %v", err)
+	}
+	if !strings.Contains(string(listJSON), `"health":"none"`) {
+		t.Errorf(`list DTO missing "health":"none"; got %s`, listJSON)
+	}
+
+	detail := ToProcessDetailResponse(info)
+	if detail.Healthcheck != nil {
+		t.Errorf("expected no healthcheck block for an unconfigured check, got %+v", detail.Healthcheck)
+	}
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatalf("marshal detail DTO: %v", err)
+	}
+	if !strings.Contains(string(detailJSON), `"health":"none"`) {
+		t.Errorf(`detail DTO missing "health":"none"; got %s`, detailJSON)
+	}
+	if strings.Contains(string(detailJSON), `"healthcheck"`) {
+		t.Errorf("detail DTO should omit the healthcheck block entirely; got %s", detailJSON)
+	}
+}
+
+// TestHealthUnknownSurvivesForConfiguredCheck is the counterpart: a CONFIGURED
+// check that has not reported still reports "unknown" (never "none"), and its
+// dormant detail block carries enabled:false rather than the old hardcoded
+// true.
+func TestHealthUnknownSurvivesForConfiguredCheck(t *testing.T) {
+	info := domain.ProcessInfo{
+		Name:   "api",
+		State:  domain.ProcessStateCrashed,
+		Health: domain.HealthStatusUnknown,
+		Cmd:    "sleep 30",
+		HealthDetails: &domain.HealthState{
+			Enabled: false,
+			Status:  domain.HealthStatusUnknown,
+		},
+	}
+
+	if got := ToProcessResponse(info).Health; got != "unknown" {
+		t.Errorf("list DTO health = %q, want %q", got, "unknown")
+	}
+
+	detail := ToProcessDetailResponse(info)
+	if detail.Health != "unknown" {
+		t.Errorf("detail DTO health = %q, want %q", detail.Health, "unknown")
+	}
+	if detail.Healthcheck == nil {
+		t.Fatal("expected a healthcheck block for a configured check")
+	}
+	if detail.Healthcheck.Enabled {
+		t.Error("expected Healthcheck.Enabled false for a check whose loop is not running")
+	}
+}
+
 func TestToLogEntryResponse(t *testing.T) {
 	now := time.Now()
 	entry := domain.LogEntry{

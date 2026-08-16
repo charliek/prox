@@ -358,6 +358,12 @@ needed for the fields below.
 
 Duration fields use Go's duration syntax (e.g. `500ms`, `30s`, `1m30s`). An invalid or negative duration makes `prox up` fail at startup with a clear error naming the field (e.g. `processes.api.healthcheck.interval: invalid duration "3x"`). Omitting a field — or setting it to `0` — uses the default shown above.
 
+A process with **no** `healthcheck:` block reports health `none` on the API and
+renders as `-` in the `prox status` table — prox never had a check to run.
+`unknown` is reserved for a *configured* check that has not reported a verdict
+yet: the process is stopped, crashed, not yet launched, or still inside its
+`start_period`. See [Health values](api.md#get-processes).
+
 ## Environment Variable Precedence
 
 Environment variables are loaded in this order (later values override earlier):

@@ -101,7 +101,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	for _, p := range processes.Processes {
 		uptime := formatDuration(time.Duration(p.UptimeSeconds) * time.Second)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
-			p.Name, statusField(p), pidField(p), uptime, p.Restarts, p.Health)
+			p.Name, statusField(p), pidField(p), uptime, p.Restarts, healthField(p))
 	}
 	w.Flush()
 
@@ -159,6 +159,19 @@ func pidField(p api.ProcessResponse) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", p.PID)
+}
+
+// healthField renders the HEALTH column. A process with no healthcheck
+// configured reports "none" on the wire and renders as "-" here (#100),
+// matching the pidField convention right beside it: nothing was ever checked,
+// so the column is empty rather than claiming an inconclusive check. "unknown"
+// is left verbatim — that means a check IS configured and has not reported yet.
+// Any other value (including one from a newer daemon) passes through unchanged.
+func healthField(p api.ProcessResponse) string {
+	if p.Health == string(domain.HealthStatusNone) || p.Health == "" {
+		return "-"
+	}
+	return p.Health
 }
 
 // blockedSummaries returns one "name(target1, target2)" entry per blocked

@@ -93,8 +93,8 @@ Key rules: names must be unique across `processes`/`dependencies`/`tasks`; a `de
 
 ```text
 NAME    STATUS                  PID  UPTIME  RESTARTS  HEALTH
-api     waiting(redis)          -    0s      0         unknown
-migrate blocked(postgres)       -    0s      0         unknown
+api     waiting(redis)          -    0s      0         -
+migrate blocked(postgres)       -    0s      0         -
 
 Blocked: migrate(postgres)
 
@@ -105,6 +105,7 @@ redis     polling  tcp localhost:6379
 ```
 
 - `waiting(x, y)` — still resolving those targets; `blocked(x)` — a required target failed and this process/task will never launch on its own.
+- **HEALTH `-` is not a problem.** It means no `healthcheck:` is configured (`"health": "none"` in JSON), so prox never had a check to run. `unknown` means a check *is* configured and has not reported yet (stopped, crashed, not yet launched, or still inside its `start_period`) — it is not a failed check either. Only `unhealthy` is a real signal.
 - A **task** that exits `0` lands in `completed` (PID `-`, uptime frozen) and runs only **once per `prox up` lifetime** — a dependent's restart does not re-run it.
 - **Re-demand a blocked dependency:** `prox start <name>` on a blocked, gated process resets only its *failed* targets (healthy/warned ones keep their cached result) and re-resolves.
 - **Re-run a task:** `prox restart <task>` (or `prox stop <task>` + `prox start <task>`).

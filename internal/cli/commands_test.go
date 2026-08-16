@@ -1601,6 +1601,83 @@ func TestRunStatus_SharedProxyDownJSONExits1(t *testing.T) {
 	}
 }
 
+// TestRunStatus_HealthNoneRendersDash pins #100 in the human table: a process
+// with no healthcheck configured reports "none" on the wire and must render as
+// "-", the same convention pidField already uses for an absent PID. It must NOT
+// read as "unknown", which claims prox tried to check and could not tell. A
+// configured-but-not-reporting check on the same table still reads "unknown".
+func TestRunStatus_HealthNoneRendersDash(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "web", Status: "running", PID: 1234, Health: "none"},
+		api.ProcessResponse{Name: "api", Status: "running", PID: 1235, Health: "unknown"},
+		api.ProcessResponse{Name: "db", Status: "running", PID: 1236, Health: "healthy"},
+	)
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+	if runErr != nil {
+		t.Fatalf("runStatus returned %v, want nil", runErr)
+	}
+
+	if strings.Contains(stdout, "none") {
+		t.Errorf("the raw wire value 'none' must not reach the table; got:\n%s", stdout)
+	}
+	for _, want := range []string{"web", "api", "db"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing process %q; got:\n%s", want, stdout)
+		}
+	}
+	// Column-accurate check: the HEALTH column is the last field on each row.
+	for _, tc := range []struct{ name, health string }{
+		{"web", "-"},
+		{"api", "unknown"},
+		{"db", "healthy"},
+	} {
+		row := statusRow(t, stdout, tc.name)
+		fields := strings.Fields(row)
+		if got := fields[len(fields)-1]; got != tc.health {
+			t.Errorf("process %q HEALTH column = %q, want %q (row: %q)", tc.name, got, tc.health, row)
+		}
+	}
+}
+
+// TestRunStatus_HealthNoneJSONIsVerbatim pins the other half of #100: the "-"
+// is a RENDERING choice, so the JSON payload still carries the machine value
+// "none" verbatim for scripts to switch on.
+func TestRunStatus_HealthNoneJSONIsVerbatim(t *testing.T) {
+	statusServerWithProxy(t, nil,
+		api.ProcessResponse{Name: "web", Status: "running", PID: 1234, Health: "none"},
+	)
+	statusJSON = true
+	t.Cleanup(func() { statusJSON = false })
+
+	var runErr error
+	stdout, _ := captureOutput(t, func() {
+		runErr = runStatus(statusCmd, []string{})
+	})
+	if runErr != nil {
+		t.Fatalf("runStatus (JSON) returned %v, want nil", runErr)
+	}
+	if !strings.Contains(stdout, `"health":"none"`) {
+		t.Errorf(`JSON output missing "health":"none"; got:\n%s`, stdout)
+	}
+}
+
+// statusRow returns the `prox status` table row whose first field is name.
+func statusRow(t *testing.T, stdout, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return line
+		}
+	}
+	t.Fatalf("no table row for process %q in:\n%s", name, stdout)
+	return ""
+}
+
 // TestRunStatus_CrashedChildExits1 pins D1 (#72): a crashed child makes
 // `prox status` return a non-nil error (exit 1) in table mode and print the
 // Crashed line naming the process.
