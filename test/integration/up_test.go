@@ -480,49 +480,33 @@ func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
 	binary := buildBinary(t)
 
 	// Isolated working dir: nothing here touches the repo root's .prox, and the
-	// process the config would have launched leaves a marker file we can look for.
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "launched.marker")
-	cfg := filepath.Join(dir, "prox.yaml")
-	cfgBody := "api:\n  host: 127.0.0.1\n\nprocesses:\n  marker:\n    cmd: touch " + marker + " && sleep 30\n"
-	if err := os.WriteFile(cfg, []byte(cfgBody), 0644); err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+	// process the config would have launched leaves a marker file we can look
+	// for. The marker path is relative because a prox process inherits the
+	// daemon's cwd, i.e. the fixture directory.
+	f := newInlineFixture(t, tuiMarkerFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "--tui", "-c", cfg)
-	cmd.Dir = dir
-
-	done := make(chan struct{})
-	var out []byte
-	var runErr error
-	go func() {
-		out, runErr = cmd.CombinedOutput()
-		close(done)
-	}()
-
-	// The guard runs before any startup work, so this is near-instant; the budget
-	// is generous only to absorb a loaded CI machine.
-	select {
-	case <-done:
-	case <-time.After(20 * time.Second):
-		killProx(cmd)
-		t.Fatal("prox up --tui did not exit; the non-TTY guard should refuse immediately")
-	}
+	// The guard runs before any startup work, so this exits near-instantly; the
+	// budget is generous only to absorb a loaded CI machine. WaitExit observes
+	// the run's single Cmd.Wait rather than racing a second one, which is what
+	// the old CombinedOutput-in-a-goroutine plus killProx-on-timeout pair did.
+	run := f.Start(t, binary, "up", "--tui", "-c", f.configPath)
+	runErr := run.WaitExit(t, 20*time.Second)
+	out := run.Output()
 
 	var ee *exec.ExitError
 	if !errors.As(runErr, &ee) {
 		t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", runErr, out)
 	}
-	if !strings.Contains(string(out), "--tui requires an interactive terminal") {
+	if !strings.Contains(out, "--tui requires an interactive terminal") {
 		t.Errorf("expected the interactive-terminal guard message, got:\n%s", out)
 	}
 
 	// Nothing may have started: no marker from the configured process, and no
 	// state directory (the guard fires before EnsureStateDir).
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.dir, tuiMarkerName)); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before starting processes, but the marker exists (stat err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.dir, ".prox")); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before any state is written, but .prox exists (stat err=%v)", err)
 	}
 }
@@ -695,27 +679,13 @@ func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "--no-tui", "-c", cfg)
-	cmd.Dir = dir
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.Start(t, binary, "up", "--no-tui", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`up --no-tui` did not reach the startup preamble; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if strings.Contains(buf.String(), "unknown flag") {
-		t.Fatalf("--no-tui must be a registered flag; output:\n%s", buf.String())
+	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	if strings.Contains(run.Output(), "unknown flag") {
+		t.Fatalf("--no-tui must be a registered flag; output:\n%s", run.Output())
 	}
 }
 
@@ -728,28 +698,13 @@ func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "-c", cfg)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PROX_TUI=banana")
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=banana")}, "up", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`up` with a bad PROX_TUI did not start; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !strings.Contains(buf.String(), "PROX_TUI") || !strings.Contains(buf.String(), "banana") {
-		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", buf.String())
+	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	if out := run.Output(); !strings.Contains(out, "PROX_TUI") || !strings.Contains(out, "banana") {
+		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", out)
 	}
 }
 
@@ -762,30 +717,17 @@ func TestUpTUIEnv_RecognizedValueIsSilent(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	dir, cfg := upTUIFixture(t)
+	f := newInlineFixture(t, tuiFixtureConfig)
 
-	cmd := exec.Command(binary, "up", "-c", cfg)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PROX_TUI=1")
-	buf := &syncBuffer{}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-	defer killProx(cmd)
+	run := f.StartWith(t, binary, []startOpt{withEnv("PROX_TUI=1")}, "up", "-c", f.configPath)
 
-	deadline := time.Now().Add(20 * time.Second)
-	for !strings.Contains(buf.String(), "API server: ") {
-		if time.Now().After(deadline) {
-			t.Fatalf("`PROX_TUI=1 up` under pipes must stream plain logs, not fail; output:\n%s", buf.String())
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Reaching the preamble at all is the "must not fail" half of the assertion.
+	waitForRunOutputContains(t, run, "API server: ", 20*time.Second)
+	out := run.Output()
+	if strings.Contains(out, "PROX_TUI") {
+		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", out)
 	}
-	if strings.Contains(buf.String(), "PROX_TUI") {
-		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", buf.String())
-	}
-	if strings.Contains(buf.String(), "requires an interactive terminal") {
-		t.Errorf("PROX_TUI=1 is a preference, not an assertion; it must never hard-error, got:\n%s", buf.String())
+	if strings.Contains(out, "requires an interactive terminal") {
+		t.Errorf("PROX_TUI=1 is a preference, not an assertion; it must never hard-error, got:\n%s", out)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,17 +239,75 @@ func (f *proxFixture) Run(t *testing.T, binary string, args ...string) (string, 
 	return string(out), exitCode
 }
 
+// startOpt customizes a launch after its exec.Cmd has been built with this
+// fixture's directory and the default stdio wiring, and before the process is
+// actually started.
+//
+// It exists so that a test needing unusual stdio -- above all the pty tests,
+// which must hand prox a real controlling terminal -- can supply that wiring
+// without owning the process. Cmd.Wait stays in StartWith, called exactly once
+// per launch: a test that starts its own process is a test that must wait for
+// it, and that is precisely how the concurrent-Wait defect got in.
+type startOpt func(t *testing.T, l *launch)
+
+// launch is the mutable description of one prox launch, handed to each startOpt
+// before the process starts.
+type launch struct {
+	// cmd is the command about to run. An opt may edit any of its fields --
+	// Env and the three stdio streams are the ones that matter -- but must
+	// never start or wait on it outside of start below.
+	cmd *exec.Cmd
+	// out is what proxRun.Output() returns. An opt that rewires stdio must
+	// replace it with a buffer it actually feeds, since the default one will
+	// then receive nothing (see startPTYRun in tui_pty_test.go).
+	out *syncBuffer
+	// start starts cmd. It is a field rather than a hardcoded cmd.Start because
+	// only pty.StartWithSize allocates a terminal; an opt that replaces it may
+	// also skip the test itself (a sandbox that refuses ptys is a skip, not a
+	// failure). A returned error is reported by StartWith.
+	start func(*exec.Cmd) error
+}
+
+// withEnv appends key=value entries to the launch's environment. A nil Env
+// means "inherit", so it is materialized first rather than replaced -- a prox
+// subprocess with an environment of exactly one variable behaves nothing like
+// the one a user runs.
+func withEnv(kv ...string) startOpt {
+	return func(t *testing.T, l *launch) {
+		if l.cmd.Env == nil {
+			l.cmd.Env = os.Environ()
+		}
+		l.cmd.Env = append(l.cmd.Env, kv...)
+	}
+}
+
 // Start launches prox in this fixture's directory and returns the run handle.
 func (f *proxFixture) Start(t *testing.T, binary string, args ...string) *proxRun {
+	t.Helper()
+	return f.StartWith(t, binary, nil, args...)
+}
+
+// StartWith is Start with the launch customized by opts -- a different
+// environment, different stdio, a different starter -- while the run handle it
+// returns still owns the one and only Cmd.Wait for the process.
+func (f *proxFixture) StartWith(t *testing.T, binary string, opts []startOpt, args ...string) *proxRun {
 	t.Helper()
 
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = f.dir
-	stdout, stderr := &syncBuffer{}, &syncBuffer{}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	// One buffer for both streams: what a test asserts on is what the terminal
+	// would have shown, and interleaving is what a pty gives anyway, so the two
+	// wirings produce comparable output.
+	out := &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 
-	if err := cmd.Start(); err != nil {
+	l := &launch{cmd: cmd, out: out, start: (*exec.Cmd).Start}
+	for _, opt := range opts {
+		opt(t, l)
+	}
+
+	if err := l.start(cmd); err != nil {
 		t.Fatalf("failed to start prox: %v", err)
 	}
 
@@ -256,8 +315,7 @@ func (f *proxFixture) Start(t *testing.T, binary string, args ...string) *proxRu
 		t:       t,
 		cmd:     cmd,
 		fixture: f,
-		stdout:  stdout,
-		stderr:  stderr,
+		out:     l.out,
 		exited:  make(chan struct{}),
 	}
 	// The ONE Wait for this process, started here and never called again from
@@ -285,14 +343,16 @@ func (f *proxFixture) Start(t *testing.T, binary string, args ...string) *proxRu
 // concurrent Cmd.Wait on the same command. exec.Cmd.Wait is documented as not
 // safe for concurrent use. Here the waiter is started once at launch and both
 // WaitExit and Kill only OBSERVE the channel it closes, so a second Wait is
-// not reachable at all.
+// not reachable at all. TestProxRun_KillDuringWaitExitIsRaceFree holds that
+// line: it reproduces the old shape and fails, under -race and on its own
+// assertion, the moment a second Wait comes back.
 type proxRun struct {
-	t              *testing.T
-	cmd            *exec.Cmd
-	fixture        *proxFixture
-	stdout, stderr *syncBuffer
-	exited         chan struct{} // closed by the single waiter goroutine
-	waitErr        error         // written before exited is closed
+	t       *testing.T
+	cmd     *exec.Cmd
+	fixture *proxFixture
+	out     *syncBuffer   // combined stdout+stderr, or the drained pty master
+	exited  chan struct{} // closed by the single waiter goroutine
+	waitErr error         // written before exited is closed
 
 	mu   sync.Mutex
 	addr string // memoized by Addr
@@ -344,7 +404,21 @@ const killReapTimeout = 10 * time.Second
 
 // Output returns the combined stdout and stderr captured so far.
 func (r *proxRun) Output() string {
-	return r.stdout.String() + r.stderr.String()
+	return r.out.String()
+}
+
+// Signal sends sig to the launched process, failing the test if it cannot.
+//
+// Tests reach for this instead of the exec.Cmd directly, so that the command
+// stays the run handle's business -- the same reason Wait does.
+func (r *proxRun) Signal(t *testing.T, sig os.Signal) {
+	t.Helper()
+	if r.cmd.Process == nil {
+		t.Fatalf("cannot signal %v: process was never started", sig)
+	}
+	if err := r.cmd.Process.Signal(sig); err != nil {
+		t.Fatalf("failed to signal %v: %v", sig, err)
+	}
 }
 
 // StateDir returns this run's private .prox directory.
@@ -430,6 +504,68 @@ const (
 	daemonStateDirName  = ".prox"
 	daemonStateFileName = "prox.state"
 )
+
+// TestProxRun_KillDuringWaitExitIsRaceFree is the regression test for the
+// defect this harness was built to remove: two goroutines calling Cmd.Wait on
+// the same command.
+//
+// The old idiom put `defer killProx(cmd)` in the test and waited via
+// waitCmdExit, which spawned its own `go cmd.Wait()`. Whenever a wait timed out
+// -- i.e. whenever a test was ALREADY failing -- t.Fatalf ran the deferred
+// killProx, whose second Cmd.Wait ran concurrently with the first. exec.Cmd.Wait
+// is documented as not safe for concurrent use, and both calls write
+// Cmd.ProcessState, so the real failure arrived buried under a race report.
+//
+// This test reproduces exactly that shape against the harness: a still-running
+// process, one goroutine waiting and another killing at the same time. Against
+// proxRun it is quiet, because the single waiter goroutine started at launch
+// owns the Wait and both callers merely observe the channel it closes. Against
+// the old pair it fails twice over -- `-race` reports the concurrent
+// ProcessState access, and the two observers disagree, since whichever Wait
+// loses gets "exec: Wait was already called" instead of the exit status.
+func TestProxRun_KillDuringWaitExitIsRaceFree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the /bin/sh probe below is unix-only")
+	}
+
+	// The config is irrelevant here -- the launched process is a shell, not
+	// prox -- but a fixture is what owns a private directory and the single
+	// Wait, so this exercises the same code path every real test takes.
+	f := newInlineFixture(t, "processes:\n  noop: \"true\"\n")
+	run := f.StartWith(t, "/bin/sh", nil, "-c", "sleep 30")
+
+	// Both calls must be in flight while the process is still running: that is
+	// what puts a second Wait alongside a first one already blocked in wait4.
+	var wg sync.WaitGroup
+	var waitErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		// Generously bounded: this must observe the kill, not its own timeout,
+		// so that no t.Fatalf is reached from this non-test goroutine.
+		waitErr = run.WaitExit(t, 30*time.Second)
+	}()
+	go func() {
+		defer wg.Done()
+		run.Kill()
+	}()
+	wg.Wait()
+
+	// One Wait means one result: a second observer sees the same error value,
+	// not "exec: Wait was already called" and not a nil clobbered by a racing
+	// writer.
+	// Identity, not equivalence, is the assertion: every observer must be handed
+	// the one stored result, so the values have to be the same error.
+	if second := run.WaitExit(t, time.Second); second != waitErr {
+		t.Fatalf("the two observers disagree: concurrent waiter got %v, later waiter got %v", waitErr, second)
+	}
+	if waitErr == nil {
+		t.Fatalf("expected the killed process to report a non-nil wait error, got nil")
+	}
+	if strings.Contains(waitErr.Error(), "Wait was already called") {
+		t.Fatalf("Cmd.Wait was called more than once: %v", waitErr)
+	}
+}
 
 // repoRoot returns the fully resolved repository root.
 func repoRoot(t *testing.T) string {

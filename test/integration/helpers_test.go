@@ -273,35 +273,6 @@ func projectRoot(t *testing.T) string {
 	return filepath.Join(wd, "..", "..")
 }
 
-// waitCmdExit waits for a started command to exit within timeout and returns the
-// exit error from Cmd.Wait (nil on a clean exit). On timeout it kills the process
-// directly (not via killProx, which would call Cmd.Wait a second time and race
-// this goroutine's Wait) and fails the test. Callers at clean-exit sites should
-// assert the returned error is nil.
-func waitCmdExit(t *testing.T, cmd *exec.Cmd, timeout time.Duration) error {
-	t.Helper()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		t.Fatalf("process did not exit within %v", timeout)
-		return nil // unreachable; t.Fatalf stops the test
-	}
-}
-
-// killProx forcefully kills the prox process
-func killProx(cmd *exec.Cmd) {
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-	}
-}
-
 // freePortAttempts bounds how many ports registerOnFreePort will try before
 // giving up. Losing the reserve/bind race once is plausible; losing it three
 // times running means the machine is out of ephemeral ports or something is

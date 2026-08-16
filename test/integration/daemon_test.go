@@ -481,78 +481,43 @@ func TestUpCommand_ForegroundDynamicPort(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
 
-	// Create config WITHOUT api.port - should use dynamic port
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
+	// Config WITHOUT api.port - should use dynamic port.
+	f := newInlineFixture(t, `
 processes:
   test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+`)
 
-	// Start foreground mode (no -d flag)
-	cmd := exec.Command(binary, "up", "-c", configPath)
-	cmd.Dir = tmpDir
-	cmd.Start()
-	defer killProx(cmd)
+	// Start foreground mode (no -d flag). The run handle owns the single
+	// Cmd.Wait and kills the process at test end.
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
-
-	// Read state file to verify dynamic port was written
-	stateData, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("failed to read state file in foreground mode: %v", err)
-	}
-
-	var state struct {
-		Port int `json:"port"`
-	}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Fatalf("failed to parse state: %v", err)
-	}
-
-	if state.Port == 0 {
-		t.Error("expected dynamic port to be assigned in foreground mode")
-	}
-
-	// Verify API is accessible
-	apiAddr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
+	// Addr reads the port back out of this run's own state file, so a non-zero
+	// dynamic port having been written IS the precondition for it returning.
+	apiAddr := run.Addr()
 	waitForAPI(t, apiAddr, apiReadyTimeout)
 
-	t.Logf("Foreground mode using dynamic port: %d", state.Port)
+	t.Logf("Foreground mode using dynamic port: %s", apiAddr)
 }
 
 func TestUpCommand_ForegroundCreatesStateFile(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
 
-	// Create config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-api:
-  port: 16667
+	// The port this config used to pin (16667) was incidental -- the test is
+	// about the state and PID files existing, not about which port they name --
+	// and the fixture strips api: so each run gets its own dynamic one.
+	f := newInlineFixture(t, `
 processes:
   test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+`)
 
 	// Start foreground mode
-	cmd := exec.Command(binary, "up", "-c", configPath)
-	cmd.Dir = tmpDir
-	cmd.Start()
-	defer killProx(cmd)
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for state file to be created
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
+	statePath := filepath.Join(run.StateDir(), daemonStateFileName)
 	waitForStateFile(t, statePath, 10*time.Second)
 
 	// Verify state file exists
@@ -561,7 +526,7 @@ processes:
 	}
 
 	// Verify PID file exists
-	pidPath := filepath.Join(tmpDir, ".prox", "prox.pid")
+	pidPath := filepath.Join(run.StateDir(), "prox.pid")
 	if _, err := os.Stat(pidPath); os.IsNotExist(err) {
 		t.Fatal("PID file not created in foreground mode")
 	}
@@ -571,41 +536,30 @@ func TestUpCommand_ForegroundRejectsSecondInstance(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	tmpDir := t.TempDir()
 
-	// Create config
-	configPath := filepath.Join(tmpDir, "prox.yaml")
-	err := os.WriteFile(configPath, []byte(`
-api:
-  port: 16668
+	// No pinned api.port (this test used to hardcode 16668): the second instance
+	// is refused by the PID-file lock in the shared .prox directory, which has
+	// nothing to do with the port.
+	f := newInlineFixture(t, `
 processes:
   test: "sleep 60"
-`), 0644)
-	if err != nil {
-		t.Fatalf("failed to write config: %v", err)
-	}
+`)
 
 	// Start first instance
-	cmd1 := exec.Command(binary, "up", "-c", configPath)
-	cmd1.Dir = tmpDir
-	cmd1.Start()
-	defer killProx(cmd1)
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	// Wait for state file to be created (indicates PID file is also locked)
-	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
-	waitForStateFile(t, statePath, 10*time.Second)
+	waitForStateFile(t, filepath.Join(run.StateDir(), daemonStateFileName), 10*time.Second)
 
 	// Try to start second instance - should fail
-	cmd2 := exec.Command(binary, "up", "-c", configPath)
-	cmd2.Dir = tmpDir
-	output, err := cmd2.CombinedOutput()
+	output, code := f.Run(t, binary, "up", "-c", f.configPath)
 
-	if err == nil {
+	if code == 0 {
 		t.Fatalf("expected second instance to fail, but it succeeded\noutput: %s", output)
 	}
 
 	// Should mention already running
-	if !strings.Contains(string(output), "already running") {
+	if !strings.Contains(output, "already running") {
 		t.Errorf("expected 'already running' error, got: %s", output)
 	}
 }
