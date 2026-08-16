@@ -1,11 +1,15 @@
 package tui
 
 import (
+	"strconv"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/charliek/prox/internal/domain"
 )
@@ -58,24 +62,110 @@ func TestProcessStyle_GatedStates(t *testing.T) {
 	}
 }
 
-// TestGatedDetail pins the inline gated-launch annotation used by the process
-// panel (plan 013 D5).
-func TestGatedDetail(t *testing.T) {
+// TestStateLabel_GatedDetailPinned pins the two gated-launch annotation
+// strings (plan 013 D5's gatedDetail, now folded into stateLabel) byte-for-byte:
+// " (waiting on: X, Y)" and " (blocked on: X)" with targets in declaration
+// order. Nothing else in the package pins these strings now that gatedDetail
+// itself is gone, so this test is their only guard (issue #92 bug 1 / plan
+// 028 C6).
+func TestStateLabel_GatedDetailPinned(t *testing.T) {
 	tests := []struct {
 		name string
 		p    domain.ProcessInfo
 		want string
 	}{
-		{"running none", domain.ProcessInfo{State: domain.ProcessStateRunning}, ""},
-		{"waiting", domain.ProcessInfo{State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres", "redis"}}, " (waiting on: postgres, redis)"},
-		{"blocked", domain.ProcessInfo{State: domain.ProcessStateBlocked, BlockedOn: []string{"restate-register"}}, " (blocked on: restate-register)"},
-		{"waiting no targets", domain.ProcessInfo{State: domain.ProcessStateWaiting}, ""},
+		{"waiting on targets", domain.ProcessInfo{State: domain.ProcessStateWaiting, WaitingOn: []string{"postgres", "redis"}}, " (waiting on: postgres, redis)"},
+		{"blocked on targets", domain.ProcessInfo{State: domain.ProcessStateBlocked, BlockedOn: []string{"restate-register"}}, " (blocked on: restate-register)"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := gatedDetail(tc.p); got != tc.want {
-				t.Errorf("gatedDetail = %q, want %q", got, tc.want)
+			if got := stateLabel(tc.p); got != tc.want {
+				t.Errorf("stateLabel = %q, want %q", got, tc.want)
 			}
+		})
+	}
+}
+
+// TestStateLabel_EnumExhaustive iterates domain.AllProcessStates() so a 9th
+// state added later fails this test until it is given a label (issue #92 bug
+// 1 pin table). running is the one state that must render nothing; every
+// other state must render a non-empty parenthesized word.
+func TestStateLabel_EnumExhaustive(t *testing.T) {
+	want := map[domain.ProcessState]string{
+		domain.ProcessStateRunning:   "",
+		domain.ProcessStateWaiting:   " (waiting)",
+		domain.ProcessStateBlocked:   " (blocked)",
+		domain.ProcessStateCrashed:   " (crashed)",
+		domain.ProcessStateCompleted: " (done)",
+		domain.ProcessStateStopped:   " (stopped)",
+		domain.ProcessStateStarting:  " (starting)",
+		domain.ProcessStateStopping:  " (stopping)",
+	}
+	states := domain.AllProcessStates()
+	require.Len(t, states, len(want), "a state was added/removed in domain — update this pin table")
+	for _, s := range states {
+		t.Run(string(s), func(t *testing.T) {
+			wantLabel, ok := want[s]
+			require.True(t, ok, "state %s has no pinned label — add one to this test AND to stateLabel", s)
+			got := stateLabel(domain.ProcessInfo{State: s})
+			assert.Equal(t, wantLabel, got)
+			if s == domain.ProcessStateRunning {
+				assert.Empty(t, got, "running must pay nothing")
+			} else {
+				assert.NotEmpty(t, got, "every non-running state must carry a colour-independent label")
+			}
+		})
+	}
+}
+
+// TestStateLabel_WaitingBlockedNoTargets pins the no-target forms of waiting
+// and blocked: these differ from running gatedDetail (which rendered "" here)
+// because a colour-independent reader still needs SOME word even without
+// named targets (issue #92 bug 1).
+func TestStateLabel_WaitingBlockedNoTargets(t *testing.T) {
+	assert.Equal(t, " (waiting)", stateLabel(domain.ProcessInfo{State: domain.ProcessStateWaiting}))
+	assert.Equal(t, " (blocked)", stateLabel(domain.ProcessInfo{State: domain.ProcessStateBlocked}))
+}
+
+// TestStateLabel_ColourIndependence is the actual point of issue #92 bug 1:
+// with ANSI stripped (piped output, TERM=dumb, screenshots, colour-blind
+// readers), a crashed process must still read differently from a running one.
+// Before this change, styles.Crashed's bold-red was the ONLY distinguishing
+// signal and healthDot renders nothing without a configured healthcheck, so
+// the two rows were byte-identical once stripped.
+func TestStateLabel_ColourIndependence(t *testing.T) {
+	pinANSIProfile(t)
+	withTestTheme(t, "tokyo-night")
+
+	b := newTestBaseModel()
+	b.viewMode = ViewModeLogs
+	b.processes = []domain.ProcessInfo{
+		{Name: "web", State: domain.ProcessStateRunning},
+		{Name: "worker", State: domain.ProcessStateCrashed},
+	}
+	plain := ansi.Strip(b.processPanel())
+	assert.Contains(t, plain, "1:web", "running carries no state label")
+	assert.NotContains(t, plain, "web (")
+	assert.Contains(t, plain, "2:worker (crashed)")
+}
+
+// TestStateLabel_FrameContractHolds re-runs the plan 023 T5 frame contract
+// (every rendered row exactly frame width) with state labels present,
+// including a width narrow enough that the panel's ansi.Cut truncates the
+// label mid-string (issue #92 bug 1 / plan 028 C6). The panel already handles
+// this for the gated-launch strings; this pins that the added label suffixes
+// don't reopen it.
+func TestStateLabel_FrameContractHolds(t *testing.T) {
+	for _, w := range []int{80, 40, 20} {
+		t.Run(strconv.Itoa(w), func(t *testing.T) {
+			m := newTestModel()
+			m.processes = []domain.ProcessInfo{
+				{Name: "web", State: domain.ProcessStateRunning},
+				{Name: "worker", State: domain.ProcessStateCrashed},
+				{Name: "db", State: domain.ProcessStateBlocked, BlockedOn: []string{"postgres", "redis"}},
+			}
+			m = clientUpdate(m, tea.WindowSizeMsg{Width: w, Height: 24})
+			assertFrameContract(t, m)
 		})
 	}
 }

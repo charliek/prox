@@ -2704,21 +2704,44 @@ func processStyle(state domain.ProcessState) lipgloss.Style {
 	}
 }
 
-// gatedDetail returns the inline gated-launch annotation for a process (plan 013
-// D5): " (waiting on: X, Y)" while waiting, " (blocked on: X)" while blocked, and
-// "" in every other state. Targets are shown in declaration order.
-func gatedDetail(p domain.ProcessInfo) string {
+// stateLabel returns the colour-independent state text appended after a
+// process name in the panel (issue #92 bug 1). processStyle colours the name,
+// but colour alone does not survive ANSI-stripped output (piped logs,
+// TERM=dumb, screenshots) or a colour-blind reader — and styles.Crashed /
+// styles.Blocked share one style, as do styles.Stopped / styles.Completed, so
+// those pairs are ONLY colour-distinguishable today. Every state but running
+// gets a parenthesized word suffix; running pays nothing so the common case
+// stays byte-identical.
+//
+// Subsumes the former gatedDetail (plan 013 D5): the waiting-on / blocked-on
+// forms below are byte-identical to its old output.
+func stateLabel(p domain.ProcessInfo) string {
 	switch p.State {
+	case domain.ProcessStateRunning:
+		return ""
 	case domain.ProcessStateWaiting:
 		if len(p.WaitingOn) > 0 {
 			return " (waiting on: " + strings.Join(p.WaitingOn, ", ") + ")"
 		}
+		return " (waiting)"
 	case domain.ProcessStateBlocked:
 		if len(p.BlockedOn) > 0 {
 			return " (blocked on: " + strings.Join(p.BlockedOn, ", ") + ")"
 		}
+		return " (blocked)"
+	case domain.ProcessStateCrashed:
+		return " (crashed)"
+	case domain.ProcessStateCompleted:
+		return " (done)"
+	case domain.ProcessStateStopped:
+		return " (stopped)"
+	case domain.ProcessStateStarting:
+		return " (starting)"
+	case domain.ProcessStateStopping:
+		return " (stopping)"
+	default:
+		return ""
 	}
-	return ""
 }
 
 // healthDot returns the process panel's health indicator (plan 018 D13): a
@@ -2759,11 +2782,11 @@ func (b *BaseModel) processPanel() string {
 			name = fmt.Sprintf("[%s]", proc.Name)
 		}
 
-		// Gated-launch detail (plan 013 D5): a waiting/blocked process shows what
-		// it is gated on inline, in declaration order, so the panel explains why it
-		// has not launched. Kept minimal — this compact panel has no separate
-		// detail area.
-		name += gatedDetail(proc)
+		// State label (issue #92 bug 1): every non-running state gets a
+		// colour-independent word suffix, so the panel does not rely on colour
+		// alone to convey e.g. crashed vs. running. Subsumes the former
+		// gated-launch detail (plan 013 D5) inline, in declaration order.
+		name += stateLabel(proc)
 
 		// Health dot (plan 018 D13): appended as a separately styled segment
 		// after the name so the name's state style cannot swallow or recolor
@@ -2943,11 +2966,19 @@ func (b *BaseModel) statusBar(msg footerMsg) string {
 	case ViewModeRequestDetail:
 		viewIndicator = "[Request Detail]"
 	}
-	followIndicator := "[FOLLOW]"
-	if !b.followMode {
-		followIndicator = "[PAUSED]"
+	// Detail view is not a scrolling list: it has no follow state and no
+	// line/request count of its own, so showing either would state something
+	// the view cannot mean (issue #92 bug 2). Render the view tag alone.
+	var countPlain string
+	if b.viewMode == ViewModeRequestDetail {
+		countPlain = viewIndicator
+	} else {
+		followIndicator := "[FOLLOW]"
+		if !b.followMode {
+			followIndicator = "[PAUSED]"
+		}
+		countPlain = fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	}
-	countPlain := fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	countStyled := styles.FooterLabel.Render(countPlain)
 
 	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints(b.helpConfig.QuitHint))

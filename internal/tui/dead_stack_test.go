@@ -285,7 +285,17 @@ func TestDeadStackBanner_HitRectsUnaffected(t *testing.T) {
 	rowYAfter, ok := m.processPanelRowY()
 	require.True(t, ok)
 	assert.Equal(t, rowY, rowYAfter, "the banner is below the chips; their row cannot move")
-	assert.Equal(t, chipsBefore, m.mustHits().chips, "chip rects unchanged by the banner")
+	// Chip Y/H (and count) are unaffected by the banner, which is what this
+	// test actually pins. X/W now widen going running->crashed: stateLabel
+	// (issue #92 bug 1 / plan 028 C6) appends " (crashed)" to the chip text,
+	// so exact rect equality across that state change is no longer the right
+	// assertion — the earlier chips-before snapshot predates the label.
+	require.Len(t, m.mustHits().chips, len(chipsBefore))
+	for i, c := range m.mustHits().chips {
+		assert.Equal(t, chipsBefore[i].Rect.Y, c.Rect.Y, "chip %d row unchanged by the banner", i)
+		assert.Equal(t, chipsBefore[i].Rect.H, c.Rect.H, "chip %d height unchanged by the banner", i)
+	}
+	assert.Contains(t, ansi.Strip(m.processPanel()), "(crashed)")
 
 	// The chip still solos on click.
 	m = clientUpdate(m, clickAt(2, rowYAfter))
