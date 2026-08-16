@@ -42,6 +42,12 @@ If you prefer a custom domain like `local.myapp.dev`, add entries to `/etc/hosts
 127.0.0.1 local.myapp.dev app.local.myapp.dev api.local.myapp.dev
 ```
 
+### If a registered hostname doesn't resolve
+
+`prox up` checks whether each hostname it registers actually resolves on this machine, and warns if one doesn't — this is exactly the `.test`-domain trap above: `Registered domains: app.sec.test` looks fine until it's pasted into a browser and comes back NXDOMAIN, because `.test` needs the local setup on this page and doesn't resolve on its own the way `*.lvh.me` does.
+
+The check is deliberately quiet the rest of the time. It only warns on a definite "no such host" answer; a slow, offline, or sandboxed resolver — a laptop on a plane, a VPN, a network-restricted CI runner — is reported as "cannot tell", never as "broken", so a perfectly good setup never triggers a false alarm.
+
 ## HTTPS Certificates
 
 ### One-Time Setup
@@ -58,6 +64,8 @@ brew install mkcert
 # Install the CA into your system trust store (run once)
 mkcert -install
 ```
+
+If you skip `mkcert -install` (or run it before installing a browser that keeps its own trust store), prox now surfaces mkcert's own warning about it — `Warning: Note: the local CA is not installed in the system trust store.`, followed by a hint to run `mkcert -install` and restart prox — instead of reporting every process healthy while HTTPS quietly fails in the browser. The warning is mkcert's own sentence, carried through verbatim, and clears itself automatically once mkcert reports the CA as trusted.
 
 ### Automatic Certificate Generation
 

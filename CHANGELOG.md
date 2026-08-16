@@ -6,6 +6,124 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A foreground `prox up` whose whole process stack has died now ends the
+  session instead of sitting there supervising nothing** (plan 028, #96). A
+  typo in `cmd:` used to leave the terminal open indefinitely, showing
+  nothing, until the user thought to press Ctrl-C — the trigger channel
+  `prox up` waited on is closed by a signal, `POST /shutdown`, or a TUI quit,
+  and by nothing a process does. It now notices for itself: once every
+  process is dead **and** at least one of them ended in `crashed` or
+  `blocked` (a partial crash with something still serving does not count,
+  and an all-`completed` task config or a deliberate API-driven stop does
+  not either), the session tears down and prints the same `Crashed:`/
+  `Blocked:` summary `prox up -d`, `start` and `restart` already print.
+
+  **This is a breaking exit-code change: a plain or piped foreground
+  `prox up` previously always exited `0`.** It now exits non-zero whenever
+  its whole stack ends up dead, printing the crash summary and a one-line
+  hint before returning. A script that treated any foreground `prox up`
+  return as "the session ended, nothing more to check" now needs to look at
+  the exit code the way it already should for `prox up -d`.
+
+  **The interactive TUI does the opposite on purpose.** A TUI session does
+  *not* auto-exit — the user is right there reading, and pulling the screen
+  away would take the crash output with it. Instead it shows a persistent
+  full-width banner between the process panel and the viewport border: `All
+  processes have stopped — 2 crashed. Nothing is running. Press q to quit.`
+  Colour is emphasis only; the sentence survives ANSI stripping. This also
+  applies in `prox attach`, since the banner is computed from the same
+  process snapshots the TUI already streams.
+
+  **Not in the `-d` child.** `--detach` short-circuits straight to plain
+  mode internally, so without an explicit guard this watcher would have run
+  inside the detached daemon too — and killed it moments after `prox up -d`
+  told the user "The daemon is still running; stop it with `prox down`",
+  taking the API and the crash logs with it. The daemon staying up on a
+  crashed stack is the existing, deliberate contract; only the daemon child
+  is exempted.
+
+- **prox gained a channel for warning you about things it previously either
+  swallowed or never checked** (plan 028). Two long-deferred warnings (#97,
+  #98) both needed a way to get from wherever prox actually observes a
+  problem to wherever the person who typed the command is looking, across
+  all three run modes — including the shared proxy daemon, whose own
+  stdout/stderr are `/dev/null`, and a `prox up -d` child, whose
+  stdout/stderr are `.prox/prox.log`. That channel now exists
+  (`domain.Warning{code, message, hint}`), and it is additive on the wire in
+  both directions: the daemon's register response and `GET /status` each
+  gained a `warnings` field.
+
+  Warnings print as `Warning: <message>` (with an indented `<hint>` line
+  underneath, when there is one) in a plain `prox up`, in the TUI's pinned
+  startup preamble (and therefore the system log and `prox logs`), and in
+  `prox status`. **A warning never changes any exit code** — including
+  `prox status`'s, which already has its own exit contract for crashed/
+  blocked processes and a down proxy — because turning a script red over an
+  untrusted CA it never asked about would be its own kind of false alarm.
+
+  **API change (additive):** `GET /status` gains `warnings` (an array of
+  `{code, message, hint}`, omitted when empty) and `warnings_sealed` (a
+  bool, always present). The latter matters because a warning can still be
+  in flight when a `prox up -d` parent takes its one status snapshot after
+  the readiness + settle wait; the parent now polls `warnings_sealed`
+  (bounded at 2.5s) rather than trusting a single race-prone fetch. See
+  [`GET /status`](https://charliek.github.io/prox/reference/api/#get-status).
+
+- **`prox` now surfaces mkcert's own untrusted-CA warning** (plan 028, #97).
+  Running `brew install mkcert` (or equivalent) without also running
+  `mkcert -install` used to leave prox reporting every process healthy while
+  every HTTPS request through the proxy failed in the browser — mkcert
+  itself explains exactly why, but in shared mode that explanation used to
+  go straight to the daemon's `/dev/null`. prox now captures mkcert's output
+  and carries its line **verbatim** through the warning channel above,
+  followed by the hint `run 'mkcert -install' and restart prox`. It still
+  implements no trust-store detection of its own — that stays entirely
+  mkcert's job, correctly, per OS/browser — and it withdraws the warning
+  automatically once mkcert reports the CA as trusted again. Because mkcert
+  only speaks when it *generates* a certificate, and a warm cert cache (the
+  normal case, since `CLAUDE.md`/`RELEASING.md` require a daemon restart
+  after every release) would otherwise never re-trigger it, a lightweight
+  probe re-asks mkcert directly whenever the last known verdict was bad.
+
+- **`prox` now warns when a registered hostname does not resolve** (plan
+  028, #98). `prox up` prints `Registered domains: app.sec.test`, which
+  looks fine right up until it's pasted into a browser and comes back
+  NXDOMAIN, because a `.test` domain needs local DNS setup that a public
+  wildcard like `*.lvh.me` does not. prox now resolves each registered
+  hostname once at startup and warns, naming the actual configured domain
+  and linking the [local DNS
+  guide](https://charliek.github.io/prox/guides/local-dns/), when one
+  fails. **The check only fires on a positive NXDOMAIN** — a timeout,
+  offline resolver, or any other lookup error is treated as "cannot tell",
+  never as "unresolvable", so a developer on a plane or behind a
+  network-sandboxed CI runner is not told their perfectly good setup is
+  broken. Runs in both shared and standalone proxy modes and never delays
+  startup past its own short budget.
+
+- **The TUI process panel states, and the requests pane's empty state, no
+  longer rely on colour or silence to say what happened** (plan 028, #92).
+  `styles.Crashed`/`styles.Blocked` and `styles.Stopped`/`styles.Completed`
+  have always shared a style, so those pairs were only ever
+  colour-distinguishable — nothing at all once ANSI is stripped (piped
+  output, `TERM=dumb`, a screenshot) or to a colour-blind reader. Every
+  process state but `running` now appends a word to the name in the panel:
+  `web (crashed)`, `migrate (done)`, `api (blocked on: db)`, `worker
+  (waiting on: redis)`, `db (stopped)`, `web (starting)`, `web (stopping)`.
+  `running` costs nothing extra, so the steady-state panel is unchanged.
+
+  The requests pane's empty state used to read "No requests yet — traffic
+  through the proxy appears here" **unconditionally**, telling a project
+  with no `proxy:` block to wait for traffic that could never arrive. It now
+  says why the pane is empty: "No proxy running — enable a proxy: block in
+  prox.yaml to capture requests" when there is no proxy running this
+  session, or "No requests yet — capture is off, so rows will show metadata
+  only" when there is a proxy but `proxy.capture.enabled: false`. The
+  request detail view gained the matching explanation for a record with no
+  headers or body: "Capture is disabled (proxy.capture.enabled: false) — no
+  headers or bodies were recorded". Also removed: the detail footer's
+  `[FOLLOW] N/M lines` tag, which described a scrolling state the detail
+  view never actually has.
+
 - **`prox up -d`, `prox start` and `prox restart` now report the resulting
   state, not just that the request was accepted** (plan 027, #94). They exit
   non-zero when a process is `crashed` or `blocked` within 500ms of starting,
@@ -48,6 +166,18 @@ All notable changes to this project will be documented in this file.
   comma-separated lists, and `--follow`.
 
 ### Fixed
+
+- **A crashed process no longer keeps its health checker running against a
+  dead pid** (plan 028, #107). A process that crashed on its own used to
+  keep re-executing its `healthcheck:` command — with whatever side effects
+  that command has — until some later `Stop` happened to arrive, and
+  `healthcheck.enabled` on `GET /processes/{name}` reported `true` the whole
+  time (plan 027 made that field truthful, which is what made the bug
+  visible). The health checker now stops the instant the process exits on
+  its own, not only when it is explicitly stopped: a crashed (or otherwise
+  terminally failed) process's `healthcheck.enabled` reads `false`
+  immediately, and its check command stops executing right then rather than
+  continuing indefinitely until some later stop request happened to arrive.
 
 - **Errors no longer claim prox is down when it just answered** (plan 027,
   #95). "Is prox running? Try 'prox up' first." was appended to every client

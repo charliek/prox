@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxyd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -48,6 +49,68 @@ func TestHeal_SuccessSwapsClient(t *testing.T) {
 	assert.Same(t, fresh, rt.Client(), "heal must swap in the fresh client for deregister (D6c)")
 	assert.Equal(t, int64(0), rt.consecutiveFailures.Load(), "heal must reset the failure counter")
 	assert.Equal(t, healStateHealthy, rt.getHealState())
+}
+
+// TestHeal_CollectsRegisterWarningsOnce pins the self-heal hop of the warning
+// channel (plan 028 A2). The re-register carries the same advisories the first
+// one did — a fresh daemon re-runs the checks behind them — and everything but
+// len(resp.Registered) used to be discarded here. Repeated heals must not stack
+// the same advisory up, since the forwarder heals for as long as the outage
+// lasts.
+func TestHeal_CollectsRegisterWarningsOnce(t *testing.T) {
+	sock := startFakeRegisterDaemon(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(proxyd.RegisterResponse{
+			Registered: []string{"api.local.dev"},
+			Warnings: []domain.Warning{{
+				Code:    domain.WarningCodeMkcertCAUntrusted,
+				Message: "the CA is not installed.",
+				Hint:    "Run 'mkcert -install'.",
+			}},
+		})
+	})
+	fresh := proxyd.NewClient(sock)
+
+	sink := newWarningSink()
+	rt := newProxyRuntime()
+	rt.SetMode(proxyModeShared)
+	rt.SetWarningSink(sink)
+	rt.SetRegisterRequest(proxyd.RegisterRequest{ProjectDir: "/p", PID: os.Getpid(), Version: "test"})
+
+	ops := healOps{
+		ensureRunning: func() (*proxyd.Client, error) { return fresh, nil },
+		sleep:         func(time.Duration) {},
+		retryDelay:    time.Millisecond,
+	}
+
+	require.True(t, rt.heal(ops))
+	require.Len(t, sink.Warnings(), 1, "the heal re-register's warnings must reach the session sink")
+	assert.Equal(t, domain.WarningCodeMkcertCAUntrusted, sink.Warnings()[0].Code)
+
+	require.True(t, rt.heal(ops))
+	assert.Len(t, sink.Warnings(), 1, "a second heal must not duplicate the same advisory")
+}
+
+// TestHeal_WithNoWarningSinkIsSafe: a runtime that was never handed a sink (unit
+// tests, and any future caller) must heal exactly as before, not panic.
+func TestHeal_WithNoWarningSinkIsSafe(t *testing.T) {
+	sock := startFakeRegisterDaemon(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(proxyd.RegisterResponse{
+			Registered: []string{"api.local.dev"},
+			Warnings:   []domain.Warning{{Code: "c", Message: "nobody is collecting this"}},
+		})
+	})
+
+	rt := newProxyRuntime()
+	rt.SetMode(proxyModeShared)
+	rt.SetRegisterRequest(proxyd.RegisterRequest{ProjectDir: "/p", PID: os.Getpid(), Version: "test"})
+
+	assert.True(t, rt.heal(healOps{
+		ensureRunning: func() (*proxyd.Client, error) { return proxyd.NewClient(sock), nil },
+		sleep:         func(time.Duration) {},
+		retryDelay:    time.Millisecond,
+	}))
 }
 
 // TestHeal_VersionMismatchKeepsWaiting pins D6b: EnsureRunning reporting a busy

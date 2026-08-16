@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/proxy/certs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +28,10 @@ import (
 // deadlock rather than silently stall — the structural backstop for this boundary.
 func TestMultiDomainCertManager_SlowGenerateDoesNotBlockOtherDomain(t *testing.T) {
 	m := NewMultiDomainCertManager(t.TempDir())
+	// EnsureDomain applies the CA-trust verdict on every call, so a test that
+	// constructs the real manager must pin the verdict source or it would shell
+	// out to the developer's actual mkcert. Unknown touches nothing.
+	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
 
 	certA, err := generateWildcardCert("a.test")
 	require.NoError(t, err)
@@ -101,6 +106,10 @@ func TestMultiDomainCertManager_SlowGenerateDoesNotBlockOtherDomain(t *testing.T
 // to CERT_GENERATION_FAILED and roll back cleanly.
 func TestMultiDomainCertManager_GenerateError_PublishesNothing(t *testing.T) {
 	m := NewMultiDomainCertManager(t.TempDir())
+	// EnsureDomain applies the CA-trust verdict on every call, so a test that
+	// constructs the real manager must pin the verdict source or it would shell
+	// out to the developer's actual mkcert. Unknown touches nothing.
+	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
 
 	wantErr := errors.New("forced generate failure")
 	m.generate = func(domain string) (*tls.Certificate, error) {

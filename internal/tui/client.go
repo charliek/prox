@@ -169,6 +169,27 @@ type ClientOptions struct {
 	ProxyHTTPSPort int
 	ProxyHTTPPort  int
 
+	// ProxyConfigured and CaptureEnabled describe the RESOLVED RUNTIME state of
+	// the proxy path behind this session, and exist so the requests pane can say
+	// why it is empty instead of promising traffic that can never arrive.
+	//
+	// Runtime, not config: `prox up --no-proxy` runs with a perfectly valid
+	// `proxy:` block and no proxy, so the caller derives these from what it
+	// actually did (up) or from the daemon's status block (attach) — see
+	// resolveProxyRuntimeState and attachProxyFacts in internal/cli.
+	//
+	// Both are STATIC for the session: the daemon loads its config once at `up`
+	// time, so neither value can change under an attached client. That is why
+	// they ride in on options rather than being fetched per frame through
+	// TUIClient — a live getter would widen the interface every fake implements
+	// to re-fetch a constant.
+	//
+	// The zero value (false, false) means "no proxy, no capture", so callers
+	// that know nothing must pass true/true — the wording that predates these
+	// fields — rather than leaving them unset.
+	ProxyConfigured bool
+	CaptureEnabled  bool
+
 	// ShutdownCh, when non-nil, quits the program on close. This is how an
 	// out-of-band shutdown request (POST /shutdown, via the coordinator's
 	// trigger channel) reaches a --tui daemon, which otherwise blocks in
@@ -235,6 +256,8 @@ func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 		opts:      opts,
 	}
 	m.projectName = resolveProjectName(opts.ProjectName)
+	m.proxyConfigured = opts.ProxyConfigured
+	m.captureEnabled = opts.CaptureEnabled
 	// Seeded here rather than from Init: a command's message would arrive after
 	// the first View (and could race the first backfill batch), whereas the
 	// preamble is the one content this model is guaranteed to be able to show
@@ -416,7 +439,24 @@ func (m ClientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// deliberately NOT touched here: it is derived from stream health
 		// alone, and the OK transition that precedes the first snapshot has
 		// already cleared it.
+		//
+		// THE RELAYOUT IS LOAD-BEARING (plan 028 C4). The dead-stack banner is
+		// the first chrome row whose height changes on a DATA message: until
+		// now only WindowSizeMsg and the visibility toggles could change
+		// chromeAbove, and they are the only callers of relayout (see its doc
+		// comment). Without this the viewport keeps its pre-banner height and
+		// overflows the frame by exactly one row — the class of bug plan 024
+		// spent a whole batch fixing. It must fire in BOTH directions: a
+		// `prox restart` that revives the stack has to give the row back.
+		bannerBefore := m.showDeadStackBanner()
 		m.processes = []domain.ProcessInfo(msg)
+		if m.showDeadStackBanner() != bannerBefore {
+			m.relayout()
+			// Same order WindowSizeMsg uses: geometry first, then re-render
+			// content against it (the empty-state hints are sized to
+			// viewport.Height, so a stale render would be a row off).
+			m.updateViewport()
+		}
 
 	case RestartResultMsg:
 		m.lastRestartProcess = msg.Process

@@ -133,3 +133,98 @@ func primedFrameModel(t *testing.T, w, h int, cfg Settings, mode ViewMode) Clien
 	}
 	return m
 }
+
+// TestFrameContract_DeadStackSweep re-runs the T5 sweep with the dead-stack
+// banner up (plan 028 C4).
+//
+// The banner is the first chrome row whose height changes on a DATA message
+// rather than on a WindowSizeMsg or a settings toggle, so it is the first thing
+// that can desync geometry from rendering mid-session -- the exact failure plan
+// 024 spent a batch fixing. The bespoke banner tests check its own behaviour;
+// this checks that the frame as a WHOLE still obeys the contract with the extra
+// row present, across every size, settings combo and view the baseline sweep
+// covers.
+//
+// It drives the banner up through the real ProcessesMsg path, not by setting
+// fields, because the relayout hook lives on that path: primed with a running
+// process and then given a crashed snapshot, this fails if that hook is ever
+// removed.
+func TestFrameContract_DeadStackSweep(t *testing.T) {
+	sizes := []struct{ w, h int }{
+		{80, 24},
+		{120, 40},
+		{40, 12},
+		{20, 8},
+		{10, 6},
+		{2, 6},
+		{1, 6},
+	}
+	settingsCombos := []Settings{
+		DefaultSettings(),
+		{MenuBar: true, ProcessPanel: false, Timestamps: true, Wrap: false},
+		{MenuBar: true, ProcessPanel: true, Timestamps: false, Wrap: true},
+		{MenuBar: false, ProcessPanel: false, Timestamps: false, Wrap: false},
+		{MenuBar: false, ProcessPanel: true, Timestamps: true, Wrap: true},
+	}
+	// Every dead-stack shape that must raise the banner, including the mixed
+	// and "nothing live, one failure" cases.
+	stacks := map[string][]domain.ProcessInfo{
+		"crashed": {
+			{Name: "web", State: domain.ProcessStateCrashed},
+			{Name: "api", State: domain.ProcessStateCrashed},
+		},
+		"blocked": {
+			{Name: "web", State: domain.ProcessStateBlocked, BlockedOn: []string{"db"}},
+		},
+		"mixed": {
+			{Name: "web", State: domain.ProcessStateCrashed},
+			{Name: "api", State: domain.ProcessStateBlocked, BlockedOn: []string{"db"}},
+			{Name: "seed", State: domain.ProcessStateCompleted},
+		},
+	}
+
+	for _, sz := range sizes {
+		for _, cfg := range settingsCombos {
+			// Same feasibility rule as the baseline sweep, plus the banner's
+			// own row -- derived from the production formula so a geometry
+			// change cannot silently desync this gate.
+			chrome := (&BaseModel{settings: cfg}).chromeHeight() + 1
+			if sz.h < chrome+1 {
+				continue
+			}
+			for name, procs := range stacks {
+				for _, mode := range []ViewMode{ViewModeLogs, ViewModeRequests, ViewModeRequestDetail} {
+					label := fmt.Sprintf("dead-%s-%s", name, viewSweepLabel(mode))
+					t.Run(frameSweepName(sz.w, sz.h, cfg, label), func(t *testing.T) {
+						m := primedFrameModel(t, sz.w, sz.h, cfg, mode)
+						require.False(t, m.showDeadStackBanner(),
+							"precondition: the primed model's stack is alive")
+
+						m = clientUpdate(m, ProcessesMsg(procs))
+						require.True(t, m.showDeadStackBanner(),
+							"the snapshot is a dead stack, so the banner must be up")
+						assertFrameContract(t, m)
+
+						// ...and giving the stack back must return the row.
+						m = clientUpdate(m, ProcessesMsg([]domain.ProcessInfo{
+							{Name: "web", State: domain.ProcessStateRunning},
+						}))
+						require.False(t, m.showDeadStackBanner())
+						assertFrameContract(t, m)
+					})
+				}
+			}
+		}
+	}
+}
+
+func viewSweepLabel(mode ViewMode) string {
+	switch mode {
+	case ViewModeRequests:
+		return "requests"
+	case ViewModeRequestDetail:
+		return "detail"
+	default:
+		return "logs"
+	}
+}

@@ -26,6 +26,7 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/proxy/certs"
 	"github.com/charliek/prox/internal/proxyd"
 	"github.com/charliek/prox/internal/supervisor"
 	"github.com/charliek/prox/internal/tui"
@@ -502,6 +503,24 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// connection state, and (C6) holds the client swapped in on heal. Created
 	// here (mode defaults to disabled) and resolved to shared/standalone below.
 	runtime := newProxyRuntime()
+	// This session's user-facing advisories (plan 028 A2). Created before the
+	// proxy path resolves, because the shared daemon's register response is the
+	// first producer; published on GET /status (which is how the `prox up -d`
+	// parent reads them back out of a child whose output goes to a log file) and
+	// rendered once at the end of startup below.
+	warnings := newWarningSink()
+	runtime.SetWarningSink(warnings)
+	handlers.SetWarningProvider(warnings)
+	// The suite's only way to produce a warning that finishes AFTER the
+	// `prox up -d` parent's settle window — the race the completion latch
+	// exists for. Unset in every real run.
+	registerTestWarningProducer(warnings, os.Getenv(warningTestHookEnvVar))
+	// The RESOLVED runtime proxy state for this session — what the proxy path
+	// below actually does, not what the file asks for (see
+	// resolveProxyRuntimeState). It gates the proxy start, feeds the status
+	// block, and tells the TUI why a request list may stay empty.
+	proxyFacts := resolveProxyRuntimeState(cfg, noProxy)
+	runtime.SetCaptureEnabled(proxyFacts.CaptureEnabled)
 	handlers.SetProxyStatusProvider(runtime)
 
 	apiServer := api.NewServer(api.ServerConfig{
@@ -540,7 +559,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Start proxy — either via shared daemon or standalone fallback.
 	var proxyService *proxy.Service
 	var daemonClient *proxyd.Client
-	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
+	if proxyFacts.Configured {
 		var proxyErr error
 		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink, preamble)
 		if proxyErr != nil {
@@ -654,6 +673,30 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 	}()
 
+	// END OF STARTUP: join the asynchronous warning producers, render everything
+	// this session has to say, and seal (plan 028 A2).
+	//
+	// All three steps are here, on runUp's own goroutine, deliberately:
+	//
+	//   - rendering goes through the preamble, which is unsynchronized by
+	//     construction, so it can only happen here;
+	//   - ONE render point means the user meets every advisory in one block and
+	//     one order, whatever produced it;
+	//   - sealing after this point (and after the API server above began
+	//     serving) is what makes warnings_sealed worth publishing at all. GET
+	//     /status can already be answered while a producer is still running,
+	//     which is exactly the window the `prox up -d` parent lands in — it
+	//     polls the latch rather than trusting a single fetch.
+	//
+	// The join is bounded: a warning must never meaningfully delay startup. A
+	// producer that misses the budget still reaches GET /status when it lands,
+	// it just misses the parent's read.
+	if !warnings.Wait(warningProducerJoinTimeout) {
+		log.Printf("prox: startup warning checks did not finish within %s; continuing", warningProducerJoinTimeout)
+	}
+	reportStartupWarnings(warnings.Warnings(), preamble, os.Stderr)
+	warnings.Seal()
+
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.
 	var tuiErr error
@@ -697,6 +740,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			// about to hide — pinned in the log pane so the proxy URL survives a
 			// startup chatty enough to have evicted them from the log ring.
 			Preamble: preamble.Lines(),
+			// Why the requests pane may stay empty. Sourced from the SAME
+			// resolved runtime state that gated the proxy start above, so a
+			// `--no-proxy` session reports "no proxy configured" rather than
+			// promising traffic this run can never see.
+			ProxyConfigured: proxyFacts.Configured,
+			CaptureEnabled:  proxyFacts.CaptureEnabled,
 		}
 		// Ports feed curl-copy only; pass them when a proxy is actually
 		// listening (disabled/--no-proxy → port-less https://<host><url>).
@@ -779,15 +828,51 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			}
 		}
 	}
+	// deadVerdict is the dead-stack watcher's verdict, latched only if it fired
+	// (plan 028 C3, #96). It survives the block below to reach the exit contract.
+	var deadVerdict *settleVerdict
 	if !tuiEnabled {
 		// Log subscription + consumer were already started above, before the
 		// supervisor started any process (D2, #92) — or, for a preferred-mode
 		// TUI that failed, a moment ago with the ring replayed behind it.
 
+		// A foreground session with every process dead used to wait here
+		// forever: the trigger channel is closed by signals, POST /shutdown and
+		// a TUI quit, and by nothing a process does (#96). The watcher supplies
+		// the missing wake — and the reason for it, which the coordinator does
+		// not carry — so a stack that is entirely down ends the session and
+		// exits non-zero.
+		//
+		// NOT in the detached daemon child: `--detach` short-circuits TUI
+		// resolution to plain mode, so it runs this very block, and a watcher
+		// here would kill the daemon `prox up -d` just promised was still
+		// running. See dead_stack.go.
+		//
+		// Started here rather than beside sup.Start so that sequential startup
+		// can never present a transient "nothing live" window, and so the
+		// mid-run TUI-failure fallback above (which flips tuiEnabled and falls
+		// into this block) is covered by the same call.
+		var deadWatcher *deadStackWatcher
+		if !daemon.IsDaemonChild() {
+			deadWatcher = startDeadStackWatcher(sup, coordinator.TriggerWith, coordinator.TriggerCh())
+		}
+
 		// Wait for shutdown. Both a signal (via forwardShutdownSignal above, which
 		// also logs it) and an API/TUI-quit trigger arrive as a coordinator trigger,
 		// so this selects on the one channel.
 		<-coordinator.TriggerCh()
+
+		if deadWatcher != nil {
+			// Stopped BEFORE performShutdown, not merely deferred to runUp's
+			// return: teardown drives every process to stopped, and a watcher
+			// still running through that would see a crashed-plus-stopped stack
+			// and latch a verdict for a shutdown the user asked for. stop()
+			// joins the goroutine, so the read below is of a finished decision.
+			deadWatcher.stop()
+			if v, fired := deadWatcher.latchedVerdict(); fired {
+				deadVerdict = &v
+			}
+		}
 		fmt.Println() // Print newline (past any echoed ^C)
 	}
 
@@ -829,6 +914,18 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		reportStdioDrops(sink)
 	}
 
+	// The dead-stack half of the exit contract (plan 028 C3, #96). Printed here,
+	// after teardown, so it is the LAST thing on the terminal rather than a line
+	// the shutdown log stream scrolls away — and printed through the same
+	// formatter `prox up -d`, `start` and `restart` use, so a crash reads
+	// identically whichever command reports it. Only ever non-nil in plain,
+	// non-daemon-child mode.
+	var deadStackErr error
+	if deadVerdict != nil {
+		deadVerdict.writeTo(os.Stderr, deadStackHint)
+		deadStackErr = deadVerdict.err()
+	}
+
 	// Foreground exit contract: a surviving process group makes `prox up` exit
 	// non-zero (cobra maps a non-nil RunE error to exit 1). Intentional split:
 	// per-process detail already went to the log stream via SystemLog inside
@@ -839,11 +936,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Breaking change: foreground `prox up` previously always exited 0 (CHANGELOG
 	// in C5).
 	if outcome != nil {
-		// errors.Join keeps a TUI failure visible alongside the shutdown
-		// verdict; either alone still makes `up` exit non-zero.
-		return errors.Join(tuiErr, fmt.Errorf("shutdown incomplete: %w", outcome))
+		// errors.Join keeps a TUI failure — and a dead stack — visible alongside
+		// the shutdown verdict; any one alone still makes `up` exit non-zero.
+		return errors.Join(tuiErr, deadStackErr, fmt.Errorf("shutdown incomplete: %w", outcome))
 	}
-	return tuiErr
+	// errors.Join of all-nil is nil, so an ordinary Ctrl-C still exits 0.
+	return errors.Join(tuiErr, deadStackErr)
 }
 
 // dialableAPIURL builds the base URL a process uses to reach its OWN in-process
@@ -1292,6 +1390,42 @@ func captureDiskBudget(cfg *config.Config) int64 {
 	return n
 }
 
+// resolveProxyRuntimeState answers the two questions the rest of the session
+// asks about the proxy path: is a proxy actually running for this project, and
+// will requests actually be captured?
+//
+// Both answers are RUNTIME state, not config state, and the gap between the two
+// is the whole point of this function: `prox up --no-proxy` leaves the config's
+// `proxy:` block enabled while refusing to start anything, so keying a UI hint
+// on cfg.Proxy.Enabled alone would tell the user to wait for traffic that this
+// session can never see. captureEnabled is gated on proxyConfigured for the same
+// reason — capture cannot happen without a proxy to capture from.
+//
+// CaptureEffectivelyEnabled is nil-receiver safe, so the second expression is
+// safe even with no proxy: block at all.
+//
+// It returns a STRUCT rather than two bools because the two are adjacent, both
+// bool, and consumed at three call sites — the proxy gate, the status block and
+// the TUI options. Returned positionally, swapping them at any of those sites
+// compiles, passes every test (each is tested in isolation) and silently gives
+// a `--no-proxy` session the wrong hint. Named fields make that mistake visible
+// at the call site instead (CodeRabbit review finding).
+func resolveProxyRuntimeState(cfg *config.Config, noProxy bool) proxyRuntimeFacts {
+	configured := !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled
+	return proxyRuntimeFacts{
+		Configured:     configured,
+		CaptureEnabled: configured && cfg.Proxy.CaptureEffectivelyEnabled(),
+	}
+}
+
+// proxyRuntimeFacts is the resolved runtime state of this session's proxy path:
+// whether a proxy is actually running, and whether requests will actually be
+// captured. Both are runtime answers, not config answers.
+type proxyRuntimeFacts struct {
+	Configured     bool
+	CaptureEnabled bool
+}
+
 // startProxy attempts to register with the shared proxy daemon. If the daemon
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
@@ -1318,12 +1452,59 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// configured, so a create/start failure here is fatal (D1): `prox up` must
 	// never start a project with the proxy silently disabled. --no-proxy is the
 	// escape hatch (named in the returned error).
+	//
+	// Warnings (plan 028 A2): this mode has no wire to carry them — mkcert runs
+	// in THIS process (internal/proxy) — so the producer below reports straight
+	// into the session's warning sink and is rendered and sealed by the same
+	// end-of-startup step in runUp as the shared-daemon path.
 	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut, pre)
 	if err != nil {
 		return nil, nil, err
 	}
 	rt.SetMode(proxyModeStandalone)
+
+	// Must run AFTER the proxy started: if HTTPS was configured and mkcert
+	// actually generated certs just now, that run already answered the
+	// CA-trust question and the resolver returns its verdict without probing.
+	//
+	// Asynchronous (Go, not Add) because the fallback — a probe, when the certs
+	// were already warm — shells out to mkcert, and no diagnostic gets to hold
+	// up a user's startup. There is no clear-side here: a standalone session's
+	// sink starts empty every run, so "trusted" simply means nothing is added.
+	//
+	// Gated on HTTPS: with no HTTPS listener there is no certificate to be
+	// distrusted, so the warning would be true and irrelevant — which is its own
+	// kind of untrue. The daemon side needs no equivalent gate: its cert phase
+	// only runs for a registration that declares an HTTPS port (server.go).
+	if cfg.Proxy.HTTPSPort > 0 {
+		rt.WarningSink().Go(func() []domain.Warning {
+			return mkcertTrustWarnings(ctx, certs.SharedTrust())
+		})
+	}
+
+	// Same hostname-resolution check as the shared-daemon path (plan 028 B2,
+	// #98), built from config with the identical <service>.<domain>
+	// construction the daemon uses (registeredHostnames) so the check is not
+	// shared-mode-only.
+	startHostnameResolutionCheck(rt.WarningSink(), ctx, defaultHostnameResolver, registeredHostnames(cfg))
 	return nil, svc, nil
+}
+
+// caTrustResolver is the CA-trust verdict source startProxy consumes, narrowed
+// to the one method so a test can supply a verdict without a real mkcert.
+type caTrustResolver interface {
+	Resolve(context.Context) certs.TrustVerdict
+}
+
+// mkcertTrustWarnings turns the process's CA-trust verdict into the warnings to
+// report. It adds nothing for a trusted CA and nothing for an unknown one:
+// prox says something here only when mkcert itself said the CA is missing from
+// the trust stores.
+func mkcertTrustWarnings(ctx context.Context, r caTrustResolver) []domain.Warning {
+	if w := r.Resolve(ctx).Warning; w != nil {
+		return []domain.Warning{*w}
+	}
+	return nil
 }
 
 // tryDaemonProxy attempts to register with the shared proxy daemon.
@@ -1420,6 +1601,25 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	if len(resp.Registered) > 0 {
 		pre.printf("Registered domains: %s", strings.Join(resp.Registered, ", "))
 	}
+
+	// Advisories the shared daemon raised while setting this project up (plan
+	// 028 A2). They ride the register response — both arms, the first attempt
+	// and the post-SHUTTING_DOWN retry (retryRegisterAfterShutdown returns the
+	// healed response into `resp` above) — because the daemon's own stdout and
+	// stderr are /dev/null, so anything it printed would be seen by nobody.
+	//
+	// They are only COLLECTED here. Rendering happens once, at the end of
+	// startup on runUp's goroutine (see reportStartupWarnings), so a warning
+	// from any producer prints in one place and in one order.
+	rt.WarningSink().Add(resp.Warnings...)
+
+	// Whether these hostnames actually resolve on THIS machine (plan 028 B2,
+	// #98): `Registered domains: app.sec.test` printed above is only useful
+	// if pasting it into a browser works, and a `.test` domain (unlike a
+	// public wildcard such as `*.lvh.me`) does not resolve without local DNS
+	// setup. Async and best-effort — see startHostnameResolutionCheck — so a
+	// slow or offline resolver never delays this session's startup.
+	startHostnameResolutionCheck(rt.WarningSink(), ctx, defaultHostnameResolver, resp.Registered)
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
 	// daemon proxy requests into this project's TUI and API. The runtime records

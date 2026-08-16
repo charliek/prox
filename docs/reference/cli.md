@@ -112,6 +112,23 @@ A non-zero exit from step 2 means something different from one from step 1: **th
 
 `.prox/prox.log` is never truncated — it accumulates across every run — but the printed diagnostics are scoped to the failed run alone: each daemon child writes a `--- run <time> pid=<pid> ---` marker to the log as its first line, and the failure diagnostic tails only the content after that run's own marker, not the whole file. So iterating on a broken config never buries the current failure under every past one. This scoping needs a marker to key off; a legacy log with no markers, or a failure so early the child never reached the point of writing one, falls back to the last ~20 lines of the file instead.
 
+**Foreground exit contract:** a plain (non-`--detach`) `prox up` used to wait indefinitely for a signal, `POST /shutdown`, or a TUI quit — nothing a process itself does — so a stack that died entirely (the classic first-run mistake: a typo in `cmd:`) left the terminal open and silent until the user pressed Ctrl-C. It now ends the session itself once **every process is dead and at least one of them ended in a terminal failure** (`crashed` or `blocked`; an all-`completed` task config, or a stack stopped deliberately through the API, does not count — `completed` is success and both are cases where nothing failed). When that happens, `prox up` tears the session down and exits non-zero, printing the same `Crashed:`/`Blocked:` summary `prox up -d`, `start` and `restart` print (see above), so a crash reads identically whichever command reports it.
+
+**Breaking change:** foreground `prox up` previously always exited `0`. A script that ran `prox up` in the foreground and treated its return as "the session ended, nothing more to check" now needs to look at the exit code the same way it already should for `prox up -d`.
+
+**The `-d` child does NOT exit on a dead stack.** `--detach` short-circuits straight to plain mode internally, so without an explicit guard this same watcher would run inside the detached daemon too — and it would kill the daemon moments after `prox up -d` told the user the daemon was still running and pointed them at `prox down`, taking the API and the crash logs with it. The daemon staying up while its processes are down is the deliberate `-d` contract described above; only the daemon child is exempt from this exit behavior.
+
+**The interactive TUI never auto-exits on a dead stack**, deliberately: the user is present and reading, and pulling the screen away would take the crash output with it. Instead it shows a persistent banner — see [the dead-stack banner](tui.md#dead-stack-banner).
+
+**Warnings.** Advisories that are not failures — an untrusted mkcert CA, a registered hostname that does not resolve — print as `Warning: <message>` on stderr, with an indented hint line underneath when there is one:
+
+```text
+Warning: Note: the local CA is not installed in the system trust store.
+         run 'mkcert -install' and restart prox
+```
+
+They appear in a plain `prox up`'s terminal output, in the TUI's pinned startup preamble, in a `prox up -d` parent (read back from the child over the API), and in `prox status`. **A warning never changes any exit code** — not `up`'s, not `up -d`'s, not `status`'s — advisory and failure are kept on separate axes throughout. See [`GET /status`](api.md#get-status) for the wire shape.
+
 **TUI mode resolution.** Whether `prox up` opens the interactive TUI is decided by, in order of precedence: a flag that asserts something, then the `PROX_TUI` environment variable, then whether the terminal can host it. A bare foreground `prox up` **prefers the TUI**: it opens on a terminal that can host one and falls back to plain log streaming everywhere else, without an error.
 
 | Source | Effect |
@@ -165,6 +182,8 @@ prox status --json
 **Precedence.** All applicable human-readable lines print regardless of which condition holds — a crashed process, a blocked process, a failed dependency, and a down proxy can all show up in the same output. The single primary stderr sentinel (and the process's own exit code stays `1` either way) follows a fixed precedence: **proxy-down > crashed > blocked > failed-dependency**. Scripts that need to react to a specific condition should parse `prox status --json` (its per-process `status`, and each dependency's `state`, are authoritative) rather than `prox status || true`, which also masks discovery errors and an unreachable supervisor.
 
 **Proxy line:** when a proxy is configured, output includes a `Proxy:` line reporting the shared-proxy health tracked by [the `proxy` block of `GET /status`](api.md#get-status) — `Proxy: shared (running, vX.Y.Z)` when healthy, `Proxy: standalone` for an in-process proxy, or the `Proxy: DOWN` line above when the shared daemon is unreachable.
+
+**Warnings:** any session warnings (see [`Warnings` under `up`](#up)) print after the process table, in the same `Warning: <message>` form. They are advisory and **never affect `prox status`'s exit code** — a script that checks the exit code should not start failing because of an untrusted mkcert CA it never asked about.
 
 **STATUS column decoration.** A `waiting` process shows its still-resolving `depends_on` targets inline — `waiting(postgres, redis)` — and a `blocked` process shows the targets that failed it — `blocked(postgres)` — in declaration order. The JSON `status` field stays the bare state name in both cases (`waiting`/`blocked`); only the human table decorates it. The PID column shows `-` whenever there is no live PID, including a `waiting` process and a `completed` task (whose uptime is frozen at completion rather than reading `0`).
 

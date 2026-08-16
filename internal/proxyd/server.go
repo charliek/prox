@@ -16,6 +16,7 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 	"github.com/go-chi/chi/v5"
 )
@@ -319,7 +320,14 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			if s.registry.registrationMatches(req) {
 				s.logger.Info("idempotent re-register: config unchanged, no-op refresh",
 					"project", conflict.Dir, "pid", conflict.PID, "start_time", conflict.StartTime)
-				return http.StatusOK, RegisterResponse{Registered: s.registry.ProjectHostnames(conflict.Dir)}
+				// The no-op arm returns BEFORE the cert phase, so it generates no
+				// warnings of its own — but it must still report the daemon's current
+				// ones. This is the self-heal path (cli.proxy_runtime), and a client
+				// reconnecting here is exactly a client that has not seen them yet.
+				return http.StatusOK, RegisterResponse{
+					Registered: s.registry.ProjectHostnames(conflict.Dir),
+					Warnings:   s.currentWarnings(),
+				}
 			}
 			// FIX 2: the same process re-registers with a CHANGED config (rare).
 			// Keep the remove+add, but make it failure-atomic: snapshot the current
@@ -423,7 +431,23 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 	// the effective daemon-wide bound and enforce it (#69). Covers the fresh,
 	// changed-config, and stale-replacement register arms (all reach here).
 	s.syncCaptureBudget()
-	return http.StatusOK, RegisterResponse{Registered: hostnames}
+	return http.StatusOK, RegisterResponse{Registered: hostnames, Warnings: s.currentWarnings()}
+}
+
+// currentWarnings returns the daemon's user-facing warnings for a register
+// response, deduped. The warnings live on the cert manager because that is where
+// they are observed and because they are CA-scoped rather than per-project: every
+// registration gets the same current set, including registrations that generated
+// no certs at all (a warm certs dir) and the no-op refresh that never reaches the
+// cert phase.
+//
+// Callers hold lifecycleMu; the holder's mutex is a leaf taken only for a slice
+// copy, so this never blocks the lifecycle transaction on cert generation.
+func (s *Server) currentWarnings() []domain.Warning {
+	if s.proxy == nil || s.proxy.certMgr == nil {
+		return nil
+	}
+	return domain.DedupeWarnings(s.proxy.certMgr.Warnings())
 }
 
 func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {

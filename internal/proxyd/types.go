@@ -5,6 +5,8 @@ package proxyd
 
 import (
 	"time"
+
+	"github.com/charliek/prox/internal/domain"
 )
 
 // ServiceTarget represents a backend service to proxy to.
@@ -50,6 +52,23 @@ type RegisterRequest struct {
 // RegisterResponse is returned after a successful registration.
 type RegisterResponse struct {
 	Registered []string `json:"registered"` // fully-qualified hostnames registered
+	// Warnings carries user-facing advisories the daemon observed on the
+	// project's behalf — things the invoking CLI could never have seen itself,
+	// because in shared mode they happen inside the daemon process, whose
+	// stdout/stderr are /dev/null (daemon.go). The register response is the one
+	// point where the daemon can hand them to the person who typed the command.
+	// It is populated on BOTH success arms of register(), including the
+	// idempotent no-op refresh the self-heal path takes, so a reconnecting
+	// client still learns about them.
+	//
+	// Compatibility: this is ordinary additive JSON — an older daemon simply
+	// omits the field and it decodes to nil; an older client ignores the unknown
+	// key. That, not the register version gate, is what makes it safe: local
+	// `make build` binaries all report version "dev"
+	// (internal/version/version.go), so the exact-version-match requirement does
+	// NOT separate two different development builds, and a dev client can very
+	// well talk to a dev daemon built before this field existed.
+	Warnings []domain.Warning `json:"warnings,omitempty"`
 }
 
 // DeregisterRequest is sent by prox down to remove a project's routes.

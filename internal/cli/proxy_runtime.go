@@ -74,6 +74,21 @@ type proxyRuntime struct {
 	// never disturbs the supervisor. nil until the shared-mode forwarder launches.
 	forwarderCancel context.CancelFunc
 
+	// captureEnabled is this project's EFFECTIVE capture state — the proxy is
+	// actually running for this session AND capture is enabled in its config
+	// (see resolveProxyRuntimeState). Reported in the status block so a client
+	// can explain an empty request list. Guarded by mu.
+	captureEnabled bool
+
+	// warnings is this session's warning sink (plan 028 A2). The shared daemon
+	// returns user-facing advisories on the register response — on the FIRST
+	// register (tryDaemonProxy) and on every self-heal re-register (heal) — and
+	// the daemon's own stdout/stderr are /dev/null, so this sink is the only way
+	// they reach the user. Guarded by mu; nil is a usable no-op sink (every
+	// warningSink method is nil-receiver safe), which is what unit-test runtimes
+	// get.
+	warnings *warningSink
+
 	// healState overrides the derived heal_state while the shared daemon is
 	// unreachable (D6b): "" (down, no heal attempted yet), "healing" (heal
 	// attempts failing), or "version_mismatch" (a busy different-version daemon).
@@ -124,11 +139,45 @@ func (r *proxyRuntime) SetMode(mode string) {
 	r.mode = mode
 }
 
+// SetCaptureEnabled records whether request/response capture is effectively on
+// for this session. runUp calls it once, from the same resolved runtime state
+// that decides whether to start the proxy at all.
+func (r *proxyRuntime) SetCaptureEnabled(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.captureEnabled = enabled
+}
+
+// SetWarningSink injects the session's warning sink (plan 028 A2). Called once
+// from runUp before the proxy path resolves, so both register arms — the first
+// one and every heal re-register — land in the same collection.
+func (r *proxyRuntime) SetWarningSink(s *warningSink) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warnings = s
+}
+
+// WarningSink returns the session's warning sink, or nil when none was injected
+// (a nil sink is a no-op, not a crash).
+func (r *proxyRuntime) WarningSink() *warningSink {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.warnings
+}
+
 // Mode returns the current proxy mode.
 func (r *proxyRuntime) Mode() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mode
+}
+
+// CaptureEnabled returns the effective capture state recorded by
+// SetCaptureEnabled (false until resolved).
+func (r *proxyRuntime) CaptureEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.captureEnabled
 }
 
 // SetClient stores the active daemon client. C6 calls this again on heal.
@@ -263,10 +312,15 @@ func (r *proxyRuntime) ForwarderBackfillFailed() {
 // mode only, with no probe.
 func (r *proxyRuntime) ProxyStatus() *api.ProxyStatusResponse {
 	mode := r.Mode()
+	// Always non-nil from a current daemon: nil is reserved for the wire case
+	// of an OLDER daemon that predates the field (see CaptureEnabled's doc), so
+	// a live runtime must state its answer even when that answer is false.
+	capture := r.CaptureEnabled()
 	resp := &api.ProxyStatusResponse{
 		Mode:                mode,
 		ConsecutiveFailures: r.consecutiveFailures.Load(),
 		BackfillFailures:    r.backfillFailures.Load(),
+		CaptureEnabled:      &capture,
 	}
 	if ns := r.lastConnectedAt.Load(); ns > 0 {
 		t := time.Unix(0, ns)
@@ -401,6 +455,23 @@ func (r *proxyRuntime) heal(ops healOps) bool {
 	r.setHealState(healStateHealthy)
 	r.invalidateProbeCache()
 	log.Printf("prox: shared proxy daemon healed — re-registered %d domain(s) with a fresh daemon", len(resp.Registered))
+
+	// The re-register carries the SAME advisories the first one did (plan 028
+	// A2): a fresh daemon re-runs the checks behind them, so a heal is often the
+	// first time a project hears about, say, an untrusted mkcert CA. Everything
+	// but len(resp.Registered) used to be discarded here.
+	//
+	// This runs on the FORWARDER's goroutine, not runUp's, so the preamble is
+	// off limits (it is unsynchronized by construction). Only the sink — which
+	// is mutex-guarded and feeds GET /status — plus the stdlib logger, which is
+	// routed through the stdio sink and therefore reaches a TUI's log pane or
+	// plain stderr. Add's return means each advisory is announced once, not once
+	// per heal.
+	for _, w := range r.WarningSink().Add(resp.Warnings...) {
+		for _, line := range formatWarning(w) {
+			log.Print(line)
+		}
+	}
 	return true
 }
 

@@ -108,6 +108,124 @@ func TestEmptyStates_FourCases(t *testing.T) {
 	})
 }
 
+// TestRequestsEmptyHint_ExplainsWhy pins the four answers the empty requests
+// pane can give (#92). The pre-C5 pane gave the last one unconditionally, so a
+// project with no proxy: block was told to wait for traffic that could never
+// arrive.
+func TestRequestsEmptyHint_ExplainsWhy(t *testing.T) {
+	pinANSIProfile(t)
+	withTestTheme(t, "tokyo-night")
+
+	// emptyRequestsHint renders the requests pane of a model built with the
+	// given proxy facts and returns its plain text.
+	emptyRequestsHint := func(t *testing.T, proxyConfigured, captureEnabled bool) string {
+		t.Helper()
+		opts := attachClientOptions()
+		opts.ProxyConfigured = proxyConfigured
+		opts.CaptureEnabled = captureEnabled
+		m := NewClientModel(&stubTUIClient{}, opts)
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 24})
+		m.setViewMode(ViewModeRequests)
+		return ansi.Strip(m.viewport.View())
+	}
+
+	t.Run("no proxy configured", func(t *testing.T) {
+		plain := emptyRequestsHint(t, false, false)
+		assert.Contains(t, plain, "No proxy running")
+		assert.Contains(t, plain, "prox.yaml")
+		assert.NotContains(t, plain, "No requests yet")
+		assert.NotContains(t, plain, "capture.enabled")
+	})
+
+	// The --no-proxy case: the file's proxy: block is enabled and capture with
+	// it, but the RUNTIME proxy is off, so the caller passes false/false and the
+	// pane must blame the proxy, not the capture setting.
+	t.Run("proxy disabled at runtime outranks capture", func(t *testing.T) {
+		plain := emptyRequestsHint(t, false, true)
+		assert.Contains(t, plain, "No proxy running")
+		assert.NotContains(t, plain, "capture is off")
+	})
+
+	// Capture being off does NOT stop rows arriving — both proxy paths still
+	// Upsert a metadata-only record (internal/proxy/proxy.go's brw branch). So
+	// this hint must still promise traffic, and only qualify what will land in
+	// it; claiming capture is why the list is empty would be false.
+	t.Run("capture disabled qualifies the promise instead of withdrawing it", func(t *testing.T) {
+		plain := emptyRequestsHint(t, true, false)
+		assert.Contains(t, plain, "No requests yet — capture is off, so rows will show metadata only")
+		assert.NotContains(t, plain, "traffic through the proxy appears here",
+			"the unqualified promise is for the capture-on case only")
+		assert.NotContains(t, plain, "No proxy running")
+	})
+
+	t.Run("proxy and capture on", func(t *testing.T) {
+		plain := emptyRequestsHint(t, true, true)
+		assert.Contains(t, plain, "No requests yet — traffic through the proxy appears here")
+	})
+
+	// An active filter is the user's own doing and outranks every hint above:
+	// the list is empty because they narrowed it, not because of the project's
+	// proxy configuration.
+	t.Run("active filter outranks both hints", func(t *testing.T) {
+		opts := attachClientOptions()
+		opts.ProxyConfigured = false
+		opts.CaptureEnabled = false
+		m := NewClientModel(&stubTUIClient{}, opts)
+		m = clientUpdate(m, tea.WindowSizeMsg{Width: 100, Height: 24})
+		m = clientUpdate(m, ProxyRequestMsg(proxy.RequestRecord{
+			ID: "r1", Method: "GET", URL: "/ok", StatusCode: 200,
+		}))
+		m.setViewMode(ViewModeRequests)
+		m.setRequestsFilterQuery("status:500")
+		m.updateViewport()
+		plain := ansi.Strip(m.viewport.View())
+		assert.Contains(t, plain, "No lines match status:500")
+		assert.NotContains(t, plain, "No proxy running")
+		assert.NotContains(t, plain, "capture is off")
+	})
+}
+
+// TestRequestDetail_CaptureDisabledNote pins the detail view's explanation for a
+// completed request with no headers and no bodies. formatRequestDetail renders
+// nothing at all for absent sections, so without the note the view is silently
+// bare — and the in-flight note must keep its own, unrelated explanation.
+func TestRequestDetail_CaptureDisabledNote(t *testing.T) {
+	pinANSIProfile(t)
+	withTestTheme(t, "tokyo-night")
+
+	const note = "Capture is disabled (proxy.capture.enabled: false) — no headers or bodies were recorded"
+
+	detail := func(captureEnabled, inFlight bool) string {
+		b := newTestBaseModel()
+		b.captureEnabled = captureEnabled
+		b.proxyConfigured = true
+		b.requestDetail = &RequestDetailData{
+			ID: "req-1", Timestamp: "t", Method: "GET", URL: "/x",
+			StatusCode: 200, InFlight: inFlight,
+		}
+		return ansi.Strip(strings.Join(b.formatRequestDetail(), "\n"))
+	}
+
+	t.Run("capture disabled", func(t *testing.T) {
+		out := detail(false, false)
+		assert.Contains(t, out, note)
+		assert.NotContains(t, out, "request in flight")
+	})
+
+	t.Run("capture enabled", func(t *testing.T) {
+		out := detail(true, false)
+		assert.NotContains(t, out, note)
+	})
+
+	// Both notes explain "no details here", so exactly one must fire. In flight
+	// wins: capture may well be on and the details simply not recorded yet.
+	t.Run("in flight wins over capture note", func(t *testing.T) {
+		out := detail(false, true)
+		assert.Contains(t, out, "(request in flight — details arrive on completion)")
+		assert.NotContains(t, out, note)
+	})
+}
+
 func TestDetailTitle_Style(t *testing.T) {
 	pinANSIProfile(t)
 	withTestTheme(t, "tokyo-night")

@@ -110,6 +110,46 @@ func TestFooter_WidthDegradation(t *testing.T) {
 	}
 }
 
+// TestFooter_RequestDetailNoFollowOrCount pins issue #92 bug 2: the detail
+// view is not a scrolling list, so its footer must render the bare view tag
+// with no follow indicator and no N/M count — those describe the OTHER
+// views' lists. Logs and requests keep both, unchanged.
+func TestFooter_RequestDetailNoFollowOrCount(t *testing.T) {
+	m := newTestModel()
+	m = clientUpdate(m, tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{Process: "web", Line: "hello"}))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("req-001", "/x")))
+
+	t.Run("detail view", func(t *testing.T) {
+		m.viewMode = ViewModeRequestDetail
+		m.requestDetail = &RequestDetailData{ID: "req-001", Method: "GET", URL: "/x", StatusCode: 200}
+		m.updateViewport()
+		plain := ansi.Strip(m.statusBar(footerMsg{}))
+		assert.Contains(t, plain, "[Request Detail]")
+		assert.NotContains(t, plain, "[FOLLOW]")
+		assert.NotContains(t, plain, "[PAUSED]")
+		assert.NotContains(t, plain, "lines")
+		assert.NotContains(t, plain, "requests")
+	})
+
+	t.Run("logs view unchanged", func(t *testing.T) {
+		m.viewMode = ViewModeLogs
+		m.updateViewport()
+		plain := ansi.Strip(m.statusBar(footerMsg{}))
+		assert.Contains(t, plain, "[Logs]")
+		assert.Contains(t, plain, "[FOLLOW]")
+		assert.Contains(t, plain, "lines")
+	})
+
+	t.Run("requests view unchanged", func(t *testing.T) {
+		m.setViewMode(ViewModeRequests)
+		plain := ansi.Strip(m.statusBar(footerMsg{}))
+		assert.Contains(t, plain, "[Requests]")
+		assert.Contains(t, plain, "[FOLLOW]")
+		assert.Contains(t, plain, "requests")
+	})
+}
+
 func TestFooter_WideCharStatus(t *testing.T) {
 	for _, w := range []int{20, 40, 80, 120} {
 		t.Run(strconv.Itoa(w), func(t *testing.T) {

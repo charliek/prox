@@ -199,6 +199,15 @@ type BaseModel struct {
 	// resolved to the cwd base in RunClient.
 	projectName string
 
+	// proxyConfigured / captureEnabled mirror the ClientOptions fields of the
+	// same name: the resolved runtime state of the proxy path behind this
+	// session (see ClientOptions.ProxyConfigured). They live on BaseModel
+	// because both readers do — the requests empty state and the request
+	// detail's capture note. Static for the session; nothing mutates them
+	// after construction.
+	proxyConfigured bool
+	captureEnabled  bool
+
 	// Menu bar open state (WS3). openMenu is -1 when closed, otherwise a MenuID.
 	// menuHighlight is the full-list index of the highlighted dropdown row.
 	// menuWindow is the first visible item index — reset on open/sibling slide,
@@ -362,8 +371,17 @@ func (b *BaseModel) handleWindowSize(msg tea.WindowSizeMsg) {
 }
 
 // chromeAbove is the number of rows above the viewport (menu bar + process
-// panel). Derived from ACTUAL enabled chrome — not fixed reservations (Codex #8).
+// panel + dead-stack banner). Derived from ACTUAL enabled chrome — not fixed
+// reservations (Codex #8).
 func (b *BaseModel) chromeAbove() int {
+	return b.fixedChromeAbove() + b.deadStackBannerRows()
+}
+
+// fixedChromeAbove is the settings-driven part of chromeAbove: the rows that
+// change only on a WindowSizeMsg or a visibility toggle. Split out because the
+// dead-stack banner's own room check (showDeadStackBanner) needs the chrome
+// around it and would otherwise recurse through chromeAbove into itself.
+func (b *BaseModel) fixedChromeAbove() int {
 	h := 0
 	if b.settings.MenuBar {
 		h++ // menu bar row
@@ -466,7 +484,10 @@ func (b *BaseModel) isFooterY(y int) bool {
 // WindowSizeMsg, every visibility toggle (a toggle emits no resize, so
 // without this the viewport keeps stale geometry — Codex #8), and view-mode
 // switches (C11 requests header changes viewport height). C4 flips
-// ProcessPanel and calls relayout the same way. Panel border (C7) insets the
+// ProcessPanel and calls relayout the same way. Plan 028 C4 adds the one DATA
+// -driven caller: the dead-stack banner appears and disappears on a
+// ProcessesMsg, so that handler compares showDeadStackBanner across the
+// assignment and relayouts when it flips. Panel border (C7) insets the
 // viewport by panelBorder() rows/cols when contentRect is large enough; the
 // requests header (C11) further shrinks height and shifts YPosition.
 func (b *BaseModel) relayout() {
@@ -1872,6 +1893,44 @@ func (b *BaseModel) clampViewportToContent() {
 	}
 }
 
+// requestsEmptyHint explains an empty requests pane. The pane being empty is
+// almost never the interesting fact — WHY it is empty is — and every answer
+// here is either actionable or a promise the session can actually keep.
+//
+// Priority matters. An active filter wins outright: the user narrowed the list
+// themselves, so reporting the project's proxy configuration would be answering
+// a question nobody asked (and a filter can hide requests that plainly exist).
+// Below that, "no proxy" outranks the capture note, because capture is
+// meaningless without a proxy to capture from.
+//
+// EVERY BRANCH IS A TRUTH CLAIM, and getting one wrong is the bug this exists
+// to fix (#92), so two of them are worded carefully:
+//
+//   - The no-proxy branch says "no proxy running", not "no proxy configured".
+//     It fires for three different states — no proxy: block at all, one that is
+//     `enabled: false`, and `--no-proxy` on the command line — and only the
+//     first is fixed by adding a block. What is true in all three is that this
+//     SESSION has no proxy, so that is what it says.
+//   - Capture being off does NOT keep this list empty. Both proxy paths still
+//     publish a metadata-only record when capture is disabled (see the brw
+//     branch in internal/proxy/proxy.go, which Upserts with nil details), so
+//     rows DO arrive — they simply carry no headers or bodies. Saying "capture
+//     is disabled" on its own would imply nothing will ever show up, which is
+//     the same class of untruth as the unconditional hint this replaced. So the
+//     branch keeps the promise of traffic and qualifies what will land.
+func (b *BaseModel) requestsEmptyHint() string {
+	switch {
+	case !b.requestsFilter.LastGood.IsEmpty():
+		return "No lines match " + b.requestsFilter.LastGood.Serialize()
+	case !b.proxyConfigured:
+		return "No proxy running — enable a proxy: block in prox.yaml to capture requests"
+	case !b.captureEnabled:
+		return "No requests yet — capture is off, so rows will show metadata only"
+	default:
+		return "No requests yet — traffic through the proxy appears here"
+	}
+}
+
 // updateViewport updates the viewport content
 func (b *BaseModel) updateViewport() {
 	var lines []string
@@ -1888,10 +1947,7 @@ func (b *BaseModel) updateViewport() {
 		// invariant agree within this single render (D6/D8).
 		b.resolveRequestCursor(requests)
 		if len(requests) == 0 {
-			hint := "No requests yet — traffic through the proxy appears here"
-			if !b.requestsFilter.LastGood.IsEmpty() {
-				hint = "No lines match " + b.requestsFilter.LastGood.Serialize()
-			}
+			hint := b.requestsEmptyHint()
 			lines = centeredHint(hint, styles.Dim, b.viewport.Width, b.viewport.Height)
 		} else {
 			for i, req := range requests {
@@ -2075,6 +2131,26 @@ func (b *BaseModel) formatRequestDetail() []string {
 		default:
 			lines = append(lines, styles.Dim.Render("(request in flight — details arrive on completion)"))
 		}
+	} else if !b.captureEnabled {
+		// Capture off: this record is a completed request whose details were
+		// never recorded, so every section below renders nothing
+		// (renderBodySection returns nil for an absent body). Without this note
+		// the detail view is silently, unexplainably bare.
+		//
+		// It says "details", not "bodies": the capture path builds
+		// RequestDetails with request AND response HEADERS alongside the two
+		// bodies (internal/proxy/proxy.go), and with capture off the record is
+		// Upserted with nil details — so the headers are just as absent as the
+		// bodies, and naming only the bodies would leave the empty header
+		// sections unexplained.
+		//
+		// Deliberately an ELSE of the in-flight branch, not a second note: an
+		// in-flight record has no details YET for a reason that has nothing to do
+		// with capture, and stacking both would give one record two competing
+		// explanations. In-flight wins; when it completes, this note takes over
+		// (see clampViewportToContent for the height change that causes).
+		lines = append(lines, "")
+		lines = append(lines, styles.Dim.Render("Capture is disabled (proxy.capture.enabled: false) — no headers or bodies were recorded"))
 	}
 
 	// Request headers (key Dim, value default — C9)
@@ -2628,21 +2704,44 @@ func processStyle(state domain.ProcessState) lipgloss.Style {
 	}
 }
 
-// gatedDetail returns the inline gated-launch annotation for a process (plan 013
-// D5): " (waiting on: X, Y)" while waiting, " (blocked on: X)" while blocked, and
-// "" in every other state. Targets are shown in declaration order.
-func gatedDetail(p domain.ProcessInfo) string {
+// stateLabel returns the colour-independent state text appended after a
+// process name in the panel (issue #92 bug 1). processStyle colours the name,
+// but colour alone does not survive ANSI-stripped output (piped logs,
+// TERM=dumb, screenshots) or a colour-blind reader — and styles.Crashed /
+// styles.Blocked share one style, as do styles.Stopped / styles.Completed, so
+// those pairs are ONLY colour-distinguishable today. Every state but running
+// gets a parenthesized word suffix; running pays nothing so the common case
+// stays byte-identical.
+//
+// Subsumes the former gatedDetail (plan 013 D5): the waiting-on / blocked-on
+// forms below are byte-identical to its old output.
+func stateLabel(p domain.ProcessInfo) string {
 	switch p.State {
+	case domain.ProcessStateRunning:
+		return ""
 	case domain.ProcessStateWaiting:
 		if len(p.WaitingOn) > 0 {
 			return " (waiting on: " + strings.Join(p.WaitingOn, ", ") + ")"
 		}
+		return " (waiting)"
 	case domain.ProcessStateBlocked:
 		if len(p.BlockedOn) > 0 {
 			return " (blocked on: " + strings.Join(p.BlockedOn, ", ") + ")"
 		}
+		return " (blocked)"
+	case domain.ProcessStateCrashed:
+		return " (crashed)"
+	case domain.ProcessStateCompleted:
+		return " (done)"
+	case domain.ProcessStateStopped:
+		return " (stopped)"
+	case domain.ProcessStateStarting:
+		return " (starting)"
+	case domain.ProcessStateStopping:
+		return " (stopping)"
+	default:
+		return ""
 	}
-	return ""
 }
 
 // healthDot returns the process panel's health indicator (plan 018 D13): a
@@ -2683,11 +2782,11 @@ func (b *BaseModel) processPanel() string {
 			name = fmt.Sprintf("[%s]", proc.Name)
 		}
 
-		// Gated-launch detail (plan 013 D5): a waiting/blocked process shows what
-		// it is gated on inline, in declaration order, so the panel explains why it
-		// has not launched. Kept minimal — this compact panel has no separate
-		// detail area.
-		name += gatedDetail(proc)
+		// State label (issue #92 bug 1): every non-running state gets a
+		// colour-independent word suffix, so the panel does not rely on colour
+		// alone to convey e.g. crashed vs. running. Subsumes the former
+		// gated-launch detail (plan 013 D5) inline, in declaration order.
+		name += stateLabel(proc)
 
 		// Health dot (plan 018 D13): appended as a separately styled segment
 		// after the name so the name's state style cannot swallow or recolor
@@ -2867,11 +2966,19 @@ func (b *BaseModel) statusBar(msg footerMsg) string {
 	case ViewModeRequestDetail:
 		viewIndicator = "[Request Detail]"
 	}
-	followIndicator := "[FOLLOW]"
-	if !b.followMode {
-		followIndicator = "[PAUSED]"
+	// Detail view is not a scrolling list: it has no follow state and no
+	// line/request count of its own, so showing either would state something
+	// the view cannot mean (issue #92 bug 2). Render the view tag alone.
+	var countPlain string
+	if b.viewMode == ViewModeRequestDetail {
+		countPlain = viewIndicator
+	} else {
+		followIndicator := "[FOLLOW]"
+		if !b.followMode {
+			followIndicator = "[PAUSED]"
+		}
+		countPlain = fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	}
-	countPlain := fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	countStyled := styles.FooterLabel.Render(countPlain)
 
 	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints(b.helpConfig.QuitHint))
@@ -2902,6 +3009,14 @@ func (b *BaseModel) mainView(msg footerMsg) string {
 		if CurrentTheme().FullFill {
 			lines = append(lines, padFrameRow("", b.width))
 		}
+	}
+
+	// Dead-stack banner (plan 028 C4): between the process panel and the panel
+	// top border, counted in chromeAbove so the viewport is one row shorter
+	// while it is up. Its own band fill (styles.Err) spans the frame, so no
+	// padFrameRow wrapping — that would re-pad an already exact-width row.
+	if b.showDeadStackBanner() {
+		lines = append(lines, singleFrameLine(b.renderDeadStackBanner(b.width)))
 	}
 
 	drawPanel := b.canDrawPanel()

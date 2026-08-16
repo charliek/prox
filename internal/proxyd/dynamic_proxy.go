@@ -17,14 +17,20 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
 
 // certManager is the cert capability the dynamic proxy and register flow need:
-// per-domain cert generation plus SNI cert selection.
+// per-domain cert generation, SNI cert selection, and the user-facing warnings
+// the cert layer observed (Warnings), which register() returns to the CLI
+// because the daemon itself has nowhere to print them.
 type certManager interface {
 	EnsureDomain(domain string) error
 	GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	// Warnings returns the CA-scoped warnings recorded so far. It must be cheap
+	// and non-blocking: register() calls it while holding lifecycleMu.
+	Warnings() []domain.Warning
 }
 
 // managedListener tracks a dynamically created port listener.

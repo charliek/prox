@@ -3,6 +3,8 @@
 package certs
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +18,11 @@ import (
 type Manager struct {
 	certsDir string
 	domain   string
+	// trust is where this manager reports what mkcert said about its own local
+	// CA. It is process-scoped, not manager-scoped (see TrustResolver): every
+	// manager in a process feeds the same verdict, so one real generation
+	// answers for every other manager and spares them the probe.
+	trust *TrustResolver
 }
 
 // CertPaths contains the paths to the certificate and key files.
@@ -24,11 +31,24 @@ type CertPaths struct {
 	KeyFile  string
 }
 
-// NewManager creates a new certificate manager.
+// NewManager creates a new certificate manager reporting to the process-wide
+// trust resolver.
 func NewManager(certsDir, domain string) *Manager {
+	return NewManagerWithTrust(certsDir, domain, SharedTrust())
+}
+
+// NewManagerWithTrust is NewManager with an explicit trust resolver. It exists
+// for callers that own a resolver deliberately — chiefly tests, which must not
+// have one test's mkcert verdict latched into the next test's process-wide
+// resolver.
+func NewManagerWithTrust(certsDir, domain string, trust *TrustResolver) *Manager {
+	if trust == nil {
+		trust = SharedTrust()
+	}
 	return &Manager{
 		certsDir: expandPath(certsDir),
 		domain:   domain,
+		trust:    trust,
 	}
 }
 
@@ -43,21 +63,33 @@ func (m *Manager) CheckMkcert() error {
 
 // EnsureCerts ensures that valid certificates exist for the configured domain.
 // If certificates don't exist, they will be generated.
-// Returns the paths to the certificate and key files.
-func (m *Manager) EnsureCerts() (*CertPaths, error) {
+//
+// It returns the paths to the certificate and key files plus the notable lines
+// mkcert printed while generating them — empty when nothing was generated,
+// because the certs were already on disk. Those lines are the only channel
+// mkcert's advice has: in shared mode this runs inside the daemon, whose
+// stdout and stderr are /dev/null (internal/proxyd/daemon.go), so anything
+// mkcert says is discarded outright unless it is captured here.
+//
+// The lines are also fed to the process-wide TrustResolver, so a generation
+// that happened for ANY domain answers the CA-trust question for the whole
+// process for free.
+func (m *Manager) EnsureCerts() (*CertPaths, []string, error) {
 	paths := m.getCertPaths()
 
 	// Check if certificates already exist
 	if m.certsExist(paths) {
-		return paths, nil
+		return paths, nil, nil
 	}
 
 	// Generate new certificates
-	if err := m.generateCerts(paths); err != nil {
-		return nil, err
+	out, err := m.generateCerts(paths)
+	if err != nil {
+		return nil, out, err
 	}
+	m.trust.observe(out)
 
-	return paths, nil
+	return paths, out, nil
 }
 
 func (m *Manager) getCertPaths() *CertPaths {
@@ -79,33 +111,66 @@ func (m *Manager) certsExist(paths *CertPaths) bool {
 	return true
 }
 
-func (m *Manager) generateCerts(paths *CertPaths) error {
+// generateCerts shells to mkcert and returns the notable lines it printed.
+//
+// It CAPTURES mkcert's combined stdout and stderr rather than wiring them to
+// this process's own streams, which is what makes the CA-untrusted note usable
+// at all: in the shared daemon those streams are /dev/null, so the one warning
+// that tells a user why every HTTPS request in their browser fails was being
+// thrown away. Captured, it reaches the person who typed the command — and on
+// failure it is attached to the error, which is a strict improvement over
+// today for the same reason.
+func (m *Manager) generateCerts(paths *CertPaths) ([]string, error) {
 	if err := m.CheckMkcert(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Ensure the certs directory exists
 	if err := os.MkdirAll(m.certsDir, constants.DirPermissionPrivate); err != nil {
-		return fmt.Errorf("creating certs directory: %w", err)
+		return nil, fmt.Errorf("creating certs directory: %w", err)
 	}
 
 	// Generate wildcard certificate for the domain
 	// mkcert -cert-file <cert> -key-file <key> "*.domain" "domain"
 	wildcardDomain := fmt.Sprintf("*.%s", m.domain)
-	cmd := exec.Command("mkcert",
+	// Bounded, because this runs inside register() while the daemon holds
+	// lifecycleMu: an mkcert that never returns would wedge every other
+	// project's registration and the shutdown barrier with it. The bound is
+	// deliberately generous -- issuing one certificate is sub-second, and this
+	// exists to break a hang, not to race a slow machine (CodeRabbit, PR #110;
+	// the unbounded exec predates plan 028).
+	//
+	// WaitDelay is NOT a substitute: it only bounds pipe cleanup AFTER the
+	// process exits, which is the separate hazard the capture below introduced.
+	// Both are needed, and they cover different failures.
+	ctx, cancel := context.WithTimeout(context.Background(), mkcertGenerateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mkcert",
 		"-cert-file", paths.CertFile,
 		"-key-file", paths.KeyFile,
 		wildcardDomain,
 		m.domain,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	// Capturing into a buffer means exec creates a pipe and Wait blocks until
+	// EOF -- so any grandchild mkcert leaves holding that pipe would hang
+	// EnsureCerts, and with it register() under lifecycleMu (CodeRabbit
+	// review). Before the capture, Stdout was an *os.File handed over as a raw
+	// fd and Wait only waited on the process.
+	cmd.WaitDelay = probeWaitDelay
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("generating certificates for %s: %w", m.domain, err)
+		lines := notableLines(buf.String())
+		if len(lines) > 0 {
+			return lines, fmt.Errorf("generating certificates for %s: %w\nmkcert output:\n%s",
+				m.domain, err, strings.Join(lines, "\n"))
+		}
+		return nil, fmt.Errorf("generating certificates for %s: %w", m.domain, err)
 	}
 
-	return nil
+	return notableLines(buf.String()), nil
 }
 
 // expandPath expands ~ to the user's home directory

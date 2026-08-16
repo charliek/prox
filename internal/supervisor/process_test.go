@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -253,6 +254,125 @@ func TestManagedProcess_Info_HealthSituations(t *testing.T) {
 		cancel()
 		assert.False(t, mp.Info().HealthDetails.Enabled)
 	})
+}
+
+// healthyForeverConfig is a healthcheck whose start period is longer than any
+// test run, so the checker's loop parks in its start-period select and never
+// shells out. The tests below observe HealthDetails.Enabled -- i.e. whether the
+// loop is alive at all -- so they need the loop RUNNING, not CHECKING, and this
+// keeps them free of subprocess timing.
+func healthyForeverConfig() *domain.HealthConfig {
+	return &domain.HealthConfig{
+		Cmd:         "true",
+		Interval:    time.Hour,
+		Timeout:     time.Minute,
+		Retries:     1,
+		StartPeriod: time.Hour,
+	}
+}
+
+// newHealthCheckedFake builds a ManagedProcess with a healthcheck configured,
+// wired to the given fake runner (mirrors newFakeManagedProcess).
+func newHealthCheckedFake(t *testing.T, runner ProcessRunner) *ManagedProcess {
+	t.Helper()
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100})
+	t.Cleanup(func() { logMgr.Close() })
+	return NewManagedProcess(domain.ProcessConfig{
+		Name:        "web",
+		Cmd:         "irrelevant",
+		Healthcheck: healthyForeverConfig(),
+	}, nil, runner, logMgr)
+}
+
+// TestManagedProcess_Monitor_NaturalExitStopsHealthChecker is the regression
+// test for #107: when a process dies on its own (no Stop), the health checker
+// must stop with it. Before the fix the instance context was cancelled ONLY by
+// stop() and the launch-failure path, so a crashed process kept re-running the
+// user's check command on its interval -- and reported enabled=true -- until
+// some later Stop tore it down.
+func TestManagedProcess_Monitor_NaturalExitStopsHealthChecker(t *testing.T) {
+	runner := newFakeRunner(func(call int) *fakeProcess { return newFakeProcess(7100 + call) })
+	mp := newHealthCheckedFake(t, runner)
+
+	require.NoError(t, mp.Start(context.Background()))
+	require.Equal(t, domain.ProcessStateRunning, mp.State())
+
+	before := mp.Info()
+	require.NotNil(t, before.HealthDetails)
+	require.True(t, before.HealthDetails.Enabled, "a live run must report an enabled check loop")
+
+	// The leader exits on its own -- no Stop, no signal. The group goes with it.
+	fp := runner.last()
+	fp.setAlive(false)
+	fp.exitLeader(errors.New("boom"))
+
+	waitForState(t, mp, domain.ProcessStateCrashed, 5*time.Second)
+
+	after := mp.Info()
+	require.NotNil(t, after.HealthDetails)
+	assert.False(t, after.HealthDetails.Enabled,
+		"a crashed process must not keep a health check loop running (#107)")
+}
+
+// TestManagedProcess_Monitor_HealthCheckerStopsBeforeOutputDrain pins the
+// INSERTION POINT of the #107 fix, which is the part that actually matters:
+// the cancel happens right after Wait() returns, BEFORE monitor's up-to-5s
+// output-drain wait. This test holds a pipe open past the leader's exit (what a
+// surviving grandchild does), so the drain is guaranteed to still be in
+// progress, and asserts the checker is already down.
+//
+// If the cancel were moved to the terminal-state commit -- the other natural
+// place for it -- this test fails: the checker would keep executing the user's
+// command for the whole outputDrainTimeout window.
+func TestManagedProcess_Monitor_HealthCheckerStopsBeforeOutputDrain(t *testing.T) {
+	// A pipe whose write end the test holds: the stdout reader blocks in Read
+	// until we close it, exactly like a grandchild that outlives the leader.
+	pr, pw, err := os.Pipe()
+	require.NoError(t, err)
+	defer pr.Close()
+	pipeClosed := false
+	closePipe := func() {
+		if !pipeClosed {
+			pipeClosed = true
+			pw.Close()
+		}
+	}
+	defer closePipe()
+
+	runner := newFakeRunner(func(call int) *fakeProcess {
+		fp := newFakeProcess(7200 + call)
+		fp.stdout = pr
+		return fp
+	})
+	mp := newHealthCheckedFake(t, runner)
+
+	require.NoError(t, mp.Start(context.Background()))
+	require.True(t, mp.Info().HealthDetails.Enabled)
+
+	fp := runner.last()
+	fp.setAlive(false)
+	start := time.Now()
+	fp.exitLeader(nil)
+
+	// The checker must go down promptly -- not after the drain window.
+	require.Eventually(t, func() bool {
+		return !mp.Info().HealthDetails.Enabled
+	}, outputDrainTimeout/2, 5*time.Millisecond,
+		"health checker must stop as soon as the leader exits, not wait out the output drain")
+	elapsed := time.Since(start)
+
+	// ...and prove the drain really was still pending when it did, so this is a
+	// statement about ordering rather than about a fast machine: the terminal
+	// state is only committed AFTER the drain, and the pipe is still open here.
+	assert.Equal(t, domain.ProcessStateRunning, mp.State(),
+		"the drain must still be in flight (state not yet committed) when the checker stops")
+	assert.Less(t, elapsed, outputDrainTimeout,
+		"checker stopped only after the full drain window")
+
+	// Release the grandchild so the monitor finishes before the log manager is
+	// torn down.
+	closePipe()
+	waitForState(t, mp, domain.ProcessStateCrashed, 5*time.Second)
 }
 
 // TestManagedProcess_Info_WaitingReportsNoPID pins the plan 013 D5 fix: a gated

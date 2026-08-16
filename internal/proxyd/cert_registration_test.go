@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,10 @@ type fakeCertManager struct {
 	certs   map[string]*tls.Certificate // base domain -> cert
 	ensured map[string]int              // domain -> EnsureDomain call count
 	failFor map[string]error            // domain -> forced EnsureDomain error
+	// warnings is the same CA-scoped holder the real manager uses, so tests that
+	// drive the register flow through this fake exercise the production holder
+	// (record + snapshot + dedupe), not a test-only reimplementation of it.
+	warnings certWarningHolder
 }
 
 func newFakeCertManager() *fakeCertManager {
@@ -77,6 +82,22 @@ func (f *fakeCertManager) EnsureDomain(domain string) error {
 	}
 	f.certs[domain] = cert
 	return nil
+}
+
+// RecordWarning stands in for the real producer (B1's mkcert trust detection):
+// it records a warning the cert layer "observed".
+func (f *fakeCertManager) RecordWarning(w domain.Warning) {
+	f.warnings.set(w)
+}
+
+// ClearWarning stands in for the producer withdrawing a resolved warning.
+func (f *fakeCertManager) ClearWarning(code string) {
+	f.warnings.clear(code)
+}
+
+// Warnings satisfies certManager, returning the recorded warnings.
+func (f *fakeCertManager) Warnings() []domain.Warning {
+	return f.warnings.snapshot()
 }
 
 // GetCertificate is the SNI callback: it selects a cert by the ClientHello's

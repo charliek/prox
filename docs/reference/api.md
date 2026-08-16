@@ -86,7 +86,8 @@ Supervisor status.
     "last_connected_at": "2025-01-19T10:32:01.123Z",
     "dropped_events": 0,
     "backfill_failures": 0,
-    "heal_state": "healthy"
+    "heal_state": "healthy",
+    "capture_enabled": true
   },
   "dependencies": [
     {
@@ -95,7 +96,15 @@ Supervisor status.
       "check": "tcp localhost:5432",
       "start_invoked": false
     }
-  ]
+  ],
+  "warnings": [
+    {
+      "code": "mkcert_ca_untrusted",
+      "message": "Note: the local CA is not installed in the system trust store.",
+      "hint": "run 'mkcert -install' and restart prox"
+    }
+  ],
+  "warnings_sealed": true
 }
 ```
 
@@ -111,6 +120,7 @@ Supervisor status.
 | `dropped_events` | Request-stream events lost to a full subscriber channel |
 | `backfill_failures` | Post-connect ring snapshot fetch failures |
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
+| `capture_enabled` | Whether request/response capture is effectively on (a proxy is running for this session **and** `proxy.capture.enabled` is true). Daemons predating this field omit it entirely; an absent `capture_enabled` means "unknown", **not** `false` |
 
 `prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
 
@@ -125,6 +135,18 @@ Supervisor status.
 | `start_invoked` | Whether the `start:` command was launched this generation (always `false` when the initial check already passed) |
 
 Only `failed` trips the exit-1 contract (see [`prox status`](cli.md#status) for the full precedence); `warned`/`pending`/`checking`/`polling`/`healthy`/`canceled` do not.
+
+`warnings` carries this session's user-facing advisories (plan 028) — things prox noticed that are not failures, most of them raised somewhere the person who typed the command cannot see directly (inside the shared proxy daemon, whose own stdout/stderr are `/dev/null`, or inside a `prox up -d` child, whose stdout/stderr are `.prox/prox.log`). Omitted when there are none (never an empty array). Each entry:
+
+| Field | Description |
+|-------|-------------|
+| `code` | A stable machine identifier for the warning kind, e.g. `mkcert_ca_untrusted` or `hostname_unresolved`. Wording under `message`/`hint` may change; `code` does not |
+| `message` | One or more complete, user-facing sentences describing what is wrong |
+| `hint` | The next action to take, when there is one; omitted otherwise |
+
+`warnings_sealed` reports whether every startup warning producer for this session has finished. Some producers (the mkcert trust probe, the hostname resolution check) run asynchronously and can still be in flight when a `prox up -d` parent takes its post-readiness status snapshot; polling this flag (rather than trusting a single fetch) is how that parent avoids silently losing a warning to the race. Always present (unlike `warnings`, it is not `omitempty`): `false` is itself the meaningful value a poller is waiting to flip.
+
+**A warning never changes any exit code.** `prox status`, `prox up`, and `prox up -d` all render `warnings` the same way (`Warning: <message>`, with `<hint>` indented underneath) and none of their exit contracts consult it.
 
 ### GET /processes
 
@@ -205,7 +227,7 @@ Get detailed process info.
 }
 ```
 
-The `healthcheck` block is present only when a `healthcheck:` **is** configured; a process reporting `"health": "none"` omits it entirely. Its `enabled` field reports whether the check loop is currently running: `false` once the process is stopped, or before it has ever been launched, in which case `health` is `unknown` because the configured check has produced no verdict.
+The `healthcheck` block is present only when a `healthcheck:` **is** configured; a process reporting `"health": "none"` omits it entirely. Its `enabled` field reports whether the check loop is currently running: `false` once the process has exited for any reason — stopped deliberately, `crashed` on its own, or `completed` — or before it has ever been launched, in which case `health` is `unknown` because the configured check has produced no verdict. A process that crashes on its own stops its checker (and flips `enabled` to `false`) the instant the exit is observed, not only once a later stop request arrives (plan 028, #107) — so a crashed process's check command is not still re-executing against a dead pid in the background.
 
 `stop_timeout` is the effective SIGTERM→SIGKILL escalation budget in force for this process (its own `stop_timeout`, else the global `shutdown_timeout`, else the `10s` default), as a duration string. It is the budget governing a `POST /processes/{name}/stop` or `POST /processes/{name}/restart`. See [Stop Timeout](configuration.md#stop-timeout).
 

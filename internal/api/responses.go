@@ -51,6 +51,23 @@ type StatusResponse struct {
 	// second endpoint so `prox status` reads a consistent snapshot in one fetch.
 	// Additive: omitted (nil) when no dependencies are configured.
 	Dependencies []DependencyStatusResponse `json:"dependencies,omitempty"`
+	// Warnings are this session's user-facing advisories (plan 028 A2), most of
+	// them raised where the person who typed the command cannot see them: inside
+	// the shared proxy daemon (stdout/stderr are /dev/null) or inside a
+	// `prox up -d` child (output goes to .prox/prox.log). Publishing them here is
+	// what lets the detached parent print them on the terminal the user is
+	// actually looking at, and `prox status` re-print them later.
+	Warnings []domain.Warning `json:"warnings,omitempty"`
+	// WarningsSealed reports whether every startup warning producer has
+	// finished. Some are asynchronous and can still be running when the
+	// `prox up -d` parent finishes its readiness + settle wait, so a single
+	// status fetch at that moment would race them and silently lose a warning;
+	// the parent polls this flag instead (bounded).
+	//
+	// NOT omitempty: false is the meaningful value the parent polls on, and a
+	// key that vanishes exactly when it is false is a key a client cannot
+	// distinguish from a daemon that never had the field.
+	WarningsSealed bool `json:"warnings_sealed"`
 }
 
 // DependencyStatusResponse reports one configured dependency's resolution state
@@ -90,6 +107,19 @@ type ProxyStatusResponse struct {
 	// HealState is "healthy" when the shared daemon is reachable, "" otherwise
 	// (C5). C6 refines it to "healing"/"version_mismatch".
 	HealState string `json:"heal_state,omitempty"`
+	// CaptureEnabled reports whether request/response capture is effectively on
+	// for this project (proxy enabled AND capture.enabled), so a client can say
+	// WHY a request list or a request detail is empty instead of promising
+	// traffic that will never be recorded.
+	//
+	// It is a POINTER on purpose. The project API carries no version gate --
+	// unlike the shared daemon, which requires an exact version match with its
+	// clients -- so `prox attach` can legitimately talk to an older daemon that
+	// predates this field. A plain bool would decode that daemon's absent field
+	// as false and assert "capture is off" about a daemon that never had an
+	// opinion. nil means UNKNOWN and callers must fall back to their
+	// capture-agnostic wording rather than treating it as disabled.
+	CaptureEnabled *bool `json:"capture_enabled,omitempty"`
 }
 
 // ProxyStatusProvider supplies the proxy block for GET /status. The daemon
@@ -99,6 +129,20 @@ type ProxyStatusResponse struct {
 // drive GetStatus with a fake.
 type ProxyStatusProvider interface {
 	ProxyStatus() *ProxyStatusResponse
+}
+
+// WarningProvider supplies this session's user-facing warnings, and the
+// completion latch that says whether every startup producer has finished, for
+// GET /status (plan 028 A2). The daemon injects an implementation (the cli's
+// warningSink); like ProxyStatusProvider it is defined here as a narrow
+// interface so the api package does not depend on internal/cli and tests can
+// drive GetStatus with a fake.
+//
+// Two methods rather than one returning both, so each maps to exactly one
+// response field and neither can be silently swapped for the other.
+type WarningProvider interface {
+	Warnings() []domain.Warning
+	WarningsSealed() bool
 }
 
 // ProcessListResponse represents the response for GET /processes

@@ -266,6 +266,11 @@ func attachClientOptions() ClientOptions {
 			QuitMessage: "Quit (daemon continues running)",
 		},
 		ConnectedStatus: "Connected via API",
+		// What attach passes when it knows nothing: attachProxyFacts answers
+		// true/true for a nil status block or a daemon predating capture_enabled,
+		// i.e. "keep the wording that predates these fields".
+		ProxyConfigured: true,
+		CaptureEnabled:  true,
 	}
 }
 

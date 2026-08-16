@@ -70,6 +70,16 @@ On narrow terminals hints drop right-to-left (non-sticky pairs first; `? help` a
 - **Dropdown menus** use rounded borders. Each row shows a right-aligned **hint** column (keyboard shortcut) when space allows; long menus clamp with “… N more …” rows.
 - **Help modal** is a centred rounded box with a **focused** border colour and the view name spliced into the top border (`─ Help — Logs ─`). On very narrow frames side padding and then the border degrade before content.
 
+### Dead-stack banner
+
+When every process has stopped and at least one of them `crashed` or was `blocked` on a failed dependency, a persistent full-width row appears between the process panel and the viewport's top border:
+
+```text
+ All processes have stopped — 2 crashed. Nothing is running. Press q to quit.
+```
+
+The TUI does **not** exit on its own here — unlike a plain, piped `prox up`, which does (see [the foreground exit contract](cli.md#up)) — because the user is present and reading, and pulling the screen away would take the crash output with it. The sentence names both `crashed` and `blocked` counts (never just "crashed", if a launch was actually blocked by a failed dependency) and, like the process labels above, is readable with every escape code stripped — colour is emphasis only. It appears identically in `prox up` and `prox attach`, and clears itself the moment any process becomes live again (a `restart`, for example).
+
 ## Themes
 
 Six built-in presets ship with prox: `tokyo-night` (default), `dark`, `light`, `catppuccin`, `gruvbox`, and `legacy` (approximates the pre-redesign ANSI look).
@@ -110,7 +120,22 @@ The processes panel colour-codes each process name by its state, including the s
 | `blocked` | error, bold |
 | `completed` | dim |
 
-A `waiting` or `blocked` process also gets an inline annotation naming what it's gated on. A process with a [healthcheck](configuration.md#health-check-fields) shows a health dot after its name: green `●` while healthy, red `✗` while unhealthy.
+**Colour is emphasis, not the only signal.** `crashed`/`blocked` share one colour role, as do `stopped`/`completed`, so those pairs are only colour-distinguishable — nothing at all once ANSI is stripped (piped output, `TERM=dumb`, a screenshot) or to a colour-blind reader. Every state but `running` therefore appends a parenthesized word to the process name, and that label is what actually survives stripping:
+
+Each suffix is appended after the process name, separated by a space.
+
+| State | Name suffix |
+| ----- | ------------ |
+| `running` | *(none)* |
+| `crashed` | `(crashed)` |
+| `blocked` | `(blocked)`, or `(blocked on: <target>[, ...])` naming the failed `depends_on` targets |
+| `waiting` | `(waiting)`, or `(waiting on: <target>[, ...])` naming the still-resolving targets |
+| `completed` | `(done)` |
+| `stopped` | `(stopped)` |
+| `starting` | `(starting)` |
+| `stopping` | `(stopping)` |
+
+A process with a [healthcheck](configuration.md#health-check-fields) shows a health dot after its name (and its state label): green `●` while healthy, red `✗` while unhealthy. A process with no healthcheck configured, or whose check has not reported yet, shows no dot.
 
 Click a process chip in the panel (logs view) to solo that process — the same as pressing its `1`–`9` key. Click again to clear solo.
 
@@ -191,6 +216,14 @@ The **Filter menu** edits the same state as the `s` bar; menu changes rewrite th
 
 The requests view has an explicit **cursor row** (marked with `❯`). Navigation moves that cursor; the viewport scrolls to keep it visible.
 
+**Empty state.** With no active filter, the empty view names *why* there are no rows rather than showing one generic message for every cause:
+
+- No proxy running this session (no `proxy:` block, one that is `enabled: false`, or `--no-proxy`): "No proxy running — enable a proxy: block in prox.yaml to capture requests".
+- A proxy is running but `proxy.capture.enabled: false`: "No requests yet — capture is off, so rows will show metadata only" — rows still arrive with capture off (method, URL, status, timing), they just carry no headers or bodies.
+- Otherwise: "No requests yet — traffic through the proxy appears here".
+
+An active filter with no matches instead shows what didn't match ("No lines match …").
+
 Open the **View** menu (`v`) for a **Columns** checkbox section (Requests and Request Detail views): toggle Time, Host, Method, Status, Duration, and ID. **URL is always shown.** Defaults are all on; choices persist under `[requests]` in config. `/` search matches only visible columns; copy keys (`y`, `c`) are unaffected.
 
 | Key | Action |
@@ -241,6 +274,8 @@ Fields:
 | Scroll wheel | Scroll detail content |
 
 Detail views live-update when the open request completes.
+
+**Capture-disabled records.** When `proxy.capture.enabled: false`, a completed request's detail view has no headers and no body sections to show — the record was written with no captured details — and says so rather than rendering an unexplained blank view: "Capture is disabled (proxy.capture.enabled: false) — no headers or bodies were recorded". An in-flight request (still running) shows its own, unrelated note instead, since its details simply haven't arrived yet.
 
 ## Search vs. Filter
 

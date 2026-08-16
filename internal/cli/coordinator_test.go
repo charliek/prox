@@ -133,3 +133,91 @@ func TestShutdownCoordinator_OutcomeBeforeDone(t *testing.T) {
 	}
 	assert.Nil(t, c.Outcome(), "Outcome before Done is nil (indistinguishable from clean; do not read it)")
 }
+
+// TestShutdownCoordinator_TriggerWithOnlyTheWinnerRecordsItsReason pins the
+// arbitration that decides `prox up`'s exit code when a dead stack and a
+// deliberate shutdown race (plan 028 C3, codex review finding).
+//
+// The dead-stack watcher records WHY it ended the session; a Ctrl-C records
+// nothing, because an intentional shutdown exits 0. "Latch, then trigger" left
+// a window in which a Ctrl-C arriving between the two still exited non-zero, so
+// the reason is now decided INSIDE triggerOnce: whoever actually requests the
+// shutdown is the only one that gets to say why.
+func TestShutdownCoordinator_TriggerWithOnlyTheWinnerRecordsItsReason(t *testing.T) {
+	t.Run("a shutdown that lost records nothing", func(t *testing.T) {
+		c := newShutdownCoordinator()
+		ran := false
+
+		c.Trigger() // the signal handler gets there first
+		c.TriggerWith(func() { ran = true })
+
+		assert.False(t, ran,
+			"the watcher lost the trigger, so it must not record a reason -- "+
+				"an intentional shutdown exits 0")
+		assertClosed(t, c.TriggerCh())
+	})
+
+	t.Run("a shutdown that won records its reason", func(t *testing.T) {
+		c := newShutdownCoordinator()
+		ran := false
+
+		c.TriggerWith(func() { ran = true })
+		c.Trigger() // a signal arriving afterwards changes nothing
+
+		assert.True(t, ran, "the watcher won the trigger, so its reason stands")
+		assertClosed(t, c.TriggerCh())
+	})
+
+	t.Run("under contention exactly one caller wins", func(t *testing.T) {
+		// The callback must also run BEFORE the channel closes: a reader woken
+		// by TriggerCh reads the latched reason immediately, and would race a
+		// callback that ran after the close.
+		const racers = 64
+		for range 32 {
+			c := newShutdownCoordinator()
+			var mu sync.Mutex
+			wins := 0
+			closedBeforeCallback := false
+
+			var wg sync.WaitGroup
+			wg.Add(racers)
+			for i := range racers {
+				go func() {
+					defer wg.Done()
+					if i%2 == 0 {
+						c.Trigger()
+						return
+					}
+					c.TriggerWith(func() {
+						mu.Lock()
+						defer mu.Unlock()
+						wins++
+						select {
+						case <-c.TriggerCh():
+							closedBeforeCallback = true
+						default:
+						}
+					})
+				}()
+			}
+			wg.Wait()
+
+			mu.Lock()
+			require.LessOrEqual(t, wins, 1, "more than one caller recorded a reason")
+			assert.False(t, closedBeforeCallback,
+				"the reason must be recorded before TriggerCh closes")
+			mu.Unlock()
+			assertClosed(t, c.TriggerCh())
+		}
+	})
+}
+
+// assertClosed fails unless ch is already closed.
+func assertClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("trigger channel was never closed")
+	}
+}

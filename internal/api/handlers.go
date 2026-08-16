@@ -53,6 +53,10 @@ type Handlers struct {
 	projectDir  string
 	shutdown    ShutdownController
 	proxyStatus ProxyStatusProvider
+	// warnings supplies the session's user-facing advisories for GET /status
+	// (plan 028 A2). Injected by the `prox up` path; nil in unit-test handlers,
+	// which then report no warnings and an unsealed latch.
+	warnings WarningProvider
 
 	// sseHeartbeatInterval overrides constants.SSEHeartbeatInterval for the SSE
 	// handlers (StreamLogs, StreamProxyRequests, StreamProcesses). Zero means
@@ -137,6 +141,14 @@ func (h *Handlers) SetProxyStatusProvider(p ProxyStatusProvider) {
 	h.proxyStatus = p
 }
 
+// SetWarningProvider injects this session's warning sink (plan 028 A2),
+// mirroring SetProxyStatusProvider: the provider is a `prox up` runtime object,
+// wired in as the session assembles. When unset, GET /status reports no
+// warnings and warnings_sealed false.
+func (h *Handlers) SetWarningProvider(p WarningProvider) {
+	h.warnings = p
+}
+
 // GetStatus handles GET /api/v1/status
 func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.supervisor.Status()
@@ -150,6 +162,10 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.proxyStatus != nil {
 		resp.Proxy = h.proxyStatus.ProxyStatus()
+	}
+	if h.warnings != nil {
+		resp.Warnings = h.warnings.Warnings()
+		resp.WarningsSealed = h.warnings.WarningsSealed()
 	}
 	if deps := h.supervisor.DependencyStatuses(); len(deps) > 0 {
 		resp.Dependencies = make([]DependencyStatusResponse, len(deps))

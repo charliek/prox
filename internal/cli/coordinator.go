@@ -44,7 +44,27 @@ func newShutdownCoordinator() *shutdownCoordinator {
 // /shutdown, or a signal racing an API trigger) is a no-op rather than a
 // double-close panic.
 func (c *shutdownCoordinator) Trigger() {
-	c.triggerOnce.Do(func() { close(c.triggerCh) })
+	c.TriggerWith(nil)
+}
+
+// TriggerWith requests shutdown and, if THIS call is the one that actually
+// requested it, runs onWin first -- inside the same sync.Once, so it happens
+// before triggerCh closes and cannot interleave with another trigger.
+//
+// It exists because one trigger source needs to record WHY: the dead-stack
+// watcher (dead_stack.go, #96) latches a verdict that turns into `prox up`'s
+// non-zero exit code. "Latch, then trigger" is not enough on its own -- a
+// Ctrl-C landing between the two would make an intentional shutdown exit
+// non-zero (codex review finding). Deciding the reason inside triggerOnce
+// makes the exit code follow whoever genuinely ended the session: if a signal
+// or POST /shutdown got here first, onWin never runs and the session exits 0.
+func (c *shutdownCoordinator) TriggerWith(onWin func()) {
+	c.triggerOnce.Do(func() {
+		if onWin != nil {
+			onWin()
+		}
+		close(c.triggerCh)
+	})
 }
 
 // TriggerCh is closed once shutdown has been requested. runUp selects on it (in

@@ -72,6 +72,86 @@ func TestGetStatus(t *testing.T) {
 	assert.Equal(t, "prox.yaml", resp.ConfigFile)
 }
 
+// fakeWarningProvider is a WarningProvider whose answers a test controls (plan
+// 028 A2).
+type fakeWarningProvider struct {
+	warnings []domain.Warning
+	sealed   bool
+}
+
+func (f fakeWarningProvider) Warnings() []domain.Warning { return f.warnings }
+func (f fakeWarningProvider) WarningsSealed() bool       { return f.sealed }
+
+// TestGetStatus_Warnings covers the publishing half of the warning channel: the
+// advisories and the completion latch that the `prox up -d` parent polls, and
+// the absent-when-empty shape that keeps every other client's payload unchanged.
+func TestGetStatus_Warnings(t *testing.T) {
+	t.Run("no provider: no warnings, unsealed, key absent", func(t *testing.T) {
+		server, _, _, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		w := httptest.NewRecorder()
+		server.router.ServeHTTP(w, req)
+
+		body := w.Body.String()
+		assert.NotContains(t, body, `"warnings"`, "omitempty must drop the key when there are none")
+		assert.Contains(t, body, `"warnings_sealed":false`,
+			"the latch is NOT omitempty: false is the value the parent polls on")
+
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal([]byte(body), &resp))
+		assert.Nil(t, resp.Warnings)
+		assert.False(t, resp.WarningsSealed)
+	})
+
+	t.Run("provider: warnings and the latch are published", func(t *testing.T) {
+		server, _, _, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		server.handlers.SetWarningProvider(fakeWarningProvider{
+			warnings: []domain.Warning{
+				{Code: domain.WarningCodeMkcertCAUntrusted, Message: "the CA is not installed.", Hint: "Run 'mkcert -install'."},
+				{Code: "other", Message: "no hint on this one"},
+			},
+			sealed: true,
+		})
+
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		w := httptest.NewRecorder()
+		server.router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+
+		require.Len(t, resp.Warnings, 2)
+		assert.Equal(t, domain.WarningCodeMkcertCAUntrusted, resp.Warnings[0].Code)
+		assert.Equal(t, "the CA is not installed.", resp.Warnings[0].Message)
+		assert.Equal(t, "Run 'mkcert -install'.", resp.Warnings[0].Hint)
+		assert.Empty(t, resp.Warnings[1].Hint)
+		assert.True(t, resp.WarningsSealed)
+	})
+
+	t.Run("provider with warnings but still running: unsealed", func(t *testing.T) {
+		server, _, _, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		server.handlers.SetWarningProvider(fakeWarningProvider{
+			warnings: []domain.Warning{{Code: "c", Message: "so far"}},
+		})
+
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		w := httptest.NewRecorder()
+		server.router.ServeHTTP(w, req)
+
+		var resp StatusResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Len(t, resp.Warnings, 1)
+		assert.False(t, resp.WarningsSealed, "an unfinished producer must be visible as such")
+	})
+}
+
 func TestGetProcesses(t *testing.T) {
 	server, _, _, cleanup := setupTestServer(t)
 	defer cleanup()
