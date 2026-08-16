@@ -397,7 +397,7 @@ When prox is running (in either foreground or daemon mode), runtime state is sto
 | `.prox/prox.pid` | Process ID with file locking to prevent multiple instances |
 | `.prox/prox.log` | Daemon logs (stdout/stderr redirected here in background mode) |
 
-When running in daemon mode (`prox up -d`), all output that would normally go to stdout/stderr is redirected to `.prox/prox.log`. This is useful for debugging startup issues or reviewing daemon activity.
+When running in daemon mode (`prox up -d`), all output that would normally go to stdout/stderr is redirected to `.prox/prox.log`. This is useful for debugging startup issues or reviewing daemon activity. The file is opened for append and never truncated or rotated, so it accumulates across every run; each run writes a `--- run <time> pid=<pid> ---` marker as its first line, which `prox up -d` failure diagnostics use to show only the failing run's own output rather than the whole file's history.
 
 **State File Format:**
 

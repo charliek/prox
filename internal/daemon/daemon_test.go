@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -338,6 +340,53 @@ func TestSetupLogging(t *testing.T) {
 		mode := info.Mode().Perm()
 		if mode != 0600 {
 			t.Errorf("expected permissions 0600, got %o", mode)
+		}
+	})
+
+	// Regression coverage for #99: SetupLogging must write a run marker keyed
+	// on this process's own pid BEFORE redirecting stdout/stderr, so a later
+	// failure diagnostic can tail only this run's output instead of the whole
+	// (never-truncated) log history.
+	t.Run("writes a run marker before redirecting stdout/stderr", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		originalStdout := os.Stdout
+		originalStderr := os.Stderr
+		t.Cleanup(func() {
+			os.Stdout = originalStdout
+			os.Stderr = originalStderr
+		})
+
+		logFile, err := SetupLogging(tmpDir)
+		if err != nil {
+			t.Fatalf("SetupLogging failed: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = logFile.Close()
+		})
+
+		// Anything written to os.Stdout after SetupLogging returns must land in
+		// the log file AFTER the marker -- this is the ordering SetupLogging's
+		// doc comment promises, and what printDaemonFailure's marker-scoped
+		// tail depends on.
+		fmt.Fprintln(os.Stdout, "hello from the child")
+
+		data, err := os.ReadFile(LogPath(tmpDir))
+		if err != nil {
+			t.Fatalf("read log file: %v", err)
+		}
+		content := string(data)
+
+		if !strings.HasPrefix(content, "--- run ") {
+			t.Fatalf("expected log file to start with a run marker, got:\n%s", content)
+		}
+
+		pid := os.Getpid()
+		tail, ok := FindRunMarkerTail(content, pid)
+		if !ok {
+			t.Fatalf("FindRunMarkerTail found no marker for this process's own pid (%d) in:\n%s", pid, content)
+		}
+		if tail != "hello from the child" {
+			t.Errorf("expected tail %q, got %q", "hello from the child", tail)
 		}
 	})
 }

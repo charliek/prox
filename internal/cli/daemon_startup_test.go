@@ -60,7 +60,7 @@ func fastStartupOps() daemonStartupOps {
 	return daemonStartupOps{
 		loadState: func(string) (*daemon.State, error) { return nil, errors.New("no state") },
 		healthOK:  func(string) bool { return false },
-		logTail:   func(string, int) string { return "" },
+		logTail:   func(string, int, int) string { return "" },
 		sleep:     func(time.Duration) {},
 
 		readyTimeout: 40 * time.Millisecond,
@@ -100,13 +100,19 @@ func TestAwaitDaemonStartup_EarlyDeath(t *testing.T) {
 	child.exit(&exitStatusError{code: 1}) // dead before we start polling
 
 	tailUsed := false
+	var gotPid int
 	ops := fastStartupOps()
-	ops.logTail = func(string, int) string { tailUsed = true; return "boom: config invalid" }
+	ops.logTail = func(_ string, pid int, _ int) string {
+		tailUsed = true
+		gotPid = pid
+		return "boom: config invalid"
+	}
 
 	err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to start")
 	assert.True(t, tailUsed, "log tail should be gathered for diagnostics")
+	assert.Equal(t, child.Pid(), gotPid, "log tail must be scoped to the failed child's own pid")
 	assert.Empty(t, child.sentSignals(), "a dead child must not be signaled")
 }
 

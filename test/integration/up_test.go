@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charliek/prox/internal/daemon"
 )
 
 // waitForRunOutputContains polls a proxRun's captured combined output until it
@@ -409,6 +411,101 @@ func TestUpDetach_EarlyDeathReportsFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "failed to start") {
 		t.Errorf("expected failure diagnostics mentioning 'failed to start', got:\n%s", out)
+	}
+}
+
+// TestDaemonLogTail_ScopedToSecondRun is the user-visible regression test for
+// #99 (plan 027 C12): .prox/prox.log is opened O_APPEND and never truncated,
+// so before this fix every failed `prox up -d` diagnostic tailed the last ~20
+// lines of the WHOLE accumulated log — a user iterating on a broken prox.yaml
+// saw every past failure stacked up with the current one buried last, exactly
+// when the diagnostic mattered most.
+//
+// This runs `prox up -d` against the same broken config TWICE, back to back
+// in one fixture directory (so the log genuinely accumulates both runs'
+// content), and asserts the second run's printed diagnostics contain ONLY the
+// second run's failure line. Both runs fail identically (same bad path, same
+// underlying "no such file" error), so their "Error: failed to load config:
+// ..." lines are byte-identical — counting occurrences in the second run's
+// output is therefore an unambiguous check: 2 occurrences would mean the
+// first run's content leaked through, which is precisely the bug #99 exists
+// to kill.
+//
+// What this test does NOT cover, verified by reintroduction rather than
+// assumed: it still passes if the tail rule is weakened to "last marker wins,
+// ignoring pid". Here the second child always reaches SetupLogging and writes
+// its own marker, so the last marker IS this run's and the naive rule happens
+// to agree. The dangerous window -- the child dying BEFORE it writes a marker,
+// where a last-marker rule would print the PREVIOUS run's output as this
+// run's diagnostics -- is not reachable from a test, because SetupLogging runs
+// before anything that can fail this way.
+//
+// The guard for that rule is the table test in
+// internal/daemon/log_marker_test.go, whose "marker for a different pid
+// present" and "multiple markers" cases DO fail against the naive rule
+// (confirmed: ok = true, want false). This test proves the end-to-end wiring;
+// that one proves the scoping rule. Do not mistake this for the regression
+// test.
+func TestDaemonLogTail_ScopedToSecondRun(t *testing.T) {
+	startTest(t, defaultTestBudget)
+	skipShort(t)
+
+	binary := buildBinary(t)
+
+	// Isolated working dir, shared by both runs so .prox/prox.log genuinely
+	// accumulates across them (that accumulation, via O_APPEND, is by design
+	// and out of scope to change — see CLAUDE.md/issue #99: rotation is
+	// explicitly not part of this fix).
+	dir := t.TempDir()
+	badCfg := filepath.Join(dir, "does-not-exist.yaml")
+
+	runOnce := func() string {
+		t.Helper()
+		ctx, cancel := cliContext(t)
+		defer cancel()
+		cmd := boundedCommand(ctx, dir, binary, "up", "-d", "-c", badCfg)
+		out, err := cmd.CombinedOutput()
+
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("expected a non-zero exit, got err=%v\nOutput:\n%s", err, out)
+		}
+		if ee.ExitCode() != 1 {
+			t.Fatalf("expected exit code 1, got %d\nOutput:\n%s", ee.ExitCode(), out)
+		}
+		return string(out)
+	}
+
+	const failureLine = "failed to load config"
+
+	out1 := runOnce()
+	if !strings.Contains(out1, failureLine) {
+		t.Fatalf("first run: expected failure diagnostics mentioning %q, got:\n%s", failureLine, out1)
+	}
+
+	out2 := runOnce()
+	if !strings.Contains(out2, failureLine) {
+		t.Fatalf("second run: expected failure diagnostics mentioning %q, got:\n%s", failureLine, out2)
+	}
+
+	if occurrences := strings.Count(out2, failureLine); occurrences != 1 {
+		t.Errorf("second run's diagnostics contain %d occurrences of %q, want 1 -- "+
+			"the first run's content leaked into the second run's diagnostics "+
+			"(the log tail was not scoped to the second run's own marker):\n"+
+			"--- run 1 output ---\n%s\n--- run 2 output ---\n%s",
+			occurrences, failureLine, out1, out2)
+	}
+
+	// The log file on disk must still hold BOTH runs' history: O_APPEND and no
+	// rotation are unchanged by this fix (#99 explicitly excludes rotation).
+	// This is the fix's other half -- scoping the printed diagnostic must not
+	// come at the cost of actually truncating or losing anything on disk.
+	logData, err := os.ReadFile(daemon.LogPath(dir))
+	if err != nil {
+		t.Fatalf("read daemon log: %v", err)
+	}
+	if got := strings.Count(string(logData), "--- run "); got != 2 {
+		t.Errorf("expected 2 run markers preserved on disk, got %d:\n%s", got, string(logData))
 	}
 }
 

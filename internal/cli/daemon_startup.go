@@ -46,8 +46,10 @@ type daemonStartupOps struct {
 	loadState func(dir string) (*daemon.State, error)
 	// healthOK reports whether GET /health on the state's address (host:port) succeeds.
 	healthOK func(addr string) bool
-	// logTail returns the last n lines of the child's daemon log for diagnostics.
-	logTail func(dir string, n int) string
+	// logTail returns the child's daemon log content for diagnostics, scoped to
+	// pid's run (via the run marker) when one is found, falling back to the
+	// last n lines otherwise. See daemonLogTail.
+	logTail func(dir string, pid int, n int) string
 
 	sleep func(time.Duration)
 
@@ -93,14 +95,33 @@ func probeHealth(addr string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// daemonLogTail returns the last n lines of the child's daemon log (.prox/prox.log)
-// for failure diagnostics. Returns "" when the log is missing or empty.
-func daemonLogTail(dir string, n int) string {
+// daemonLogFallbackLines is the last-N-lines fallback used when no run marker
+// matching the child's pid is found in the log: a legacy log predating this
+// feature, the pre-SetupLogging window (checkEarlyDeath can fire before the
+// child ever reaches SetupLogging), or the shared-proxy log, which gains no
+// marker at all. This is the pre-#99 behavior, preserved as the fallback.
+const daemonLogFallbackLines = 20
+
+// daemonLogTail returns the child's daemon log (.prox/prox.log) content for
+// failure diagnostics, scoped to THIS run when possible: it looks for the run
+// marker daemon.SetupLogging wrote for pid and, if found, returns only the
+// content after it (see daemon.FindRunMarkerTail) -- otherwise the log is
+// never truncated (#99), so with no marker a user iterating on a broken
+// config would see every past failure stacked up with the current one buried
+// last. Falls back to the last n lines when no matching marker is found.
+// Returns "" when the log is missing.
+func daemonLogTail(dir string, pid int, n int) string {
 	data, err := os.ReadFile(daemon.LogPath(dir))
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	content := string(data)
+
+	if tail, ok := daemon.FindRunMarkerTail(content, pid); ok {
+		return tail
+	}
+
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
@@ -169,7 +190,7 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 			// Child alive but never ready (API bind failures are fatal in the
 			// child, so this is a genuinely wedged startup: config load hang,
 			// supervisor stall, or similar).
-			printDaemonFailure(cwd, ops, fmt.Sprintf(
+			printDaemonFailure(cwd, pid, ops, fmt.Sprintf(
 				"prox daemon (pid %d) did not become ready within %s", pid, ops.readyTimeout))
 			terminateChild(child, childErr, ops)
 			return fmt.Errorf("prox daemon failed to become ready within %s", ops.readyTimeout)
@@ -188,7 +209,7 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 func checkEarlyDeath(childErr <-chan error, pid int, cwd string, ops daemonStartupOps) error {
 	select {
 	case werr := <-childErr:
-		printDaemonFailure(cwd, ops, fmt.Sprintf(
+		printDaemonFailure(cwd, pid, ops, fmt.Sprintf(
 			"prox daemon (pid %d) exited before startup completed: %s", pid, exitDesc(werr)))
 		return fmt.Errorf("prox daemon failed to start")
 	default:
@@ -219,12 +240,14 @@ func terminateChild(child daemonChild, childErr <-chan error, ops daemonStartupO
 	}
 }
 
-// printDaemonFailure prints a failure headline plus the last ~20 lines of the
-// child's daemon log to stderr, for `prox up -d` failure diagnostics.
-func printDaemonFailure(dir string, ops daemonStartupOps, headline string) {
+// printDaemonFailure prints a failure headline plus this run's tail of the
+// child's daemon log (see daemonLogTail) to stderr, for `prox up -d` failure
+// diagnostics. pid is the failed child's pid, used to scope the tail to its
+// own run marker rather than the log's full, never-truncated history (#99).
+func printDaemonFailure(dir string, pid int, ops daemonStartupOps, headline string) {
 	fmt.Fprintln(os.Stderr, headline)
 	logPath := daemon.LogPath(dir)
-	if tail := ops.logTail(dir, 20); strings.TrimSpace(tail) != "" {
+	if tail := ops.logTail(dir, pid, daemonLogFallbackLines); strings.TrimSpace(tail) != "" {
 		fmt.Fprintf(os.Stderr, "\nLast lines of %s:\n%s\n", logPath, tail)
 	} else {
 		fmt.Fprintf(os.Stderr, "\n(no output in %s)\n", logPath)
