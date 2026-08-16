@@ -1,6 +1,7 @@
 package proxyd
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"strings"
@@ -24,8 +25,10 @@ import (
 // EnsureDomain short-circuits on its own loaded-cert cache, so a daemon that
 // starts with certs already on disk — the normal case, since a release requires
 // restarting the daemon while its certs dir persists — may never re-enter
-// generation. A verdict recorded once (by whatever observes it) therefore has to
-// keep answering for later registrations that generate nothing.
+// generation. The verdict therefore comes from certs.TrustResolver (a real
+// generation's output when there was one, a probe when there was not), and
+// EnsureDomain re-applies it on every registration so it keeps answering for
+// registrations that generate nothing.
 //
 // Its mutex is a leaf: it is never held across mkcert, file I/O, or any other
 // lock, and in particular it is NOT MultiDomainCertManager.mu — recording a
@@ -119,6 +122,19 @@ type MultiDomainCertManager struct {
 	// warnings holds the CA-scoped user-facing warnings observed by the cert
 	// layer (see certWarningHolder). Guarded by its own mutex, never by mu.
 	warnings certWarningHolder
+
+	// trust answers "is mkcert's local CA installed in the trust stores?" once
+	// per process — from a real generation's output when there was one, from a
+	// probe when the certs were already warm. It is the SOURCE of every warning
+	// in `warnings` above, and it is handed to each per-domain certs.Manager so
+	// their generations feed the same verdict.
+	trust *certs.TrustResolver
+
+	// resolveTrust reads that verdict. Set once in the constructor; overridable
+	// in tests ONLY (like generate above), so a test can pin the record/clear
+	// wiring without a real mkcert on PATH — what mkcert's output MEANS is
+	// tested where it is parsed, in internal/proxy/certs.
+	resolveTrust func() certs.TrustVerdict
 }
 
 // NewMultiDomainCertManager creates a new multi-domain cert manager.
@@ -127,8 +143,10 @@ func NewMultiDomainCertManager(certsDir string) *MultiDomainCertManager {
 		certsDir: certsDir,
 		managers: make(map[string]*certs.Manager),
 		loaded:   make(map[string]*tls.Certificate),
+		trust:    certs.SharedTrust(),
 	}
 	m.generate = m.generateViaMkcert
+	m.resolveTrust = func() certs.TrustVerdict { return m.trust.Resolve(context.Background()) }
 	return m
 }
 
@@ -145,6 +163,22 @@ func NewMultiDomainCertManager(certsDir string) *MultiDomainCertManager {
 // single-flight MUST be reintroduced: two concurrent EnsureCerts on the same
 // *certs.Manager would race on the cert files.
 func (m *MultiDomainCertManager) EnsureDomain(baseDomain string) error {
+	// Refresh the CA-trust verdict on EVERY registration that touches certs,
+	// not just on a generation.
+	//
+	// Doing it only inside generateViaMkcert made the withdraw path nearly
+	// unreachable: a warm daemon never generates again, so a user who followed
+	// the warning's own hint (`mkcert -install`, restart prox) would keep being
+	// told their CA was untrusted by a daemon that outlived their restart
+	// (CodeRabbit review). Here it runs whenever a project registers, which is
+	// exactly when a user would expect prox to notice they fixed it.
+	//
+	// It is cheap in the case that matters: Resolve returns a settled GOOD
+	// verdict without touching a subprocess, so the steady state costs one map
+	// read. Only a machine that is actually broken pays for a probe, and only
+	// until it is fixed.
+	m.applyCATrust()
+
 	// Fast path: already loaded — RLock only, never blocks on generation.
 	m.mu.RLock()
 	_, ok := m.loaded[baseDomain]
@@ -178,11 +212,21 @@ func (m *MultiDomainCertManager) EnsureDomain(baseDomain string) error {
 func (m *MultiDomainCertManager) generateViaMkcert(baseDomain string) (*tls.Certificate, error) {
 	mgr := m.managerFor(baseDomain)
 
-	// Ensure certs exist (generate via mkcert if needed).
-	paths, err := mgr.EnsureCerts()
+	// Ensure certs exist (generate via mkcert if needed). The captured mkcert
+	// output has already been handed to m.trust by EnsureCerts, so the verdict
+	// below is free whenever generation actually ran.
+	paths, _, err := mgr.EnsureCerts()
 	if err != nil {
 		return nil, fmt.Errorf("ensuring certs for %s: %w", baseDomain, err)
 	}
+
+	// Publish (or withdraw) the CA-trust warning for the client that cannot see
+	// this process's output. Doing it HERE, rather than only on the generation
+	// path, is what covers the warm-cert case: a daemon restarted onto a new
+	// release finds its certs already on disk, runs mkcert never, and would
+	// otherwise report nothing at all.
+	// (The trust verdict is applied by EnsureDomain, which runs on every
+	// registration — not only on the generations that reach here.)
 
 	// Load the certificate.
 	cert, err := tls.LoadX509KeyPair(paths.CertFile, paths.KeyFile)
@@ -190,6 +234,30 @@ func (m *MultiDomainCertManager) generateViaMkcert(baseDomain string) (*tls.Cert
 		return nil, fmt.Errorf("loading cert for %s: %w", baseDomain, err)
 	}
 	return &cert, nil
+}
+
+// applyCATrust resolves this process's mkcert CA-trust verdict and reflects it
+// into the warning holder: record when the CA is NOT installed, WITHDRAW when
+// mkcert says it is.
+//
+// Both directions matter. A verdict that could only be added would keep telling
+// a user their CA is untrusted after they fixed it, and prox reporting something
+// that is no longer true is the same class of bug as prox reporting nothing at
+// all. An UNKNOWN verdict (no mkcert, no CA yet, probe failed) touches neither:
+// it is not evidence of trust, so it must not retract a warning, and it is not
+// evidence of a problem, so it must not raise one.
+//
+// It is called at the top of EnsureDomain — before the cache fast path, so a
+// warm daemon that never generates again still re-checks — outside m.mu, and it
+// takes only the holder's leaf mutex, so it never blocks a TLS handshake.
+func (m *MultiDomainCertManager) applyCATrust() {
+	v := m.resolveTrust()
+	switch {
+	case v.Warning != nil:
+		m.RecordWarning(*v.Warning)
+	case v.Known:
+		m.ClearWarning(domain.WarningCodeMkcertCAUntrusted)
+	}
 }
 
 // RecordWarning records (or replaces) a user-facing warning observed while
@@ -224,7 +292,7 @@ func (m *MultiDomainCertManager) managerFor(domain string) *certs.Manager {
 	defer m.mu.Unlock()
 	mgr, ok := m.managers[domain]
 	if !ok {
-		mgr = certs.NewManager(m.certsDir, domain)
+		mgr = certs.NewManagerWithTrust(m.certsDir, domain, m.trust)
 		m.managers[domain] = mgr
 	}
 	return mgr

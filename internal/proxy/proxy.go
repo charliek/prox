@@ -177,8 +177,11 @@ func (s *Service) startHTTPS(router http.Handler) error {
 		return fmt.Errorf("certificates not configured for HTTPS proxy")
 	}
 
-	// Ensure certificates exist
-	certPaths, err := s.certs.EnsureCerts()
+	// Ensure certificates exist. The captured mkcert lines are dropped here on
+	// purpose: this process's verdict about mkcert's CA is held by the
+	// process-wide certs.TrustResolver that EnsureCerts feeds, and the CLI reads
+	// it from there (internal/cli/up.go) — a proxy service does not print.
+	certPaths, _, err := s.certs.EnsureCerts()
 	if err != nil {
 		return fmt.Errorf("ensuring certificates: %w", err)
 	}

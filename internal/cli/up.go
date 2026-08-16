@@ -26,6 +26,7 @@ import (
 	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxy"
+	"github.com/charliek/prox/internal/proxy/certs"
 	"github.com/charliek/prox/internal/proxyd"
 	"github.com/charliek/prox/internal/supervisor"
 	"github.com/charliek/prox/internal/tui"
@@ -1453,16 +1454,51 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// escape hatch (named in the returned error).
 	//
 	// Warnings (plan 028 A2): this mode has no wire to carry them — mkcert runs
-	// in THIS process (internal/proxy) — so a producer added here reports
-	// straight into rt.WarningSink().Add(...) and is rendered and sealed by the
-	// same end-of-startup step in runUp as the shared-daemon path. There is no
-	// producer yet; B1 adds one.
+	// in THIS process (internal/proxy) — so the producer below reports straight
+	// into the session's warning sink and is rendered and sealed by the same
+	// end-of-startup step in runUp as the shared-daemon path.
 	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut, pre)
 	if err != nil {
 		return nil, nil, err
 	}
 	rt.SetMode(proxyModeStandalone)
+
+	// Must run AFTER the proxy started: if HTTPS was configured and mkcert
+	// actually generated certs just now, that run already answered the
+	// CA-trust question and the resolver returns its verdict without probing.
+	//
+	// Asynchronous (Go, not Add) because the fallback — a probe, when the certs
+	// were already warm — shells out to mkcert, and no diagnostic gets to hold
+	// up a user's startup. There is no clear-side here: a standalone session's
+	// sink starts empty every run, so "trusted" simply means nothing is added.
+	//
+	// Gated on HTTPS: with no HTTPS listener there is no certificate to be
+	// distrusted, so the warning would be true and irrelevant — which is its own
+	// kind of untrue. The daemon side needs no equivalent gate: its cert phase
+	// only runs for a registration that declares an HTTPS port (server.go).
+	if cfg.Proxy.HTTPSPort > 0 {
+		rt.WarningSink().Go(func() []domain.Warning {
+			return mkcertTrustWarnings(ctx, certs.SharedTrust())
+		})
+	}
 	return nil, svc, nil
+}
+
+// caTrustResolver is the CA-trust verdict source startProxy consumes, narrowed
+// to the one method so a test can supply a verdict without a real mkcert.
+type caTrustResolver interface {
+	Resolve(context.Context) certs.TrustVerdict
+}
+
+// mkcertTrustWarnings turns the process's CA-trust verdict into the warnings to
+// report. It adds nothing for a trusted CA and nothing for an unknown one:
+// prox says something here only when mkcert itself said the CA is missing from
+// the trust stores.
+func mkcertTrustWarnings(ctx context.Context, r caTrustResolver) []domain.Warning {
+	if w := r.Resolve(ctx).Warning; w != nil {
+		return []domain.Warning{*w}
+	}
+	return nil
 }
 
 // tryDaemonProxy attempts to register with the shared proxy daemon.

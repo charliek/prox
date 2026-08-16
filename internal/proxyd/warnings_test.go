@@ -3,17 +3,22 @@ package proxyd
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/charliek/prox/internal/domain"
+	"github.com/charliek/prox/internal/proxy/certs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -172,6 +177,12 @@ func TestRegister_WarningsSurviveWarmCertGeneration(t *testing.T) {
 		m.RecordWarning(testWarning) // the producer seam, fired during generation
 		return generateWildcardCert(d)
 	}
+	// applyCATrust runs on EVERY EnsureDomain now, so the verdict source has to
+	// be pinned here for two reasons: an UNKNOWN verdict touches the holder
+	// neither way, leaving this test's synthetic RecordWarning to stand for the
+	// producer; and without it the real resolver would shell out to the
+	// developer's actual mkcert, which no unit test may do.
+	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
 	s := newProxyServerWithCertMgr(t, m)
 	port := freePort(t)
 
@@ -289,8 +300,13 @@ func TestClientRegister_PassesWarningsThrough(t *testing.T) {
 // snapshot must be a copy the caller can mutate without corrupting the holder.
 func TestCertWarningHolder_Concurrent(t *testing.T) {
 	m := NewMultiDomainCertManager(t.TempDir())
-	// Never shell to mkcert from a test: swap in the in-memory generator.
+	// Never shell to mkcert from a test: swap in the in-memory generator AND
+	// pin the trust verdict. applyCATrust runs on every EnsureDomain, so the
+	// generator override alone no longer keeps the real mkcert out of a unit
+	// test — and an UNKNOWN verdict leaves this test's own RecordWarning
+	// standing, which is what it is measuring.
 	m.generate = func(d string) (*tls.Certificate, error) { return generateWildcardCert(d) }
+	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
 	backendHost, backendPort := backendTarget(t)
 	s := newProxyServerWithCertMgr(t, m)
 
@@ -407,4 +423,95 @@ func TestRegister_ClearedWarningStopsBeingReported(t *testing.T) {
 	resp = registerResp(t, s, req)
 	assert.Empty(t, resp.Warnings,
 		"a withdrawn warning must not keep arriving — reporting a fixed problem is the bug, not the fix")
+}
+
+// warmCertFiles writes a usable cert/key pair to dir under the names
+// certs.Manager expects, standing in for "the certs are already on disk". It is
+// the state a daemon restarted onto a new release starts in — the one in which
+// mkcert never runs and therefore never says anything.
+func warmCertFiles(t *testing.T, dir, baseDomain string) {
+	t.Helper()
+	cert, err := generateWildcardCert(baseDomain)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	require.NoError(t, err)
+
+	safe := strings.ReplaceAll(baseDomain, ".", "_")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, safe+".pem"),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, safe+"-key.pem"),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
+}
+
+// warmCertManager returns a real MultiDomainCertManager (real holder, real
+// EnsureDomain cache, real certs.Manager) whose certs are already on disk and
+// whose CA-trust verdict is the given one. Only the verdict is faked: what
+// mkcert's output MEANS is tested where it is parsed (internal/proxy/certs);
+// what the DAEMON does with the verdict is what these tests pin.
+func warmCertManager(t *testing.T, baseDomain string, v certs.TrustVerdict) *MultiDomainCertManager {
+	t.Helper()
+	dir := t.TempDir()
+	warmCertFiles(t, dir, baseDomain)
+	m := NewMultiDomainCertManager(dir)
+	m.resolveTrust = func() certs.TrustVerdict { return v }
+	return m
+}
+
+// TestGenerateViaMkcert_PublishesWarmCertVerdict is the case the daemon exists
+// to cover: certs already on disk, mkcert never runs, and the warning still
+// reaches the client. Before the trust probe this path could only ever report
+// nothing, which — given RELEASING.md requires restarting the daemon after every
+// release — is the state most users would have been in.
+func TestGenerateViaMkcert_PublishesWarmCertVerdict(t *testing.T) {
+	untrusted := testWarning
+	m := warmCertManager(t, "warmwarn.test", certs.TrustVerdict{Known: true, Warning: &untrusted})
+
+	require.NoError(t, m.EnsureDomain("warmwarn.test"))
+	assert.Equal(t, []domain.Warning{untrusted}, m.Warnings(),
+		"a generation-free cert load must still publish the CA-scoped verdict")
+}
+
+// TestGenerateViaMkcert_TrustedVerdictWithdrawsWarning is the anti-lying half
+// wired end to end: the user ran `mkcert -install`, so the daemon must stop
+// saying otherwise rather than repeating a fixed problem until it restarts.
+func TestGenerateViaMkcert_TrustedVerdictWithdrawsWarning(t *testing.T) {
+	m := warmCertManager(t, "fixed.test", certs.TrustVerdict{Known: true})
+	m.RecordWarning(testWarning)
+	require.Len(t, m.Warnings(), 1, "precondition: the warning is being reported")
+
+	require.NoError(t, m.EnsureDomain("fixed.test"))
+	assert.Empty(t, m.Warnings(), "a trusted verdict must withdraw the warning")
+}
+
+// TestGenerateViaMkcert_UnknownVerdictChangesNothing pins the third state. An
+// unknown verdict (no mkcert, no CA yet, a probe that failed) is not evidence
+// of trust, so it must not retract a warning, and not evidence of a problem, so
+// it must not raise one.
+func TestGenerateViaMkcert_UnknownVerdictChangesNothing(t *testing.T) {
+	m := warmCertManager(t, "unknown.test", certs.TrustVerdict{})
+	m.RecordWarning(testWarning)
+
+	require.NoError(t, m.EnsureDomain("unknown.test"))
+	assert.Equal(t, []domain.Warning{testWarning}, m.Warnings(),
+		"an unknown verdict must neither raise nor retract anything")
+}
+
+// TestRegister_ReportsCATrustWarningFromCertPhase closes the daemon loop over a
+// real register: the cert phase itself — not a test calling RecordWarning —
+// produces the warning the response carries.
+func TestRegister_ReportsCATrustWarningFromCertPhase(t *testing.T) {
+	backendHost, backendPort := backendTarget(t)
+	untrusted := testWarning
+	m := warmCertManager(t, "catrust.test", certs.TrustVerdict{Known: true, Warning: &untrusted})
+	s := newProxyServerWithCertMgr(t, m)
+
+	resp := registerResp(t, s, RegisterRequest{
+		ProjectDir: "/projects/catrust", PID: os.Getpid(), Version: "test", Domain: "catrust.test",
+		Services:  map[string]ServiceTarget{"svc": {Host: backendHost, Port: backendPort}},
+		HTTPSPort: freePort(t),
+	})
+
+	assert.Equal(t, []string{"svc.catrust.test"}, resp.Registered)
+	assert.Equal(t, []domain.Warning{untrusted}, resp.Warnings,
+		"the cert phase's own verdict must reach the client that cannot see the daemon's output")
 }
