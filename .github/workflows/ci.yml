@@ -27,7 +27,14 @@ jobs:
     # against observed cost while still bounded.
     timeout-minutes: 25
     steps:
+      # persist-credentials: false — actions/checkout otherwise leaves the job
+      # token in .git/config, and the very next step runs `go test ./...`, i.e.
+      # this repo's code AND every dependency's test code, with a writable
+      # credential sitting on disk. Nothing here talks to the API, so there is
+      # nothing to keep it for. (docs.yml and docs-pr.yml already set this.)
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
@@ -40,7 +47,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # See the test job: the linter loads and analyses the same third-party
+      # code, so the token has no business being on disk here either.
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
@@ -56,7 +67,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # GoReleaser needs the full history to compute a snapshot version;
+          # it does not need (and this job never uses) the job token, so the
+          # credential is dropped while the depth is kept.
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod

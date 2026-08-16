@@ -20,9 +20,20 @@ import (
 // names the process and offers the next step, and — the half that is easy to
 // forget — that the ordinary, benign states do NOT.
 
-// settleCrashedProcess is the failure this whole feature exists for: a command
-// that launches (sh always launches) and then immediately dies. Distinct from a
-// process prox cannot launch at all, which was already reported.
+// settleCrashedProcess is a command that cannot be exec'd at all, so the
+// supervisor marks it crashed the instant `up -d` tries to start it.
+//
+// The comment here used to describe the opposite value -- "launches (sh always
+// launches) and then immediately dies" -- which is a different failure and a
+// different spelling (CodeRabbit, PR #108). The value is right and the comment
+// was wrong: what `up -d`'s settle check has to notice is the resulting CRASHED
+// state, and this reaches it deterministically and immediately, with no sleep
+// for a slow runner to race. Nothing was reported for EITHER shape before #94 --
+// the daemon starts processes asynchronously, so the launcher exited 0 while
+// `prox status` a second later said crashed.
+//
+// The launch-then-die half is covered, against the same settle check, by
+// TestSettle_StartProcessReportsTheResultingState (newFlakyFixture).
 const settleCrashedProcess = "/no/such/binary-xyz"
 
 // TestSettle_UpDetachCrashedProcessExitsNonZero: `prox up -d` for a project

@@ -50,6 +50,16 @@ func TestMain(m *testing.M) {
 	}
 	packageLedger.remove()
 
+	// A cleanup phase that blew its watchdog budget does NOT abort the process
+	// (watchdog_test.go: that would punish every remaining test for one slow
+	// teardown), so the failure has to be carried out here instead. Without
+	// this, a run whose tests all passed while a teardown hung would exit 0.
+	if teardownOverran.Load() && code == 0 {
+		fmt.Fprintln(os.Stderr, "prox integration: a test's cleanup exceeded its watchdog budget; "+
+			"see the WATCHDOG dump above for the goroutine that was stuck")
+		code = 1
+	}
+
 	// The shared binary outlives every t.TempDir(), so it is removed here.
 	if sharedBinary.dir != "" {
 		_ = os.RemoveAll(sharedBinary.dir)

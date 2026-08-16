@@ -971,3 +971,104 @@ func TestLeak_StaleStateFileIsNotAdoptedByFailedDetachedLaunch(t *testing.T) {
 		t.Fatal("teardown signalled a process that merely inherited a pid named by a stale state file")
 	}
 }
+
+// TestLedgerDir_IsPerUserAndForeignDirsAreIgnored pins the hardening CodeRabbit
+// asked for on PR #108.
+//
+// The ledger directory sits under os.TempDir(), which on Linux is usually the
+// world-writable /tmp. A fixed name there can be created FIRST by another user,
+// who then owns a directory this run writes pids, addresses and project paths
+// into -- and reads pids-to-signal out of. So the name carries the uid, and the
+// contents are trusted only while the directory is ours and unwritable by anyone
+// else.
+//
+// The other half is the one that would be easy to break silently: after all
+// that, this user's own ledgers must still be found. A reaper that no longer
+// finds them is not "safer", it is switched off.
+func TestLedgerDir_IsPerUserAndForeignDirsAreIgnored(t *testing.T) {
+	startTest(t, defaultTestBudget)
+
+	// The writer and the sweep must agree on one per-uid path: TestMain sweeps
+	// packageLedger.dir, and packageLedger writes there.
+	want := filepath.Join(os.TempDir(), ledgerDirBase+"-"+strconv.Itoa(os.Getuid()))
+	if packageLedger.dir != want {
+		t.Errorf("packageLedger.dir = %q, want the per-uid %q", packageLedger.dir, want)
+	}
+
+	owner := startSleeper(t)
+	ownerID := owner.identity()
+	owner.kill(t) // a previous run that died without cleaning up
+	target := startSleeper(t)
+
+	dir := filepath.Join(t.TempDir(), ledgerDirName)
+	path := writeLedgerFile(t, dir, ownerID, ledgerEntryFor(ownerID, target.asLeakedDaemon(t)))
+
+	// A directory anybody could have written is not evidence about which pids to
+	// signal, however well-formed its rows are.
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod ledger dir: %v", err)
+	}
+	var log bytes.Buffer
+	if n := reapStaleLedgers(dir, os.Getpid(), &log); n != 0 {
+		t.Fatalf("reaped %d daemon(s) on the word of a world-writable directory\n%s", n, log.String())
+	}
+	if !target.alive() {
+		t.Fatal("a process was signalled on the word of a world-writable directory")
+	}
+	if !strings.Contains(log.String(), "ignoring the run-ledger directory") {
+		t.Errorf("an untrusted ledger directory must say so rather than passing silently, got:\n%s", log.String())
+	}
+	if !fileExists(t, path) {
+		t.Error("an untrusted directory must be left alone, not swept")
+	}
+
+	// Owned by us and private: the sweep still does its job.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod ledger dir back: %v", err)
+	}
+	log.Reset()
+	if n := reapStaleLedgers(dir, os.Getpid(), &log); n != 1 {
+		t.Fatalf("this user's own ledger was not swept: reaped %d, want 1\n%s", n, log.String())
+	}
+	target.requireGone(t)
+	if fileExists(t, path) {
+		t.Error("a swept ledger must be removed so the next run does not re-examine it")
+	}
+}
+
+// TestLedger_RecordRefusesAnUntrustedDirectory is the write half: a run must not
+// append pids, API addresses and project paths to a file inside a directory
+// another user controls.
+//
+// Reported, never fatal: the ledger is a safety net, and refusing to run tests
+// because ${TMPDIR} is odd would trade a rare leak for a certain outage.
+func TestLedger_RecordRefusesAnUntrustedDirectory(t *testing.T) {
+	startTest(t, defaultTestBudget)
+
+	dir := filepath.Join(t.TempDir(), ledgerDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir ledger dir: %v", err)
+	}
+	// Explicitly, after the fact: MkdirAll's mode is masked by the umask, so
+	// asking for 0777 up front would quietly produce 0755 and prove nothing.
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod ledger dir: %v", err)
+	}
+
+	l := newRunLedger(dir, os.Getpid())
+	err := l.record(daemonIdentity{PID: 4321, StartToken: 99, StateDir: dir})
+	if err == nil {
+		t.Fatal("record wrote into a world-writable ledger directory")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Errorf("the refusal must explain itself, got: %v", err)
+	}
+	if fileExists(t, l.path) {
+		t.Error("nothing may be written into an untrusted ledger directory")
+	}
+	// The identity is still held in memory, so this run's own end-of-run sweep
+	// (reapOwn) can still stop what it started -- only the CROSS-run half is lost.
+	if got := l.recorded(); len(got) != 1 {
+		t.Errorf("in-memory record = %d entries, want 1: a directory problem must not cost this run its own teardown", len(got))
+	}
+}

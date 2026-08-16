@@ -318,8 +318,16 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 	// Stop() only returns after its finalization gate + verdict, so the
 	// grandchild should already be gone -- poll with a deadline as a
 	// robustness net rather than asserting instantaneously.
-	if !waitForPIDGone(grandchildPID, within(t, pidGoneTimeout)) {
-		t.Fatalf("grandchild pid %d still alive %v after stop returned (stop took %v)", grandchildPID, 15*time.Second, elapsed)
+	//
+	// waitedFor, not the nominal 15s of pidGoneTimeout: `within` hands this wait
+	// only what is left of the test's own budget, so quoting the role budget
+	// would send the reader looking for a 15s stall that never happened (the
+	// invariant helpers_test.go's waitedFor exists to hold).
+	goneStart := time.Now()
+	goneDeadline := within(t, pidGoneTimeout)
+	if !waitForPIDGone(grandchildPID, goneDeadline) {
+		t.Fatalf("grandchild pid %d still alive %s after stop returned (stop took %v)",
+			grandchildPID, waitedFor(goneStart, goneDeadline), elapsed)
 	}
 }
 

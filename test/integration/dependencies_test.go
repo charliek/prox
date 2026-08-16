@@ -1,12 +1,9 @@
 package integration
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,78 +24,60 @@ func depStatusRunner(t *testing.T, binary, config string) (tmpDir string, runSta
 		t.Fatalf("write config: %v", err)
 	}
 
-	// Not runCLI: several of these configs describe a process or task that is
-	// MEANT to fail, and since plan 027 C13 (#94) `up -d` exits non-zero when a
+	// Not StartDetached: several of these configs describe a process or task that
+	// is MEANT to fail, and since plan 027 C13 (#94) `up -d` exits non-zero when a
 	// process reaches a terminal-failed state inside the settle window. That
 	// non-zero exit means "the daemon is up, its processes are not" -- the
 	// daemon this runner then queries is running either way.
+	//
+	// Teardown comes from the harness: it targets the DAEMON the launcher left
+	// behind, asks it to stop and WAITS for the answer, and escalates to signals
+	// only on expiry.
 	startDaemonAllowingProcessFailure(t, binary, tmpDir, "start daemon", "up", "-d", "--no-proxy", "-c", configPath)
-	t.Cleanup(func() {
-		stopCLIQuietly(binary, tmpDir, "stop", "-c", configPath)
-		time.Sleep(300 * time.Millisecond)
-	})
 
 	waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), within(t, stateFileTimeout))
 
 	return tmpDir, runStatusIn(t, binary, tmpDir, configPath)
 }
 
-// runCLI runs one prox CLI invocation to completion in dir, bounded by the CLI
-// ceiling, and fails the test with what it printed if it does not exit 0.
-func runCLI(t *testing.T, binary, dir, what string, args ...string) string {
-	t.Helper()
-
-	ctx, cancel := boundedContext(within(t, cliCommandTimeout), cliCommandTimeout)
-	defer cancel()
-
-	cmd := boundedCommand(ctx, dir, binary, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s: %v\noutput: %s", what, err, out)
-	}
-	return string(out)
-}
-
-// startDaemonAllowingProcessFailure is runCLI for a `prox up -d` whose config
-// deliberately contains a process or task that fails.
+// startDaemonAllowingProcessFailure is StartDetached for a `prox up -d` whose
+// config deliberately contains a process or task that fails.
 //
 // Since plan 027 C13 (#94) the launcher reports the resulting STATE, not just
 // that the daemon accepted the request: a process that reaches crashed (or
 // blocked) inside the settle window makes `up -d` exit 1 even though the daemon
-// itself is up and stays up. runCLI would fail such a test on the very
-// condition it was written to produce. Exit 0 and exit 1 are therefore both
-// accepted here; anything else (a signal, a config error, a failure to launch
-// at all) still fails the test, and the output is returned for inspection.
-func startDaemonAllowingProcessFailure(t *testing.T, binary, dir, what string, args ...string) string {
+// itself is up and stays up. StartDetached fails a test on ANY non-zero exit,
+// which here is the very condition the test was written to produce. Exit 0 and
+// exit 1 are therefore both accepted; anything else (a signal, a config error, a
+// failure to launch at all) still fails the test.
+//
+// It goes through the harness rather than running the CLI itself (CodeRabbit, PR
+// #108). A bare boundedCommand creates no proxRun, so nothing records the daemon
+// in the cross-run ledger: neither reapOwn nor the next run's sweep could find
+// it, and the only teardown it had was the fire-and-forget `stop` + 300ms sleep
+// that plan 027 C5 replaced everywhere else. `up -d` detaches, so that "cleanup"
+// recovered nothing whenever the daemon did not answer.
+//
+// The run handle is returned so callers get the daemon's address and output as
+// well as its teardown.
+func startDaemonAllowingProcessFailure(t *testing.T, binary, dir, what string, args ...string) *proxRun {
 	t.Helper()
 
-	ctx, cancel := boundedContext(within(t, cliCommandTimeout), cliCommandTimeout)
-	defer cancel()
-
-	cmd := boundedCommand(ctx, dir, binary, args...)
-	out, err := cmd.CombinedOutput()
+	run, err := tryStartDetachedIn(t, binary, dir, nil, args...)
 	if err != nil {
-		var ee *exec.ExitError
-		if !errors.As(err, &ee) {
-			t.Fatalf("%s: %v\noutput: %s", what, err, out)
-		}
-		if ee.ExitCode() != 1 {
-			t.Fatalf("%s: unexpected exit code %d\noutput: %s", what, ee.ExitCode(), out)
+		// ExitCode fails the test itself if the launcher died without an exit
+		// status (a signal, or a failure to start at all).
+		if code := run.ExitCode(t); code != 1 {
+			t.Fatalf("%s: unexpected exit code %d\noutput:\n%s", what, code, run.Output())
 		}
 	}
-	return string(out)
-}
 
-// stopCLIQuietly runs a best-effort teardown command, bounded, ignoring its
-// outcome. Bounded because a cleanup that hangs hangs the test that registered
-// it, and t.Cleanup is exactly where an unbounded wait is hardest to see;
-// t-free because it also runs after a test has already failed.
-func stopCLIQuietly(binary, dir string, args ...string) {
-	ctx, cancel := context.WithTimeout(context.Background(), cliCommandTimeout)
-	defer cancel()
-
-	cmd := boundedCommand(ctx, dir, binary, args...)
-	_, _ = cmd.CombinedOutput()
+	// Resolve the daemon identity NOW, not at teardown. tryStartDetachedIn skips
+	// this on the error path (a genuinely failed launch has no daemon to
+	// resolve), and the identity is what puts the daemon in the run ledger --
+	// i.e. what makes it reapable if this run dies before its cleanups run.
+	run.DaemonIdentity()
+	return run
 }
 
 // statusJSONPayload is the subset of `prox status --json` this suite asserts on.
@@ -441,15 +420,17 @@ dependencies:
 		}
 
 		start := time.Now()
-		runCLI(t, binary, tmpDir, "start daemon", "up", "-d", "--no-proxy", "-c", configPath)
+		// startDetachedIn, not a bare CLI invocation: `up -d` leaves a daemon
+		// behind, and only the harness records it in the run ledger and tears the
+		// DAEMON (rather than the already-exited launcher) down.
+		startDetachedIn(t, binary, tmpDir, nil, "up", "-d", "--no-proxy", "-c", configPath)
 		elapsed := time.Since(start)
+		// Registered after the harness's own teardown, so LIFO runs it FIRST:
+		// self-release the barrier so the start helper's loop exits even if the
+		// test failed before the release step — otherwise the loop would spin on
+		// unfailingly at 10Hz while the daemon is being stopped.
 		t.Cleanup(func() {
-			// Self-release the barrier so the start helper's loop exits even if
-			// the test failed before the release step or `stop` cannot reach the
-			// daemon — otherwise the loop would spin on unfailingly at 10Hz.
 			_ = os.WriteFile(release, nil, 0644)
-			stopCLIQuietly(binary, tmpDir, "stop", "-c", configPath)
-			time.Sleep(300 * time.Millisecond)
 		})
 		waitForStateFile(t, filepath.Join(tmpDir, ".prox", "prox.state"), within(t, stateFileTimeout))
 		// Detached start returns without waiting for the dependency.

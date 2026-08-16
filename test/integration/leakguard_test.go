@@ -40,7 +40,7 @@ import (
 //     harness) -- covers a test that passes, fails, or panics;
 //  2. a SIGINT/SIGTERM trap in TestMain -- covers Ctrl-C and a supervising
 //     harness's `kill`;
-//  3. a cross-run ledger under ${TMPDIR}/prox-integration-runs -- covers
+//  3. a cross-run ledger under ${TMPDIR}/prox-integration-runs-<uid> -- covers
 //     SIGKILL, a panic in the runtime, and a power-cycle, by letting the NEXT
 //     run reap what this one could not.
 //
@@ -449,9 +449,64 @@ func cleanAbsPath(p string) string {
 // nothing to verify in CI and no point trying. What it buys is the developer
 // loop, where run N+1 runs minutes after run N was SIGKILLed on the same box.
 
-// ledgerDirName is the directory under ${TMPDIR} holding one JSONL file per
-// test-binary run, named <owner pid>-<owner start token>.jsonl.
-const ledgerDirName = "prox-integration-runs"
+// ledgerDirBase is the stem of the directory under ${TMPDIR} holding one JSONL
+// file per test-binary run, named <owner pid>-<owner start token>.jsonl.
+const ledgerDirBase = "prox-integration-runs"
+
+// ledgerDirName is ledgerDirBase with this user's uid appended.
+//
+// The uid matters because os.TempDir() is usually the world-writable /tmp on
+// Linux (CodeRabbit, PR #108). A fixed, predictable name there is a directory
+// ANY user on the box can create first and then own, after which this run writes
+// pids, API addresses and project paths into a place that user controls, and
+// reads pids-to-signal back out of it. Per-uid naming means two users on one
+// machine cannot land in the same directory by accident, and ledgerDirUsable
+// below refuses one we do not own or that anybody else can write -- which is
+// what actually closes the hole, since a name is only a convention and can still
+// be squatted.
+//
+// The signal path was already well defended (killableAcrossRuns requires a start
+// token, and confirmProxDaemon makes the process itself confirm, over prox's own
+// API, that it is the daemon the row describes). This is hardening of the read
+// and write paths, not a missing kill guard.
+var ledgerDirName = ledgerDirBase + "-" + strconv.Itoa(os.Getuid())
+
+// ledgerDirUsable reports whether dir is safe for this run to read pids out of
+// and write pids into: a real directory (not a symlink to one), owned by us, and
+// not writable by any other user.
+//
+// It never CREATES anything -- the caller decides that -- so a missing directory
+// is "usable" and the reason is empty: there is nothing there to distrust.
+func ledgerDirUsable(dir string) (bool, string) {
+	// Lstat, not Stat: a symlink planted at this path would otherwise be
+	// followed to a target whose ownership says nothing about the link.
+	info, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, ""
+	}
+	if err != nil {
+		return false, fmt.Sprintf("it cannot be inspected: %v", err)
+	}
+	if !info.Mode().IsDir() {
+		return false, fmt.Sprintf("it is not a directory (mode %s)", info.Mode())
+	}
+	// WRITABILITY is the property that matters: a directory another user can
+	// write is one where they can plant a ledger row naming a pid for this run to
+	// signal. Group/other READ is left alone deliberately, because t.TempDir()
+	// hands its numbered subdirectories out as 0755 and the reaper's own tests
+	// point it at exactly those.
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return false, fmt.Sprintf("it is writable by other users (mode %#o)", perm)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true, ""
+	}
+	if int(st.Uid) != os.Getuid() {
+		return false, fmt.Sprintf("it is owned by uid %d rather than by this user (uid %d)", st.Uid, os.Getuid())
+	}
+	return true, ""
+}
 
 // ledgerFileName names the ledger belonging to one run GENERATION.
 //
@@ -543,6 +598,12 @@ func (l *runLedger) record(id daemonIdentity) error {
 	if err := os.MkdirAll(l.dir, 0o700); err != nil {
 		return err
 	}
+	// Checked AFTER MkdirAll, because the case worth catching is a directory
+	// somebody else created first: MkdirAll is a no-op on an existing path and
+	// silently accepts whatever mode and owner it already had.
+	if ok, why := ledgerDirUsable(l.dir); !ok {
+		return fmt.Errorf("refusing to write the run ledger into %s: %s", l.dir, why)
+	}
 	// 0600: the file names pids this process will signal, so nothing else on a
 	// shared machine gets to add rows to it.
 	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -598,6 +659,15 @@ var packageLedger = newRunLedger(filepath.Join(os.TempDir(), ledgerDirName), os.
 //
 // selfPID's own ledger is skipped: this run is, definitionally, alive.
 func reapStaleLedgers(dir string, selfPID int, w io.Writer) int {
+	// A ledger directory this user does not own is not a ledger directory: its
+	// rows are somebody else's claims about which pids to signal, and acting on
+	// them is the one thing this reaper must never do on somebody else's say-so.
+	if ok, why := ledgerDirUsable(dir); !ok {
+		fmt.Fprintf(w, "prox integration: ignoring the run-ledger directory %s: %s. "+
+			"No cross-run reaping will happen; if a stray prox is left over, stop it manually.\n", dir, why)
+		return 0
+	}
+
 	names, err := os.ReadDir(dir)
 	if err != nil {
 		// No directory means no previous run ever recorded anything here.

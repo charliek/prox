@@ -39,14 +39,12 @@ processes:
 	// crashes inside the settle window. The daemon is up regardless -- that is
 	// precisely what the non-zero exit means here -- so the rest of the test
 	// (which is about `prox status`) is unaffected.
+	//
+	// The harness owns the teardown: it registers it BEFORE the launcher runs,
+	// targets the daemon the launcher left behind rather than the corpse of the
+	// launcher itself, and records that daemon in the cross-run ledger so even a
+	// SIGKILLed run cannot strand it.
 	startDaemonAllowingProcessFailure(t, binary, tmpDir, "failed to start daemon", "up", "-d", "--no-proxy", "-c", configPath)
-
-	// Always tear the daemon down so a wedged test never strands a daemon.
-	// Registered before the readiness wait so a failed wait still cleans up.
-	t.Cleanup(func() {
-		stopCLIQuietly(binary, tmpDir, "stop", "-c", configPath)
-		time.Sleep(300 * time.Millisecond)
-	})
 
 	statePath := filepath.Join(tmpDir, ".prox", "prox.state")
 	waitForStateFile(t, statePath, within(t, stateFileTimeout))

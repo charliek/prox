@@ -231,6 +231,12 @@ func TestManagedProcess_Info_HealthSituations(t *testing.T) {
 		}, nil, NewExecRunner(), logMgr)
 
 		ctx, cancel := context.WithCancel(context.Background())
+		// The explicit cancel below is the SUBJECT of this test, but it is not
+		// reached if an assertion before it fails -- and then the checker's loop
+		// would outlive the test, shelling out on its interval for as long as the
+		// package keeps running. The deferred cancel is the backstop; cancelling
+		// twice is a no-op.
+		defer cancel()
 		checker := NewHealthChecker("web", domain.HealthConfig{Cmd: "true"}, nil)
 		checker.Start(ctx)
 		mp.mu.Lock()
