@@ -114,14 +114,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// pointer at their logs. Printed even when the proxy is also down so neither
 	// signal is hidden.
 	if len(crashed) > 0 {
-		fmt.Printf("\nCrashed: %s — check 'prox logs %s'.\n", strings.Join(crashed, ", "), crashed[0])
+		fmt.Printf("\n%s\n", crashedLine(crashed))
 	}
 
 	// Blocked line (plan 013 D5). Mirrors the Crashed line: names each blocked
 	// process with its failed dependency targets in declaration order. Printed
 	// alongside any crashed/proxy-down signal so none is hidden.
 	if len(blocked) > 0 {
-		fmt.Printf("\nBlocked: %s\n", strings.Join(blockedSummaries(processes.Processes), ", "))
+		fmt.Printf("\n%s\n", blockedLine(blockedSummaries(processes.Processes)))
 	}
 
 	// Dependencies section (plan 013 D5). Only when dependencies are configured.
@@ -180,10 +180,37 @@ func blockedSummaries(procs []api.ProcessResponse) []string {
 	var out []string
 	for _, p := range procs {
 		if p.Status == string(domain.ProcessStateBlocked) {
-			out = append(out, fmt.Sprintf("%s(%s)", p.Name, strings.Join(p.BlockedOn, ", ")))
+			out = append(out, blockedSummary(p.Name, p.BlockedOn))
 		}
 	}
 	return out
+}
+
+// crashedLine and blockedLine build the two human-readable failure sentences.
+//
+// They are functions rather than inline Printf calls because `prox status` is
+// no longer their only caller: the post-start settle check (#94, process_
+// settle.go) prints the SAME sentences from `prox up -d`, `prox start` and
+// `prox restart`, and a user who has learned to read one of them must not have
+// to learn a second phrasing for the same fact. crashedLine points at the first
+// crashed process's logs, which is where the reason actually is.
+func crashedLine(crashed []string) string {
+	return fmt.Sprintf("Crashed: %s — check 'prox logs %s'.", strings.Join(crashed, ", "), crashed[0])
+}
+
+func blockedLine(summaries []string) string {
+	return fmt.Sprintf("Blocked: %s", strings.Join(summaries, ", "))
+}
+
+// blockedSummary renders one blocked process as "name(target1, target2)", or as
+// the bare name when the blocking targets are unknown — GET /processes/{name}
+// does not carry blocked_on, so the settle check's single-process path has no
+// targets to name and must not print an empty "name()".
+func blockedSummary(name string, blockedOn []string) string {
+	if len(blockedOn) == 0 {
+		return name
+	}
+	return fmt.Sprintf("%s(%s)", name, strings.Join(blockedOn, ", "))
 }
 
 // renderDependencies prints the Dependencies section (plan 013 D5): one row per
@@ -620,8 +647,10 @@ func runStartProcess(cmd *cobra.Command, args []string) error {
 		return processClientError(client, processName, err, "Is prox running? Try 'prox up' first.")
 	}
 
-	fmt.Printf("Started process: %s\n", processName)
-	return nil
+	// The 200 above only means the daemon got exec.Start to return; it says
+	// nothing about whether the process is still alive a moment later (#94).
+	// reportProcessLifecycle owns the headline and the exit code from here.
+	return reportProcessLifecycle(client, processName, fmt.Sprintf("Started process: %s", processName))
 }
 
 // restartCmd represents the restart command
@@ -648,8 +677,9 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		return processClientError(client, processName, err, "Is prox running? Try 'prox up' first.")
 	}
 
-	fmt.Printf("Restarted process: %s\n", processName)
-	return nil
+	// Same contract as `prox start`: the ack means "relaunched", not "still
+	// running" (#94).
+	return reportProcessLifecycle(client, processName, fmt.Sprintf("Restarted process: %s", processName))
 }
 
 // attachCmd represents the attach command

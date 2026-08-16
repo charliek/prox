@@ -50,6 +50,10 @@ type daemonStartupOps struct {
 	// pid's run (via the run marker) when one is found, falling back to the
 	// last n lines otherwise. See daemonLogTail.
 	logTail func(dir string, pid int, n int) string
+	// settle observes the now-ready daemon's processes for the settle window and
+	// reports what it saw (plan 027 C13, #94). Its error return is the
+	// OBSERVATION's failure, never a process's -- see awaitProcessSettle.
+	settle func(addr string) (settleVerdict, error)
 
 	sleep func(time.Duration)
 
@@ -70,6 +74,7 @@ func defaultDaemonStartupOps() daemonStartupOps {
 		loadState: daemon.LoadState,
 		healthOK:  probeHealth,
 		logTail:   daemonLogTail,
+		settle:    settleDaemonProcesses,
 		sleep:     time.Sleep,
 
 		readyTimeout: 15 * time.Second,
@@ -145,12 +150,18 @@ func daemonLogTail(dir string, pid int, n int) string {
 // either ordering is tolerated per D2 (a hypothetical future reordering, or a
 // slow state fsync racing an early bind, still converges).
 //
-// Returns nil on success (prints the started line; caller returns 0). On early
-// death or never-ready timeout it prints diagnostics (headline + log tail) and
-// returns an error (caller exits 1). On timeout with the child still alive it
-// SIGTERMs the child and escalates to SIGKILL after killGrace so a child that
-// already registered with the shared daemon gets a chance to deregister.
-func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) error {
+// Returns the daemon's resolved API address (host:port) on success. It does NOT
+// print the started line: readiness is no longer the whole success condition
+// (#94), so the headline belongs to startDetachedDaemon, after the processes
+// have been observed. Returning the address rather than keeping it local to the
+// loop is what lets that caller talk to the daemon it just waited for.
+//
+// On early death or never-ready timeout it prints diagnostics (headline + log
+// tail) and returns an error (caller exits 1). On timeout with the child still
+// alive it SIGTERMs the child and escalates to SIGKILL after killGrace so a
+// child that already registered with the shared daemon gets a chance to
+// deregister.
+func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) (string, error) {
 	pid := child.Pid()
 
 	// Reap the direct child on a goroutine: this prevents a zombie and signals
@@ -162,7 +173,7 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 	for {
 		// Early death: the child exited before it became ready.
 		if err := checkEarlyDeath(childErr, pid, cwd, ops); err != nil {
-			return err
+			return "", err
 		}
 
 		if st, err := ops.loadState(cwd); err == nil && st.PID == pid {
@@ -174,10 +185,9 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 				// This narrows — it cannot close — the inherent window where
 				// the child dies right after the parent exits 0.
 				if err := checkEarlyDeath(childErr, pid, cwd, ops); err != nil {
-					return err
+					return "", err
 				}
-				fmt.Printf("prox started (pid %d, api http://%s)\n", pid, addr)
-				return nil
+				return addr, nil
 			}
 		}
 
@@ -185,7 +195,7 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 			// Deadline reached. Re-check death first: the child may have exited
 			// right at the boundary, in which case report it as early death.
 			if err := checkEarlyDeath(childErr, pid, cwd, ops); err != nil {
-				return err
+				return "", err
 			}
 			// Child alive but never ready (API bind failures are fatal in the
 			// child, so this is a genuinely wedged startup: config load hang,
@@ -193,11 +203,75 @@ func awaitDaemonStartup(child daemonChild, cwd string, ops daemonStartupOps) err
 			printDaemonFailure(cwd, pid, ops, fmt.Sprintf(
 				"prox daemon (pid %d) did not become ready within %s", pid, ops.readyTimeout))
 			terminateChild(child, childErr, ops)
-			return fmt.Errorf("prox daemon failed to become ready within %s", ops.readyTimeout)
+			return "", fmt.Errorf("prox daemon failed to become ready within %s", ops.readyTimeout)
 		}
 
 		ops.sleep(ops.pollInterval)
 	}
+}
+
+// startDetachedDaemon is the whole parent side of `prox up -d`: wait for the
+// child to become ready, then watch what its processes actually DO before
+// claiming the start succeeded (plan 027 C13, #94).
+//
+// The two halves answer different questions and neither subsumes the other.
+// awaitDaemonStartup asks "is the daemon accepting requests"; this asks "did
+// the things it was started for survive being started". Before #94 only the
+// first was asked, so `prox up -d` exited 0 for a project whose every process
+// was already dead — the daemon was fine, and that was all anyone checked.
+//
+// A non-zero exit from HERE means something quite different from a non-zero
+// exit from awaitDaemonStartup: the daemon IS up and stays up. Nothing is
+// rolled back — tearing down a healthy daemon because one process died would
+// destroy the logs the user needs — so the failure message points at
+// `prox down` rather than pretending nothing started.
+func startDetachedDaemon(child daemonChild, cwd string, ops daemonStartupOps) error {
+	addr, err := awaitDaemonStartup(child, cwd, ops)
+	if err != nil {
+		return err
+	}
+	pid := child.Pid()
+
+	verdict, settleErr := ops.settle(addr)
+	switch {
+	case settleErr != nil:
+		// The OBSERVATION failed, not the processes. Readiness was already
+		// established, so a flaky follow-up request must not invent a failure:
+		// keep the pre-existing exit code and say once that state is unconfirmed.
+		printDaemonStarted(pid, addr)
+		fmt.Fprintf(os.Stderr,
+			"Warning: could not confirm process state after startup: %v\n", settleErr)
+		return nil
+	case verdict.failed():
+		// No success headline: printing "prox started" and then exiting 1 is
+		// the same lie #94 is about, relocated.
+		fmt.Fprintf(os.Stderr,
+			"prox daemon started (pid %d, api http://%s), but its processes did not.\n", pid, addr)
+		verdict.writeTo(os.Stderr, "The daemon is still running; stop it with 'prox down'.")
+		return verdict.err()
+	default:
+		printDaemonStarted(pid, addr)
+		return nil
+	}
+}
+
+// printDaemonStarted prints the one success line `prox up -d` has always
+// printed. Its position is the load-bearing part: it now happens after the
+// settle window, so it is never followed by a non-zero exit.
+func printDaemonStarted(pid int, addr string) {
+	fmt.Printf("prox started (pid %d, api http://%s)\n", pid, addr)
+}
+
+// settleDaemonProcesses is the production settle step: talk to the daemon that
+// just became ready and watch every process it manages for the settle window.
+//
+// The client reads ~/.prox/token, which the child wrote before it started
+// serving — so by the time /health has answered (which is the only way we get
+// here) the token is on disk.
+func settleDaemonProcesses(addr string) (settleVerdict, error) {
+	client := NewClient("http://" + addr)
+	return awaitProcessSettle(
+		context.Background(), settleAllProcesses(client), processSettleTimeout, processSettlePollInterval)
 }
 
 // checkEarlyDeath does a non-blocking check of childErr. If the child has

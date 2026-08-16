@@ -3,8 +3,10 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,7 +27,12 @@ func depStatusRunner(t *testing.T, binary, config string) (tmpDir string, runSta
 		t.Fatalf("write config: %v", err)
 	}
 
-	runCLI(t, binary, tmpDir, "start daemon", "up", "-d", "--no-proxy", "-c", configPath)
+	// Not runCLI: several of these configs describe a process or task that is
+	// MEANT to fail, and since plan 027 C13 (#94) `up -d` exits non-zero when a
+	// process reaches a terminal-failed state inside the settle window. That
+	// non-zero exit means "the daemon is up, its processes are not" -- the
+	// daemon this runner then queries is running either way.
+	startDaemonAllowingProcessFailure(t, binary, tmpDir, "start daemon", "up", "-d", "--no-proxy", "-c", configPath)
 	t.Cleanup(func() {
 		stopCLIQuietly(binary, tmpDir, "stop", "-c", configPath)
 		time.Sleep(300 * time.Millisecond)
@@ -48,6 +55,36 @@ func runCLI(t *testing.T, binary, dir, what string, args ...string) string {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s: %v\noutput: %s", what, err, out)
+	}
+	return string(out)
+}
+
+// startDaemonAllowingProcessFailure is runCLI for a `prox up -d` whose config
+// deliberately contains a process or task that fails.
+//
+// Since plan 027 C13 (#94) the launcher reports the resulting STATE, not just
+// that the daemon accepted the request: a process that reaches crashed (or
+// blocked) inside the settle window makes `up -d` exit 1 even though the daemon
+// itself is up and stays up. runCLI would fail such a test on the very
+// condition it was written to produce. Exit 0 and exit 1 are therefore both
+// accepted here; anything else (a signal, a config error, a failure to launch
+// at all) still fails the test, and the output is returned for inspection.
+func startDaemonAllowingProcessFailure(t *testing.T, binary, dir, what string, args ...string) string {
+	t.Helper()
+
+	ctx, cancel := boundedContext(within(t, cliCommandTimeout), cliCommandTimeout)
+	defer cancel()
+
+	cmd := boundedCommand(ctx, dir, binary, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("%s: %v\noutput: %s", what, err, out)
+		}
+		if ee.ExitCode() != 1 {
+			t.Fatalf("%s: unexpected exit code %d\noutput: %s", what, ee.ExitCode(), out)
+		}
 	}
 	return string(out)
 }

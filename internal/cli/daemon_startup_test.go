@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -61,7 +62,10 @@ func fastStartupOps() daemonStartupOps {
 		loadState: func(string) (*daemon.State, error) { return nil, errors.New("no state") },
 		healthOK:  func(string) bool { return false },
 		logTail:   func(string, int, int) string { return "" },
-		sleep:     func(time.Duration) {},
+		// Default: nothing failed within the settle window (plan 027 C13).
+		// Tests that care about the post-readiness verdict override it.
+		settle: func(string) (settleVerdict, error) { return settleVerdict{}, nil },
+		sleep:  func(time.Duration) {},
 
 		readyTimeout: 40 * time.Millisecond,
 		pollInterval: time.Millisecond,
@@ -87,10 +91,153 @@ func TestAwaitDaemonStartup_Success(t *testing.T) {
 		return true
 	}
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	addr, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:12345", addr,
+		"the resolved address must be returned: the settle check that follows has no other way to reach the daemon")
 	assert.Equal(t, 1, healthCalls, "health should be probed once")
 	assert.Empty(t, child.sentSignals(), "a ready child must not be signaled")
+}
+
+// readyStartupOps returns fastStartupOps for a child that becomes ready
+// immediately, so a test can concentrate on what happens AFTER readiness.
+func readyStartupOps(pid int) daemonStartupOps {
+	ops := fastStartupOps()
+	ops.loadState = func(string) (*daemon.State, error) {
+		return &daemon.State{PID: pid, Host: "127.0.0.1", Port: 12345}, nil
+	}
+	ops.healthOK = func(string) bool { return true }
+	return ops
+}
+
+// TestStartDetachedDaemon_SuccessPrintsHeadlineAfterSettle: a ready daemon whose
+// processes survive the settle window exits 0 and prints the started line — and
+// prints it only ONCE the settle step has run, which is the ordering the whole
+// commit turns on.
+func TestStartDetachedDaemon_SuccessPrintsHeadlineAfterSettle(t *testing.T) {
+	child := newFakeChild(5000)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5000)
+	settled := false
+	var gotAddr string
+	ops.settle = func(addr string) (settleVerdict, error) {
+		settled = true
+		gotAddr = addr
+		return settleVerdict{}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.NoError(t, err)
+	assert.True(t, settled, "the settle step must run before success is declared")
+	assert.Equal(t, "127.0.0.1:12345", gotAddr)
+	assert.Contains(t, stdout, "prox started (pid 5000, api http://127.0.0.1:12345)")
+	assert.Empty(t, stderr)
+}
+
+// TestStartDetachedDaemon_CrashedProcessExitsNonZero is the #94 contract itself:
+// the daemon is up, a process is crashed, and `prox up -d` must NOT report
+// success. The success headline must be absent (printing it and then exiting
+// non-zero is the same lie in a new place), the crashed process must be named
+// with the same sentence `prox status` uses, and `prox down` must be offered —
+// because a non-zero exit here does not mean nothing started.
+func TestStartDetachedDaemon_CrashedProcessExitsNonZero(t *testing.T) {
+	child := newFakeChild(5001)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5001)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{crashed: []string{"web", "worker"}}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "2 process(es) crashed", err.Error(),
+		"the sentinel must be the one `prox status` returns, not a second vocabulary")
+	assert.NotContains(t, stdout, "prox started", "no success headline may precede a non-zero exit")
+	assert.Contains(t, stderr, "Crashed: web, worker — check 'prox logs web'.")
+	assert.Contains(t, stderr, "prox down")
+	assert.Contains(t, stderr, "pid 5001", "the failure still has to say what IS running")
+}
+
+// TestStartDetachedDaemon_BlockedProcessExitsNonZero: blocked shares the exit
+// contract and the formatter with crashed, so the two paths cannot drift.
+func TestStartDetachedDaemon_BlockedProcessExitsNonZero(t *testing.T) {
+	child := newFakeChild(5002)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5002)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{blocked: []settleProcess{{Name: "gated", Status: "blocked", BlockedOn: []string{"pg"}}}}, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "1 process(es) blocked on failed dependencies", err.Error())
+	assert.NotContains(t, stdout, "prox started")
+	assert.Contains(t, stderr, "Blocked: gated(pg)")
+}
+
+// TestStartDetachedDaemon_UnverifiableStateKeepsExitCode: when the VERIFICATION
+// fails (transport error, daemon shut down mid-poll, malformed body), readiness
+// was still established — so the command keeps its pre-existing exit code and
+// says once that the state could not be confirmed. A flaky follow-up request
+// must never invent a failure.
+func TestStartDetachedDaemon_UnverifiableStateKeepsExitCode(t *testing.T) {
+	child := newFakeChild(5003)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5003)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{}, errors.New("connection refused")
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.NoError(t, err, "a failed verification must not turn a ready daemon into a failed start")
+	assert.Contains(t, stdout, "prox started (pid 5003")
+	assert.Contains(t, stderr, "could not confirm process state")
+	assert.Equal(t, 1, strings.Count(stderr, "Warning:"), "exactly one warning, not one per poll")
+}
+
+// TestStartDetachedDaemon_NeverReadySkipsSettle: a daemon that never became
+// ready fails on readiness alone. The settle step must not run at all — there
+// is nothing to ask, and asking would only replace a precise diagnostic with a
+// transport error.
+func TestStartDetachedDaemon_NeverReadySkipsSettle(t *testing.T) {
+	child := newFakeChild(5004)
+	child.exitOn[syscall.SIGTERM] = true
+
+	ops := fastStartupOps()
+	settled := false
+	ops.settle = func(string) (settleVerdict, error) {
+		settled = true
+		return settleVerdict{}, nil
+	}
+
+	var err error
+	captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to become ready")
+	assert.False(t, settled, "readiness failed; there is nothing to settle")
 }
 
 // TestAwaitDaemonStartup_EarlyDeath: the child exits (non-zero) before becoming
@@ -108,7 +255,7 @@ func TestAwaitDaemonStartup_EarlyDeath(t *testing.T) {
 		return "boom: config invalid"
 	}
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to start")
 	assert.True(t, tailUsed, "log tail should be gathered for diagnostics")
@@ -127,7 +274,7 @@ func TestAwaitDaemonStartup_NeverReadyTimeout(t *testing.T) {
 	ops := fastStartupOps()
 
 	start := time.Now()
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to become ready")
 	assert.GreaterOrEqual(t, time.Since(start), ops.readyTimeout, "must poll until the deadline")
@@ -144,7 +291,7 @@ func TestAwaitDaemonStartup_TermSuffices(t *testing.T) {
 	child := newFakeChild(4245)
 	child.exitOn[syscall.SIGTERM] = true
 
-	err := awaitDaemonStartup(child, t.TempDir(), fastStartupOps())
+	_, err := awaitDaemonStartup(child, t.TempDir(), fastStartupOps())
 	require.Error(t, err)
 
 	sigs := child.sentSignals()
@@ -168,7 +315,7 @@ func TestAwaitDaemonStartup_StaleStateIgnored(t *testing.T) {
 	healthCalls := 0
 	ops.healthOK = func(string) bool { healthCalls++; return true }
 
-	err := awaitDaemonStartup(child, t.TempDir(), ops)
+	_, err := awaitDaemonStartup(child, t.TempDir(), ops)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to become ready")
 	assert.Zero(t, healthCalls, "stale state (wrong PID) must not advance to the health probe")

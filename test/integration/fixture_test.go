@@ -395,6 +395,12 @@ func startDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args ...
 // than ending the test with it. Teardown and the ledger entry are registered
 // either way, so a launcher that fails AFTER its daemon came up still cannot
 // leak it.
+//
+// The run handle comes back even alongside an error, because since plan 027 C13
+// (#94) a NON-ZERO `up -d` no longer implies "no daemon": the launcher exits 1
+// when the daemon is up and healthy but one of its processes crashed inside the
+// settle window. A test about that case needs the handle -- its output, its exit
+// code, and above all its teardown -- exactly as much as a successful one does.
 func tryStartDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args ...string) (*proxRun, error) {
 	t.Helper()
 
@@ -418,12 +424,12 @@ func tryStartDetachedIn(t *testing.T, binary, dir string, opts []startOpt, args 
 	// -- unlike a foreground run, there is nothing to observe while it lives.
 	if err := l.start(cmd); err != nil {
 		close(r.exited)
-		return nil, fmt.Errorf("failed to start detached prox %v: %w", args, err)
+		return r, fmt.Errorf("failed to start detached prox %v: %w", args, err)
 	}
 	r.waitErr = cmd.Wait()
 	close(r.exited)
 	if r.waitErr != nil {
-		return nil, fmt.Errorf("failed to start detached prox %v: %w\noutput:\n%s", args, r.waitErr, r.Output())
+		return r, fmt.Errorf("failed to start detached prox %v: %w\noutput:\n%s", args, r.waitErr, r.Output())
 	}
 
 	// The launcher only exits 0 after the state file names its child AND that
@@ -504,6 +510,27 @@ func (r *proxRun) WaitExit(t *testing.T, deadline time.Time) error {
 		t.Fatalf("process did not exit %s; output:\n%s", waitedFor(start, deadline), r.Output())
 		return nil // unreachable; t.Fatalf stops the test
 	}
+}
+
+// ExitCode returns the launcher's exit status. It may only be called once the
+// process has exited (every detached launch has, by the time its handle is
+// returned); calling it earlier is a test bug, not a wait.
+func (r *proxRun) ExitCode(t *testing.T) int {
+	t.Helper()
+	select {
+	case <-r.exited:
+	default:
+		t.Fatalf("ExitCode called while the process is still running")
+	}
+	if r.waitErr == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(r.waitErr, &ee) {
+		return ee.ExitCode()
+	}
+	t.Fatalf("process failed without an exit status: %v", r.waitErr)
+	return 0 // unreachable; t.Fatalf stops the test
 }
 
 // Kill terminates the process if it is still running, then waits for the

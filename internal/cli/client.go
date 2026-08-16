@@ -101,8 +101,19 @@ func (c *Client) GetStatusWithContext(ctx context.Context) (*api.StatusResponse,
 
 // GetProcesses gets all processes
 func (c *Client) GetProcesses() (*api.ProcessListResponse, error) {
+	return c.GetProcessesWithContext(context.Background())
+}
+
+// GetProcessesWithContext is GetProcesses with a caller-supplied context.
+//
+// The post-start settle check (plan 027 C13, #94) needs it: that check observes
+// the daemon's processes for a 500ms window, and the client's own 30s timeout
+// would let ONE request overrun that window by 60x — the whole poll loop would
+// then be bounded by a deadline it silently blew past. With a context the
+// caller's window is authoritative.
+func (c *Client) GetProcessesWithContext(ctx context.Context) (*api.ProcessListResponse, error) {
 	var resp api.ProcessListResponse
-	if err := c.get("/api/v1/processes", &resp); err != nil {
+	if err := c.getCtx(ctx, "/api/v1/processes", &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -110,8 +121,15 @@ func (c *Client) GetProcesses() (*api.ProcessListResponse, error) {
 
 // GetProcess gets a single process
 func (c *Client) GetProcess(name string) (*api.ProcessDetailResponse, error) {
+	return c.GetProcessWithContext(context.Background(), name)
+}
+
+// GetProcessWithContext is GetProcess with a caller-supplied context, for the
+// same reason as GetProcessesWithContext: `prox start`/`prox restart` poll this
+// endpoint inside a bounded settle window (plan 027 C13, #94).
+func (c *Client) GetProcessWithContext(ctx context.Context, name string) (*api.ProcessDetailResponse, error) {
 	var resp api.ProcessDetailResponse
-	if err := c.get("/api/v1/processes/"+url.PathEscape(name), &resp); err != nil {
+	if err := c.getCtx(ctx, "/api/v1/processes/"+url.PathEscape(name), &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

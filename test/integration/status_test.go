@@ -34,7 +34,12 @@ processes:
 
 	// Start the daemon without the shared proxy so this test never touches the
 	// machine-wide daemon socket.
-	runCLI(t, binary, tmpDir, "failed to start daemon", "up", "-d", "--no-proxy", "-c", configPath)
+	// The launcher itself now exits 1 for this config: since plan 027 C13 (#94)
+	// `up -d` reports the resulting state, and this config's only process
+	// crashes inside the settle window. The daemon is up regardless -- that is
+	// precisely what the non-zero exit means here -- so the rest of the test
+	// (which is about `prox status`) is unaffected.
+	startDaemonAllowingProcessFailure(t, binary, tmpDir, "failed to start daemon", "up", "-d", "--no-proxy", "-c", configPath)
 
 	// Always tear the daemon down so a wedged test never strands a daemon.
 	// Registered before the readiness wait so a failed wait still cleans up.
