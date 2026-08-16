@@ -1251,6 +1251,41 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 	claimedExit := inst.claimTerminal(claimExit)
 	inst.markExited()
 
+	// Tear down THIS instance's context the instant the leader is gone (#107).
+	// Before this, the only cancels were the launch-failure cleanup and stop(),
+	// so a process that crashed on its own left its health checker ticking --
+	// re-executing the user's check command against a dead pid, with whatever
+	// side effects that command has, until some later Stop happened to arrive
+	// (and reporting `"healthcheck": {"enabled": true}` the whole time).
+	//
+	// WHY HERE, before the output-drain wait, and not at the terminal-state
+	// commit below: the drain can take up to outputDrainTimeout (5s) when a
+	// grandchild is holding the pipe open, and cancelling at the commit point
+	// would keep the checker shelling out for that entire window. From the
+	// instant inst.proc.Wait() returns, the leader is gone and the health
+	// checker is meaningless.
+	//
+	// WHY IT IS SAFE:
+	//   - The only consumers of processCtx are healthChecker.Start and
+	//     runner.Start; the production ExecRunner explicitly ignores its ctx
+	//     (lifecycle is driven via Signal, see runner.go), so cancelling kills
+	//     nothing.
+	//   - Output draining is tracked on inst.outputWg, NOT on the context, so
+	//     this cannot truncate log capture -- the drain wait below is unaffected.
+	//   - Teardown is by inst.proc.Signal(...) in stop(). Cancelling sends no
+	//     signal and disturbs no pgid.
+	//   - Cancelling is NOT the same as releasing p.current: the instance (and
+	//     therefore the pgid) is deliberately retained below, so a surviving
+	//     group stays reapable by a later Stop. Only the health loop stops.
+	//   - It touches only this instance's context. A restart installs a fresh
+	//     HealthChecker on a fresh processCtx, so a stale monitor cancels only
+	//     its own dead checker.
+	//   - stop()'s later inst.cancel() becomes a no-op; context.CancelFunc is
+	//     idempotent by contract.
+	if inst.cancel != nil {
+		inst.cancel()
+	}
+
 	// Wait for this instance's output readers to finish draining pipes with a
 	// timeout. With manual pipes (not cmd.StdoutPipe), the pipes stay open
 	// until all processes (including grandchildren) close them, so graceful
@@ -1320,7 +1355,10 @@ func (p *ManagedProcess) monitor(inst *processInstance) {
 		}
 	}
 	// Deliberately do NOT null p.current: retaining it keeps the pgid reapable
-	// for a retry Stop.
+	// for a retry Stop. Note this is untouched by the instance-context cancel
+	// above (#107) -- cancelling the context is NOT releasing the instance: it
+	// stops the health loop and nothing else, so the retained pgid stays exactly
+	// as reapable as it was before.
 	stateChanged := p.state != prevState
 	p.mu.Unlock()
 
