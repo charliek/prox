@@ -2,4 +2,9 @@ processes:
   worker:
     cmd: ./testdata/scripts/stubborn_grandchild.sh
     env:
+      # Placeholder only. The integration harness replaces this with a
+      # per-fixture dynamic port when it renders the config
+      # (proxFixture.StubbornPort), so no test binds 15561. The literal is kept
+      # so this config still works if run by hand with
+      # `prox up -c testdata/configs/stubborn.yaml`.
       STUBBORN_PORT: "15561"

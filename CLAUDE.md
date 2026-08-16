@@ -46,19 +46,29 @@ PR of small gated commits. The plan file is never committed here, so the PR
 body must carry the plan's substance — reviewers and future readers only
 have the PR, not the plan file.
 
-## Test-fixture pitfall: stubborn_listener.py / port 15561
+## Test-fixture pitfall: stubborn_listener.py (no longer port 15561)
 
 `testdata/scripts/stubborn_listener.py` deliberately ignores SIGTERM (it
-simulates an orphaned grandchild holding a port). If the test suite is
-killed mid-run, this process can be stranded holding port 15561
-(`test/integration/restart_test.go`'s `stubbornListenerPort`). Symptom:
-orphan-grandchild integration tests fail with `marker GRANDCHILD_PID= not
-found`. Recover with:
+simulates an orphaned grandchild holding a port). If the suite is killed
+mid-run, one of these can be stranded holding whatever port it had.
+
+**Plan 027 removed the fixed-port form of this hazard.** The listener port is
+no longer 15561: it is allocated dynamically per fixture
+(`proxFixture.StubbornPort()`, `test/integration/fixture_test.go`), so a
+stranded listener can no longer wedge a *later* run — it holds a port nothing
+else wants. The old recovery recipe (`lsof -nP -i :15561`) is obsolete; there
+is no fixed port to check.
+
+A strand now costs a stray process rather than a broken suite. To find one:
 
 ```shell
-lsof -nP -i :15561
+pgrep -af stubborn_listener
 kill -9 <pid>
 ```
+
+The orphan-reaping tests register a `t.Cleanup` that kills the listener PID
+they capture from the test marker, so this should be needed only if a run is
+killed with SIGKILL.
 
 ## Shared daemon PID: argv is a decoy
 

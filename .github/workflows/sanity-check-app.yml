@@ -33,6 +33,7 @@ permissions: {}   # this workflow needs nothing from the workflow token
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # ── 1. self (charliek/prox) ──
       - id: self-token
