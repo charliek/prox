@@ -502,6 +502,18 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// connection state, and (C6) holds the client swapped in on heal. Created
 	// here (mode defaults to disabled) and resolved to shared/standalone below.
 	runtime := newProxyRuntime()
+	// This session's user-facing advisories (plan 028 A2). Created before the
+	// proxy path resolves, because the shared daemon's register response is the
+	// first producer; published on GET /status (which is how the `prox up -d`
+	// parent reads them back out of a child whose output goes to a log file) and
+	// rendered once at the end of startup below.
+	warnings := newWarningSink()
+	runtime.SetWarningSink(warnings)
+	handlers.SetWarningProvider(warnings)
+	// The suite's only way to produce a warning that finishes AFTER the
+	// `prox up -d` parent's settle window — the race the completion latch
+	// exists for. Unset in every real run.
+	registerTestWarningProducer(warnings, os.Getenv(warningTestHookEnvVar))
 	// The RESOLVED runtime proxy state for this session — what the proxy path
 	// below actually does, not what the file asks for (see
 	// resolveProxyRuntimeState). It gates the proxy start, feeds the status
@@ -659,6 +671,30 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			}
 		}
 	}()
+
+	// END OF STARTUP: join the asynchronous warning producers, render everything
+	// this session has to say, and seal (plan 028 A2).
+	//
+	// All three steps are here, on runUp's own goroutine, deliberately:
+	//
+	//   - rendering goes through the preamble, which is unsynchronized by
+	//     construction, so it can only happen here;
+	//   - ONE render point means the user meets every advisory in one block and
+	//     one order, whatever produced it;
+	//   - sealing after this point (and after the API server above began
+	//     serving) is what makes warnings_sealed worth publishing at all. GET
+	//     /status can already be answered while a producer is still running,
+	//     which is exactly the window the `prox up -d` parent lands in — it
+	//     polls the latch rather than trusting a single fetch.
+	//
+	// The join is bounded: a warning must never meaningfully delay startup. A
+	// producer that misses the budget still reaches GET /status when it lands,
+	// it just misses the parent's read.
+	if !warnings.Wait(warningProducerJoinTimeout) {
+		log.Printf("prox: startup warning checks did not finish within %s; continuing", warningProducerJoinTimeout)
+	}
+	reportStartupWarnings(warnings.Warnings(), preamble, os.Stderr)
+	warnings.Seal()
 
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.
@@ -1415,6 +1451,12 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// configured, so a create/start failure here is fatal (D1): `prox up` must
 	// never start a project with the proxy silently disabled. --no-proxy is the
 	// escape hatch (named in the returned error).
+	//
+	// Warnings (plan 028 A2): this mode has no wire to carry them — mkcert runs
+	// in THIS process (internal/proxy) — so a producer added here reports
+	// straight into rt.WarningSink().Add(...) and is rendered and sealed by the
+	// same end-of-startup step in runUp as the shared-daemon path. There is no
+	// producer yet; B1 adds one.
 	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut, pre)
 	if err != nil {
 		return nil, nil, err
@@ -1517,6 +1559,17 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	if len(resp.Registered) > 0 {
 		pre.printf("Registered domains: %s", strings.Join(resp.Registered, ", "))
 	}
+
+	// Advisories the shared daemon raised while setting this project up (plan
+	// 028 A2). They ride the register response — both arms, the first attempt
+	// and the post-SHUTTING_DOWN retry (retryRegisterAfterShutdown returns the
+	// healed response into `resp` above) — because the daemon's own stdout and
+	// stderr are /dev/null, so anything it printed would be seen by nobody.
+	//
+	// They are only COLLECTED here. Rendering happens once, at the end of
+	// startup on runUp's goroutine (see reportStartupWarnings), so a warning
+	// from any producer prints in one place and in one order.
+	rt.WarningSink().Add(resp.Warnings...)
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
 	// daemon proxy requests into this project's TUI and API. The runtime records

@@ -109,6 +109,19 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// visible even when the shared proxy is down (which then forces exit 1).
 	renderProxyStatus(status.Proxy)
 
+	// Session warnings (plan 028 A2). They are advisory, so they are PRINTED
+	// here and deliberately absent from statusExitError below: a warning is not
+	// a failure, and turning `prox status` red for one would make every script
+	// that checks the exit code start failing over an untrusted CA.
+	//
+	// Printed to stdout with the rest of the human report (the --json path
+	// carries them automatically, inside "status"). A daemon that predates the
+	// field simply sends none.
+	if len(status.Warnings) > 0 {
+		fmt.Println()
+		writeWarnings(os.Stdout, status.Warnings)
+	}
+
 	// Crashed line (D1, #72). Printed after the proxy line, naming the crashed
 	// process(es) in the order the supervisor reported them (no sort), with a
 	// pointer at their logs. Printed even when the proxy is also down so neither

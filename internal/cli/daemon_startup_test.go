@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -66,11 +67,16 @@ func fastStartupOps() daemonStartupOps {
 		// Default: nothing failed within the settle window (plan 027 C13).
 		// Tests that care about the post-readiness verdict override it.
 		settle: func(string) (settleVerdict, error) { return settleVerdict{}, nil },
-		sleep:  func(time.Duration) {},
+		// Default: a sealed session with nothing to say (plan 028 A2), so a test
+		// about anything else sees no extra output.
+		fetchWarnings: func(string) ([]domain.Warning, bool, error) { return nil, true, nil },
+		sleep:         func(time.Duration) {},
 
-		readyTimeout: 40 * time.Millisecond,
-		pollInterval: time.Millisecond,
-		killGrace:    30 * time.Millisecond,
+		readyTimeout:    40 * time.Millisecond,
+		pollInterval:    time.Millisecond,
+		killGrace:       30 * time.Millisecond,
+		warningsTimeout: 40 * time.Millisecond,
+		warningsPoll:    time.Millisecond,
 	}
 }
 
@@ -239,6 +245,157 @@ func TestStartDetachedDaemon_NeverReadySkipsSettle(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to become ready")
 	assert.False(t, settled, "readiness failed; there is nothing to settle")
+}
+
+// TestStartDetachedDaemon_WarningsReachTheParentsStderr: a `-d` child's stdout
+// and stderr are .prox/prox.log, so anything it printed is invisible to the
+// person who typed `prox up -d`. The parent reads the warnings back over the
+// child's own API and prints them itself — AFTER the success headline, since a
+// warning is advisory and must not displace the outcome (plan 028 A2).
+func TestStartDetachedDaemon_WarningsReachTheParentsStderr(t *testing.T) {
+	child := newFakeChild(5100)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5100)
+	var fetchedAddr string
+	ops.fetchWarnings = func(addr string) ([]domain.Warning, bool, error) {
+		fetchedAddr = addr
+		return []domain.Warning{{
+			Code: domain.WarningCodeMkcertCAUntrusted, Message: "the CA is not installed.", Hint: "Run 'mkcert -install'.",
+		}}, true, nil
+	}
+
+	var err error
+	stdout, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.NoError(t, err, "a warning must never turn a working start into a failed one")
+	assert.Equal(t, "127.0.0.1:12345", fetchedAddr, "warnings come from the daemon that just became ready")
+	assert.Contains(t, stdout, "prox started (pid 5100")
+	assert.Equal(t, "Warning: the CA is not installed.\n         Run 'mkcert -install'.\n", stderr)
+}
+
+// TestStartDetachedDaemon_WarningsPrintOnAFailedStartToo: the process verdict
+// and the advisories answer different questions, so a non-zero start still
+// reports what the daemon had to say.
+func TestStartDetachedDaemon_WarningsPrintOnAFailedStartToo(t *testing.T) {
+	child := newFakeChild(5101)
+	t.Cleanup(func() { child.exit(nil) })
+
+	ops := readyStartupOps(5101)
+	ops.settle = func(string) (settleVerdict, error) {
+		return settleVerdict{crashed: []string{"web"}}, nil
+	}
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		return []domain.Warning{{Code: "c", Message: "advisory"}}, true, nil
+	}
+
+	var err error
+	_, stderr := captureOutput(t, func() {
+		err = startDetachedDaemon(child, t.TempDir(), ops)
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, stderr, "Crashed: web")
+	assert.Contains(t, stderr, "Warning: advisory")
+	assert.Less(t, strings.Index(stderr, "Crashed: web"), strings.Index(stderr, "Warning: advisory"),
+		"the failure is still the headline; the advisory follows it")
+}
+
+// TestAwaitDaemonWarnings_PollsUntilSealed is the race the completion latch
+// exists for, at the unit level: the child is serving /status (so readiness and
+// the settle window are long past) while an asynchronous producer is still
+// running. A single fetch at that instant would return nothing.
+func TestAwaitDaemonWarnings_PollsUntilSealed(t *testing.T) {
+	ops := fastStartupOps()
+	fetches := 0
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		fetches++
+		if fetches < 3 {
+			return nil, false, nil // producer still running
+		}
+		return []domain.Warning{{Code: "late", Message: "sealed after the settle window"}}, true, nil
+	}
+
+	got := awaitDaemonWarnings("127.0.0.1:1", ops)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, "sealed after the settle window", got[0].Message)
+	assert.Equal(t, 3, fetches, "it polls until the latch flips, then stops")
+}
+
+// TestAwaitDaemonWarnings_SealedImmediatelyCostsOneFetch: the common case (no
+// asynchronous producer, so the session sealed before it ever served /status)
+// must not pay the polling budget.
+func TestAwaitDaemonWarnings_SealedImmediatelyCostsOneFetch(t *testing.T) {
+	ops := fastStartupOps()
+	fetches := 0
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		fetches++
+		return nil, true, nil
+	}
+
+	assert.Nil(t, awaitDaemonWarnings("127.0.0.1:1", ops))
+	assert.Equal(t, 1, fetches)
+}
+
+// TestAwaitDaemonWarnings_NeverSealedPrintsWhatItHas: if the latch never flips
+// the parent gives up on time and reports the best answer it saw. A warning must
+// never delay startup meaningfully, and never fail it.
+func TestAwaitDaemonWarnings_NeverSealedPrintsWhatItHas(t *testing.T) {
+	ops := fastStartupOps()
+	// A real (short) sleep here, not the no-op fake: the deadline is wall-clock,
+	// so a no-op sleep would spin the poll loop for the whole budget.
+	ops.sleep = time.Sleep
+	ops.warningsTimeout = 30 * time.Millisecond
+	ops.warningsPoll = 5 * time.Millisecond
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		return []domain.Warning{{Code: "partial", Message: "seen but never sealed"}}, false, nil
+	}
+
+	start := time.Now()
+	got := awaitDaemonWarnings("127.0.0.1:1", ops)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, "seen but never sealed", got[0].Message)
+	assert.Less(t, time.Since(start), 2*time.Second, "the wait is bounded by warningsTimeout")
+}
+
+// TestAwaitDaemonWarnings_FetchErrorsAreSurvivable: the daemon is up (readiness
+// proved it), so a flaky status read is a reason to retry and then say nothing —
+// never a reason to fail the start.
+func TestAwaitDaemonWarnings_FetchErrorsAreSurvivable(t *testing.T) {
+	ops := fastStartupOps()
+	ops.sleep = time.Sleep
+	ops.warningsTimeout = 30 * time.Millisecond
+	ops.warningsPoll = 5 * time.Millisecond
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		return nil, false, errors.New("connection refused")
+	}
+
+	assert.Nil(t, awaitDaemonWarnings("127.0.0.1:1", ops))
+
+	// A transient error followed by a sealed answer still yields the warning.
+	calls := 0
+	ops.fetchWarnings = func(string) ([]domain.Warning, bool, error) {
+		calls++
+		if calls == 1 {
+			return nil, false, errors.New("connection refused")
+		}
+		return []domain.Warning{{Code: "c", Message: "arrived on the retry"}}, true, nil
+	}
+	got := awaitDaemonWarnings("127.0.0.1:1", ops)
+	require.Len(t, got, 1)
+	assert.Equal(t, "arrived on the retry", got[0].Message)
+}
+
+// TestAwaitDaemonWarnings_NoFetcherIsANoOp guards the unit-test ops literals
+// (and any future caller) that never wire a fetcher.
+func TestAwaitDaemonWarnings_NoFetcherIsANoOp(t *testing.T) {
+	ops := fastStartupOps()
+	ops.fetchWarnings = nil
+	assert.Nil(t, awaitDaemonWarnings("127.0.0.1:1", ops))
 }
 
 // TestAwaitDaemonStartup_EarlyDeath: the child exits (non-zero) before becoming

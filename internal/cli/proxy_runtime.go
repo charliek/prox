@@ -80,6 +80,15 @@ type proxyRuntime struct {
 	// can explain an empty request list. Guarded by mu.
 	captureEnabled bool
 
+	// warnings is this session's warning sink (plan 028 A2). The shared daemon
+	// returns user-facing advisories on the register response — on the FIRST
+	// register (tryDaemonProxy) and on every self-heal re-register (heal) — and
+	// the daemon's own stdout/stderr are /dev/null, so this sink is the only way
+	// they reach the user. Guarded by mu; nil is a usable no-op sink (every
+	// warningSink method is nil-receiver safe), which is what unit-test runtimes
+	// get.
+	warnings *warningSink
+
 	// healState overrides the derived heal_state while the shared daemon is
 	// unreachable (D6b): "" (down, no heal attempted yet), "healing" (heal
 	// attempts failing), or "version_mismatch" (a busy different-version daemon).
@@ -137,6 +146,23 @@ func (r *proxyRuntime) SetCaptureEnabled(enabled bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.captureEnabled = enabled
+}
+
+// SetWarningSink injects the session's warning sink (plan 028 A2). Called once
+// from runUp before the proxy path resolves, so both register arms — the first
+// one and every heal re-register — land in the same collection.
+func (r *proxyRuntime) SetWarningSink(s *warningSink) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warnings = s
+}
+
+// WarningSink returns the session's warning sink, or nil when none was injected
+// (a nil sink is a no-op, not a crash).
+func (r *proxyRuntime) WarningSink() *warningSink {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.warnings
 }
 
 // Mode returns the current proxy mode.
@@ -429,6 +455,23 @@ func (r *proxyRuntime) heal(ops healOps) bool {
 	r.setHealState(healStateHealthy)
 	r.invalidateProbeCache()
 	log.Printf("prox: shared proxy daemon healed — re-registered %d domain(s) with a fresh daemon", len(resp.Registered))
+
+	// The re-register carries the SAME advisories the first one did (plan 028
+	// A2): a fresh daemon re-runs the checks behind them, so a heal is often the
+	// first time a project hears about, say, an untrusted mkcert CA. Everything
+	// but len(resp.Registered) used to be discarded here.
+	//
+	// This runs on the FORWARDER's goroutine, not runUp's, so the preamble is
+	// off limits (it is unsynchronized by construction). Only the sink — which
+	// is mutex-guarded and feeds GET /status — plus the stdlib logger, which is
+	// routed through the stdio sink and therefore reaches a TUI's log pane or
+	// plain stderr. Add's return means each advisory is announced once, not once
+	// per heal.
+	for _, w := range r.WarningSink().Add(resp.Warnings...) {
+		for _, line := range formatWarning(w) {
+			log.Print(line)
+		}
+	}
 	return true
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/daemon"
+	"github.com/charliek/prox/internal/domain"
 )
 
 // daemonChild is the parent's handle on the detached daemon process. The real
@@ -55,12 +56,20 @@ type daemonStartupOps struct {
 	// reports what it saw (plan 027 C13, #94). Its error return is the
 	// OBSERVATION's failure, never a process's -- see awaitProcessSettle.
 	settle func(addr string) (settleVerdict, error)
+	// fetchWarnings reads the child's session warnings and its completion latch
+	// off GET /status (plan 028 A2). sealed false means "startup producers are
+	// still running"; see awaitDaemonWarnings.
+	fetchWarnings func(addr string) (warnings []domain.Warning, sealed bool, err error)
 
 	sleep func(time.Duration)
 
 	readyTimeout time.Duration // total budget for the child to become ready
 	pollInterval time.Duration // interval between readiness polls
 	killGrace    time.Duration // grace after SIGTERM before escalating to SIGKILL
+	// warningsTimeout is the total budget for waiting on the child's warning
+	// latch, and warningsPoll the gap between fetches.
+	warningsTimeout time.Duration
+	warningsPoll    time.Duration
 }
 
 // killWaitBound caps how long the parent waits for the post-SIGKILL reap
@@ -72,15 +81,76 @@ const killWaitBound = 2 * time.Second
 // readiness budget polled at 200ms, and a 5s SIGTERM→SIGKILL grace.
 func defaultDaemonStartupOps() daemonStartupOps {
 	return daemonStartupOps{
-		loadState: daemon.LoadState,
-		healthOK:  probeHealth,
-		logTail:   daemonLogTail,
-		settle:    settleDaemonProcesses,
-		sleep:     time.Sleep,
+		loadState:     daemon.LoadState,
+		healthOK:      probeHealth,
+		logTail:       daemonLogTail,
+		settle:        settleDaemonProcesses,
+		fetchWarnings: fetchDaemonWarnings,
+		sleep:         time.Sleep,
 
 		readyTimeout: 15 * time.Second,
 		pollInterval: 200 * time.Millisecond,
 		killGrace:    5 * time.Second,
+		// 2.5s of polling at 100ms. The common case costs ONE fetch: a session
+		// with no asynchronous producer has already sealed by the time it serves
+		// /status at all. The budget is for the case that has not, and it is a
+		// ceiling, not a wait — the loop returns the instant the latch flips.
+		warningsTimeout: 2500 * time.Millisecond,
+		warningsPoll:    100 * time.Millisecond,
+	}
+}
+
+// daemonWarningsFetchTimeout bounds ONE status fetch on the warning path. The
+// Client's own 30s timeout is far too generous here: the whole point of the
+// poll loop is a ~2.5s ceiling, and a single wedged listener that answered
+// /health and then stopped reading would otherwise hold `prox up -d` for half a
+// minute over an advisory.
+const daemonWarningsFetchTimeout = 1 * time.Second
+
+// fetchDaemonWarnings is the production warning read: one GET /status against
+// the daemon that just became ready, through the same client (and therefore the
+// same ~/.prox/token) settleDaemonProcesses uses.
+func fetchDaemonWarnings(addr string) ([]domain.Warning, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), daemonWarningsFetchTimeout)
+	defer cancel()
+	resp, err := NewClient("http://" + addr).GetStatusWithContext(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return resp.Warnings, resp.WarningsSealed, nil
+}
+
+// awaitDaemonWarnings reads the child's warnings, waiting (bounded by
+// ops.warningsTimeout) for its completion latch (plan 028 A2).
+//
+// The latch is the whole point. A `-d` child's stdout and stderr are
+// .prox/prox.log, so anything it prints is invisible to the person who typed
+// `prox up -d`; the parent has to read the warnings back over the child's own
+// API. But some startup warning producers are asynchronous and can still be
+// running when the parent's readiness + settle wait finishes, so a single fetch
+// at that instant would race them and silently lose the warning.
+//
+// It never fails and never blocks meaningfully: a fetch error or an expired
+// budget yields the best answer seen so far (possibly none), because a warning
+// must never turn a working start into a failed or a slow one.
+func awaitDaemonWarnings(addr string, ops daemonStartupOps) []domain.Warning {
+	if ops.fetchWarnings == nil || ops.sleep == nil {
+		return nil
+	}
+	deadline := time.Now().Add(ops.warningsTimeout)
+	var latest []domain.Warning
+	for {
+		ws, sealed, err := ops.fetchWarnings(addr)
+		if err == nil {
+			latest = ws
+			if sealed {
+				return ws
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return latest
+		}
+		ops.sleep(ops.warningsPoll)
 	}
 }
 
@@ -292,6 +362,18 @@ func startDetachedDaemon(child daemonChild, cwd string, ops daemonStartupOps) er
 	pid := child.Pid()
 
 	verdict, settleErr := ops.settle(addr)
+	// The outcome is decided and PRINTED first, then the warnings are fetched
+	// and printed under it: a warning is advisory, so it must neither delay the
+	// headline the user is waiting for nor displace it as the last thing said
+	// about a failure.
+	outcome := reportSettleOutcome(pid, addr, verdict, settleErr)
+	writeWarnings(os.Stderr, awaitDaemonWarnings(addr, ops))
+	return outcome
+}
+
+// reportSettleOutcome prints what `prox up -d` has to say about the settle step
+// and returns the command's exit verdict (nil for success).
+func reportSettleOutcome(pid int, addr string, verdict settleVerdict, settleErr error) error {
 	switch {
 	case settleErr != nil:
 		// The OBSERVATION failed, not the processes. Readiness was already
