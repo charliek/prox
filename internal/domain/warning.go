@@ -33,6 +33,14 @@ const (
 	// through the proxy will show certificate errors until `mkcert -install`
 	// runs.
 	WarningCodeMkcertCAUntrusted = "mkcert_ca_untrusted"
+
+	// WarningCodeHostnameUnresolved means one or more of this session's
+	// registered `<service>.<domain>` hostnames did not resolve via DNS on
+	// this machine — e.g. a `.test` domain, which does not resolve without
+	// local setup, as opposed to a public wildcard like `*.lvh.me`. Pasting
+	// such a hostname into a browser gets NXDOMAIN even though prox itself is
+	// listening (issue #98).
+	WarningCodeHostnameUnresolved = "hostname_unresolved"
 )
 
 // DedupeWarnings returns ws with duplicates (same Code AND Message) removed,

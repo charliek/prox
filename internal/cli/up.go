@@ -1481,6 +1481,12 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 			return mkcertTrustWarnings(ctx, certs.SharedTrust())
 		})
 	}
+
+	// Same hostname-resolution check as the shared-daemon path (plan 028 B2,
+	// #98), built from config with the identical <service>.<domain>
+	// construction the daemon uses (registeredHostnames) so the check is not
+	// shared-mode-only.
+	startHostnameResolutionCheck(rt.WarningSink(), ctx, defaultHostnameResolver, registeredHostnames(cfg))
 	return nil, svc, nil
 }
 
@@ -1606,6 +1612,14 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 	// startup on runUp's goroutine (see reportStartupWarnings), so a warning
 	// from any producer prints in one place and in one order.
 	rt.WarningSink().Add(resp.Warnings...)
+
+	// Whether these hostnames actually resolve on THIS machine (plan 028 B2,
+	// #98): `Registered domains: app.sec.test` printed above is only useful
+	// if pasting it into a browser works, and a `.test` domain (unlike a
+	// public wildcard such as `*.lvh.me`) does not resolve without local DNS
+	// setup. Async and best-effort — see startHostnameResolutionCheck — so a
+	// slow or offline resolver never delays this session's startup.
+	startHostnameResolutionCheck(rt.WarningSink(), ctx, defaultHostnameResolver, resp.Registered)
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
 	// daemon proxy requests into this project's TUI and API. The runtime records
