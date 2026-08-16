@@ -900,3 +900,39 @@ func TestClassifyTUIExit(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveProxyRuntimeState pins the RUNTIME-vs-config distinction the TUI's
+// empty-state hints depend on. The trap is `--no-proxy`: the config's proxy:
+// block stays enabled (capture with it), yet nothing proxies and nothing can be
+// captured, so a hint keyed on the config alone would promise traffic this
+// session can never see.
+func TestResolveProxyRuntimeState(t *testing.T) {
+	enabledProxy := func() *config.ProxyConfig {
+		return &config.ProxyConfig{Enabled: true, Capture: &config.CaptureConfig{Enabled: true}}
+	}
+
+	cases := []struct {
+		name        string
+		proxy       *config.ProxyConfig
+		noProxy     bool
+		wantProxy   bool
+		wantCapture bool
+	}{
+		{"no proxy block", nil, false, false, false},
+		{"proxy and capture enabled", enabledProxy(), false, true, true},
+		{"--no-proxy overrides an enabled block", enabledProxy(), true, false, false},
+		{"proxy block disabled", &config.ProxyConfig{Enabled: false, Capture: &config.CaptureConfig{Enabled: true}}, false, false, false},
+		{"capture disabled", &config.ProxyConfig{Enabled: true, Capture: &config.CaptureConfig{Enabled: false}}, false, true, false},
+		{"capture absent", &config.ProxyConfig{Enabled: true}, false, true, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveProxyRuntimeState(&config.Config{Proxy: tc.proxy}, tc.noProxy)
+			if got.Configured != tc.wantProxy || got.CaptureEnabled != tc.wantCapture {
+				t.Errorf("resolveProxyRuntimeState = %+v, want {Configured:%v CaptureEnabled:%v}",
+					got, tc.wantProxy, tc.wantCapture)
+			}
+		})
+	}
+}

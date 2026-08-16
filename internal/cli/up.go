@@ -502,6 +502,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// connection state, and (C6) holds the client swapped in on heal. Created
 	// here (mode defaults to disabled) and resolved to shared/standalone below.
 	runtime := newProxyRuntime()
+	// The RESOLVED runtime proxy state for this session — what the proxy path
+	// below actually does, not what the file asks for (see
+	// resolveProxyRuntimeState). It gates the proxy start, feeds the status
+	// block, and tells the TUI why a request list may stay empty.
+	proxyFacts := resolveProxyRuntimeState(cfg, noProxy)
+	runtime.SetCaptureEnabled(proxyFacts.CaptureEnabled)
 	handlers.SetProxyStatusProvider(runtime)
 
 	apiServer := api.NewServer(api.ServerConfig{
@@ -540,7 +546,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Start proxy — either via shared daemon or standalone fallback.
 	var proxyService *proxy.Service
 	var daemonClient *proxyd.Client
-	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
+	if proxyFacts.Configured {
 		var proxyErr error
 		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink, preamble)
 		if proxyErr != nil {
@@ -697,6 +703,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			// about to hide — pinned in the log pane so the proxy URL survives a
 			// startup chatty enough to have evicted them from the log ring.
 			Preamble: preamble.Lines(),
+			// Why the requests pane may stay empty. Sourced from the SAME
+			// resolved runtime state that gated the proxy start above, so a
+			// `--no-proxy` session reports "no proxy configured" rather than
+			// promising traffic this run can never see.
+			ProxyConfigured: proxyFacts.Configured,
+			CaptureEnabled:  proxyFacts.CaptureEnabled,
 		}
 		// Ports feed curl-copy only; pass them when a proxy is actually
 		// listening (disabled/--no-proxy → port-less https://<host><url>).
@@ -1339,6 +1351,42 @@ func captureDiskBudget(cfg *config.Config) int64 {
 		return 0
 	}
 	return n
+}
+
+// resolveProxyRuntimeState answers the two questions the rest of the session
+// asks about the proxy path: is a proxy actually running for this project, and
+// will requests actually be captured?
+//
+// Both answers are RUNTIME state, not config state, and the gap between the two
+// is the whole point of this function: `prox up --no-proxy` leaves the config's
+// `proxy:` block enabled while refusing to start anything, so keying a UI hint
+// on cfg.Proxy.Enabled alone would tell the user to wait for traffic that this
+// session can never see. captureEnabled is gated on proxyConfigured for the same
+// reason — capture cannot happen without a proxy to capture from.
+//
+// CaptureEffectivelyEnabled is nil-receiver safe, so the second expression is
+// safe even with no proxy: block at all.
+//
+// It returns a STRUCT rather than two bools because the two are adjacent, both
+// bool, and consumed at three call sites — the proxy gate, the status block and
+// the TUI options. Returned positionally, swapping them at any of those sites
+// compiles, passes every test (each is tested in isolation) and silently gives
+// a `--no-proxy` session the wrong hint. Named fields make that mistake visible
+// at the call site instead (CodeRabbit review finding).
+func resolveProxyRuntimeState(cfg *config.Config, noProxy bool) proxyRuntimeFacts {
+	configured := !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled
+	return proxyRuntimeFacts{
+		Configured:     configured,
+		CaptureEnabled: configured && cfg.Proxy.CaptureEffectivelyEnabled(),
+	}
+}
+
+// proxyRuntimeFacts is the resolved runtime state of this session's proxy path:
+// whether a proxy is actually running, and whether requests will actually be
+// captured. Both are runtime answers, not config answers.
+type proxyRuntimeFacts struct {
+	Configured     bool
+	CaptureEnabled bool
 }
 
 // startProxy attempts to register with the shared proxy daemon. If the daemon

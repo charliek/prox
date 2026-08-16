@@ -732,6 +732,10 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		ProjectName:     tui.StatusProjectName(status.ProjectDir),
 		ShutdownCh:      nil,
 	}
+	// Attach has no config of its own: the daemon it connects to resolved the
+	// proxy path (including --no-proxy) at ITS `up` time, so the status block
+	// is the only truthful source for why the requests pane may stay empty.
+	opts.ProxyConfigured, opts.CaptureEnabled = attachProxyFacts(status.Proxy)
 	// Attach owns no log manager, so its alt screen gets the deferred-buffer
 	// target: mid-session diagnostics (the shared SSE-parse warnings in
 	// client.go, an http.Server dump, anything else reaching the stdlib logger)
@@ -744,6 +748,29 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("TUI error: %w", err)
 	}
 	return nil
+}
+
+// attachProxyFacts derives the TUI's two proxy facts from a GET /status proxy
+// block: whether a proxy is running for the attached project, and whether it
+// captures requests.
+//
+// Both default to TRUE for anything unknown, and that is deliberate: true is
+// "say nothing new", the pre-existing wording. The project API has no version
+// gate, so attach can be talking to a daemon older than either signal — a nil
+// block (no proxy provider at all) or a nil CaptureEnabled (a daemon predating
+// the field). Guessing "off" there would print a confident, wrong explanation
+// for an empty list; falling back to the generic wording merely fails to add
+// the new hint.
+func attachProxyFacts(p *api.ProxyStatusResponse) (proxyConfigured, captureEnabled bool) {
+	if p == nil {
+		return true, true
+	}
+	proxyConfigured = p.Mode != proxyModeDisabled
+	captureEnabled = true
+	if p.CaptureEnabled != nil {
+		captureEnabled = *p.CaptureEnabled
+	}
+	return proxyConfigured, captureEnabled
 }
 
 // Requests command flags

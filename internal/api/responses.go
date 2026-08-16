@@ -90,6 +90,19 @@ type ProxyStatusResponse struct {
 	// HealState is "healthy" when the shared daemon is reachable, "" otherwise
 	// (C5). C6 refines it to "healing"/"version_mismatch".
 	HealState string `json:"heal_state,omitempty"`
+	// CaptureEnabled reports whether request/response capture is effectively on
+	// for this project (proxy enabled AND capture.enabled), so a client can say
+	// WHY a request list or a request detail is empty instead of promising
+	// traffic that will never be recorded.
+	//
+	// It is a POINTER on purpose. The project API carries no version gate --
+	// unlike the shared daemon, which requires an exact version match with its
+	// clients -- so `prox attach` can legitimately talk to an older daemon that
+	// predates this field. A plain bool would decode that daemon's absent field
+	// as false and assert "capture is off" about a daemon that never had an
+	// opinion. nil means UNKNOWN and callers must fall back to their
+	// capture-agnostic wording rather than treating it as disabled.
+	CaptureEnabled *bool `json:"capture_enabled,omitempty"`
 }
 
 // ProxyStatusProvider supplies the proxy block for GET /status. The daemon

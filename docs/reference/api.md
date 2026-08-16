@@ -86,7 +86,8 @@ Supervisor status.
     "last_connected_at": "2025-01-19T10:32:01.123Z",
     "dropped_events": 0,
     "backfill_failures": 0,
-    "heal_state": "healthy"
+    "heal_state": "healthy",
+    "capture_enabled": true
   },
   "dependencies": [
     {
@@ -111,6 +112,7 @@ Supervisor status.
 | `dropped_events` | Request-stream events lost to a full subscriber channel |
 | `backfill_failures` | Post-connect ring snapshot fetch failures |
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
+| `capture_enabled` | Whether request/response capture is effectively on (a proxy is running for this session **and** `proxy.capture.enabled` is true). Daemons predating this field omit it entirely; an absent `capture_enabled` means "unknown", **not** `false` |
 
 `prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
 

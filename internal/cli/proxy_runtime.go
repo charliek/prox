@@ -74,6 +74,12 @@ type proxyRuntime struct {
 	// never disturbs the supervisor. nil until the shared-mode forwarder launches.
 	forwarderCancel context.CancelFunc
 
+	// captureEnabled is this project's EFFECTIVE capture state — the proxy is
+	// actually running for this session AND capture is enabled in its config
+	// (see resolveProxyRuntimeState). Reported in the status block so a client
+	// can explain an empty request list. Guarded by mu.
+	captureEnabled bool
+
 	// healState overrides the derived heal_state while the shared daemon is
 	// unreachable (D6b): "" (down, no heal attempted yet), "healing" (heal
 	// attempts failing), or "version_mismatch" (a busy different-version daemon).
@@ -124,11 +130,28 @@ func (r *proxyRuntime) SetMode(mode string) {
 	r.mode = mode
 }
 
+// SetCaptureEnabled records whether request/response capture is effectively on
+// for this session. runUp calls it once, from the same resolved runtime state
+// that decides whether to start the proxy at all.
+func (r *proxyRuntime) SetCaptureEnabled(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.captureEnabled = enabled
+}
+
 // Mode returns the current proxy mode.
 func (r *proxyRuntime) Mode() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mode
+}
+
+// CaptureEnabled returns the effective capture state recorded by
+// SetCaptureEnabled (false until resolved).
+func (r *proxyRuntime) CaptureEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.captureEnabled
 }
 
 // SetClient stores the active daemon client. C6 calls this again on heal.
@@ -263,10 +286,15 @@ func (r *proxyRuntime) ForwarderBackfillFailed() {
 // mode only, with no probe.
 func (r *proxyRuntime) ProxyStatus() *api.ProxyStatusResponse {
 	mode := r.Mode()
+	// Always non-nil from a current daemon: nil is reserved for the wire case
+	// of an OLDER daemon that predates the field (see CaptureEnabled's doc), so
+	// a live runtime must state its answer even when that answer is false.
+	capture := r.CaptureEnabled()
 	resp := &api.ProxyStatusResponse{
 		Mode:                mode,
 		ConsecutiveFailures: r.consecutiveFailures.Load(),
 		BackfillFailures:    r.backfillFailures.Load(),
+		CaptureEnabled:      &capture,
 	}
 	if ns := r.lastConnectedAt.Load(); ns > 0 {
 		t := time.Unix(0, ns)

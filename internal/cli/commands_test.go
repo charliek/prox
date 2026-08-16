@@ -1840,3 +1840,36 @@ func TestRunStatus_CrashedAndProxyDownPrecedenceJSON(t *testing.T) {
 		t.Errorf("JSON output missing the crashed process; got:\n%s", stdout)
 	}
 }
+
+// TestAttachProxyFacts pins how `prox attach` reads the two proxy facts off a
+// status block — including the versions of the block it can legitimately meet.
+// The project API has no version gate, so attach can be talking to a daemon
+// older than capture_enabled; unknown must degrade to the pre-existing wording
+// (true/true), never to a confident "capture is off".
+func TestAttachProxyFacts(t *testing.T) {
+	ptr := func(b bool) *bool { return &b }
+
+	cases := []struct {
+		name        string
+		proxy       *api.ProxyStatusResponse
+		wantProxy   bool
+		wantCapture bool
+	}{
+		{"nil block", nil, true, true},
+		{"older daemon: capture unknown", &api.ProxyStatusResponse{Mode: proxyModeShared}, true, true},
+		{"shared with capture on", &api.ProxyStatusResponse{Mode: proxyModeShared, CaptureEnabled: ptr(true)}, true, true},
+		{"standalone with capture off", &api.ProxyStatusResponse{Mode: proxyModeStandalone, CaptureEnabled: ptr(false)}, true, false},
+		{"disabled", &api.ProxyStatusResponse{Mode: proxyModeDisabled, CaptureEnabled: ptr(false)}, false, false},
+		{"disabled, capture unknown", &api.ProxyStatusResponse{Mode: proxyModeDisabled}, false, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotProxy, gotCapture := attachProxyFacts(tc.proxy)
+			if gotProxy != tc.wantProxy || gotCapture != tc.wantCapture {
+				t.Errorf("attachProxyFacts = (%v, %v), want (%v, %v)",
+					gotProxy, gotCapture, tc.wantProxy, tc.wantCapture)
+			}
+		})
+	}
+}

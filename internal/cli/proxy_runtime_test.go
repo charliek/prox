@@ -74,6 +74,38 @@ func TestProxyRuntime_ProxyStatus_StandaloneNoProbe(t *testing.T) {
 	}
 }
 
+// TestProxyRuntime_ProxyStatus_CaptureEnabled pins that a LIVE runtime always
+// states its capture answer, both ways. The pointer's nil case is reserved for
+// the wire — a daemon older than the field — so a nil here would make a current
+// daemon indistinguishable from one that has no opinion (see
+// api.ProxyStatusResponse.CaptureEnabled).
+func TestProxyRuntime_ProxyStatus_CaptureEnabled(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%v", want), func(t *testing.T) {
+			rt := newProxyRuntime()
+			rt.SetMode(proxyModeStandalone) // avoid the shared-mode probe
+			rt.SetCaptureEnabled(want)
+
+			s := rt.ProxyStatus()
+			if s.CaptureEnabled == nil {
+				t.Fatal("CaptureEnabled = nil from a live runtime; want a stated answer")
+			}
+			if *s.CaptureEnabled != want {
+				t.Errorf("CaptureEnabled = %v, want %v", *s.CaptureEnabled, want)
+			}
+		})
+	}
+
+	t.Run("unset defaults to false", func(t *testing.T) {
+		rt := newProxyRuntime()
+		rt.SetMode(proxyModeDisabled)
+		s := rt.ProxyStatus()
+		if s.CaptureEnabled == nil || *s.CaptureEnabled {
+			t.Errorf("CaptureEnabled = %v, want a stated false", s.CaptureEnabled)
+		}
+	})
+}
+
 // TestProxyRuntime_ProbeCacheTTL pins D5: a second status within the TTL reuses
 // the cached probe result rather than re-probing; past the TTL it re-probes.
 func TestProxyRuntime_ProbeCacheTTL(t *testing.T) {
