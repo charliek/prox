@@ -16,7 +16,7 @@ func TestAPI_StatusEndpoint(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	resp, err := http.Get(testAPIAddr + "/api/v1/status")
 	requireNoError(t, err, "failed to get status")
@@ -43,7 +43,7 @@ func TestAPI_ProcessRestartEndpoint(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get initial PID
@@ -95,7 +95,7 @@ func TestAPI_ProcessStopStartEndpoint(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	// Wait for process to be running before we try to stop it
 	waitForProcessState(t, testAPIAddr, "long", "running", 5*time.Second)
@@ -144,7 +144,7 @@ func TestAPI_LogsEndpoint(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	// Wait for some logs to be generated
 	time.Sleep(2 * time.Second)
@@ -180,7 +180,7 @@ func TestAPI_SSELogsStream(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	// Connect to SSE stream
 	resp, err := http.Get(testAPIAddr + "/api/v1/logs/stream")
@@ -228,7 +228,7 @@ func TestAPI_NotFoundProcess(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	resp, err := http.Get(testAPIAddr + "/api/v1/processes/nonexistent")
 	requireNoError(t, err, "failed to get process")

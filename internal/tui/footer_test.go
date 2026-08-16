@@ -125,7 +125,7 @@ func TestFooter_WideCharStatus(t *testing.T) {
 }
 
 func TestFooter_HintDropOrder(t *testing.T) {
-	hints := defaultFooterHints()
+	hints := defaultFooterHints("")
 	require.Len(t, hints, 5)
 	hints = dropFooterHint(hints)
 	// Non-sticky dropped from the right first: s filter gone

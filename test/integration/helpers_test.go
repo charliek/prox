@@ -21,6 +21,23 @@ const (
 	testAPIAddr = "http://127.0.0.1:15555"
 )
 
+// TestMain scrubs PROX_TUI from this test process's environment before any test
+// runs, so no `prox` subprocess started here can inherit a developer's own
+// setting (codex review of plan 026 C7).
+//
+// PROX_TUI is a documented per-shell knob that outranks terminal capability, and
+// nearly every test in this package launches the real binary with an inherited
+// environment. An ambient PROX_TUI=1 makes the TUI-default tests pass even
+// against a reverted default; an ambient PROX_TUI=0 makes them fail against
+// correct code; an ambient garbage value adds a warning line to output several
+// tests assert on. Tests that mean to exercise the variable set it explicitly on
+// cmd.Env, which is unaffected by this. (The pty helpers filter it out of
+// cmd.Env as well, so they do not silently depend on this.)
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("PROX_TUI")
+	os.Exit(m.Run())
+}
+
 // buildBinary builds the prox binary and returns its path
 func buildBinary(t *testing.T) string {
 	t.Helper()
@@ -44,16 +61,82 @@ func buildBinary(t *testing.T) string {
 	return binary
 }
 
+// apiReadyTimeout is the standard budget for "has the daemon's API come up
+// yet?" across this suite.
+//
+// It is not a performance assertion — every use polls for something that either
+// happens or fails the test — so a generous budget costs only how long a real
+// failure takes to report. It was a fixed 10s, which does not survive
+// `make test-race`: that builds and runs every package concurrently with race
+// instrumentation, so the whole unit suite competes with these integration
+// tests for cores and a race-instrumented `prox up` regularly needs more than
+// 10s to bind and answer. The failure signature is a wave of "API did not
+// become ready within 10s" across unrelated tests, which reads exactly like a
+// real regression and is not one. See ptyWaitTimeout in tui_pty_test.go for the
+// same problem on the pty side.
+const apiReadyTimeout = 20 * time.Second
+
+// pollClient bounds every poll in this file with a per-request deadline.
+//
+// The naked http.Get these helpers used goes through http.DefaultClient, which
+// has NO timeout: a server that accepts the connection and then stalls blocks
+// the call indefinitely, so the helper sails past its own budget and the package
+// eventually dies on go test's timeout instead of failing one assertion
+// (CodeRabbit, PR #106). The per-request budget is deliberately much shorter
+// than the surrounding poll loop, since every attempt is retried anyway.
+var pollClient = &http.Client{Timeout: pollRequestTimeout}
+
+// pollRequestTimeout caps a single poll. It is a ceiling, not the budget —
+// pollGetWithinDeadline shortens it to whatever is left of the caller's own
+// deadline.
+const pollRequestTimeout = 5 * time.Second
+
+// pollGetWithinDeadline issues one poll bounded by BOTH the per-request ceiling
+// and the caller's remaining budget, returning a cancel the caller must run
+// after closing the body.
+//
+// The client timeout alone bounds a stalled call but not the operation: a
+// request that starts just before the deadline may still run the full ceiling
+// past it, so a helper given a 5s budget could take ~10s and then report a
+// timeout "within 5s" (CodeRabbit, PR #106). A timeout message that misstates
+// its own budget is exactly the kind of misleading signal that makes these
+// failures expensive to diagnose.
+func pollGetWithinDeadline(url string, deadline time.Time) (*http.Response, context.CancelFunc, error) {
+	budget := min(time.Until(deadline), pollRequestTimeout)
+	if budget <= 0 {
+		// The budget ran out between the caller's loop check and here. Do not
+		// start a request at all: a very short one could still succeed and let
+		// the helper report readiness AFTER its deadline (CodeRabbit, PR #106).
+		// Returning the error lets the loop's own condition end the wait.
+		return nil, nil, context.DeadlineExceeded
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	resp, err := pollClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
+}
+
 // waitForAPI waits for the API to be ready
 func waitForAPI(t *testing.T, addr string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(addr + "/api/v1/status")
+		resp, cancel, err := pollGetWithinDeadline(addr+"/api/v1/status", deadline)
 		if err == nil {
+			ok := resp.StatusCode == http.StatusOK
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			cancel()
+			if ok {
 				return
 			}
 		}
@@ -294,17 +377,19 @@ func waitForProcessState(t *testing.T, addr, name, expectedStatus string, timeou
 	deadline := time.Now().Add(timeout)
 	var lastStatus string
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/processes/%s", addr, name))
+		resp, cancel, err := pollGetWithinDeadline(fmt.Sprintf("%s/api/v1/processes/%s", addr, name), deadline)
 		if err == nil {
 			var proc ProcessInfo
+			matched := false
 			if err := json.NewDecoder(resp.Body).Decode(&proc); err == nil {
 				lastStatus = proc.Status
-				if proc.Status == expectedStatus {
-					resp.Body.Close()
-					return proc
-				}
+				matched = proc.Status == expectedStatus
 			}
 			resp.Body.Close()
+			cancel()
+			if matched {
+				return proc
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

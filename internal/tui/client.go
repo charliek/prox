@@ -141,6 +141,23 @@ type ClientOptions struct {
 	// result — outranks it; see View.
 	ConnectedStatus string
 
+	// Preamble is the caller's startup session info — config path, API address,
+	// proxy URLs, registered domains, the process list, any startup warning —
+	// rendered as pinned log lines the moment the model is built (plan 026 C4).
+	//
+	// It exists because `prox up` prints those lines to a terminal the alt screen
+	// then hides for the whole session, and because the obvious fix (write them
+	// to the log stream and let the backfill carry them) is not a guarantee: the
+	// server ring holds 1000 entries SHARED with process output, so a chatty
+	// startup can evict every one of them before this model connects. The caller
+	// does both — the log stream for `prox logs` and the daemon log, this field
+	// for the screen — and the model swallows the backfilled duplicates
+	// (BaseModel.preambleEcho).
+	//
+	// Attach mode passes nothing: it supervises no processes and started no
+	// proxy, so there is no session of its own to describe.
+	Preamble []string
+
 	// ProjectName is shown in the menu bar after the brand (plan 023 B3).
 	// Empty → resolveProjectName falls back to the cwd basename. Callers
 	// (`prox up --tui`, `prox attach`) supply an explicit derivation.
@@ -218,6 +235,13 @@ func NewClientModel(client TUIClient, opts ClientOptions) ClientModel {
 		opts:      opts,
 	}
 	m.projectName = resolveProjectName(opts.ProjectName)
+	// Seeded here rather than from Init: a command's message would arrive after
+	// the first View (and could race the first backfill batch), whereas the
+	// preamble is the one content this model is guaranteed to be able to show
+	// from its very first frame.
+	for _, line := range opts.Preamble {
+		m.pinLogEntry(preambleLogEntry(line))
+	}
 	return m
 }
 

@@ -32,6 +32,8 @@ When a project has a `prox.yaml`, **use prox to manage processes** — do not ru
 
 **Always use `-d` (daemon mode)** when starting prox so the CLI returns control immediately. Do not start prox in the foreground — it will block. `prox up -d` now confirms real readiness: it exits non-zero with a `.prox/prox.log` tail if the daemon never becomes healthy (trust the exit code), and fails hard with remediation on a daemon/CLI version mismatch instead of silently degrading.
 
+**Foreground `prox up` now opens the interactive TUI** when it is run in a real terminal. This does not change what you should do — keep using `-d` — and it does not change what you get: an agent's shell is not an interactive terminal, so a bare `prox up` still streams plain logs and still blocks. The TUI is only reached when stdin *and* stdout are a terminal, `TERM` is set and not `dumb`, and the process is in the terminal's foreground process group; otherwise prox falls back to log streaming silently, with no error. `--no-tui` or `PROX_TUI=0` force plain streaming, and `--tui` demands the TUI and fails if the terminal cannot host one — but if you find yourself reaching for any of them, you probably wanted `-d`.
+
 **Never kill processes directly** (e.g., `kill <pid>`). Use prox commands so it can track state and handle restarts correctly.
 
 **`prox stop`/`prox down` exit non-zero if the daemon's own teardown doesn't finish.** They wait (up to ~15s) for the daemon to confirm it has fully exited; if that wait times out they still print the stopped summary but exit `1` with a `Warning: the daemon is still finishing shutdown` line on stderr — trust the exit code, not just the summary text. Exit `0` means the daemon is fully torn down.

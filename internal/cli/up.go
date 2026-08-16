@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -40,11 +42,18 @@ const (
 	teardownStageTimeout = 5 * time.Second
 	// logFlushDelay is the time to wait for logs to be printed before closing
 	logFlushDelay = 50 * time.Millisecond
+	// logRingBufferSize is how many entries this session's log manager keeps.
+	// It doubles as the replay bound for a preferred-mode TUI fallback
+	// (streamLogsAfterTUIFallback): asking for the whole ring is exactly "give
+	// me everything you still have", and naming the two with one constant keeps
+	// them from drifting apart.
+	logRingBufferSize = 1000
 )
 
 // Up command flags
 var (
 	useTUI        bool
+	noTUI         bool
 	noProxy       bool
 	apiPort       int
 	httpPort      int
@@ -59,13 +68,20 @@ var upCmd = &cobra.Command{
 	Short: "Start processes",
 	Long: `Start all or specific processes from the configuration.
 
-By default, processes run in the foreground with logs streaming to the terminal.
-Use -d/--detach to run in background (daemon mode), or --tui for interactive mode.
+In the foreground prox opens the interactive TUI whenever the terminal can host
+one, and streams plain logs otherwise (a pipe, a redirect, CI, TERM=dumb, or a
+backgrounded 'prox up &'). Quitting the TUI with 'q' stops the processes, just
+as Ctrl-C does.
+
+Use --no-tui (or PROX_TUI=0) to stream plain logs on a terminal too, --tui to
+require the TUI and fail if the terminal cannot host one, or -d/--detach to run
+in the background and watch it later with 'prox attach'.
 
 Examples:
-  prox up                     # Start all processes (foreground)
+  prox up                     # Start all processes (TUI on a terminal, plain logs otherwise)
+  prox up --no-tui            # Start in the foreground with plain log streaming
   prox up -d                  # Start in background (daemon mode)
-  prox up --tui               # Start with interactive TUI
+  prox up --tui               # Require the TUI (error if the terminal cannot host one)
   prox up web api             # Start specific processes
   prox up --no-proxy          # Start without proxy
   prox up --no-capture        # Disable request/response capture for this run`,
@@ -77,7 +93,8 @@ Examples:
 func init() {
 	rootCmd.AddCommand(upCmd)
 
-	upCmd.Flags().BoolVar(&useTUI, "tui", false, "Enable interactive TUI mode")
+	upCmd.Flags().BoolVar(&useTUI, "tui", false, "Require the interactive TUI (error if the terminal cannot host one; it is already the default on a capable terminal)")
+	upCmd.Flags().BoolVar(&noTUI, "no-tui", false, "Disable interactive TUI mode for this run (overrides PROX_TUI)")
 	upCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "Disable proxy even if configured")
 	upCmd.Flags().IntVarP(&apiPort, "api-port", "p", 0, "Override API server port (otherwise dynamic)")
 	upCmd.Flags().IntVar(&httpPort, "http-port", 0, "Override proxy HTTP port")
@@ -95,9 +112,36 @@ func completeProcessNames(cmd *cobra.Command, args []string, toComplete string) 
 func runUp(cmd *cobra.Command, args []string) (err error) {
 	processes := args
 
-	// Validate mutually exclusive flags
-	if useTUI && detach {
-		return fmt.Errorf("--tui and --detach are mutually exclusive")
+	// Resolve how this invocation wants the TUI, FIRST, before any other work:
+	// explicit flag > PROX_TUI > terminal capability (see tui_mode.go). This
+	// pure step subsumes the old `useTUI && detach` conflict check, with the
+	// same message; the terminal probe it used to sit next to happens a few
+	// lines below, deliberately after the capture check.
+	//
+	// The wiring is the one line the pure matrix cannot cover, so read it
+	// carefully: Changed() answers "was it typed", the flag var answers "what
+	// did it parse to", and swapping the two is exactly the bug that would
+	// break `prox up -d --tui=false`.
+	envTUI, envTUIPresent := os.LookupEnv(proxTUIEnvVar)
+	tuiWantMode, tuiWarnings, err := resolveTUIMode(tuiModeInputs{
+		TUISet:     cmd.Flags().Changed("tui"),
+		TUIVal:     useTUI,
+		NoTUISet:   cmd.Flags().Changed("no-tui"),
+		NoTUIVal:   noTUI,
+		Detach:     detach,
+		Env:        envTUI,
+		EnvPresent: envTUIPresent,
+		// THE FLIP (plan 026 C7): with nothing asked for either way, a
+		// foreground `prox up` now PREFERS the TUI. Preferred, never required —
+		// every non-interactive invocation (a pipe, CI, an agent harness,
+		// TERM=dumb, a backgrounded `prox up &`) falls back to plain log
+		// streaming silently, and `--no-tui` / `PROX_TUI=0` are the explicit
+		// opt-outs. `--detach` short-circuits the whole decision, so this flag
+		// does not reach `prox up -d` at all.
+		AutoDefault: true,
+	})
+	if err != nil {
+		return err
 	}
 	// captureOverrideSet/captureOverrideEnabled resolve once here (before cfg is
 	// even loaded) so the mutual-exclusivity error surfaces immediately, mirroring
@@ -107,16 +151,36 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// A TUI needs a keyboard and a screen. Refuse here — before the supervisor,
+	// A TUI needs a keyboard, a screen, a TERM it can draw with, and the
+	// terminal's foreground process group. Probe here — before the supervisor,
 	// proxy, or API server exist — so a piped or non-interactive invocation
 	// (`prox up --tui | tee log`, CI, an agent harness) fails fast instead of
 	// starting everything and then handing bubbletea a screen nobody can read and a
 	// keyboard nobody can press — a run that can then only be ended by signal.
 	// Ordered AFTER the flag-conflict checks above so a genuine misuse of flags
 	// reports the conflict rather than the terminal.
-	if useTUI && !isInteractiveStdio() {
-		return fmt.Errorf("--tui requires an interactive terminal")
+	//
+	// required (an explicit --tui) errors; preferred (the default, or
+	// PROX_TUI=1) degrades silently to plain streaming, with no stderr note —
+	// a note on every non-interactive `prox up` would pollute CI output forever
+	// for a mode change the caller never asked about. This is the branch that
+	// keeps every piped, redirected, CI and agent-harness `prox up` behaving
+	// exactly as it did before the TUI became the default.
+	tuiEnabled := tuiWantMode != tuiModePlain
+	if tuiEnabled {
+		if hostErr := terminalHostable(); hostErr != nil {
+			if tuiWantMode == tuiModeRequired {
+				return hostErr
+			}
+			tuiEnabled = false
+		}
 	}
+	// Everything this run prints about itself is collected here as well as
+	// printed, so a TUI session can render it on a screen the user can actually
+	// see (see preamble.go). Disabled — and therefore free — in plain mode.
+	preamble := newStartupPreamble(tuiEnabled)
+	// The single warning call site (see reportTUIWarnings).
+	reportTUIWarnings(tuiWarnings, preamble, tuiEnabled, os.Stderr)
 
 	// Get working directory for state files
 	cwd, err := os.Getwd()
@@ -161,6 +225,38 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			}
 		}()
 	}
+
+	// Route every unintended diagnostic in this process through one switchable
+	// sink so a TUI session can render it instead of having its frame corrupted
+	// by it (see stdio_sink.go for the full audit and the concurrency protocol).
+	// This covers all 17 stdlib log.Printf sites AND every http.Server here,
+	// none of which sets ErrorLog — so net/http's TLS handshake errors and
+	// handler-panic dumps land in the sink too.
+	//
+	// A `-d` child's diagnostics reach .prox/prox.log rather than the /dev/null
+	// its real fd 2 points at, because the sink resolves os.Stderr at WRITE
+	// time and daemon.SetupLogging above reassigned that variable. Until now
+	// those lines were lost outright. (Construction order does NOT matter for
+	// that — lazy resolution is what makes it work — but the DEFER order does:
+	// see below.)
+	//
+	// Outside a TUI window the sink is a synchronous pass-through to stderr, so
+	// plain `prox up`, `-d` and CI behave exactly as before.
+	sink := newStdioSink()
+	restoreStdio := installStdioSink(sink)
+	// This install MUST stay below `defer logFile.Close()` above. Defers are
+	// LIFO, so registering the restore later makes it run EARLIER — its final
+	// flush to os.Stderr therefore lands in the daemon log file while that file
+	// is still open. Move this block above the SetupLogging block and the
+	// teardown diagnostics of every `-d` session are silently written to a
+	// closed descriptor.
+	//
+	// The restore itself is a backstop ONLY, for a panic or an early return:
+	// the owner-mode TUI path below restores explicitly and synchronously the
+	// moment RunClient returns, because this defer fires after performShutdown
+	// has already closed the log manager (see stdioSink.RestoreStderr's doc
+	// comment). Restoring twice is a no-op.
+	defer restoreStdio()
 
 	// Load config
 	cfg, err := config.Load(configPath)
@@ -321,7 +417,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 
 	// Create log manager
 	logMgr := logs.NewManager(logs.ManagerConfig{
-		BufferSize:         1000,
+		BufferSize:         logRingBufferSize,
 		SubscriptionBuffer: 1000,
 	})
 
@@ -356,6 +452,13 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		supConfig.ShutdownTimeout = globalShutdownTimeout
 	}
 	sup := supervisor.New(cfg, logMgr, nil, supConfig)
+	// Attach the preamble's second path now that there is a supervisor to log
+	// through: every preamble line also becomes a system log entry, so `prox
+	// logs`, the daemon log and any other subscriber get it too. SystemLog is
+	// safe before sup.Start, and the sup construction here precedes every
+	// preamble site below — the warnings recorded above are flushed by this
+	// call.
+	preamble.logTo(sup.SystemLog)
 
 	// Create the shutdown coordinator. Its Trigger()/TriggerCh() replace the raw
 	// shutdownCh (a bare close was a latent double-close panic on a second POST
@@ -436,7 +539,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	var daemonClient *proxyd.Client
 	if !noProxy && cfg.Proxy != nil && cfg.Proxy.Enabled {
 		var proxyErr error
-		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime)
+		daemonClient, proxyService, proxyErr = startProxy(cfg, cwd, ctx, handlers, runtime, sink, preamble)
 		if proxyErr != nil {
 			return proxyErr
 		}
@@ -466,8 +569,8 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// buffered and Send is a non-blocking select (subscription.go), so
 	// subscribing before the consumer goroutine runs is safe.
 	//
-	// Gated on !useTUI (known well before this point, checked at flag-parse
-	// time): a TUI session must have NO terminal log subscriber, since nothing
+	// Gated on !tuiEnabled (resolved at the very top of runUp, long before this
+	// point): a TUI session must have NO terminal log subscriber, since nothing
 	// would ever drain it, guaranteeing an overflow (which permanently closes
 	// the subscription, subscription.go) and a spurious "subscription
 	// overflowed" line every TUI session.
@@ -476,8 +579,13 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// before supervisor start: Broadcast closes a subscription on its very
 	// first overflow, so subscribing early and only later getting around to
 	// draining it would itself risk losing the subscription before it is read.
+	//
+	// The one path that subscribes LATE is a preferred-mode TUI that failed to
+	// start (see streamLogsAfterTUIFallback below). It is safe there only
+	// because it replays the ring first — everything skipped here is still in
+	// the buffer at that point.
 	var logCh <-chan domain.LogEntry
-	if !useTUI {
+	if !tuiEnabled {
 		var subErr error
 		logCh, subErr = subscribeLogPrinter(logMgr)
 		if subErr != nil {
@@ -487,26 +595,26 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	// Start supervisor
-	fmt.Printf("Starting prox with config: %s\n", configPath)
+	preamble.printf("Starting prox with config: %s", configPath)
 	if isLocalhost(cfg.API.Host) {
 		if authEnabled {
-			fmt.Printf("API server: http://%s (local only, auth enabled)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (local only, auth enabled)", apiServer.Addr())
 		} else {
-			fmt.Printf("API server: http://%s (local only, no auth)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (local only, no auth)", apiServer.Addr())
 		}
 	} else {
 		if authEnabled {
-			fmt.Printf("API server: http://%s (network accessible, auth enabled)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (network accessible, auth enabled)", apiServer.Addr())
 		} else {
-			fmt.Printf("API server: http://%s (network accessible, no auth)\n", apiServer.Addr())
+			preamble.printf("API server: http://%s (network accessible, no auth)", apiServer.Addr())
 		}
 	}
 	if authEnabled {
-		fmt.Printf("Auth token saved to: %s\n", tokenPath())
+		preamble.printf("Auth token saved to: %s", tokenPath())
 	}
 
 	if len(processes) > 0 {
-		fmt.Printf("Starting processes: %s\n", strings.Join(processes, ", "))
+		preamble.printf("Starting processes: %s", strings.Join(processes, ", "))
 		result, err := sup.StartProcesses(ctx, processes)
 		if err != nil {
 			return fmt.Errorf("failed to start processes: %w", err)
@@ -533,7 +641,12 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		if err := apiServer.Serve(apiListener); err != nil {
 			// Server closed is expected on shutdown
 			if !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
+				// Through the stdlib logger (and therefore the stdio sink), not
+				// straight to stderr: this fires on a DETACHED goroutine for the
+				// whole life of the session, so a permanent listener error would
+				// otherwise be written over the TUI's alt screen. log.SetFlags(0)
+				// keeps the plain-mode line byte-identical to the old write.
+				log.Printf("API server error: %v", err)
 			}
 		}
 	}()
@@ -541,7 +654,7 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.
 	var tuiErr error
-	if useTUI {
+	if tuiEnabled {
 		// `up --tui` runs the SAME API-client TUI as `prox attach` (plan 018), just
 		// pointed at the API server this process started a few lines above instead of
 		// another project's daemon. One model, one set of streams, one set of key
@@ -563,9 +676,24 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		// re-read from ~/.prox/token.
 		client := NewClientWithToken(dialableAPIURL(cfg.API.Host, boundAPIPort(apiListener, cfg.API.Port)), token)
 		tuiOpts := tui.ClientOptions{
-			Help:        tui.HelpConfig{TitleSuffix: "", QuitMessage: "Quit"},
+			// Owner-mode wording. `q` behaves exactly as it always has —
+			// RunClient returning falls through into the shutdown sequence
+			// below — but this TUI is pixel-for-pixel the attach TUI, where the
+			// same key leaves a daemon running, so the label is what keeps the
+			// two apart (plan 026 §3.2). The note names the supported way to
+			// keep processes alive past quit, since Model A has no detach key.
+			Help: tui.HelpConfig{
+				TitleSuffix: "",
+				QuitMessage: "Quit (stops processes)",
+				QuitNote:    "To keep processes running, start with 'prox up -d' and use 'prox attach'",
+				QuitHint:    "stop",
+			},
 			ShutdownCh:  coordinator.TriggerCh(),
 			ProjectName: tui.ConfigPathProjectName(absConfigPath),
+			// The startup lines this run printed to a terminal the alt screen is
+			// about to hide — pinned in the log pane so the proxy URL survives a
+			// startup chatty enough to have evicted them from the log ring.
+			Preamble: preamble.Lines(),
 		}
 		// Ports feed curl-copy only; pass them when a proxy is actually
 		// listening (disabled/--no-proxy → port-less https://<host><url>).
@@ -573,17 +701,85 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 			tuiOpts.ProxyHTTPSPort = cfg.Proxy.HTTPSPort
 			tuiOpts.ProxyHTTPPort = cfg.Proxy.HTTPPort
 		}
-		if err := tui.RunClient(client, tuiOpts); err != nil {
+		// For the length of the alt-screen session, unintended diagnostics
+		// become "system" entries in the log pane instead of bytes written over
+		// a rendered frame. The route is asynchronous by necessity — a
+		// synchronous adapter deadlocks inside logs.Manager the first time a
+		// subscriber overflows (see stdio_sink.go).
+		sink.RouteToLogManager(logMgr)
+		runErr := tui.RunClient(client, tuiOpts)
+		// Restore EXPLICITLY and synchronously here, not via a runUp-scoped
+		// defer: that defer runs after performShutdown closes logMgr, so every
+		// teardown-era line — the shared-daemon "lost connection" line most of
+		// all — would be written into a manager with no subscribers that is
+		// about to be discarded, while the terminal showed nothing. This call
+		// is the barrier + drain + join back to stderr.
+		sink.RestoreStderr()
+		switch classifyTUIExit(runErr, tuiWantMode) {
+		case tuiExitClean:
+			// `q`, POST /shutdown, an external signal — including a SIGINT that
+			// bubbletea's own handler won the race for (see tui.IsCleanExit).
+			// Nothing to report and nothing to fall back to: the fallthrough
+			// below runs the shutdown sequence exactly as a `q` quit does.
+		case tuiExitFailedRequired:
 			// Printed now for the interactive user, and retained: a session
 			// whose TUI failed must not exit 0 just because shutdown went
 			// cleanly — scripted callers need to tell the two apart
 			// (CodeRabbit, PR #88). Folded into the exit contract below.
-			tuiErr = fmt.Errorf("TUI error: %w", err)
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			//
+			// REQUIRED only. The user typed `--tui`, so a TUI that cannot run
+			// is a failed request and must fail the command, exactly as it did
+			// before the TUI became the default.
+			tuiErr = fmt.Errorf("TUI error: %w", runErr)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", runErr)
+		case tuiExitFailedPreferred:
+			// PREFERRED (the default, or PROX_TUI=1): nobody asked for a TUI on
+			// this command line, so a bubbletea failure must not turn a working
+			// `prox up` into exit 1 (plan 026 §3.1, CodeRabbit finding 10).
+			// Degrade to the plain log stream this run would have had if the
+			// terminal had been incapable in the first place.
+			//
+			// ANY failure that is not an orderly quit, not just an
+			// initialization failure. bubbletea does separate the two —
+			// everything after its event loop starts comes back wrapped in
+			// tea.ErrProgramKilled, initialization errors do not — but the safe
+			// side of that line is the same either way: falling back leaves the
+			// processes running under a terminal log stream and a working
+			// Ctrl-C, whereas treating a mid-session failure as fatal tears down
+			// a developer's whole stack because a UI they never asked for
+			// crashed. What IS separated out (above) is an orderly quit that
+			// merely reports an error — an external SIGINT bubbletea won the
+			// race for — which is not a failure at all.
+			//
+			// Said out loud, unlike the silent capability fallback: "this
+			// terminal cannot host a TUI" is a routine, expected answer, while
+			// "the TUI itself broke" is an anomaly the user is entitled to see
+			// the reason for — and by this point the primary screen is back, so
+			// it is a line they can actually read.
+			fmt.Fprintf(os.Stderr, "Warning: the TUI could not run (%v); falling back to plain log streaming\n", runErr)
+			if subErr := streamLogsAfterTUIFallback(logMgr, coordinator.Done()); subErr != nil {
+				// Nothing left to fall back TO: without a log subscriber the
+				// session would sit on a silent terminal until it was
+				// signalled. Fail as a required-mode failure would.
+				tuiErr = fmt.Errorf("TUI error: %w", errors.Join(runErr, subErr))
+				fmt.Fprintf(os.Stderr, "Error: %v\n", tuiErr)
+			} else {
+				// This session is now, in every respect the rest of runUp cares
+				// about, a plain-mode session: it waits on the coordinator
+				// below and prints no post-TUI shutdown summary (its log stream
+				// is on the terminal, so performShutdown's own SystemLog lines
+				// are already visible there). Any drops from the brief window
+				// the sink was routed at the log manager are reported here,
+				// since the tuiEnabled-gated report below will no longer fire.
+				reportStdioDrops(sink)
+				tuiEnabled = false
+			}
 		}
-	} else {
+	}
+	if !tuiEnabled {
 		// Log subscription + consumer were already started above, before the
-		// supervisor started any process (D2, #92).
+		// supervisor started any process (D2, #92) — or, for a preferred-mode
+		// TUI that failed, a moment ago with the ring replayed behind it.
 
 		// Wait for shutdown. Both a signal (via forwardShutdownSignal above, which
 		// also logs it) and an API/TUI-quit trigger arrive as a coordinator trigger,
@@ -616,6 +812,19 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// performShutdown already tore the standalone proxy down; nil the local so the
 	// early-error cleanup defer (registered above) stays a no-op.
 	proxyService = nil
+
+	// TUI-only: the alt screen is down and sink.RestoreStderr() above already
+	// pointed output back at the real terminal, so this is the first point after
+	// the verdict lands where a human is looking at the primary screen. Gated on
+	// tuiEnabled, not on outcome or drops, so plain mode's output stays exactly
+	// what the integration suite already asserts byte-for-byte.
+	if tuiEnabled {
+		printShutdownSummary(outcome, os.Stdout, os.Stderr)
+		// C2's stdio sink counts drops on the manager route this session used
+		// (RouteToLogManager above); reuse reportStdioDrops rather than
+		// re-deriving the same "n diagnostic line(s) were dropped" report.
+		reportStdioDrops(sink)
+	}
 
 	// Foreground exit contract: a surviving process group makes `prox up` exit
 	// non-zero (cobra maps a non-nil RunE error to exit 1). Intentional split:
@@ -906,6 +1115,37 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	return outcome
 }
 
+// printShutdownSummary tells a TUI user, on the now-restored primary screen,
+// what happened during shutdown -- detail that performShutdown otherwise sends
+// only into SystemLog, a log stream the alt screen has hidden for the whole
+// session and that has now disappeared along with the TUI itself (plan 026 C5,
+// §3.4).
+//
+// Call ONLY for a TUI session (runUp gates this on tuiEnabled). In plain mode
+// the log stream was on the terminal the whole time and performShutdown's own
+// SystemLog lines were already visible there, so a second copy here would be
+// duplicate noise and would change today's byte-for-byte-asserted plain-mode
+// output (test/integration/up_test.go, api_test.go).
+//
+// outcome is performShutdown's verdict: nil means a clean stop, printed as one
+// short confirmation line so the common case stays quiet. A non-nil outcome
+// names each survivor -- still true and still actionable, since the group holds
+// whatever ports it bound. The per-survivor lines use the same `name: err` shape
+// as `prox stop`'s failure output (commands.go) rather than repeating the
+// header's "did not stop cleanly" on every row. out and errOut are threaded in
+// (rather than hard-wired to os.Stdout/os.Stderr) so a unit test can capture
+// both without a pty.
+func printShutdownSummary(outcome *domain.ProcessStopError, out, errOut io.Writer) {
+	if outcome == nil {
+		fmt.Fprintln(out, "All processes stopped cleanly.")
+		return
+	}
+	fmt.Fprintln(errOut, "Some processes did not stop cleanly (their process groups may still hold ports):")
+	for _, f := range outcome.Failures {
+		fmt.Fprintf(errOut, "  %s: %v\n", f.Name, f.Err)
+	}
+}
+
 // proxDir returns the prox config directory path (~/.prox)
 func proxDir() string {
 	home, err := os.UserHomeDir()
@@ -1053,9 +1293,16 @@ func captureDiskBudget(cfg *config.Config) int64 {
 // cannot be reached (e.g., sandboxed environment), it falls back to starting a
 // standalone proxy. Returns the daemon client (if using daemon) and/or the
 // standalone proxy service (if using fallback).
-func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, *proxy.Service, error) {
+//
+// pre collects the "Proxy (…)" / "Registered domains" lines for the TUI. It is
+// threaded IN rather than having these functions return their lines: the lines
+// are produced at four points spread across two functions with three error
+// paths between them, and printing them where they happen is what keeps the
+// terminal output byte- and order-identical to before (preamble.printf prints
+// exactly what the fmt.Printf it replaced printed, at the same moment).
+func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, logOut io.Writer, pre *startupPreamble) (*proxyd.Client, *proxy.Service, error) {
 	// Try shared daemon first
-	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt)
+	client, ok, fatalErr := tryDaemonProxy(cfg, cwd, ctx, handlers, rt, pre)
 	if ok {
 		return client, nil, nil
 	}
@@ -1068,7 +1315,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 	// configured, so a create/start failure here is fatal (D1): `prox up` must
 	// never start a project with the proxy silently disabled. --no-proxy is the
 	// escape hatch (named in the returned error).
-	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers)
+	svc, err := startStandaloneProxy(cfg, cwd, ctx, handlers, logOut, pre)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1080,7 +1327,7 @@ func startProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *a
 // Returns (client, true, nil) on success, (nil, false, nil) when daemon is
 // unavailable (fall back to standalone), (nil, false, error) when daemon is
 // running but registration failed (don't fall back, fail the command).
-func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime) (*proxyd.Client, bool, error) {
+func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, rt *proxyRuntime, pre *startupPreamble) (*proxyd.Client, bool, error) {
 	// Check if we can access the daemon directory
 	if err := proxyd.EnsureDaemonDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v — running proxy in standalone mode\n", err)
@@ -1165,10 +1412,10 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
 	}
 	if len(proxyAddrs) > 0 {
-		fmt.Printf("Proxy (shared daemon): %s\n", strings.Join(proxyAddrs, ", "))
+		pre.printf("Proxy (shared daemon): %s", strings.Join(proxyAddrs, ", "))
 	}
 	if len(resp.Registered) > 0 {
-		fmt.Printf("Registered domains: %s\n", strings.Join(resp.Registered, ", "))
+		pre.printf("Registered domains: %s", strings.Join(resp.Registered, ", "))
 	}
 
 	// Create a local RequestManager and start the SSE forwarder to bridge
@@ -1207,12 +1454,28 @@ func tryDaemonProxy(cfg *config.Config, cwd string, ctx context.Context, handler
 // `prox up` exits non-zero rather than continuing with the proxy silently
 // disabled. The returned error carries the proxyStartError hint (port-conflict
 // detail plus the --no-proxy escape hatch).
-func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers) (*proxy.Service, error) {
+//
+// logOut is where the service's slog handler writes, and it is required. It is
+// threaded in rather than hard-wired to os.Stderr because proxy.Service's
+// ErrorHandler logs once per FAILED UPSTREAM REQUEST — the "backend has not
+// bound its port yet" window — which is mid-session output that would otherwise
+// shred a TUI frame. Deliberately NOT nil-tolerant: a nil-means-os.Stderr
+// default would let a future call site silently bypass the sink, which is the
+// exact frame corruption this plumbing exists to prevent.
+func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, handlers *api.Handlers, logOut io.Writer, pre *startupPreamble) (*proxy.Service, error) {
+	// Fail here rather than at the first log record. slog would accept a nil
+	// writer and only panic when the ErrorHandler fires — i.e. mid-session, on
+	// the first failed upstream request, taking the whole daemon down long
+	// after the mistake was made (codex review finding).
+	if logOut == nil {
+		return nil, fmt.Errorf("internal: startStandaloneProxy requires a log destination")
+	}
+
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level}))
 
 	proxyService, err := proxy.NewService(cfg.Proxy, cfg.Services, cfg.Certs, logger, cwd)
 	if err != nil {
@@ -1230,7 +1493,7 @@ func startStandaloneProxy(cfg *config.Config, cwd string, ctx context.Context, h
 		proxyAddrs = append(proxyAddrs, fmt.Sprintf("https://*.%s:%d", cfg.Proxy.Domain, cfg.Proxy.HTTPSPort))
 	}
 	if len(proxyAddrs) > 0 {
-		fmt.Printf("Proxy (standalone): %s\n", strings.Join(proxyAddrs, ", "))
+		pre.printf("Proxy (standalone): %s", strings.Join(proxyAddrs, ", "))
 	}
 	handlers.SetRequestManager(proxyService.RequestManager())
 	handlers.SetCaptureManager(proxyService.CaptureManager())
@@ -1271,5 +1534,176 @@ func printLogEntries(ch <-chan domain.LogEntry) {
 	printer := NewLogPrinter()
 	for entry := range ch {
 		printer.PrintEntry(entry)
+	}
+}
+
+// tuiExitKind classifies what tui.RunClient returning means for the session:
+// an orderly quit, a failure of a TUI the user REQUIRED, or a failure of a TUI
+// that was merely preferred (and so must degrade instead of failing).
+type tuiExitKind int
+
+const (
+	tuiExitClean tuiExitKind = iota
+	tuiExitFailedRequired
+	tuiExitFailedPreferred
+)
+
+// classifyTUIExit maps (RunClient's error, the resolved mode) onto that
+// decision. Split out of runUp so the matrix is unit-testable — the branch it
+// replaces was only reachable through a full pty-driven session.
+//
+// The non-obvious row is a NON-NIL error that is still a clean quit. Both prox
+// and bubbletea install SIGINT handlers, so an external `kill -INT` (or a
+// Ctrl-C on a terminal that is not in raw mode) is a race: if bubbletea gets
+// there first, Run returns an interrupt error even though the user simply
+// stopped the session. Reporting that as "the TUI could not run", replaying the
+// log ring over it and suppressing the shutdown summary would be a spurious,
+// race-dependent failure report — so it is treated exactly like a `q` quit.
+// tui.IsCleanExit owns the bubbletea identifiers behind that (verified against
+// the vendored v1.3.10).
+func classifyTUIExit(runErr error, mode tuiMode) tuiExitKind {
+	if tui.IsCleanExit(runErr) {
+		return tuiExitClean
+	}
+	if mode == tuiModeRequired {
+		return tuiExitFailedRequired
+	}
+	return tuiExitFailedPreferred
+}
+
+// streamLogsAfterTUIFallback starts the terminal log stream for a session whose
+// preferred-mode TUI failed and which is degrading to plain streaming (plan 026
+// §3.1). It is the ONLY late subscriber in runUp.
+//
+// Accepted cosmetic wart: the ring it replays still contains the startup
+// preamble lines, which were printed on the primary screen before the TUI
+// started — so on this path the user sees them twice. Filtering them out would
+// mean teaching the replay which entries the terminal has already shown, i.e.
+// new state carried purely for a rare error path; the duplication is harmless
+// and deliberately left alone.
+//
+// It has to replay the ring, not just subscribe. The early subscribe-before-
+// start invariant (D2, #92) is deliberately skipped for a TUI session — nothing
+// would drain that subscription and its first overflow would close it — so by
+// the time the TUI has failed, every startup line and every log a process has
+// already emitted is behind us. A bare late subscribe would leave the user
+// looking at a terminal that says nothing about the run it just started;
+// replaying what the manager still holds is what makes the late subscribe safe.
+//
+// Order is subscribe-THEN-query, never the reverse: an entry written between
+// the two arrives twice this way (dropped below by Seq) but is lost outright
+// the other way round. logs.Manager assigns Seq inside the same critical
+// section it broadcasts from, so the ring and the channel can never disagree
+// about which entries the replay already covered.
+func streamLogsAfterTUIFallback(logMgr *logs.Manager, shutdown <-chan struct{}) error {
+	printer := NewLogPrinter()
+	return streamLogsAfterTUIFallbackTo(logMgr, shutdown, printer.PrintEntry)
+}
+
+// streamLogsAfterTUIFallbackTo is streamLogsAfterTUIFallback with the terminal
+// write injected, so a unit test can assert the replay order and the
+// de-duplication without owning a terminal (LogPrinter writes to stdout).
+//
+// shutdown is the coordinator's Done channel, used ONLY to tell an expected
+// end-of-stream (performShutdown closes the log manager, and it closes it after
+// latching the verdict) from a subscription that died early. See
+// emitLogEntriesAfter.
+func streamLogsAfterTUIFallbackTo(logMgr *logs.Manager, shutdown <-chan struct{}, emit func(domain.LogEntry)) error {
+	ch, err := subscribeLogPrinter(logMgr)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to logs: %w", err)
+	}
+	backfill, _, err := logMgr.QueryLast(domain.LogFilter{}, logRingBufferSize)
+	if err != nil {
+		return fmt.Errorf("failed to read buffered logs: %w", err)
+	}
+	var lastSeq uint64
+	if n := len(backfill); n > 0 {
+		lastSeq = backfill[n-1].Seq
+	}
+	go func() {
+		if emitLogEntriesAfter(backfill, lastSeq, ch, shutdown, emit) {
+			// Loud on purpose. Everything else this function exists for is
+			// diagnostics, and a diagnostic stream that has silently stopped is
+			// worse than one that never started: the terminal simply goes quiet
+			// and the user reads that as "nothing is happening".
+			fmt.Fprintln(os.Stderr, "Warning: the log stream was dropped (subscription overflowed); this terminal will show no further logs — use `prox logs -f` to resume")
+		}
+	}()
+	return nil
+}
+
+// emitLogEntriesAfter emits a ring replay and then the live stream, skipping
+// live entries the replay already covered. A zero Seq means the entry was never
+// stamped by a manager, so it cannot be a duplicate of anything in the ring and
+// is always emitted.
+//
+// The replay and the live channel are INTERLEAVED, which is the whole point:
+// emitting a 1000-entry backfill to a terminal takes long enough for a chatty
+// process to fill the 1000-slot subscription buffer behind it, and
+// SubscriptionManager.Broadcast closes a subscription on its FIRST overflow
+// (internal/logs/subscription.go) — permanently, silently, for the rest of the
+// run. So after every backfill entry we drain whatever has already arrived,
+// non-blockingly, into pending. The subscription is never left unread while the
+// replay is in progress. pending is bounded by how much the session logs during
+// the replay; it is transient and freed as soon as the replay ends.
+//
+// It returns true when the live channel closed EARLY — i.e. not as part of
+// shutdown. The manager's Close (performShutdown stage 4) runs after the
+// coordinator's verdict is latched (stage 3), so a closed shutdown channel at
+// that moment means "expected"; anything else is a dropped subscription the
+// caller should say out loud.
+func emitLogEntriesAfter(backfill []domain.LogEntry, lastSeq uint64, ch <-chan domain.LogEntry, shutdown <-chan struct{}, emit func(domain.LogEntry)) bool {
+	live := ch
+	var pending []domain.LogEntry
+
+	// drain takes everything already buffered without ever blocking. A closed
+	// channel is latched by nil-ing live: a receive on a nil channel is never
+	// ready, so the select below simply falls to its default afterwards.
+	drain := func() {
+		for live != nil {
+			select {
+			case entry, ok := <-live:
+				if !ok {
+					live = nil
+					return
+				}
+				pending = append(pending, entry)
+			default:
+				return
+			}
+		}
+	}
+
+	for _, entry := range backfill {
+		emit(entry)
+		drain()
+	}
+
+	emitAfter := func(entry domain.LogEntry) {
+		if entry.Seq != 0 && entry.Seq <= lastSeq {
+			return
+		}
+		emit(entry)
+	}
+	for _, entry := range pending {
+		emitAfter(entry)
+	}
+	pending = nil
+
+	// Either the drain above already saw the close (live is nil — ranging over
+	// a nil channel would block forever, so it is skipped) or this range ends
+	// on it: the function only ever returns once the live channel is closed.
+	if live != nil {
+		for entry := range live {
+			emitAfter(entry)
+		}
+	}
+
+	select {
+	case <-shutdown:
+		return false
+	default:
+		return true
 	}
 }

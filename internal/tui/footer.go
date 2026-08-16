@@ -52,14 +52,21 @@ type footerHint struct {
 	sticky     bool
 }
 
-// defaultFooterHints is the merged-row key hint strip (plan 023 B2).
-func defaultFooterHints() []footerHint {
+// defaultFooterHints is the merged-row key hint strip (plan 023 B2). quitLabel
+// is the caller's wording for the q pair (HelpConfig.QuitHint): owner mode
+// passes "stop" because there `q` takes the processes down with it, attach mode
+// leaves it empty and gets "quit" (plan 026 §3.2). Only the label varies —
+// order and sticky flags are fixed, so the degradation ladder is unchanged.
+func defaultFooterHints(quitLabel string) []footerHint {
+	if quitLabel == "" {
+		quitLabel = "quit"
+	}
 	return []footerHint{
 		{key: "m", label: " menu", sticky: false},
 		{key: "/", label: " search", sticky: false},
 		{key: "s", label: " filter", sticky: false},
 		{key: "?", label: " help", sticky: true},
-		{key: "q", label: " quit", sticky: true},
+		{key: "q", label: " " + quitLabel, sticky: true},
 	}
 }
 

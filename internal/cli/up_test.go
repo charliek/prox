@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +22,7 @@ import (
 	"github.com/charliek/prox/internal/logs"
 	"github.com/charliek/prox/internal/proxyd"
 	"github.com/charliek/prox/internal/supervisor"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -198,6 +201,81 @@ func TestPerformShutdown_CleanReturnsNil(t *testing.T) {
 		t.Fatal("performShutdown must Complete the coordinator even on a clean stop")
 	}
 	assert.Nil(t, coord.Outcome())
+}
+
+// TestPrintShutdownSummary pins plan 026 C5: the terminal-visible verdict a TUI
+// session prints once RunClient has returned and performShutdown has produced
+// its outcome. Per-survivor detail otherwise reaches only SystemLog -- a stream
+// that has just disappeared along with the TUI -- so this is the only copy a TUI
+// user ever sees of it.
+func TestPrintShutdownSummary(t *testing.T) {
+	t.Run("clean stop prints one confirmation line and nothing to stderr", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		printShutdownSummary(nil, &out, &errOut)
+
+		assert.Equal(t, "All processes stopped cleanly.\n", out.String(),
+			"the common case must stay a single quiet line")
+		assert.Empty(t, errOut.String())
+	})
+
+	t.Run("unclean stop names each survivor on stderr and writes nothing to stdout", func(t *testing.T) {
+		outcome := &domain.ProcessStopError{Failures: []domain.ProcessStopFailure{
+			{Name: "api", Err: domain.ErrProcessGroupNotReaped},
+			{Name: "web", Err: errors.New("boom")},
+		}}
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+
+		assert.Empty(t, out.String(), "survivor detail must not land on stdout")
+		assert.Contains(t, errOut.String(), "api: "+domain.ErrProcessGroupNotReaped.Error())
+		assert.Contains(t, errOut.String(), "web: boom")
+	})
+
+	t.Run("integrates with performShutdown's real verdict on a leaked group", func(t *testing.T) {
+		sup, logMgr := newStartedSupervisor(t, map[string]*fakeStopProcess{
+			"web": newFakeStopProcess(4291, true),
+		})
+		outcome := performShutdown(shutdownDeps{
+			sup:          sup,
+			coordinator:  newShutdownCoordinator(),
+			logMgr:       logMgr,
+			stageTimeout: teardownStageTimeout,
+		})
+		require.NotNil(t, outcome, "a surviving group must yield a non-nil outcome")
+
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+
+		assert.Empty(t, out.String())
+		assert.Contains(t, errOut.String(), "web: ")
+
+		// The exit contract itself (errors.Is/As through the wrap) is unchanged by
+		// C5 -- pinned already by TestPerformShutdown_SurvivorNamesProcess -- so this
+		// only re-confirms printShutdownSummary is a side channel, not a replacement:
+		// the same outcome still wraps and unwraps correctly after being printed.
+		wrapped := fmt.Errorf("shutdown incomplete: %w", outcome)
+		var agg *domain.ProcessStopError
+		require.ErrorAs(t, wrapped, &agg)
+		assert.Same(t, outcome, agg)
+	})
+
+	t.Run("clean integration: performShutdown's nil verdict prints the confirmation", func(t *testing.T) {
+		sup, logMgr := newStartedSupervisor(t, map[string]*fakeStopProcess{
+			"web": newFakeStopProcess(4292, false),
+		})
+		outcome := performShutdown(shutdownDeps{
+			sup:          sup,
+			coordinator:  newShutdownCoordinator(),
+			logMgr:       logMgr,
+			stageTimeout: teardownStageTimeout,
+		})
+		require.Nil(t, outcome)
+
+		var out, errOut bytes.Buffer
+		printShutdownSummary(outcome, &out, &errOut)
+		assert.Equal(t, "All processes stopped cleanly.\n", out.String())
+		assert.Empty(t, errOut.String())
+	})
 }
 
 // TestPerformShutdown_NilDepsNoPanic: nil proxy/API/coordinator deps are all
@@ -589,5 +667,236 @@ func TestSubscribeLogPrinter_HappensBeforeWrite(t *testing.T) {
 func printLogEntriesInto(ch <-chan domain.LogEntry, out chan<- domain.LogEntry) {
 	for entry := range ch {
 		out <- entry
+	}
+}
+
+// TestStreamLogsAfterTUIFallback_ReplaysRingThenStreams covers the preferred-mode
+// TUI fallback (plan 026 §3.1, C7). A TUI session deliberately skips runUp's
+// early log subscription, so when the TUI fails this LATE subscriber is all the
+// user has -- and a bare subscribe would start at "now", leaving the terminal
+// silent about the run that has already started. What makes it safe is that it
+// replays the ring first.
+func TestStreamLogsAfterTUIFallback_ReplaysRingThenStreams(t *testing.T) {
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 100, SubscriptionBuffer: 10})
+	defer logMgr.Close()
+
+	// Everything the skipped early subscriber would have printed.
+	logMgr.Write(domain.LogEntry{Process: "system", Stream: domain.StreamStdout, Line: "API server: http://127.0.0.1:5555"})
+	logMgr.Write(domain.LogEntry{Process: "web", Stream: domain.StreamStdout, Line: "listening on :3000"})
+
+	seen := make(chan domain.LogEntry, 16)
+	shutdown := make(chan struct{})
+	defer close(shutdown)
+	require.NoError(t, streamLogsAfterTUIFallbackTo(logMgr, shutdown, func(e domain.LogEntry) { seen <- e }))
+
+	// ...and one line emitted after the fallback took over.
+	logMgr.Write(domain.LogEntry{Process: "web", Stream: domain.StreamStderr, Line: "GET / 200"})
+
+	var lines []string
+	for i := 0; i < 3; i++ {
+		select {
+		case entry := <-seen:
+			lines = append(lines, entry.Line)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for entry %d; got %v", i, lines)
+		}
+	}
+	assert.Equal(t, []string{
+		"API server: http://127.0.0.1:5555",
+		"listening on :3000",
+		"GET / 200",
+	}, lines, "the ring must be replayed in order, then the live stream continues it")
+
+	select {
+	case extra := <-seen:
+		t.Fatalf("nothing else should have been emitted, got %+v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestEmitLogEntriesAfter_DropsEntriesTheReplayAlreadyCovered pins the
+// de-duplication that lets the fallback subscribe BEFORE it queries the ring.
+//
+// That order is the safe one -- querying first would lose any entry written
+// between the query and the subscribe -- but it means an entry can arrive on
+// both paths. logs.Manager stamps Seq in the same critical section it
+// broadcasts from, so the overlap is exactly "Seq <= the last replayed Seq" and
+// can be dropped precisely rather than guessed at. An unstamped (Seq 0) entry
+// cannot be in the ring, so it is always emitted.
+func TestEmitLogEntriesAfter_DropsEntriesTheReplayAlreadyCovered(t *testing.T) {
+	backfill := []domain.LogEntry{
+		{Seq: 7, Process: "web", Line: "old"},
+		{Seq: 8, Process: "web", Line: "newest replayed"},
+	}
+	live := make(chan domain.LogEntry, 4)
+	live <- domain.LogEntry{Seq: 8, Process: "web", Line: "newest replayed"} // duplicate
+	live <- domain.LogEntry{Seq: 9, Process: "web", Line: "genuinely new"}
+	live <- domain.LogEntry{Seq: 0, Process: "web", Line: "never stamped"}
+	close(live)
+
+	var got []string
+	shutdown := make(chan struct{})
+	close(shutdown) // an expected end-of-stream, so no "dropped" report
+	dropped := emitLogEntriesAfter(backfill, 8, live, shutdown, func(e domain.LogEntry) { got = append(got, e.Line) })
+
+	assert.Equal(t, []string{"old", "newest replayed", "genuinely new", "never stamped"}, got)
+	assert.False(t, dropped, "a close during shutdown is the expected end of the stream")
+}
+
+// TestStreamLogsAfterTUIFallback_BurstDuringReplayKeepsLiveStream is the
+// regression test for the fallback's worst failure mode, and the reason the
+// replay and the live channel are interleaved rather than sequential.
+//
+// The fallback subscribes FIRST and then replays the ring to the terminal. If
+// it emitted the whole replay before reading the subscription even once, a
+// process chatty enough to fill the subscription buffer during that window
+// would overflow it -- and SubscriptionManager.Broadcast closes a subscription
+// on its FIRST overflow, permanently and silently. The session would then run
+// to completion with a terminal that shows nothing at all after the replay.
+//
+// The fixture reproduces exactly that: the emit callback writes new entries
+// while the replay is being emitted, more than the subscription buffer can
+// hold. With the interleaved drain every entry survives; without it the
+// subscription dies mid-replay and the sentinel written afterwards never
+// arrives (verified by reverting the interleave -- the test then fails on the
+// sentinel wait).
+func TestStreamLogsAfterTUIFallback_BurstDuringReplayKeepsLiveStream(t *testing.T) {
+	const (
+		subscriptionBuffer = 4 // deliberately tiny: this is what must not overflow
+		backfillCount      = 8 // ring entries the replay has to get through
+		burstPerEntry      = 2 // live entries produced per replayed entry
+		burstTotal         = backfillCount * burstPerEntry
+	)
+	logMgr := logs.NewManager(logs.ManagerConfig{BufferSize: 200, SubscriptionBuffer: subscriptionBuffer})
+	defer logMgr.Close()
+
+	for i := 1; i <= backfillCount; i++ {
+		logMgr.Write(domain.LogEntry{Process: "web", Stream: domain.StreamStdout, Line: fmt.Sprintf("backfill-%d", i)})
+	}
+
+	// Generously buffered so the emitting goroutine never blocks on the test.
+	seen := make(chan string, 4*(backfillCount+burstTotal))
+	written := 0
+	shutdown := make(chan struct{})
+	defer close(shutdown) // runs BEFORE logMgr.Close (LIFO): no spurious drop report
+
+	require.NoError(t, streamLogsAfterTUIFallbackTo(logMgr, shutdown, func(e domain.LogEntry) {
+		seen <- e.Line
+		// Only the replay drives the burst: recursing on live entries would
+		// never terminate.
+		if !strings.HasPrefix(e.Line, "backfill-") {
+			return
+		}
+		for j := 0; j < burstPerEntry; j++ {
+			written++
+			logMgr.Write(domain.LogEntry{Process: "web", Stream: domain.StreamStdout, Line: fmt.Sprintf("burst-%d", written)})
+		}
+	}))
+
+	var want []string
+	for i := 1; i <= backfillCount; i++ {
+		want = append(want, fmt.Sprintf("backfill-%d", i))
+	}
+	for i := 1; i <= burstTotal; i++ {
+		want = append(want, fmt.Sprintf("burst-%d", i))
+	}
+
+	next := func() string {
+		t.Helper()
+		select {
+		case line := <-seen:
+			return line
+		case <-time.After(5 * time.Second):
+			t.Fatal("the live stream went silent: the subscription was dropped mid-replay and every later log line is lost")
+			return ""
+		}
+	}
+
+	var got []string
+	for range want {
+		got = append(got, next())
+	}
+	assert.Equal(t, want, got, "the replay comes first, then everything that arrived while it was draining")
+
+	// The replay is over and the burst is fully accounted for, so this last
+	// line exercises the ordinary live path on the SAME subscription -- which
+	// only still exists because nothing overflowed.
+	logMgr.Write(domain.LogEntry{Process: "web", Stream: domain.StreamStdout, Line: "after-replay"})
+	assert.Equal(t, "after-replay", next(), "the subscription must survive the replay and keep streaming")
+}
+
+// TestEmitLogEntriesAfter_ReportsAnEarlyClose pins the other half of the
+// dropped-subscription fix: the fallback can tell an expected end-of-stream
+// (performShutdown closes the log manager, and only after latching the
+// coordinator's verdict) from a subscription that died early, and reports the
+// early one so the loss is never silent.
+func TestEmitLogEntriesAfter_ReportsAnEarlyClose(t *testing.T) {
+	t.Run("closed with no shutdown in progress is a drop", func(t *testing.T) {
+		live := make(chan domain.LogEntry)
+		close(live)
+		dropped := emitLogEntriesAfter(nil, 0, live, make(chan struct{}), func(domain.LogEntry) {})
+		assert.True(t, dropped)
+	})
+
+	t.Run("closed during shutdown is expected", func(t *testing.T) {
+		live := make(chan domain.LogEntry)
+		close(live)
+		shutdown := make(chan struct{})
+		close(shutdown)
+		dropped := emitLogEntriesAfter(nil, 0, live, shutdown, func(domain.LogEntry) {})
+		assert.False(t, dropped)
+	})
+
+	t.Run("a close seen by the mid-replay drain is still reported", func(t *testing.T) {
+		live := make(chan domain.LogEntry, 1)
+		live <- domain.LogEntry{Seq: 9, Line: "live"}
+		close(live)
+
+		var got []string
+		dropped := emitLogEntriesAfter(
+			[]domain.LogEntry{{Seq: 8, Line: "replayed"}}, 8, live, make(chan struct{}),
+			func(e domain.LogEntry) { got = append(got, e.Line) })
+
+		assert.True(t, dropped, "the drain nils the channel out; the report must survive that path too")
+		assert.Equal(t, []string{"replayed", "live"}, got, "an entry buffered before the close must still be emitted")
+	})
+}
+
+// TestClassifyTUIExit pins plan 026's post-RunClient decision, and in particular
+// the row a codex review of C7 flagged: prox and bubbletea BOTH handle SIGINT,
+// so an external `kill -INT` races between them. If bubbletea wins, RunClient
+// returns an interrupt error for what the user experienced as a normal Ctrl-C.
+// Treating that as a TUI failure would print a spurious "the TUI could not run"
+// warning, replay the whole log ring over the terminal, and suppress the
+// shutdown summary -- all non-deterministically. It must be a clean quit.
+func TestClassifyTUIExit(t *testing.T) {
+	// The shapes bubbletea v1.3.10 actually produces: the event loop returns
+	// ErrInterrupted for an InterruptMsg and Run then wraps every killing error
+	// as "ErrProgramKilled: <cause>" (tea.go).
+	interrupted := fmt.Errorf("%w: %w", tea.ErrProgramKilled, tea.ErrInterrupted)
+	panicked := fmt.Errorf("%w: %w", tea.ErrProgramKilled, tea.ErrProgramPanic)
+	initFailure := errors.New("open /dev/tty: no such device or address")
+
+	tests := []struct {
+		name string
+		err  error
+		mode tuiMode
+		want tuiExitKind
+	}{
+		{"clean quit, preferred", nil, tuiModePreferred, tuiExitClean},
+		{"clean quit, required", nil, tuiModeRequired, tuiExitClean},
+		{"external SIGINT bubbletea won the race for, preferred", interrupted, tuiModePreferred, tuiExitClean},
+		{"external SIGINT bubbletea won the race for, required", interrupted, tuiModeRequired, tuiExitClean},
+		{"bare ErrInterrupted", tea.ErrInterrupted, tuiModePreferred, tuiExitClean},
+		{"bare ErrProgramKilled (Kill/cancelled context)", tea.ErrProgramKilled, tuiModePreferred, tuiExitClean},
+		{"a recovered panic is NOT clean, despite the ErrProgramKilled wrap", panicked, tuiModePreferred, tuiExitFailedPreferred},
+		{"a recovered panic under --tui fails the command", panicked, tuiModeRequired, tuiExitFailedRequired},
+		{"an init failure degrades when the TUI was only preferred", initFailure, tuiModePreferred, tuiExitFailedPreferred},
+		{"an init failure fails the command when --tui was typed", initFailure, tuiModeRequired, tuiExitFailedRequired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyTUIExit(tt.err, tt.mode))
+		})
 	}
 }

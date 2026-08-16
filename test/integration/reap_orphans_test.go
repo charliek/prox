@@ -49,7 +49,7 @@ func TestReap_OrphanedGrandchildAfterKill(t *testing.T) {
 		}
 	}()
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	pidStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	pid, err := strconv.Atoi(pidStr)

@@ -183,7 +183,7 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", cfgPath)
 	defer killProx(cmd)
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 	waitForLogContains(t, addr, "quiet", "QUIET_START", 5*time.Second)
 
 	logsClient, err := dialSSE(addr + "/api/v1/logs/stream")
@@ -243,7 +243,7 @@ func TestAPI_ProcessesStreamServesSnapshots(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	waitForProcessState(t, testAPIAddr, "long", "running", 5*time.Second)
 
 	client, err := dialSSE(testAPIAddr + "/api/v1/processes/stream")
@@ -314,7 +314,7 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	client, err := dialSSE(testAPIAddr + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
@@ -397,7 +397,7 @@ func TestUpForeground_NoControlPlaneAccessLogs(t *testing.T) {
 	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	waitForOutputContains(t, prox, "Still running...", 5*time.Second)
 
 	for _, path := range []string{"/api/v1/status", "/api/v1/processes", "/api/v1/logs"} {
@@ -446,7 +446,7 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	// any earlier t.Fatal in this test before shutdown is even triggered.
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	waitForProcessState(t, testAPIAddr, "long", "running", 5*time.Second)
 
 	logsClient, err := dialSSE(testAPIAddr + "/api/v1/logs/stream")

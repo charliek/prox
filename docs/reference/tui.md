@@ -4,15 +4,27 @@ The interactive terminal UI provides real-time log viewing with filtering and se
 
 ## Starting the TUI
 
+A foreground `prox up` opens the TUI whenever the terminal can host one — no flag needed:
+
 ```bash
-prox up --tui
+prox up
 ```
 
 Or start specific processes:
 
 ```bash
-prox up --tui web api
+prox up web api
 ```
+
+For a daemon started with `prox up -d`, attach to it instead:
+
+```bash
+prox attach
+```
+
+It is the same TUI either way. The difference is ownership: `prox up` **is** the supervisor, so quitting it stops your processes, while `prox attach` only watches a daemon and quitting leaves it running. The footer and the `?` help modal say which one you are in (`q stop` vs `q quit`).
+
+`prox up` falls back to plain log streaming when the terminal cannot host a TUI (a pipe or redirect, CI, `TERM` unset or `dumb`, a backgrounded `prox up &`). `--no-tui` or `PROX_TUI=0` opts out on a capable terminal; `--tui` requires the TUI and errors instead of falling back. See [TUI mode resolution](cli.md#up).
 
 ## Views
 
@@ -35,7 +47,7 @@ With the default chrome (menu bar and process panel visible):
 │ 10:32:02 api    │ GET /api/users 200 12ms                 │
 │ ...                                                      │
 ╰──────────────────────────────────────────────────────────╯
- Tab: switch view | ? for help   [Logs] [FOLLOW] 45/120 lines   ? help · m menu · / search · s filter · q quit
+ Tab: switch view | ? for help   [Logs] [FOLLOW] 45/120 lines   ? help · m menu · / search · s filter · q stop
 ```
 
 The **process panel** sits above the main content. The **viewport** (logs, requests list, or detail body) is wrapped in a rounded border with a title spliced into the top edge (`─ Logs ─`, `─ Requests ─`, or `─ Request <id> ─`). On very small terminals the panel may render borderless rather than corrupt the frame.
@@ -47,9 +59,11 @@ Toggle the menu bar with `m`, the process panel with `p`. View preferences persi
 A single footer row carries everything that used to split across status and hint rows:
 
 - **Left:** typed status — mode prompts (`Search:` / `Filter:` while typing), committed search/filter/solo text, connection or restart messages, or the idle hint. Errors render as `✗ …` on the footer background.
-- **Right:** `[Logs]` / `[Requests]` / `[Request Detail]`, `[FOLLOW]` / `[PAUSED]`, visible/total count, then two-tone key hints (`? help · m menu · / search · s filter · q quit`).
+- **Right:** `[Logs]` / `[Requests]` / `[Request Detail]`, `[FOLLOW]` / `[PAUSED]`, visible/total count, then two-tone key hints (`? help · m menu · / search · s filter · q stop`).
 
-On narrow terminals hints drop right-to-left (non-sticky pairs first; `? help` and `q quit` last), then the count, then the status text truncates. Clicks on the footer are consumed and do nothing.
+The last hint is mode-aware: `q stop` under `prox up`, where quitting stops the processes, and `q quit` under `prox attach`, where it only detaches. The `?` help modal spells the same thing out in full.
+
+On narrow terminals hints drop right-to-left (non-sticky pairs first; `? help` and the `q` pair last), then the count, then the status text truncates. Clicks on the footer are consumed and do nothing.
 
 ### Bordered chrome
 
@@ -121,8 +135,8 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 | `T` | Toggle timestamps in log lines |
 | `w` | Toggle soft-wrap in logs |
 | `Esc` | Clear filters/search/solo; back from detail |
-| `q` | Quit (Normal mode); close help without quitting (Help mode); typed into search/filter bars while editing |
-| `ctrl+c` | Quit from any mode (including help and text entry) |
+| `q` | Quit (Normal mode) — under `prox up` this also stops the processes, under `prox attach` it only detaches; close help without quitting (Help mode); typed into search/filter bars while editing |
+| `ctrl+c` | Quit from any mode (including help and text entry), with the same stop-vs-detach meaning as `q` |
 
 ### Menu bar
 
@@ -222,7 +236,7 @@ Fields:
 | --- | ------ |
 | `Esc` | Back to requests list |
 | `y` | Copy request ID |
-| `c` | Copy as curl (`https://<host>[:port]<path>`; port included in `up --tui`, omitted in attach) |
+| `c` | Copy as curl (`https://<host>[:port]<path>`; port included under `prox up`, omitted in attach) |
 | `Y` | Copy wire JSON (exact API payload) |
 | Scroll wheel | Scroll detail content |
 

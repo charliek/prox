@@ -637,7 +637,11 @@ var attachCmd = &cobra.Command{
 	Long: `Attach the interactive TUI to a running prox daemon.
 
 This allows you to monitor and interact with processes started with
-'prox up -d' (daemon mode).
+'prox up -d' (daemon mode). A foreground 'prox up' already shows the same TUI
+itself, so attach is for daemons you started detached.
+
+The two differ only in ownership: quitting attach with 'q' leaves the daemon
+and its processes running, while quitting a foreground 'prox up' stops them.
 
 Examples:
   prox attach`,
@@ -676,7 +680,15 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		ProjectName:     tui.StatusProjectName(status.ProjectDir),
 		ShutdownCh:      nil,
 	}
-	if err := tui.RunClient(client, opts); err != nil {
+	// Attach owns no log manager, so its alt screen gets the deferred-buffer
+	// target: mid-session diagnostics (the shared SSE-parse warnings in
+	// client.go, an http.Server dump, anything else reaching the stdlib logger)
+	// accumulate and replay verbatim to stderr the instant RunClient returns
+	// rather than being written over a rendered frame. See
+	// runBufferedStdioSession.
+	if err := runBufferedStdioSession(func() error {
+		return tui.RunClient(client, opts)
+	}); err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}
 	return nil

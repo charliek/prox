@@ -67,7 +67,7 @@ func startDaemonIn(t *testing.T, binary, dir string, args ...string) string {
 	statePath := filepath.Join(dir, ".prox", "prox.state")
 	waitForStateFile(t, statePath, 10*time.Second)
 	addr := "http://" + net.JoinHostPort(readStateHost(t, statePath), strconv.Itoa(readStatePort(t, statePath)))
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	t.Cleanup(func() { _ = stopProx(t, addr) })
 	return addr
@@ -372,7 +372,7 @@ func TestOwnership_TmpVsPrivateTmpAllowed(t *testing.T) {
 	statePath := filepath.Join(dir, ".prox", "prox.state")
 	waitForStateFile(t, statePath, 10*time.Second)
 	addr := "http://" + net.JoinHostPort(readStateHost(t, statePath), strconv.Itoa(readStatePort(t, statePath)))
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 	t.Cleanup(func() { _ = stopProx(t, addr) })
 
 	// The client gets no $PWD, so its cwd resolves to /private/tmp/...

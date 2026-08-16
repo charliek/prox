@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestUpCommand_StartsProcesses(t *testing.T) {
 	defer killProx(cmd)
 
 	// Wait for API to be ready
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 
 	// Give processes time to start
 	time.Sleep(500 * time.Millisecond)
@@ -69,7 +70,7 @@ func TestUpCommand_ProcessList(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
@@ -107,7 +108,7 @@ func TestUpCommand_GracefulShutdown(t *testing.T) {
 	binary := buildBinary(t)
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Request shutdown via API
@@ -142,7 +143,7 @@ func TestStopCommand_WaitsForCleanExit(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	out, exitCode := runProx(t, binary, "stop", "-c", configPath("integration"))
@@ -177,7 +178,7 @@ func TestStopCommand_AsyncPostReturnsImmediately(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	start := time.Now()
@@ -204,7 +205,7 @@ func TestStopCommand_DoubleStopNoPanic(t *testing.T) {
 	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Fire the first stop in the background; it waits for the drain. Capture its
@@ -284,7 +285,7 @@ func TestUpCommand_SpecificProcesses(t *testing.T) {
 	cmd := startProx(t, binary, "up", "-c", configPath("integration"), "long")
 	defer killProx(cmd)
 
-	waitForAPI(t, testAPIAddr, 10*time.Second)
+	waitForAPI(t, testAPIAddr, apiReadyTimeout)
 	time.Sleep(500 * time.Millisecond)
 
 	// Get process list
@@ -326,7 +327,7 @@ func TestUpCommand_GrandchildOutputCapture(t *testing.T) {
 	defer killProx(prox.cmd)
 
 	// Wait for API to be ready
-	waitForAPI(t, grandchildAPIAddr, 10*time.Second)
+	waitForAPI(t, grandchildAPIAddr, apiReadyTimeout)
 
 	// Wait until the grandchild's startup marker is visible in the SAME
 	// captured-output surface the post-exit assertions read (the terminal
@@ -450,7 +451,7 @@ func TestUpCommand_InstantCrashLogsAlwaysVisible(t *testing.T) {
 		// Confirms the daemon itself came up; the process crash happens
 		// concurrently with (just after) supervisor start, so this does not run
 		// past the window we're testing.
-		waitForAPI(t, addr, 10*time.Second)
+		waitForAPI(t, addr, apiReadyTimeout)
 
 		// Give the crashed process's log line a short, bounded window to reach
 		// the terminal. Bounded deliberately short: ghost is never restarted, so
@@ -532,5 +533,268 @@ func TestUpTUI_NonInteractiveRefusesToStart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
 		t.Errorf("--tui guard must refuse before any state is written, but .prox exists (stat err=%v)", err)
+	}
+}
+
+// --- plan 026 C3: TUI mode resolution, through the real CLI ------------------
+//
+// resolveTUIMode is a pure function with an exhaustive unit matrix
+// (internal/cli/tui_mode_test.go). The tests below cover the two things that
+// matrix structurally cannot reach:
+//
+//   - cobra wiring — that --no-tui is registered at all, that Changed("tui") is
+//     read where "was it typed" belongs and the flag value where the value
+//     belongs. Getting those two backwards is the regression this whole design
+//     guards against, and it looks identical to a correct implementation from
+//     inside a unit test.
+//   - package-global flag bleed — useTUI/noTUI/detach are package vars, so two
+//     cobra runs in one process share them. Only a subprocess per invocation
+//     proves each command line on its own.
+//
+// NOTE: there is deliberately no pty-based `prox up -d` test here. It belongs
+// in C7. The `-d` conflict regression can only manifest when resolution returns
+// something other than plain, which requires AutoDefault: true — and C3 wires
+// AutoDefault: false, so on a pty `up -d` resolves plain and such a test would
+// pass *against* the bug rather than catching it.
+
+// upTUIFixture writes a config with a single long-lived process into a fresh
+// temp dir and returns (dir, configPath). Loopback api.host keeps the daemon
+// auth-disabled so the shutdown call below needs no token.
+func upTUIFixture(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "prox.yaml")
+	body := "api:\n  host: 127.0.0.1\n\nprocesses:\n  worker:\n    cmd: sleep 300\n"
+	if err := os.WriteFile(cfg, []byte(body), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+	return dir, cfg
+}
+
+// shutdownDaemonIn stops a detached daemon started in dir by reading the port
+// it recorded in .prox/prox.state and posting /shutdown. Best-effort cleanup:
+// the assertions live in the tests, not here.
+func shutdownDaemonIn(t *testing.T, dir string) {
+	t.Helper()
+	statePath := filepath.Join(dir, ".prox", "prox.state")
+	stateData, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Logf("cleanup: no state file at %s: %v", statePath, err)
+		return
+	}
+	var state struct {
+		Port int `json:"port"`
+	}
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		t.Logf("cleanup: unparseable state file: %v", err)
+		return
+	}
+	addr := "http://127.0.0.1:" + strconv.Itoa(state.Port)
+	req, _ := http.NewRequest("POST", addr+"/api/v1/shutdown", nil)
+	if resp, err := http.DefaultClient.Do(req); err == nil && resp != nil {
+		resp.Body.Close()
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
+// TestUpTUIFlags_Conflicts pins the two flag combinations that must be refused
+// and the false-valued forms that must NOT be, through real process
+// invocations. `-d --tui=false` is the load-bearing row: cobra reports
+// Changed("tui") for it, so a conflict predicate that forgets to also check the
+// parsed value breaks a command line that is valid today.
+func TestUpTUIFlags_Conflicts(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+
+	t.Run("--tui --no-tui is refused", func(t *testing.T) {
+		dir, cfg := upTUIFixture(t)
+		cmd := exec.Command(binary, "up", "--tui", "--no-tui", "-c", cfg)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("expected a non-zero exit, got err=%v\noutput:\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "--tui and --no-tui are mutually exclusive") {
+			t.Errorf("expected the --tui/--no-tui conflict message, got:\n%s", out)
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".prox")); !os.IsNotExist(err) {
+			t.Errorf("the conflict must be reported before any state is written, but .prox exists (stat err=%v)", err)
+		}
+	})
+
+	t.Run("-d --tui is refused", func(t *testing.T) {
+		dir, cfg := upTUIFixture(t)
+		cmd := exec.Command(binary, "up", "-d", "--tui", "-c", cfg)
+		cmd.Dir = dir
+		// No cleanup needed: the conflict is reported before daemonization, so
+		// there is no child to stop and no state file to find.
+		out, err := cmd.CombinedOutput()
+
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("expected a non-zero exit, got err=%v\noutput:\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "--tui and --detach are mutually exclusive") {
+			t.Errorf("expected the --tui/--detach conflict message, got:\n%s", out)
+		}
+	})
+
+	t.Run("-d --tui=false is accepted", func(t *testing.T) {
+		dir, cfg := upTUIFixture(t)
+		cmd := exec.Command(binary, "up", "-d", "--tui=false", "-c", cfg)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		defer shutdownDaemonIn(t, dir)
+
+		if err != nil {
+			t.Fatalf("`up -d --tui=false` must succeed (Changed(\"tui\") is true for it, but no TUI was asserted): %v\noutput:\n%s", err, out)
+		}
+		if strings.Contains(string(out), "mutually exclusive") {
+			t.Errorf("no conflict may be reported for --tui=false, got:\n%s", out)
+		}
+		if !strings.Contains(string(out), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		}
+	})
+
+	t.Run("-d --no-tui is accepted", func(t *testing.T) {
+		dir, cfg := upTUIFixture(t)
+		cmd := exec.Command(binary, "up", "-d", "--no-tui", "-c", cfg)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		defer shutdownDaemonIn(t, dir)
+
+		if err != nil {
+			t.Fatalf("`up -d --no-tui` must succeed: %v\noutput:\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		}
+	})
+
+	t.Run("plain -d still succeeds", func(t *testing.T) {
+		dir, cfg := upTUIFixture(t)
+		cmd := exec.Command(binary, "up", "-d", "-c", cfg)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		defer shutdownDaemonIn(t, dir)
+
+		if err != nil {
+			t.Fatalf("`up -d` must succeed with no flag-conflict error: %v\noutput:\n%s", err, out)
+		}
+		if strings.Contains(string(out), "mutually exclusive") {
+			t.Errorf("a bare `up -d` must never report a flag conflict, got:\n%s", out)
+		}
+		if !strings.Contains(string(out), "prox started (pid") {
+			t.Errorf("expected the daemon readiness line, got:\n%s", out)
+		}
+	})
+}
+
+// TestUpNoTUI_ForegroundStreamsPlainLogs proves `--no-tui` is a registered flag
+// that a foreground `prox up` accepts and then behaves exactly as it does
+// without it. Under `go test` stdio is pipes, so this run is non-interactive by
+// construction and resolution would yield plain anyway -- the point here is the
+// cobra registration and that the flag is not rejected, which an unregistered
+// flag would fail instantly and loudly.
+func TestUpNoTUI_ForegroundStreamsPlainLogs(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	dir, cfg := upTUIFixture(t)
+
+	cmd := exec.Command(binary, "up", "--no-tui", "-c", cfg)
+	cmd.Dir = dir
+	buf := &syncBuffer{}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start prox: %v", err)
+	}
+	defer killProx(cmd)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(buf.String(), "API server: ") {
+		if time.Now().After(deadline) {
+			t.Fatalf("`up --no-tui` did not reach the startup preamble; output:\n%s", buf.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if strings.Contains(buf.String(), "unknown flag") {
+		t.Fatalf("--no-tui must be a registered flag; output:\n%s", buf.String())
+	}
+}
+
+// TestUpTUIEnv_UnrecognizedValueWarns pins the PROX_TUI failure mode a user is
+// most likely to hit: a typo'd value is not silently obeyed and not silently
+// ignored. It warns, names the offending value, and the run continues normally.
+// (C4 moves this warning onto the TUI-visible path; the wording assertion here
+// is deliberately loose so that move does not have to touch this test.)
+func TestUpTUIEnv_UnrecognizedValueWarns(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	dir, cfg := upTUIFixture(t)
+
+	cmd := exec.Command(binary, "up", "-c", cfg)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "PROX_TUI=banana")
+	buf := &syncBuffer{}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start prox: %v", err)
+	}
+	defer killProx(cmd)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(buf.String(), "API server: ") {
+		if time.Now().After(deadline) {
+			t.Fatalf("`up` with a bad PROX_TUI did not start; output:\n%s", buf.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !strings.Contains(buf.String(), "PROX_TUI") || !strings.Contains(buf.String(), "banana") {
+		t.Errorf("expected a warning naming PROX_TUI and the rejected value, got:\n%s", buf.String())
+	}
+}
+
+// TestUpTUIEnv_RecognizedValueIsSilent is the other half: PROX_TUI=1 under
+// pipes must fall back to plain streaming SILENTLY. A standing shell preference
+// is not a per-invocation assertion, so it must neither error (that would
+// booby-trap every piped `prox up` in that shell) nor print a note (that would
+// pollute CI output forever for a mode change nobody asked about).
+func TestUpTUIEnv_RecognizedValueIsSilent(t *testing.T) {
+	skipShort(t)
+
+	binary := buildBinary(t)
+	dir, cfg := upTUIFixture(t)
+
+	cmd := exec.Command(binary, "up", "-c", cfg)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "PROX_TUI=1")
+	buf := &syncBuffer{}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start prox: %v", err)
+	}
+	defer killProx(cmd)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(buf.String(), "API server: ") {
+		if time.Now().After(deadline) {
+			t.Fatalf("`PROX_TUI=1 up` under pipes must stream plain logs, not fail; output:\n%s", buf.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if strings.Contains(buf.String(), "PROX_TUI") {
+		t.Errorf("a recognized PROX_TUI value must fall back silently, got:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "requires an interactive terminal") {
+		t.Errorf("PROX_TUI=1 is a preference, not an assertion; it must never hard-error, got:\n%s", buf.String())
 	}
 }

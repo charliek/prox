@@ -172,7 +172,7 @@ processes:
 	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	// Confirm the process is running with the initial value before mutating
 	// the env file out from under it.
@@ -225,7 +225,7 @@ func TestRestart_ReloadsChangedCmd(t *testing.T) {
 	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 	waitForLogContains(t, addr, "printer", "MARKER=v1", 5*time.Second)
 
 	// Two consecutive edit->restart cycles, each picking up the latest file.
@@ -268,7 +268,7 @@ processes:
 	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
 	defer killProx(prox.cmd)
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 	waitForLogContains(t, addr, "alpha", "ALPHA", 5*time.Second)
 
 	// Snapshot alpha's identity so we can prove the failed restart didn't
@@ -321,7 +321,7 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	pidStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	pid, err := strconv.Atoi(pidStr)
@@ -366,7 +366,7 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 		killIfAlive(oldPID)
 	})
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	oldPIDStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	oldPID, err := strconv.Atoi(oldPIDStr)
@@ -424,7 +424,7 @@ func TestFullStop_NoOrphanedGrandchild(t *testing.T) {
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, addr, 10*time.Second)
+	waitForAPI(t, addr, apiReadyTimeout)
 
 	pidStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	pid, err := strconv.Atoi(pidStr)

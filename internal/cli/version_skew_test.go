@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -288,7 +289,9 @@ func TestStartStandaloneProxy_BindFailureFatal(t *testing.T) {
 
 	// handlers is only touched on the success path; the bind fails before that,
 	// so nil is safe here (and asserts the failure returns early).
-	svc, err := startStandaloneProxy(cfg, t.TempDir(), context.Background(), nil)
+	// The bind fails before the logger is used; io.Discard keeps the assertion
+	// output clean.
+	svc, err := startStandaloneProxy(cfg, t.TempDir(), context.Background(), nil, io.Discard, newStartupPreamble(false))
 	require.Error(t, err)
 	assert.Nil(t, svc)
 	assert.ErrorIs(t, err, proxy.ErrPortInUse, "bind failure must surface a port conflict")

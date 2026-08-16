@@ -50,6 +50,12 @@ type logRowSpan struct {
 // maxLogEntries is the maximum number of log entries to keep in memory
 const maxLogEntries = 1000
 
+// maxPinnedLogEntries bounds the pinned head of the log ring (the session
+// preamble — see pinLogEntry). The real preamble is a handful of lines; this is
+// only here so a pathological caller cannot hand over a preamble large enough to
+// crowd out the live log stream it sits above.
+const maxPinnedLogEntries = 32
+
 // maxRequestHistory is the maximum number of proxy requests the TUI keeps in
 // memory. DEFINED as the server's retention (constants.MaxProxyRequests), not
 // as the sync fetch size: scroll-back (D11) pages the ring in
@@ -63,12 +69,28 @@ const maxRequestHistory = constants.MaxProxyRequests
 // maxErrorDisplayLen is the maximum length of error messages in the status bar
 const maxErrorDisplayLen = 60
 
-// HelpConfig configures the help view for different modes
+// HelpConfig carries the per-mode wording for quitting: the help modal's title
+// suffix and quit line, and the footer strip's quit hint. The two callers of
+// this one TUI mean OPPOSITE things by `q` — `prox up` owns the processes and
+// takes them down with it, `prox attach` leaves a daemon running — while the
+// screens are otherwise identical, so this wording is the only thing that tells
+// a user which of the two they are looking at (plan 026 §3.2).
 type HelpConfig struct {
 	// TitleSuffix is appended to "Prox - Process Manager" (e.g., "(Client Mode)")
 	TitleSuffix string
-	// QuitMessage describes what happens on quit (e.g., "Quit" or "Quit (daemon continues running)")
+	// QuitMessage describes what happens on quit (e.g., "Quit (stops processes)"
+	// or "Quit (daemon continues running)")
 	QuitMessage string
+	// QuitNote is an optional second help-modal line under the quit binding,
+	// rendered in the description column. Owner mode names `prox up -d` +
+	// `prox attach` there as the way to keep processes running past quit;
+	// attach mode leaves it empty, having nothing to qualify.
+	QuitNote string
+	// QuitHint is the footer strip's label for the q key, rendered as
+	// `q <QuitHint>`. Empty → "quit". Owner mode passes "stop": the footer is
+	// always on screen, so it is where the two modes have to be distinguishable
+	// without opening help.
+	QuitHint string
 }
 
 // BaseModel contains shared fields for both Model and ClientModel
@@ -77,6 +99,23 @@ type BaseModel struct {
 	processes     []domain.ProcessInfo
 	logEntries    []domain.LogEntry
 	proxyRequests []proxy.RequestRecord
+
+	// pinnedLogEntries is how many of the leading logEntries are exempt from the
+	// front-eviction ring: the session preamble the caller handed over
+	// (ClientOptions.Preamble), appended at construction. They are pinned
+	// because they are a GUARANTEE — the server-side ring that would otherwise
+	// carry them is shared with process output and can be flooded empty of them
+	// before this model ever connects. See pinLogEntry.
+	pinnedLogEntries int
+
+	// preambleEcho counts, per line, how many server-delivered copies of a
+	// pinned preamble line are still to be swallowed. The caller writes the same
+	// lines to the supervisor's system log (so `prox logs` and the daemon log
+	// have them too), and the first backfill hands them straight back — without
+	// this the pane would show prox's own session info twice on every session
+	// whose ring had NOT overflowed. Each pinned line absorbs exactly one echo;
+	// the CLI writes each of them exactly once per session.
+	preambleEcho map[string]int
 
 	// UI components
 	viewport  viewport.Model
@@ -471,9 +510,19 @@ func (b *BaseModel) handleLogEntry(entry domain.LogEntry) {
 // appendLogEntry stamps one entry and appends it to the ring WITHOUT
 // rendering. Split out of handleLogEntry so a sync batch (C9) can apply a
 // thousand entries and render once; every arrival path — live entry, batch
-// entry, synthetic notice — goes through here, so the DisplaySeq stamping and
-// the eviction trim are identical for all of them.
+// entry, synthetic notice — goes through here, so the DisplaySeq stamping, the
+// preamble echo suppression and the eviction trim are identical for all of them.
 func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
+	if b.swallowPreambleEcho(entry) {
+		return
+	}
+	b.storeLogEntry(entry)
+}
+
+// storeLogEntry is the raw append: stamp, ingest meta, evict. It bypasses the
+// echo suppression above because it is also how the pinned preamble itself is
+// seeded — a preamble line must never be mistaken for its own echo.
+func (b *BaseModel) storeLogEntry(entry domain.LogEntry) {
 	// Stamp a session-local monotonic DisplaySeq so the logs search cursor can
 	// anchor to this line's identity across the front-eviction ring below. This
 	// overwrites nothing on the wire: the server's LogEntry.Seq is a separate
@@ -488,17 +537,73 @@ func (b *BaseModel) appendLogEntry(entry domain.LogEntry) {
 	b.logMeta[entry.DisplaySeq] = ingestLogMeta(entry.Line)
 
 	b.logEntries = append(b.logEntries, entry)
-	// Keep only last entries - create new slice to release memory from old entries
-	if len(b.logEntries) > maxLogEntries {
+	// Keep only last entries - create new slice to release memory from old
+	// entries. The pinned head (pinnedLogEntries, normally 0) is kept on top of
+	// the cap rather than counted against it: eviction is a bound on the LIVE
+	// stream, and the preamble is not part of it.
+	if len(b.logEntries)-b.pinnedLogEntries > maxLogEntries {
 		// Drop meta for evicted entries before the slice copy (Codex #11).
-		drop := b.logEntries[:len(b.logEntries)-maxLogEntries]
+		drop := b.logEntries[b.pinnedLogEntries : len(b.logEntries)-maxLogEntries]
 		for _, e := range drop {
 			delete(b.logMeta, e.DisplaySeq)
 		}
-		newEntries := make([]domain.LogEntry, maxLogEntries)
-		copy(newEntries, b.logEntries[len(b.logEntries)-maxLogEntries:])
+		newEntries := make([]domain.LogEntry, 0, b.pinnedLogEntries+maxLogEntries)
+		newEntries = append(newEntries, b.logEntries[:b.pinnedLogEntries]...)
+		newEntries = append(newEntries, b.logEntries[len(b.logEntries)-maxLogEntries:]...)
 		b.logEntries = newEntries
 	}
+}
+
+// pinLogEntry seeds one line of the caller's startup preamble at the pinned head
+// of the log ring. Only valid at construction, before any other entry exists —
+// the pinned head is a prefix, not a set — and capped at maxPinnedLogEntries.
+//
+// Pinning is the whole point of ClientOptions.Preamble: these lines say where
+// the user's app is listening, and they must still be there after a startup that
+// emitted more log output than either ring can hold.
+func (b *BaseModel) pinLogEntry(entry domain.LogEntry) {
+	if len(b.logEntries) != b.pinnedLogEntries || b.pinnedLogEntries >= maxPinnedLogEntries {
+		return
+	}
+	b.storeLogEntry(entry)
+	b.pinnedLogEntries++
+	if b.preambleEcho == nil {
+		b.preambleEcho = make(map[string]int)
+	}
+	b.preambleEcho[entry.Line]++
+}
+
+// retirePreambleEcho drops every outstanding echo credit. Called once the first
+// backfill has been applied — see handleLogsSync for why credits must not
+// outlive it.
+func (b *BaseModel) retirePreambleEcho() {
+	b.preambleEcho = nil
+}
+
+// swallowPreambleEcho reports whether entry is the server's own copy of a line
+// this model already pinned, and consumes the credit if so. Matching is on the
+// system process, the stdout stream and the exact line — i.e. exactly what
+// supervisor.SystemLog writes for a preamble line and nothing else.
+//
+// A process CAN legitimately be named "system", so this match is not by itself
+// proof of an echo; what makes it safe is that credits live only until the first
+// backfill lands (retirePreambleEcho), which is the only window in which the
+// server's copies can arrive.
+func (b *BaseModel) swallowPreambleEcho(entry domain.LogEntry) bool {
+	if len(b.preambleEcho) == 0 ||
+		entry.Process != systemProcessName || entry.Stream != domain.StreamStdout {
+		return false
+	}
+	remaining, ok := b.preambleEcho[entry.Line]
+	if !ok {
+		return false
+	}
+	if remaining <= 1 {
+		delete(b.preambleEcho, entry.Line)
+	} else {
+		b.preambleEcho[entry.Line] = remaining - 1
+	}
+	return true
 }
 
 // renderAfterLogEntries is the shared render tail for log arrivals — one live
@@ -540,6 +645,12 @@ func (b *BaseModel) renderAfterLogEntries(wasNearBottom bool) {
 // what the previous daemon run printed, and the notice line marks the seam.
 func (b *BaseModel) handleLogsSync(msg LogsSyncMsg) {
 	if msg.Notice == "" && len(msg.Entries) == 0 {
+		// Retire BEFORE returning. A first sync that comes back empty is still a
+		// sync — the server's copies of the preamble were never coming — so
+		// leaving credits armed here would let them survive indefinitely and
+		// later swallow real output from a process named `system` (CodeRabbit,
+		// PR #106). See the retire call at the end of this function.
+		b.retirePreambleEcho()
 		return // nothing changed: a caught-up reconnect must not force a render
 	}
 
@@ -550,6 +661,16 @@ func (b *BaseModel) handleLogsSync(msg LogsSyncMsg) {
 	for _, entry := range msg.Entries {
 		b.appendLogEntry(entry)
 	}
+	// The server's copies of the preamble were written to the log manager before
+	// this model existed, so they can only arrive in a backfill — and the first
+	// one has now been applied. Retire the credits here rather than letting them
+	// sit indefinitely: "system" is a legal process name
+	// (config.ValidateProcessName rejects only empty and whitespace/separator
+	// names), so a credit that outlives the backfill could later swallow the real
+	// output of a process actually called `system` that happens to print the same
+	// text. An unredeemed credit (its copy evicted from the server ring before we
+	// fetched) must expire for the same reason (codex review finding).
+	b.retirePreambleEcho()
 	b.renderAfterLogEntries(wasNearBottom)
 }
 
@@ -2753,7 +2874,7 @@ func (b *BaseModel) statusBar(msg footerMsg) string {
 	countPlain := fmt.Sprintf("%s %s %d/%d %s", viewIndicator, followIndicator, visible, total, label)
 	countStyled := styles.FooterLabel.Render(countPlain)
 
-	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints())
+	left, right := fitFooterRow(b.width, leftStyled, countStyled, defaultFooterHints(b.helpConfig.QuitHint))
 	// Leading pad + flush-right mid-pad between left and right (plan 024 F3).
 	leading := styles.FooterLabel.Render(" ")
 	return singleFrameLine(padFooterRow(leading+left, right, b.width))
@@ -2865,6 +2986,19 @@ func (b *BaseModel) helpQuit() string {
 		return b.helpConfig.QuitMessage
 	}
 	return "Quit"
+}
+
+// helpQuitRows is the quit binding as it appears in every help section that
+// lists it: the binding itself, plus HelpConfig.QuitNote as a keyless
+// continuation line when the caller supplied one (owner mode). Keyless rows
+// render in the description column — the same idiom the filter sections use for
+// their query examples.
+func (b *BaseModel) helpQuitRows() []helpKeyRow {
+	rows := []helpKeyRow{{key: "q/Ctrl+C", desc: b.helpQuit()}}
+	if note := b.helpConfig.QuitNote; note != "" {
+		rows = append(rows, helpKeyRow{key: "", desc: note})
+	}
+	return rows
 }
 
 // containsIgnoreCase performs a case-insensitive substring search

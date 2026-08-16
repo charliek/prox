@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"time"
@@ -14,13 +15,38 @@ import (
 	"github.com/charliek/prox/internal/stream"
 )
 
+// systemProcessName is the process column every synthetic, prox-generated log
+// line is filed under — here and in the supervisor's SystemLog, which is where
+// the same lines reach `prox logs`. It is deliberately the one name shared by
+// both, so a line looks identical whichever path delivered it.
+const systemProcessName = "system"
+
 // systemLogEntry builds the synthetic "system" log line the TUI uses to show
-// itself a message in the log pane.
+// itself a message in the log pane. Stderr, so it carries the ERR badge: every
+// caller is a warning or a failure notice.
 func systemLogEntry(line string) domain.LogEntry {
 	return domain.LogEntry{
 		Timestamp: time.Now(),
-		Process:   "system",
+		Process:   systemProcessName,
 		Stream:    domain.StreamStderr,
+		Line:      line,
+	}
+}
+
+// preambleLogEntry builds one line of the caller's startup preamble
+// (ClientOptions.Preamble).
+//
+// Field-for-field what supervisor.SystemLog writes for the same line — system
+// process, stdout stream — because they ARE the same line arriving by a second
+// route: the pane must not render prox's own session info two different ways
+// depending on whether the log ring still held it. Stdout (no ERR badge) is what
+// separates this from systemLogEntry above, and the neutral "system" process
+// column is what separates it from supervised process output.
+func preambleLogEntry(line string) domain.LogEntry {
+	return domain.LogEntry{
+		Timestamp: time.Now(),
+		Process:   systemProcessName,
+		Stream:    domain.StreamStdout,
 		Line:      line,
 	}
 }
@@ -102,6 +128,41 @@ func RunClient(client TUIClient, opts ClientOptions) error {
 	cancel()
 
 	return err
+}
+
+// IsCleanExit reports whether an error returned by RunClient describes an
+// ORDERLY end of the session rather than a failure — a quit the caller should
+// treat exactly as it treats `q`.
+//
+// It lives here, next to the one p.Run() call in the codebase, because it
+// encodes version-specific bubbletea internals (verified against the vendored
+// v1.3.10, tea.go):
+//
+//   - A normal quit (QuitMsg — `q`, ctrl+c in raw mode, opts.ShutdownCh, and an
+//     external SIGTERM caught by bubbletea's own handler) returns nil.
+//   - An external SIGINT caught by bubbletea's signal handler becomes an
+//     InterruptMsg, which ends the event loop with ErrInterrupted; Run then
+//     wraps it as `ErrProgramKilled: ErrInterrupted`. BOTH prox and bubbletea
+//     handle SIGINT, so which one gets there first is a race — this is the
+//     identifier that keeps a plain Ctrl-C/`kill -INT` from being reported as a
+//     TUI failure.
+//   - ErrProgramKilled BARE (identity, not errors.Is) is the Kill()/cancelled-
+//     context path, likewise an orderly end. errors.Is is deliberately NOT used
+//     for it: Run wraps EVERY killing error as `ErrProgramKilled: <cause>`
+//     (including `ErrProgramKilled: ErrProgramPanic` for a recovered panic), so
+//     an errors.Is check here would swallow real failures.
+func IsCleanExit(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, tea.ErrProgramPanic) {
+		return false
+	}
+	//nolint:errorlint // identity is the point: see the doc comment.
+	if err == tea.ErrProgramKilled {
+		return true
+	}
+	return errors.Is(err, tea.ErrInterrupted)
 }
 
 // runClientStreams runs one reconnect loop per attach-mode stream and blocks

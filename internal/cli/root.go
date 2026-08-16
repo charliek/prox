@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,7 +41,7 @@ processes for local development. It supports:
   - Real-time log aggregation and filtering
   - HTTP/HTTPS reverse proxy with hostname routing, shared across projects
   - Proxied request inspection (prox requests) with captured bodies
-  - Interactive TUI for monitoring
+  - An interactive TUI, shown by default when you run 'prox up' in a terminal
   - Background daemon mode`,
 	Version:           version.Version,
 	SilenceUsage:      true,
@@ -110,6 +111,18 @@ var clientCommands = map[string]bool{
 // If the process is the proxy daemon child, it runs the daemon instead of
 // normal CLI dispatch.
 func Execute() {
+	// prox has never prefixed its own diagnostics with a date and time, and the
+	// TUI log pane renders its own timestamp column. Clearing the stdlib flags
+	// once, for the whole process, keeps every command consistent — including
+	// the ones that never install a stdio sink.
+	//
+	// Without this, only sink-installing commands (`up`, `attach`) would be
+	// prefix-free: the SSE-parse warnings in client.go are shared with
+	// `prox logs -f` and `prox requests -f`, which would print
+	// "2026/08/15 12:34:56 warning: ..." while `up` printed "warning: ..."
+	// (codex review finding).
+	log.SetFlags(0)
+
 	if proxyd.IsDaemonProcess() {
 		if err := proxyd.RunDaemon(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "Proxy daemon error: %v\n", err)
