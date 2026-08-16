@@ -16,12 +16,14 @@ import (
 // TestIsTerminalFailureState_CoversEveryState is the guard on the ONE decision
 // this commit makes: which process states mean "the start failed".
 //
-// It enumerates every domain.ProcessState by its constant, so the table cannot
-// silently fall behind the enum — a renamed or deleted constant breaks the
-// build here, and the count assertion at the end fails the moment a new state
-// is added without a deliberate decision about which side of the line it falls
-// on. That matters because widening this set silently changes the exit code of
-// `prox up -d`, `prox start` and `prox restart`.
+// It iterates domain.AllProcessStates() rather than a literal map, so the
+// table cannot silently fall behind the enum — a require.Len(cases, 8) guard
+// against a hand-written map does NOT fail when a 9th state is added (the map
+// and the literal both stay at 8 unless someone remembers to touch both);
+// iterating the enum's own enumeration does, because the length assertion is
+// against len(AllProcessStates()), not a number typed by hand. That matters
+// because widening this set silently changes the exit code of `prox up -d`,
+// `prox start` and `prox restart`.
 //
 // The specific trap it exists to prevent: reaching for ProcessState.IsStopped
 // as the predicate. IsStopped is true for completed — a task's terminal SUCCESS
@@ -42,9 +44,12 @@ func TestIsTerminalFailureState_CoversEveryState(t *testing.T) {
 	// If this fails, domain.ProcessState gained (or lost) a member: decide
 	// explicitly whether it is a terminal FAILURE and add it above. Do not just
 	// bump the number.
-	require.Len(t, cases, 8, "every domain.ProcessState must be classified here")
+	require.Len(t, cases, len(domain.AllProcessStates()), "every domain.ProcessState must be classified here")
 
-	for state, wantFailure := range cases {
+	for _, state := range domain.AllProcessStates() {
+		wantFailure, ok := cases[state]
+		require.True(t, ok, "state %q not classified above", state)
+
 		got := isTerminalFailureState(string(state))
 		assert.Equal(t, wantFailure, got, "state %q", state)
 

@@ -80,26 +80,16 @@ func settleProcessFromDetail(p *api.ProcessDetailResponse) []settleProcess {
 // isTerminalFailureState reports whether a reported process status means the
 // start has definitively FAILED.
 //
-// The set is exactly two states, and widening it is a behavior change to three
-// commands' exit codes:
-//
-//   - crashed — exited unexpectedly, or failed to start. Terminal: prox has no
-//     restart/backoff policy, so a crashed process stays crashed and this check
-//     cannot false-positive on a process that is merely mid-restart.
-//   - blocked — a gated process a failed required dependency will never let
-//     launch.
-//
-// Everything else is NOT a failure: starting and stopping are transient,
-// waiting is limbo (the process is still scheduled to launch), stopped is
-// deliberate, running is the goal, and completed is a task's terminal SUCCESS.
-//
-// Do NOT reach for domain.ProcessState.IsStopped here — it collapses stopped,
-// crashed, blocked AND completed, so a task that finished cleanly would be
-// reported as a failed start. TestIsTerminalFailureState_CoversEveryState pins
-// the whole enum against exactly this.
+// The truth lives in domain.ProcessState.IsTerminalFailure (crashed or
+// blocked; widening it is a behavior change to three commands' exit codes).
+// This wrapper stays STRING-typed rather than taking a domain.ProcessState:
+// status comes off the wire, and an unknown value from a newer daemon must
+// fall through as "not a terminal failure" rather than being forced into the
+// enum (a bad ProcessState conversion has no zero value that means "I don't
+// know"). TestIsTerminalFailureState_CoversEveryState pins the whole enum
+// against exactly this.
 func isTerminalFailureState(status string) bool {
-	return status == string(domain.ProcessStateCrashed) ||
-		status == string(domain.ProcessStateBlocked)
+	return domain.ProcessState(status).IsTerminalFailure()
 }
 
 // settleVerdict is what one observation of the processes concluded.

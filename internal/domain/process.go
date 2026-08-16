@@ -75,6 +75,61 @@ func (s ProcessState) IsStopped() bool {
 		s == ProcessStateBlocked || s == ProcessStateCompleted
 }
 
+// IsTerminalFailure reports whether the state means the process definitively
+// FAILED. The set is exactly two states, and widening it is a behavior change
+// to the exit codes of `prox up`, `up -d`, `start` and `restart`:
+//
+//   - crashed -- exited unexpectedly, or failed to start. Terminal: prox has
+//     no restart/backoff policy anywhere (there is no RestartPolicy in the
+//     tree), so a crashed process STAYS crashed and this predicate cannot
+//     false-positive on one that is merely mid-relaunch.
+//   - blocked -- a gated process that a failed required dependency will never
+//     let launch.
+//
+// Everything else is NOT a failure: starting and stopping are transient,
+// waiting is limbo (the process is still scheduled to launch), stopped is
+// deliberate, running is the goal, and completed is a task's terminal
+// SUCCESS.
+//
+// Do NOT reach for IsStopped when you mean this: it collapses stopped,
+// crashed, blocked AND completed together, so a task that finished cleanly
+// would be reported as a failed start.
+func (s ProcessState) IsTerminalFailure() bool {
+	return s == ProcessStateCrashed || s == ProcessStateBlocked
+}
+
+// IsLive reports whether the state can still change on its own: running,
+// starting, stopping, or waiting. Against today's 8 states this predicate and
+// IsStopped are arithmetically opposite, but they are kept as two separate
+// functions on purpose: they answer different questions -- "can this still
+// change on its own?" versus "should PID be reported as 0?" -- and a 9th
+// state added later is not guaranteed to answer both the same way. Defining
+// IsLive as "not IsStopped" would make that future drift silent.
+func (s ProcessState) IsLive() bool {
+	return s == ProcessStateRunning || s == ProcessStateStarting ||
+		s == ProcessStateStopping || s == ProcessStateWaiting
+}
+
+// AllProcessStates returns the canonical enumeration of every ProcessState.
+// It exists so tests of the predicates above (and any future one) can be
+// genuinely exhaustive: a table keyed by a literal count like
+// require.Len(cases, 8) does not fail when a 9th state is added, because
+// nothing enumerates the enum against that literal. Iterating this slice
+// does. Returns a fresh slice each call so callers cannot mutate a
+// package-level array.
+func AllProcessStates() []ProcessState {
+	return []ProcessState{
+		ProcessStateRunning,
+		ProcessStateStopped,
+		ProcessStateStarting,
+		ProcessStateStopping,
+		ProcessStateCrashed,
+		ProcessStateWaiting,
+		ProcessStateBlocked,
+		ProcessStateCompleted,
+	}
+}
+
 // ProcessConfig defines the configuration for a single process
 type ProcessConfig struct {
 	Name        string
