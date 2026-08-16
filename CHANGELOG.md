@@ -62,7 +62,12 @@ All notable changes to this project will be documented in this file.
   each failed attempt buried the current error further under previous ones —
   worst exactly while iterating on a broken `prox.yaml`. Each daemon run now
   writes a marker identifying itself, and the tail is scoped to the current run.
-  The log is still never truncated; history stays on disk.
+  The log is still never truncated; history stays on disk. Reporting is bounded
+  at both ends — only the end of the log is read, and a run that logged more
+  than 200 lines is printed capped, and says so — so a huge log costs a huge
+  print no more than it costs a huge read. A run marker that was cut short
+  mid-write falls back to the unscoped tail rather than presenting the previous
+  run's output as the current one's.
 
 - **A foreground `prox up` now opens the interactive TUI** (plan 026).
   Previously it streamed plain logs and the TUI was reachable only behind an

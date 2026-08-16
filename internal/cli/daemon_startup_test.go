@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -327,3 +328,109 @@ func TestAwaitDaemonStartup_StaleStateIgnored(t *testing.T) {
 type exitStatusError struct{ code int }
 
 func (e *exitStatusError) Error() string { return "exit status " + strconv.Itoa(e.code) }
+
+// --- bounded log diagnostics (plan 027 C16, M3) -------------------------------
+
+// writeDaemonLog writes content as dir's .prox/prox.log and returns dir.
+func writeDaemonLog(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := daemon.LogPath(dir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	return dir
+}
+
+// TestReadLogTail_ReadsAtMostTheLimit is the M3 regression at its source.
+// .prox/prox.log is never truncated, so reading it whole (os.ReadFile, as this
+// did) makes the memory cost of REPORTING a startup failure a function of every
+// run that ever wrote to that project's log.
+func TestReadLogTail_ReadsAtMostTheLimit(t *testing.T) {
+	var b strings.Builder
+	for b.Len() < 3*daemonLogReadLimit {
+		b.WriteString("a log line that is here purely to make the file large\n")
+	}
+	full := b.String()
+	dir := writeDaemonLog(t, full)
+
+	got, err := readLogTail(daemon.LogPath(dir), daemonLogReadLimit)
+	require.NoError(t, err)
+
+	require.LessOrEqual(t, len(got), daemonLogReadLimit,
+		"read more than the byte cap from a %d-byte log", len(full))
+	require.NotEmpty(t, got)
+	assert.True(t, strings.HasSuffix(full, got), "the window must be the END of the file")
+	// The window opens mid-line; that fragment must be dropped rather than
+	// handed on as if it were a whole line (a half-written run marker read as a
+	// damaged one would be one we manufactured ourselves).
+	assert.Equal(t, byte('\n'), full[len(full)-len(got)-1],
+		"the returned window must start at a line boundary")
+}
+
+// TestReadLogTail_SmallFileIsReadWhole keeps the ordinary case exact: a log
+// under the cap is returned byte for byte, first line included.
+func TestReadLogTail_SmallFileIsReadWhole(t *testing.T) {
+	const content = "--- run 2026-08-15T09:00:00Z pid=100 ---\nboom\n"
+	dir := writeDaemonLog(t, content)
+
+	got, err := readLogTail(daemon.LogPath(dir), daemonLogReadLimit)
+	require.NoError(t, err)
+	assert.Equal(t, content, got)
+}
+
+// TestDaemonLogTail_CapsLinesAndSaysSo pins the other half of M3: a run that
+// logged more than the cap is reported as capped. Printing its last N lines
+// under a bare "Last lines of ..." heading would present a fragment of the run
+// as the whole of it -- the same class of quiet misstatement #99 was about.
+func TestDaemonLogTail_CapsLinesAndSaysSo(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("--- run 2026-08-15T09:00:00Z pid=4242 ---\n")
+	for i := 0; i < daemon.MaxRunTailLines+50; i++ {
+		b.WriteString("chatty line " + strconv.Itoa(i) + "\n")
+	}
+	dir := writeDaemonLog(t, b.String())
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	lines := strings.Split(got, "\n")
+
+	assert.Contains(t, got, "earlier lines of this run omitted",
+		"a capped tail must say it was capped")
+	assert.Len(t, lines, daemon.MaxRunTailLines+1, "notice plus exactly the capped line count")
+	assert.Equal(t, "chatty line "+strconv.Itoa(daemon.MaxRunTailLines+49), lines[len(lines)-1],
+		"the NEWEST lines are the ones worth keeping")
+}
+
+// TestDaemonLogTail_ShortRunIsVerbatim: nothing above is allowed to change the
+// ordinary case, which is a short run reported exactly as it was logged.
+func TestDaemonLogTail_ShortRunIsVerbatim(t *testing.T) {
+	dir := writeDaemonLog(t, "--- run 2026-08-15T09:00:00Z pid=4242 ---\nboom: config invalid\n")
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	assert.Equal(t, "boom: config invalid", got)
+	assert.NotContains(t, got, "omitted")
+}
+
+// TestDaemonLogTail_DamagedCurrentMarkerFallsBack is M4 seen from the CLI: the
+// current run crashed partway through writing its marker and an OLDER run had
+// the same pid. The scoped tail must refuse rather than hand the old run's
+// output to a message that calls it this run's; the fallback that takes over
+// claims nothing about which run it came from.
+func TestDaemonLogTail_DamagedCurrentMarkerFallsBack(t *testing.T) {
+	dir := writeDaemonLog(t, ""+
+		"--- run 2026-08-15T08:00:00Z pid=4242 ---\n"+
+		"OLD RUN OUTPUT\n"+
+		"--- run 2026-08-15T09:00:00Z pid=42")
+
+	got := daemonLogTail(dir, 4242, daemonLogFallbackLines)
+	// The fallback (last n lines) still shows the file's end, torn marker and
+	// all -- what it must NOT do is present the old segment as scoped to pid.
+	assert.Contains(t, got, "--- run 2026-08-15T09:00:00Z pid=42",
+		"the fallback shows the raw end of the log")
+	assert.Contains(t, got, "--- run 2026-08-15T08:00:00Z pid=4242 ---",
+		"the fallback is unscoped: it includes the old marker line itself")
+}
+
+// TestDaemonLogTail_MissingLogIsEmpty keeps the no-log case at "".
+func TestDaemonLogTail_MissingLogIsEmpty(t *testing.T) {
+	assert.Empty(t, daemonLogTail(t.TempDir(), 4242, daemonLogFallbackLines))
+}

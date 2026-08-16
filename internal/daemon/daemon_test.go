@@ -381,9 +381,12 @@ func TestSetupLogging(t *testing.T) {
 		}
 
 		pid := os.Getpid()
-		tail, ok := FindRunMarkerTail(content, pid)
+		tail, truncated, ok := FindRunMarkerTail(content, pid)
 		if !ok {
 			t.Fatalf("FindRunMarkerTail found no marker for this process's own pid (%d) in:\n%s", pid, content)
+		}
+		if truncated {
+			t.Errorf("a one-line run must not report a truncated tail")
 		}
 		if tail != "hello from the child" {
 			t.Errorf("expected tail %q, got %q", "hello from the child", tail)

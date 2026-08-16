@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -107,6 +108,55 @@ func probeHealth(addr string) bool {
 // marker at all. This is the pre-#99 behavior, preserved as the fallback.
 const daemonLogFallbackLines = 20
 
+// daemonLogReadLimit caps how many BYTES of .prox/prox.log are read for
+// failure diagnostics. The file is never truncated (#99) and grows without
+// bound across runs, so os.ReadFile on it is an unbounded allocation -- several
+// times over, once the content is split, sliced and re-joined -- to produce a
+// tail that is capped at a couple of hundred lines anyway. 256 KiB is far more
+// than any single run's startup diagnostics and is read from the END of the
+// file, where the current run is.
+const daemonLogReadLimit = 256 << 10
+
+// readLogTail returns the last daemonLogReadLimit bytes of the file at path,
+// starting at a line boundary: when the file is longer than the limit the
+// window opens mid-line, and that fragment is dropped rather than handed on --
+// half a line is not a log line, and half a RUN MARKER is a damaged marker
+// (daemon.FindRunMarkerTail) that we would have manufactured ourselves.
+func readLogTail(path string, limit int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.Size() > limit {
+		if _, err := f.Seek(info.Size()-limit, io.SeekStart); err != nil {
+			return "", err
+		}
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, limit))
+	if err != nil {
+		return "", err
+	}
+	if info.Size() <= limit {
+		return string(data), nil
+	}
+
+	content := string(data)
+	i := strings.IndexByte(content, '\n')
+	if i < 0 {
+		// A single line longer than the whole window: there is no complete line
+		// to report at all.
+		return "", nil
+	}
+	return content[i+1:], nil
+}
+
 // daemonLogTail returns the child's daemon log (.prox/prox.log) content for
 // failure diagnostics, scoped to THIS run when possible: it looks for the run
 // marker daemon.SetupLogging wrote for pid and, if found, returns only the
@@ -115,14 +165,23 @@ const daemonLogFallbackLines = 20
 // config would see every past failure stacked up with the current one buried
 // last. Falls back to the last n lines when no matching marker is found.
 // Returns "" when the log is missing.
+//
+// Every stage is bounded: at most daemonLogReadLimit bytes are read, and the
+// scoped tail is capped at daemon.MaxRunTailLines lines. A run whose segment
+// exceeds that cap is reported as capped -- printing its last 200 lines under
+// a heading that implies they are all of it would misrepresent the run just as
+// surely as showing another run's output would.
 func daemonLogTail(dir string, pid int, n int) string {
-	data, err := os.ReadFile(daemon.LogPath(dir))
+	content, err := readLogTail(daemon.LogPath(dir), daemonLogReadLimit)
 	if err != nil {
 		return ""
 	}
-	content := string(data)
 
-	if tail, ok := daemon.FindRunMarkerTail(content, pid); ok {
+	if tail, truncated, ok := daemon.FindRunMarkerTail(content, pid); ok {
+		if truncated {
+			return fmt.Sprintf("(earlier lines of this run omitted; showing the last %d)\n%s",
+				daemon.MaxRunTailLines, tail)
+		}
 		return tail
 	}
 

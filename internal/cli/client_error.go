@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charliek/prox/internal/domain"
 )
@@ -48,10 +49,18 @@ func clientError(err error, hint string) error {
 // which faced the same question for the ownership probe, and reuses its
 // predicates so the two cannot drift:
 //
+//  0. *responseError — the client HELD a response when this error was made
+//     (client.go). This is the one branch that needs no inference at all, and it
+//     is checked first for exactly that reason: a 2xx body cut short by a
+//     connection reset produces an error whose SHAPE is a dial failure's, and
+//     every rung below would have to grow a special case to keep it out. A
+//     typed fact recorded at the source cannot be fooled by shape.
 //  1. decode failure — the daemon ANSWERED, just not with something parseable
-//     (client.go's "decoding response: ..."). Checked first because a truncated
-//     or empty body surfaces as io.EOF, which the transport check below would
-//     otherwise read as "nothing is listening".
+//     (client.go's "decoding response: ..."). Kept even though every decode
+//     failure the client itself raises is now tagged above: a truncated or empty
+//     body surfaces as io.EOF, which the transport check below would otherwise
+//     read as "nothing is listening", and this predicate is shared with
+//     classifyOwnershipProbeFailure, which classifies errors it did not make.
 //  2. *APIError — the daemon answered with a status. `prox stop boom` returning
 //     PROCESS_NOT_RUNNING is the canonical case: prox just replied.
 //  3. context cancellation — Ctrl-C, or a caller's own deadline. A live daemon
@@ -65,6 +74,10 @@ func clientError(err error, hint string) error {
 //  6. anything else — no hint.
 func hintFits(err error) bool {
 	if err == nil {
+		return false
+	}
+	var respErr *responseError
+	if errors.As(err, &respErr) {
 		return false
 	}
 	if isDecodeFailure(err) {
@@ -110,7 +123,10 @@ func processClientError(client *Client, name string, err error, hint string) err
 //
 // Enrichment is best-effort: any failure of that lookup returns the ORIGINAL
 // error unchanged, so a slow or wedged daemon never hides the real failure
-// behind an enrichment error of our own making.
+// behind an enrichment error of our own making. "Slow" is bounded as well as
+// tolerated — the lookup carries its own processLookupTimeout, because an
+// enrichment that DELAYS the error it decorates is no more acceptable than one
+// that replaces it.
 func enrichProcessNotFound(client *Client, name string, err error) error {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != domain.ErrCodeProcessNotFound {
@@ -145,12 +161,26 @@ func unknownProcessError(name string, names []string) error {
 	return fmt.Errorf("unknown process %q\n%s", name, processNameHelp(name, names))
 }
 
+// processLookupTimeout bounds the best-effort process-list lookups on this
+// page. Both of them (enrichProcessNotFound, validateLogProcesses) only ever
+// IMPROVE a message the caller already has, so they must never outlive it: on
+// the client's own 30s budget an unresponsive daemon would hold a
+// PROCESS_NOT_FOUND — already decided, already true — for half a minute before
+// printing it, which is a worse outcome than the bare message this code exists
+// to embellish. Two seconds is generous for a local daemon answering from
+// memory, and expiry lands on the same path as any other lookup failure.
+const processLookupTimeout = 2 * time.Second
+
 // knownProcessNames returns the daemon's current process names. The bool
 // reports whether the daemon actually answered: an empty list from a daemon
 // with nothing configured is a real answer ("there are no processes"), which is
-// a different thing from not having been able to ask.
+// a different thing from not having been able to ask — as is a daemon that did
+// not answer inside processLookupTimeout.
 func knownProcessNames(client *Client) ([]string, bool) {
-	resp, err := client.GetProcesses()
+	ctx, cancel := context.WithTimeout(context.Background(), processLookupTimeout)
+	defer cancel()
+
+	resp, err := client.GetProcessesWithContext(ctx)
 	if err != nil {
 		return nil, false
 	}

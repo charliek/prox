@@ -96,6 +96,21 @@ func TestClientError_HintTargeting(t *testing.T) {
 			},
 		},
 		{
+			name: "2xx whose body is cut off by a connection reset",
+			err: func(t *testing.T) error {
+				// The M1 case (plan 027 C16). The daemon answered 200 and then
+				// the connection died mid-body, so the decode step returns an
+				// error whose SHAPE is a dial failure's — ECONNRESET inside a
+				// *net.OpError — even though nothing about it says the daemon is
+				// down. Classification by elimination gets this wrong every
+				// time; only the fact that a response was in hand settles it.
+				client := NewClientWithToken("http://daemon.invalid", "")
+				client.httpClient = &http.Client{Transport: resetMidBodyTransport{prefix: `{"running":`}}
+				_, err := client.GetStatus()
+				return err
+			},
+		},
+		{
 			name: "connection refused",
 			err: func(t *testing.T) error {
 				// A server that is started and immediately closed leaves a port
@@ -173,6 +188,125 @@ func TestClientError_HintTargeting(t *testing.T) {
 			}
 			if !errors.Is(got, err) {
 				t.Errorf("clientError must keep the original error reachable, got %v", got)
+			}
+		})
+	}
+}
+
+// resetMidBodyTransport answers every request with a 200 whose body yields
+// prefix and then fails with ECONNRESET, reproducing a daemon whose connection
+// dies partway through a reply. It is a transport rather than a real socket on
+// purpose: forcing a genuine RST at a chosen point of the body is a timing race
+// (the reset can beat the client's header read, which produces a DIFFERENT
+// error), and a test for a classification rule must not be able to land on the
+// wrong input.
+type resetMidBodyTransport struct{ prefix string }
+
+func (t resetMidBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "200 OK",
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       &resetAfterReader{data: []byte(t.prefix)},
+		Request:    req,
+	}, nil
+}
+
+// resetAfterReader hands out data, then fails the way a reset connection does.
+type resetAfterReader struct {
+	data []byte
+	off  int
+}
+
+func (r *resetAfterReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	return 0, &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+}
+
+func (r *resetAfterReader) Close() error { return nil }
+
+// TestResponseError_TagsFailuresAfterAResponse pins the positive fact the hint
+// rule now rests on (plan 027 C16, M1): every error raised while reading or
+// interpreting a body the daemon already sent carries *responseError, at every
+// site that reads one. The hint check is a consequence — proven here too, so
+// the tag and its one consumer cannot drift.
+func TestResponseError_TagsFailuresAfterAResponse(t *testing.T) {
+	const hint = "Is prox running? Try 'prox up' first."
+
+	cases := []struct {
+		name string
+		err  func(t *testing.T) error
+	}{
+		{
+			name: "2xx with a body that never finishes",
+			err: func(t *testing.T) error {
+				client := NewClientWithToken("http://daemon.invalid", "")
+				client.httpClient = &http.Client{Transport: resetMidBodyTransport{prefix: `{"running":`}}
+				_, err := client.GetStatus()
+				return err
+			},
+		},
+		{
+			name: "2xx that is not JSON at all",
+			err: func(t *testing.T) error {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Write([]byte("<html>not a prox</html>"))
+				}))
+				t.Cleanup(server.Close)
+				_, err := NewClientWithToken(server.URL, "").GetStatus()
+				return err
+			},
+		},
+		{
+			name: "an SSE endpoint answering with the wrong content type",
+			err: func(t *testing.T) error {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/plain")
+					w.Write([]byte("hello"))
+				}))
+				t.Cleanup(server.Close)
+				_, err := NewClientWithToken(server.URL, "").StreamLogsChannel(
+					context.Background(), domain.LogParams{})
+				return err
+			},
+		},
+		{
+			name: "an SSE stream that hangs up mid-stream",
+			err: func(t *testing.T) error {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					// Returning ends the response body: the reader's next read
+					// fails, after a stream that was demonstrably established.
+				}))
+				t.Cleanup(server.Close)
+				return NewClientWithToken(server.URL, "").ConsumeLogs(
+					context.Background(), domain.LogParams{}, nil, nil,
+					func(api.LogEntryResponse) {})
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.err(t)
+			if err == nil {
+				t.Fatal("expected the setup to produce an error")
+			}
+			var respErr *responseError
+			if !errors.As(err, &respErr) {
+				t.Errorf("error raised after a response must carry *responseError, got %T: %v", err, err)
+			}
+			if got := clientError(err, hint); strings.Contains(got.Error(), hint) {
+				t.Errorf("the daemon answered; the hint must not appear: %q", got.Error())
 			}
 		})
 	}
@@ -284,6 +418,61 @@ func TestEnrichProcessNotFound_LookupFailureKeepsOriginal(t *testing.T) {
 	got := enrichProcessNotFound(NewClientWithToken(server.URL, ""), "web", base)
 	if got != error(base) {
 		t.Errorf("expected the original error unchanged, got %v", got)
+	}
+}
+
+// TestEnrichProcessNotFound_SlowLookupCannotDelayTheError is the M2 regression
+// (plan 027 C16). Enrichment only ever IMPROVES an error the caller already
+// holds, so it must not make the caller wait for it: against a daemon that
+// accepts the connection and never answers, the unbounded lookup this used to
+// make sat on the client's 30s budget before printing a PROCESS_NOT_FOUND that
+// was decided long before.
+func TestEnrichProcessNotFound_SlowLookupCannotDelayTheError(t *testing.T) {
+	// Parallel: this test spends its time WAITING on processLookupTimeout, and
+	// its sibling below spends the same wall clock on the same budget.
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // accept, then never answer
+	}))
+	defer server.Close()
+
+	base := &APIError{Status: http.StatusNotFound, Code: domain.ErrCodeProcessNotFound, Message: "process not found"}
+
+	start := time.Now()
+	got := enrichProcessNotFound(NewClientWithToken(server.URL, ""), "web", base)
+	elapsed := time.Since(start)
+
+	if got != error(base) {
+		t.Errorf("a lookup that timed out must return the original error, got %v", got)
+	}
+	// Generous headroom over processLookupTimeout: the assertion is about the
+	// ORDER of magnitude (a lookup budget, not the client's 30s one).
+	if bound := 3 * processLookupTimeout; elapsed > bound {
+		t.Errorf("enrichment took %s, above its %s budget (bound %s)", elapsed, processLookupTimeout, bound)
+	}
+}
+
+// TestValidateLogProcesses_SlowLookupFailsOpenFast is the same rule on the
+// other caller of knownProcessNames: `prox logs` against an unresponsive daemon
+// proceeds (fails open) without first burning the client's full timeout.
+func TestValidateLogProcesses_SlowLookupFailsOpenFast(t *testing.T) {
+	// Parallel: this test spends its time WAITING on processLookupTimeout, and
+	// its sibling below spends the same wall clock on the same budget.
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	start := time.Now()
+	err := validateLogProcesses(NewClientWithToken(server.URL, ""), "web")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("validation must fail OPEN when the daemon cannot be asked, got %v", err)
+	}
+	if bound := 3 * processLookupTimeout; elapsed > bound {
+		t.Errorf("validation took %s, above its %s budget (bound %s)", elapsed, processLookupTimeout, bound)
 	}
 }
 
