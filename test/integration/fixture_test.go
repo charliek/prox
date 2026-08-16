@@ -379,10 +379,26 @@ func (r *proxRun) Addr() string {
 		// or zero port as "not yet" and retry.
 		if data, err := os.ReadFile(statePath); err == nil {
 			var state struct {
+				PID  int    `json:"pid"`
 				Port int    `json:"port"`
 				Host string `json:"host"`
 			}
-			if json.Unmarshal(data, &state) == nil && state.Port > 0 {
+			// Require the state file to belong to THIS process, not merely to
+			// be parseable. A fixture directory can host more than one daemon
+			// generation (reap_orphans_test.go starts a second prox in the
+			// first one's dir), and a generation killed with SIGKILL leaves its
+			// state file behind: daemon.State.Write truncates in place rather
+			// than renaming, so a read between generations can return the DEAD
+			// generation's port, which then fails to answer. Matching the pid
+			// makes staleness unrepresentable instead of something each caller
+			// has to notice.
+			//
+			// This is the foreground contract: for `prox up` the state pid is
+			// the launched process. A detached `up -d` records its CHILD's pid
+			// instead, so a detached proxRun needs the separate daemon identity
+			// C5 introduces -- there are no detached f.Start callers today.
+			if json.Unmarshal(data, &state) == nil && state.Port > 0 &&
+				r.cmd.Process != nil && state.PID == r.cmd.Process.Pid {
 				host := state.Host
 				if host == "" {
 					host = "127.0.0.1"

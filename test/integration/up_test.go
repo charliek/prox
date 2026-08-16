@@ -14,9 +14,7 @@ import (
 )
 
 // waitForRunOutputContains polls a proxRun's captured combined output until it
-// contains substr, or fails the test after timeout. Mirrors
-// waitForOutputContains (helpers_test.go), which stays keyed on the older
-// *proxWithOutput type for push_data_plane_test.go's still-unmigrated use.
+// contains substr, or fails the test after timeout.
 func waitForRunOutputContains(t *testing.T, run *proxRun, substr string, timeout time.Duration) {
 	t.Helper()
 

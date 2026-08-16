@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -145,16 +143,13 @@ func waitForFrameCountAtLeast(t *testing.T, c *sseClient, event string, n int, t
 // quietConfig renders a config with a single process that prints one
 // distinctive marker on launch and then sleeps quietly (no periodic output),
 // so a freshly-connected SSE client sees no log traffic at all until
-// something (a restart) triggers a new line.
-func quietConfig(port int) string {
-	return fmt.Sprintf(`api:
-  port: %d
-  host: 127.0.0.1
-
-processes:
+// something (a restart) triggers a new line. No api: block -- the fixture
+// harness drops it and allocates a dynamic port (see fixture_test.go).
+func quietConfig() string {
+	return `processes:
   quiet:
     cmd: 'echo "QUIET_START"; sleep 3600'
-`, port)
+`
 }
 
 // TestAPI_SSEHeartbeatsKeepIdleStreamsAlive (plan 017 C14): idles two SSE
@@ -173,30 +168,23 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	const port = 15565
-	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+	f := newInlineFixture(t, quietConfig())
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "prox.yaml")
-	requireNoError(t, os.WriteFile(cfgPath, []byte(quietConfig(port)), 0644), "writing quiet config")
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForLogContains(t, run.Addr(), "quiet", "QUIET_START", 5*time.Second)
 
-	cmd := startProx(t, binary, "up", "-c", cfgPath)
-	defer killProx(cmd)
-
-	waitForAPI(t, addr, apiReadyTimeout)
-	waitForLogContains(t, addr, "quiet", "QUIET_START", 5*time.Second)
-
-	logsClient, err := dialSSE(addr + "/api/v1/logs/stream")
+	logsClient, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
 	defer logsClient.Close()
 
-	processesClient, err := dialSSE(addr + "/api/v1/processes/stream")
+	processesClient, err := dialSSE(run.Addr() + "/api/v1/processes/stream")
 	requireNoError(t, err, "connecting to processes stream")
 	defer processesClient.Close()
 
 	// Confirm the requests stream correctly refuses without a proxy config,
 	// rather than holding it open (see doc comment above).
-	if resp, rerr := http.Get(addr + "/api/v1/proxy/requests/stream"); rerr == nil {
+	if resp, rerr := http.Get(run.Addr() + "/api/v1/proxy/requests/stream"); rerr == nil {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Errorf("expected requests stream to 503 without a proxy config, got %d", resp.StatusCode)
@@ -222,7 +210,7 @@ func TestAPI_SSEHeartbeatsKeepIdleStreamsAlive(t *testing.T) {
 	// makes it print a fresh QUIET_START line, which must arrive as a new
 	// (unnamed-event) data frame.
 	before := len(logsClient.Frames())
-	status, errResp := restartProcess(t, addr, "quiet")
+	status, errResp := restartProcess(t, run.Addr(), "quiet")
 	if status != http.StatusOK {
 		t.Fatalf("restart failed: status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
 	}
@@ -240,13 +228,13 @@ func TestAPI_ProcessesStreamServesSnapshots(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
-	waitForProcessState(t, testAPIAddr, "long", "running", 5*time.Second)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForProcessState(t, run.Addr(), "long", "running", 5*time.Second)
 
-	client, err := dialSSE(testAPIAddr + "/api/v1/processes/stream")
+	client, err := dialSSE(run.Addr() + "/api/v1/processes/stream")
 	requireNoError(t, err, "connecting to processes stream")
 	defer client.Close()
 
@@ -264,7 +252,7 @@ func TestAPI_ProcessesStreamServesSnapshots(t *testing.T) {
 		}
 	}
 
-	status, errResp := stopProcess(t, testAPIAddr, "long")
+	status, errResp := stopProcess(t, run.Addr(), "long")
 	if status != http.StatusOK {
 		t.Fatalf("stop failed: status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
 	}
@@ -311,12 +299,12 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
-	client, err := dialSSE(testAPIAddr + "/api/v1/logs/stream")
+	client, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
 	defer client.Close()
 
@@ -355,7 +343,7 @@ func TestAPI_LogsStreamHandshakeAndCursor(t *testing.T) {
 	// stream_id.
 	mid := seqs[len(seqs)/2]
 
-	resp, err := http.Get(fmt.Sprintf("%s/api/v1/logs?since_seq=%d", testAPIAddr, mid))
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/logs?since_seq=%d", run.Addr(), mid))
 	requireNoError(t, err, "GET /api/v1/logs?since_seq")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -394,14 +382,14 @@ func TestUpForeground_NoControlPlaneAccessLogs(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("integration"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
-	waitForOutputContains(t, prox, "Still running...", 5*time.Second)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForRunOutputContains(t, run, "Still running...", 5*time.Second)
 
 	for _, path := range []string{"/api/v1/status", "/api/v1/processes", "/api/v1/logs"} {
-		resp, err := http.Get(testAPIAddr + path)
+		resp, err := http.Get(run.Addr() + path)
 		requireNoError(t, err, "GET "+path)
 		resp.Body.Close()
 	}
@@ -410,7 +398,7 @@ func TestUpForeground_NoControlPlaneAccessLogs(t *testing.T) {
 	// its absence.
 	time.Sleep(500 * time.Millisecond)
 
-	output := prox.Output()
+	output := run.Output()
 
 	// chi's DefaultLogFormatter renders a request line as
 	// `"GET http://host/path HTTP/1.1" from 127.0.0.1:port - 200 ...`; match
@@ -439,21 +427,17 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	cmd := startProx(t, binary, "up", "-c", configPath("integration"))
-	// Safety net: harmless no-op once waitCmdExit below has already reaped
-	// the process (Kill on an exited process and a second Wait both just
-	// return discarded errors -- see waitCmdExit's doc comment) but catches
-	// any earlier t.Fatal in this test before shutdown is even triggered.
-	defer killProx(cmd)
+	f := newFixture(t, "integration")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	waitForAPI(t, testAPIAddr, apiReadyTimeout)
-	waitForProcessState(t, testAPIAddr, "long", "running", 5*time.Second)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForProcessState(t, run.Addr(), "long", "running", 5*time.Second)
 
-	logsClient, err := dialSSE(testAPIAddr + "/api/v1/logs/stream")
+	logsClient, err := dialSSE(run.Addr() + "/api/v1/logs/stream")
 	requireNoError(t, err, "connecting to logs stream")
 	defer logsClient.Close()
 
-	processesClient, err := dialSSE(testAPIAddr + "/api/v1/processes/stream")
+	processesClient, err := dialSSE(run.Addr() + "/api/v1/processes/stream")
 	requireNoError(t, err, "connecting to processes stream")
 	defer processesClient.Close()
 
@@ -463,7 +447,7 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	waitForFrameCountAtLeast(t, logsClient, "handshake", 1, 5*time.Second)
 	waitForFrameCountAtLeast(t, processesClient, "", 1, 5*time.Second)
 
-	req, err := http.NewRequest(http.MethodPost, testAPIAddr+"/api/v1/shutdown?wait=true", nil)
+	req, err := http.NewRequest(http.MethodPost, run.Addr()+"/api/v1/shutdown?wait=true", nil)
 	requireNoError(t, err, "building shutdown request")
 
 	start := time.Now()
@@ -475,7 +459,7 @@ func TestAPI_ShutdownPromptWithStreamsConnected(t *testing.T) {
 	// Reuse the existing suite's shutdown budget (TestFullStop_NoOrphanedGrandchild
 	// uses the same 20s ceiling for a full-instance stop) rather than inventing a
 	// tighter one.
-	if err := waitCmdExit(t, cmd, 20*time.Second); err != nil {
+	if err := run.WaitExit(t, 20*time.Second); err != nil {
 		t.Errorf("foreground prox up should exit cleanly with SSE clients connected, got %v", err)
 	}
 }

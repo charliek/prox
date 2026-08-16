@@ -14,19 +14,6 @@ import (
 	"time"
 )
 
-// stubbornAPIAddr is the API address for the stubborn.yaml fixture, used by
-// every test in this file that drives the real orphan-grandchild scenario
-// (#29): a leader shell that exits cleanly on SIGTERM while a backgrounded
-// python grandchild ignores SIGTERM and holds a real TCP port. Tests in this
-// file run sequentially (no t.Parallel), so reusing one port across them is
-// safe -- each test fully tears down its prox instance before the next runs.
-const stubbornAPIAddr = "http://127.0.0.1:15560"
-
-// stubbornListenerPort is the TCP port testdata/scripts/stubborn_grandchild.sh
-// tells its python grandchild to bind (see testdata/configs/stubborn.yaml's
-// STUBBORN_PORT inline env).
-const stubbornListenerPort = "15561"
-
 // logLines fetches the most recent log lines for a process via
 // GET /api/v1/logs. It returns nil (rather than failing the test) on a
 // transient request/decode error so callers can poll it in a retry loop.
@@ -151,60 +138,52 @@ func TestRestart_ReloadsEnvFile(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	addr := "http://127.0.0.1:15562"
 
-	dir := t.TempDir()
-	envFile := filepath.Join(dir, "worker.env")
+	// The env file lives in its own temp dir -- it isn't the fixture's own
+	// config, just a file env_file points at, so there's nothing here for
+	// f.Rewrite to own.
+	envDir := t.TempDir()
+	envFile := filepath.Join(envDir, "worker.env")
 	requireNoError(t, os.WriteFile(envFile, []byte("MYVAL=v1\n"), 0644), "writing initial env file")
 
-	cfgContent := fmt.Sprintf(`api:
-  port: 15562
-  host: 127.0.0.1
-
-processes:
+	cfgContent := fmt.Sprintf(`processes:
   echoenv:
     cmd: 'while :; do echo "MYVAL=$MYVAL"; sleep 0.3; done'
     env_file: %q
 `, envFile)
-	cfgPath := filepath.Join(dir, "prox.yaml")
-	requireNoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0644), "writing temp config")
+	f := newInlineFixture(t, cfgContent)
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
-	defer killProx(prox.cmd)
-
-	waitForAPI(t, addr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
 	// Confirm the process is running with the initial value before mutating
 	// the env file out from under it.
-	waitForLogContains(t, addr, "echoenv", "MYVAL=v1", 5*time.Second)
+	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v1", 5*time.Second)
 
 	// Mutate the (mutable, t.TempDir-owned) env file -- never a committed
 	// fixture -- and restart.
 	requireNoError(t, os.WriteFile(envFile, []byte("MYVAL=v2\n"), 0644), "rewriting env file")
 
-	status, errResp := restartProcess(t, addr, "echoenv")
+	status, errResp := restartProcess(t, run.Addr(), "echoenv")
 	if status != http.StatusOK {
 		t.Fatalf("restart failed: status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
 	}
 
 	// The replacement instance must reload env_file from disk and observe
 	// the new value.
-	waitForLogContains(t, addr, "echoenv", "MYVAL=v2", 5*time.Second)
+	waitForLogContains(t, run.Addr(), "echoenv", "MYVAL=v2", 5*time.Second)
 }
 
 // printerConfig renders a config whose single `printer` process echoes
-// "MARKER=<marker>" in a loop, on the given API port. Used by the
+// "MARKER=<marker>" in a loop. No api: block -- the fixture harness drops it
+// and allocates a dynamic port (see fixture_test.go). Used by the
 // changed-cmd reload test to edit the launched command out from under a
 // running process.
-func printerConfig(port int, marker string) string {
-	return fmt.Sprintf(`api:
-  port: %d
-  host: 127.0.0.1
-
-processes:
+func printerConfig(marker string) string {
+	return fmt.Sprintf(`processes:
   printer:
     cmd: 'while :; do echo "MARKER=%s"; sleep 0.3; done'
-`, port, marker)
+`, marker)
 }
 
 // TestRestart_ReloadsChangedCmd (#33): edit the launched command in prox.yaml
@@ -215,28 +194,21 @@ func TestRestart_ReloadsChangedCmd(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	const port = 15563
-	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+	f := newInlineFixture(t, printerConfig("v1"))
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "prox.yaml")
-	requireNoError(t, os.WriteFile(cfgPath, []byte(printerConfig(port, "v1")), 0644), "writing initial config")
-
-	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
-	defer killProx(prox.cmd)
-
-	waitForAPI(t, addr, apiReadyTimeout)
-	waitForLogContains(t, addr, "printer", "MARKER=v1", 5*time.Second)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForLogContains(t, run.Addr(), "printer", "MARKER=v1", 5*time.Second)
 
 	// Two consecutive edit->restart cycles, each picking up the latest file.
 	for _, marker := range []string{"v2", "v3"} {
-		requireNoError(t, os.WriteFile(cfgPath, []byte(printerConfig(port, marker)), 0644), "rewriting config")
+		f.Rewrite(t, printerConfig(marker))
 
-		status, errResp := restartProcess(t, addr, "printer")
+		status, errResp := restartProcess(t, run.Addr(), "printer")
 		if status != http.StatusOK {
 			t.Fatalf("restart (%s) failed: status=%d code=%s error=%s", marker, status, errResp.Code, errResp.Error)
 		}
-		waitForLogContains(t, addr, "printer", "MARKER="+marker, 5*time.Second)
+		waitForLogContains(t, run.Addr(), "printer", "MARKER="+marker, 5*time.Second)
 	}
 }
 
@@ -248,46 +220,31 @@ func TestRestart_RemovedProcessReturns409(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	const port = 15564
-	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
-
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "prox.yaml")
-	twoProcs := fmt.Sprintf(`api:
-  port: %d
-  host: 127.0.0.1
-
-processes:
+	twoProcs := `processes:
   alpha:
     cmd: 'while :; do echo "ALPHA"; sleep 0.3; done'
   beta:
     cmd: 'while :; do echo "BETA"; sleep 0.3; done'
-`, port)
-	requireNoError(t, os.WriteFile(cfgPath, []byte(twoProcs), 0644), "writing initial config")
+`
+	f := newInlineFixture(t, twoProcs)
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
-	prox := startProxWithOutput(t, binary, "up", "-c", cfgPath)
-	defer killProx(prox.cmd)
-
-	waitForAPI(t, addr, apiReadyTimeout)
-	waitForLogContains(t, addr, "alpha", "ALPHA", 5*time.Second)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
+	waitForLogContains(t, run.Addr(), "alpha", "ALPHA", 5*time.Second)
 
 	// Snapshot alpha's identity so we can prove the failed restart didn't
 	// stop-and-relaunch it (same PID, same restart count), not merely that
 	// something named alpha ended up running.
-	before := waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+	before := waitForProcessState(t, run.Addr(), "alpha", "running", 3*time.Second)
 
 	// Remove alpha from the file (beta remains so the file still validates).
-	onlyBeta := fmt.Sprintf(`api:
-  port: %d
-  host: 127.0.0.1
-
-processes:
+	onlyBeta := `processes:
   beta:
     cmd: 'while :; do echo "BETA"; sleep 0.3; done'
-`, port)
-	requireNoError(t, os.WriteFile(cfgPath, []byte(onlyBeta), 0644), "rewriting config without alpha")
+`
+	f.Rewrite(t, onlyBeta)
 
-	status, errResp := restartProcess(t, addr, "alpha")
+	status, errResp := restartProcess(t, run.Addr(), "alpha")
 	if status != http.StatusConflict {
 		t.Fatalf("expected 409 restarting a removed process, got status=%d code=%s error=%s", status, errResp.Code, errResp.Error)
 	}
@@ -297,7 +254,7 @@ processes:
 
 	// alpha must still be running, and it must be the SAME instance: identical
 	// PID and restart count, not a stop-and-relaunch.
-	after := waitForProcessState(t, addr, "alpha", "running", 3*time.Second)
+	after := waitForProcessState(t, run.Addr(), "alpha", "running", 3*time.Second)
 	if after.PID != before.PID || after.Restarts != before.Restarts {
 		t.Fatalf("alpha was disturbed by the failed restart: pid %d->%d restarts %d->%d",
 			before.PID, after.PID, before.Restarts, after.Restarts)
@@ -313,25 +270,23 @@ func TestStop_KillsStubbornGrandchild(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	addr := stubbornAPIAddr
-
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("stubborn"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "stubborn")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, addr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
-	pidStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	pid, err := strconv.Atoi(pidStr)
 	requireNoError(t, err, "parsing GRANDCHILD_PID")
 	grandchildPID = pid
 
-	waitForMarkerValue(t, addr, "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
 
 	start := time.Now()
-	status, errResp := stopProcess(t, addr, "worker")
+	status, errResp := stopProcess(t, run.Addr(), "worker")
 	elapsed := time.Since(start)
 	if status != http.StatusOK {
 		t.Fatalf("stop failed: status=%d code=%s error=%s (after %v)", status, errResp.Code, errResp.Error, elapsed)
@@ -355,10 +310,8 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	addr := stubbornAPIAddr
-
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("stubborn"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "stubborn")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	var oldPID, newPID int
 	t.Cleanup(func() {
@@ -366,15 +319,15 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 		killIfAlive(oldPID)
 	})
 
-	waitForAPI(t, addr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
-	oldPIDStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	oldPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	oldPID, err := strconv.Atoi(oldPIDStr)
 	requireNoError(t, err, "parsing initial GRANDCHILD_PID")
-	waitForMarkerValue(t, addr, "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
 
 	start := time.Now()
-	status, errResp := restartProcess(t, addr, "worker")
+	status, errResp := restartProcess(t, run.Addr(), "worker")
 	elapsed := time.Since(start)
 	if status != http.StatusOK {
 		t.Fatalf("restart failed: status=%d code=%s error=%s (after %v)", status, errResp.Code, errResp.Error, elapsed)
@@ -391,21 +344,21 @@ func TestRestart_StubbornGrandchildPortRebinds(t *testing.T) {
 	// after a successful bind+listen, so its mere presence proves the
 	// rebind succeeded -- a failed rebind would crash the python script
 	// before it ever printed GRANDCHILD_PID/LISTENING).
-	newPIDStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", oldPIDStr, 10*time.Second)
+	newPIDStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", oldPIDStr, 10*time.Second)
 	newPID, err = strconv.Atoi(newPIDStr)
 	requireNoError(t, err, "parsing new GRANDCHILD_PID")
 	if newPID == oldPID {
 		t.Fatalf("expected a new grandchild pid distinct from %d, got the same pid", oldPID)
 	}
 
-	listeningPort := waitForMarkerValue(t, addr, "worker", "LISTENING=", "", 5*time.Second)
-	if listeningPort != stubbornListenerPort {
-		t.Fatalf("expected grandchild to listen on port %s, got %q", stubbornListenerPort, listeningPort)
+	listeningPort := waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
+	if wantPort := strconv.Itoa(f.StubbornPort()); listeningPort != wantPort {
+		t.Fatalf("expected grandchild to listen on port %s, got %q", wantPort, listeningPort)
 	}
 
 	// The replacement should have settled into "running" (not crashed on
 	// EADDRINUSE).
-	waitForProcessState(t, addr, "worker", "running", 3*time.Second)
+	waitForProcessState(t, run.Addr(), "worker", "running", 3*time.Second)
 }
 
 // TestFullStop_NoOrphanedGrandchild (A5): the same stubborn-grandchild
@@ -416,34 +369,26 @@ func TestFullStop_NoOrphanedGrandchild(t *testing.T) {
 	skipShort(t)
 
 	binary := buildBinary(t)
-	addr := stubbornAPIAddr
-
-	prox := startProxWithOutput(t, binary, "up", "-c", configPath("stubborn"))
-	defer killProx(prox.cmd)
+	f := newFixture(t, "stubborn")
+	run := f.Start(t, binary, "up", "-c", f.configPath)
 
 	var grandchildPID int
 	t.Cleanup(func() { killIfAlive(grandchildPID) })
 
-	waitForAPI(t, addr, apiReadyTimeout)
+	waitForAPI(t, run.Addr(), apiReadyTimeout)
 
-	pidStr := waitForMarkerValue(t, addr, "worker", "GRANDCHILD_PID=", "", 5*time.Second)
+	pidStr := waitForMarkerValue(t, run.Addr(), "worker", "GRANDCHILD_PID=", "", 5*time.Second)
 	pid, err := strconv.Atoi(pidStr)
 	requireNoError(t, err, "parsing GRANDCHILD_PID")
 	grandchildPID = pid
-	waitForMarkerValue(t, addr, "worker", "LISTENING=", "", 5*time.Second)
+	waitForMarkerValue(t, run.Addr(), "worker", "LISTENING=", "", 5*time.Second)
 
-	requireNoError(t, stopProx(t, addr), "requesting full shutdown")
+	requireNoError(t, stopProx(t, run.Addr()), "requesting full shutdown")
 
-	done := make(chan error, 1)
-	go func() { done <- prox.cmd.Wait() }()
-
-	select {
-	case <-done:
-		// Process exited.
-	case <-time.After(20 * time.Second):
-		killProx(prox.cmd)
-		t.Fatal("prox did not shut down within timeout")
-	}
+	// WaitExit blocks until the process exits, or fails the test (killing it
+	// first) on timeout -- mirrors the goroutine + select this replaces. The
+	// exit error itself is not asserted here, matching the original.
+	_ = run.WaitExit(t, 20*time.Second)
 
 	if !waitForPIDGone(grandchildPID, 5*time.Second) {
 		t.Fatalf("grandchild pid %d still alive after full shutdown", grandchildPID)

@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-const testAPIAddr = "http://127.0.0.1:15555"
-
 // TestMain scrubs PROX_TUI from this test process's environment before any test
 // runs, so no `prox` subprocess started here can inherit a developer's own
 // setting (codex review of plan 026 C7).
@@ -143,29 +141,6 @@ func waitForAPI(t *testing.T, addr string, timeout time.Duration) {
 	t.Fatalf("API did not become ready within %v", timeout)
 }
 
-// startProx starts the prox binary with the given arguments
-func startProx(t *testing.T, binary string, args ...string) *exec.Cmd {
-	t.Helper()
-
-	// Get project root
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	projectRoot := filepath.Join(wd, "..", "..")
-
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = projectRoot
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-
-	return cmd
-}
-
 // syncBuffer is a goroutine-safe bytes.Buffer: the exec copier goroutines
 // write while tests poll Output() before the process has exited.
 type syncBuffer struct {
@@ -183,69 +158,6 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
-}
-
-// proxWithOutput holds a prox command and its captured output
-type proxWithOutput struct {
-	cmd    *exec.Cmd
-	stdout *syncBuffer
-	stderr *syncBuffer
-}
-
-// startProxWithOutput starts prox and captures its stdout/stderr
-func startProxWithOutput(t *testing.T, binary string, args ...string) *proxWithOutput {
-	t.Helper()
-
-	// Get project root
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	projectRoot := filepath.Join(wd, "..", "..")
-
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = projectRoot
-
-	stdout := &syncBuffer{}
-	stderr := &syncBuffer{}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start prox: %v", err)
-	}
-
-	return &proxWithOutput{
-		cmd:    cmd,
-		stdout: stdout,
-		stderr: stderr,
-	}
-}
-
-// Output returns the combined stdout and stderr
-func (p *proxWithOutput) Output() string {
-	return p.stdout.String() + p.stderr.String()
-}
-
-// waitForOutputContains polls the captured combined output until it contains
-// substr, or fails the test after timeout.
-func waitForOutputContains(t *testing.T, prox *proxWithOutput, substr string, timeout time.Duration) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	var last string
-	for time.Now().Before(deadline) {
-		last = prox.Output()
-		if strings.Contains(last, substr) {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	// Final sample: the marker may have arrived during the last sleep.
-	if last = prox.Output(); strings.Contains(last, substr) {
-		return
-	}
-	t.Fatalf("output did not contain %q within %v; captured output: %s", substr, timeout, last)
 }
 
 // stopProx sends shutdown request to prox via API
@@ -424,11 +336,6 @@ func requireNoError(t *testing.T, err error, msg string) {
 	if err != nil {
 		t.Fatalf("%s: %v", msg, err)
 	}
-}
-
-// configPath returns the path to a test config
-func configPath(name string) string {
-	return fmt.Sprintf("testdata/configs/%s.yaml", name)
 }
 
 // skipShort skips the test if -short flag is provided
