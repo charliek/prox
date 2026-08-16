@@ -23,9 +23,6 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
-      - path: _test\.go
-        linters:
-          - unused
       - linters:
           - staticcheck
         text: "SA1019:.*viewport\\.(LineUp|LineDown|HalfViewUp|HalfViewDown)"

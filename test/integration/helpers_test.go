@@ -16,10 +16,7 @@ import (
 	"time"
 )
 
-const (
-	testAPIPort = 15555
-	testAPIAddr = "http://127.0.0.1:15555"
-)
+const testAPIAddr = "http://127.0.0.1:15555"
 
 // TestMain scrubs PROX_TUI from this test process's environment before any test
 // runs, so no `prox` subprocess started here can inherit a developer's own
@@ -429,23 +426,4 @@ func waitForStateFile(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("state file %s not created within %v", path, timeout)
-}
-
-// withTimeout runs the test with a timeout
-func withTimeout(t *testing.T, timeout time.Duration, f func()) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	done := make(chan struct{})
-	go func() {
-		f()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Test completed
-	case <-ctx.Done():
-		t.Fatal("test timed out")
-	}
 }
