@@ -605,7 +605,7 @@ func TestReportStdioDrops(t *testing.T) {
 		require.NotZero(t, sink.Drops(), "the wedged drain should have forced drops")
 
 		reportStdioDrops(sink)
-		assert.Contains(t, readStderr(), "diagnostic line(s) were dropped")
+		assert.Contains(t, readStderr(), "diagnostic record(s) were dropped")
 		assert.Zero(t, sink.Drops(), "TakeDrops must consume the count so a backstop cannot double-report")
 
 		// A second report is silent — nothing new was lost.

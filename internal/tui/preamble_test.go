@@ -181,6 +181,25 @@ func TestClientOptionsPreamble(t *testing.T) {
 			"a stale echo credit swallowed real output from a process named 'system'")
 	})
 
+	t.Run("echo credits do not survive an EMPTY first sync", func(t *testing.T) {
+		// handleLogsSync returns early when a sync carries neither a notice nor
+		// entries (a caught-up reconnect must not force a render). That early
+		// return skipped the retire, so a first sync that came back empty left
+		// credits armed indefinitely — the same swallowing hazard, reached by a
+		// different door (CodeRabbit, PR #106).
+		line := testPreamble[0]
+		m := ownerPreambleModel([]string{line})
+
+		m = clientUpdate(m, LogsSyncMsg{})
+		require.Equal(t, 1, countLines(m.logEntries, line))
+
+		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+			Process: systemProcessName, Stream: domain.StreamStdout, Line: line,
+		}))
+		assert.Equal(t, 2, countLines(m.logEntries, line),
+			"an empty sync left an echo credit armed, and it swallowed real output")
+	})
+
 	t.Run("a resolver warning reaches the TUI", func(t *testing.T) {
 		// The invalid-PROX_TUI warning rides the same path: the CLI records it
 		// into the preamble instead of writing it to a primary screen the alt

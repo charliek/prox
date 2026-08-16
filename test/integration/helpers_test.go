@@ -76,13 +76,23 @@ func buildBinary(t *testing.T) string {
 // same problem on the pty side.
 const apiReadyTimeout = 20 * time.Second
 
+// pollClient bounds every poll in this file with a per-request deadline.
+//
+// The naked http.Get these helpers used goes through http.DefaultClient, which
+// has NO timeout: a server that accepts the connection and then stalls blocks
+// the call indefinitely, so the helper sails past its own budget and the package
+// eventually dies on go test's timeout instead of failing one assertion
+// (CodeRabbit, PR #106). The per-request budget is deliberately much shorter
+// than the surrounding poll loop, since every attempt is retried anyway.
+var pollClient = &http.Client{Timeout: 5 * time.Second}
+
 // waitForAPI waits for the API to be ready
 func waitForAPI(t *testing.T, addr string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(addr + "/api/v1/status")
+		resp, err := pollClient.Get(addr + "/api/v1/status")
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -326,7 +336,7 @@ func waitForProcessState(t *testing.T, addr, name, expectedStatus string, timeou
 	deadline := time.Now().Add(timeout)
 	var lastStatus string
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/processes/%s", addr, name))
+		resp, err := pollClient.Get(fmt.Sprintf("%s/api/v1/processes/%s", addr, name))
 		if err == nil {
 			var proc ProcessInfo
 			if err := json.NewDecoder(resp.Body).Decode(&proc); err == nil {

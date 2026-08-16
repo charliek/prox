@@ -545,6 +545,12 @@ func runBufferedStdioSession(run func() error) error {
 // backstop cannot both report the same drops.
 func reportStdioDrops(sink *stdioSink) {
 	if n := sink.TakeDrops(); n > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d diagnostic line(s) were dropped while the TUI held the screen\n", n)
+		// "record(s) ... dropped or truncated", not "line(s) ... dropped": the
+		// two targets count different things. The manager target counts one drop
+		// per line, but the buffer target counts one per rejected or truncated
+		// Write whatever its size, so a single truncated 300 KiB write would be
+		// reported as one lost "line" (CodeRabbit, PR #106). Neutral wording is
+		// honest for both rather than precise for one.
+		fmt.Fprintf(os.Stderr, "warning: %d diagnostic record(s) were dropped or truncated while the TUI held the screen\n", n)
 	}
 }

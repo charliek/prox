@@ -645,6 +645,12 @@ func (b *BaseModel) renderAfterLogEntries(wasNearBottom bool) {
 // what the previous daemon run printed, and the notice line marks the seam.
 func (b *BaseModel) handleLogsSync(msg LogsSyncMsg) {
 	if msg.Notice == "" && len(msg.Entries) == 0 {
+		// Retire BEFORE returning. A first sync that comes back empty is still a
+		// sync — the server's copies of the preamble were never coming — so
+		// leaving credits armed here would let them survive indefinitely and
+		// later swallow real output from a process named `system` (CodeRabbit,
+		// PR #106). See the retire call at the end of this function.
+		b.retirePreambleEcho()
 		return // nothing changed: a caught-up reconnect must not force a render
 	}
 
