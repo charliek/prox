@@ -21,7 +21,8 @@ type Manager struct {
 	// trust is where this manager reports what mkcert said about its own local
 	// CA. It is process-scoped, not manager-scoped (see TrustResolver): every
 	// manager in a process feeds the same verdict, so one real generation
-	// answers for every other manager and spares them the probe.
+	// answers for every other manager, which generate nothing and learn nothing
+	// on their own.
 	trust *TrustResolver
 }
 
@@ -159,7 +160,7 @@ func (m *Manager) generateCerts(paths *CertPaths) ([]string, error) {
 	// EnsureCerts, and with it register() under lifecycleMu (CodeRabbit
 	// review). Before the capture, Stdout was an *os.File handed over as a raw
 	// fd and Wait only waited on the process.
-	cmd.WaitDelay = probeWaitDelay
+	cmd.WaitDelay = mkcertWaitDelay
 
 	if err := cmd.Run(); err != nil {
 		lines := notableLines(buf.String())

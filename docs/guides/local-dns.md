@@ -65,7 +65,7 @@ brew install mkcert
 mkcert -install
 ```
 
-If you skip `mkcert -install` (or run it before installing a browser that keeps its own trust store), prox now surfaces mkcert's own warning about it — `Warning: Note: the local CA is not installed in the system trust store.`, followed by a hint to run `mkcert -install` and restart prox — instead of reporting every process healthy while HTTPS quietly fails in the browser. The warning is mkcert's own sentence, carried through verbatim, and clears itself automatically once mkcert reports the CA as trusted.
+If you skip `mkcert -install` (or run it before installing a browser that keeps its own trust store), prox now surfaces mkcert's own warning about it — `Warning: Note: the local CA is not installed in the system trust store.`, followed by a hint to run `mkcert -install` and restart prox — instead of reporting every process healthy while HTTPS quietly fails in the browser. The warning is mkcert's own sentence, carried through verbatim, and clears itself automatically once mkcert reports the CA as trusted. It appears when prox generates certificates, which is exactly what happens on a first run like this one; certs that were already generated before the CA broke won't re-trigger the warning until the next generation.
 
 ### Automatic Certificate Generation
 

@@ -1,13 +1,11 @@
 package certs
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/charliek/prox/internal/domain"
 	"github.com/stretchr/testify/assert"
@@ -26,70 +24,39 @@ const (
 
 // fakeMkcertOpts configures the stand-in mkcert.
 type fakeMkcertOpts struct {
-	// Stdout and Stderr are what the fake prints when asked to GENERATE a
-	// certificate (the -CAROOT query always answers with the CAROOT path).
+	// Stdout and Stderr are what the fake prints when it generates a
+	// certificate.
 	Stdout string
 	Stderr string
 	// ExitCode is the fake's exit status for a generation.
 	ExitCode int
-	// NoCA leaves CAROOT without a rootCA.pem, i.e. mkcert has never run on
-	// this machine — the state in which prox must never provoke a probe.
-	NoCA bool
-	// SleepSeconds stalls a generation, for proving the probe is bounded.
-	SleepSeconds int
 }
 
 // fakeMkcert is a shell script named `mkcert`, on a PATH that contains nothing
 // else executable of that name. It is how these tests exercise the real
-// capture/marker/probe code without a real mkcert — and, critically, without
-// ever touching the developer's actual CAROOT, which a probe against the real
-// binary would read and a generation could create.
+// capture/marker code without a real mkcert — and, critically, without ever
+// reaching the developer's actual mkcert, whose CAROOT a real generation could
+// create.
+//
+// calls is the per-invocation log: a test can assert not just what prox did
+// with mkcert's output but how many times it asked for any.
 type fakeMkcert struct {
-	dir    string
-	caroot string
-	calls  string
-}
-
-// setStdout rewrites what the fake prints, so a test can model the user going
-// away and running `mkcert -install` between two resolves.
-func (f *fakeMkcert) setStdout(t *testing.T, out string) {
-	t.Helper()
-	require.NoError(t, os.WriteFile(filepath.Join(f.dir, "stdout.txt"), []byte(out), 0o600))
+	calls string
 }
 
 func newFakeMkcert(t *testing.T, opts fakeMkcertOpts) *fakeMkcert {
 	t.Helper()
 
 	dir := t.TempDir()
-	caroot := filepath.Join(dir, "caroot")
-	require.NoError(t, os.MkdirAll(caroot, 0o755))
-	if !opts.NoCA {
-		require.NoError(t, os.WriteFile(filepath.Join(caroot, caRootFile), []byte("fake root CA"), 0o600))
-	}
-
 	calls := filepath.Join(dir, "calls.log")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "stdout.txt"), []byte(opts.Stdout), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "stderr.txt"), []byte(opts.Stderr), 0o600))
 
-	sleep := ""
-	if opts.SleepSeconds > 0 {
-		// exec, so the sleep REPLACES the shell rather than becoming its child:
-		// killing the process on timeout then kills the sleep too. Without this
-		// the shell dies and the orphaned sleep lingers for its full duration —
-		// and this repo is deliberately intolerant of stranded fixture
-		// processes (CodeRabbit review).
-		sleep = fmt.Sprintf("exec sleep %d\n", opts.SleepSeconds)
-	}
-
-	// Records every invocation, answers -CAROOT, and otherwise writes the cert
-	// and key files it was asked for so the caller's own bookkeeping proceeds.
+	// Records every invocation and writes the cert and key files it was asked
+	// for, so the caller's own bookkeeping proceeds.
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %[1]q
-if [ "$1" = "-CAROOT" ]; then
-  printf '%%s\n' %[2]q
-  exit 0
-fi
-%[3]scert=""
+cert=""
 key=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -100,17 +67,17 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "$cert" ]; then printf 'fake-cert\n' > "$cert"; fi
 if [ -n "$key" ]; then printf 'fake-key\n' > "$key"; fi
-cat %[4]q
-cat %[5]q >&2
-exit %[6]d
-`, calls, caroot, sleep, filepath.Join(dir, "stdout.txt"), filepath.Join(dir, "stderr.txt"), opts.ExitCode)
+cat %[2]q
+cat %[3]q >&2
+exit %[4]d
+`, calls, filepath.Join(dir, "stdout.txt"), filepath.Join(dir, "stderr.txt"), opts.ExitCode)
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mkcert"), []byte(script), 0o755))
-	// /bin and /usr/bin stay reachable for the script's own `cat`/`sleep`; the
-	// real mkcert (typically /opt/homebrew/bin) does not.
+	// /bin and /usr/bin stay reachable for the script's own `cat`; the real
+	// mkcert (typically /opt/homebrew/bin) does not.
 	t.Setenv("PATH", dir+":/bin:/usr/bin")
 
-	return &fakeMkcert{dir: dir, caroot: caroot, calls: calls}
+	return &fakeMkcert{calls: calls}
 }
 
 // callArgs returns the argument line of each invocation, in order.
@@ -125,18 +92,6 @@ func (f *fakeMkcert) callArgs(t *testing.T) []string {
 	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
 		if line != "" {
 			out = append(out, line)
-		}
-	}
-	return out
-}
-
-// generationCalls returns only the invocations that generated a certificate.
-func (f *fakeMkcert) generationCalls(t *testing.T) []string {
-	t.Helper()
-	var out []string
-	for _, c := range f.callArgs(t) {
-		if !strings.Contains(c, "-CAROOT") {
-			out = append(out, c)
 		}
 	}
 	return out
@@ -202,11 +157,11 @@ func TestEnsureCerts_CapturesMkcertOutput(t *testing.T) {
 				assert.Contains(t, lines, want)
 			}
 
-			v := tr.Resolve(context.Background())
+			v := tr.Verdict()
 			require.True(t, v.Known, "a real generation always answers the question")
+			require.Len(t, fake.callArgs(t), 1, "one generation, and nothing else asks mkcert anything")
 			if tc.wantWarning == "" {
 				assert.Nil(t, v.Warning)
-				assert.Empty(t, fake.generationCalls(t)[1:], "a generation answered, so nothing should probe")
 				return
 			}
 			require.NotNil(t, v.Warning)
@@ -233,14 +188,14 @@ func TestEnsureCerts_FailureIncludesOutput(t *testing.T) {
 	assert.Contains(t, err.Error(), "permission denied")
 	assert.Contains(t, lines, "failed to load the CA key: open /nope/rootCA-key.pem: permission denied")
 
-	assert.False(t, tr.verdict().Known,
+	assert.False(t, tr.Verdict().Known,
 		"a failed generation proves nothing about the trust stores")
 }
 
-// TestEnsureCerts_WarmCertsSkipMkcert pins the case that motivates the probe:
-// with the cert files already on disk, mkcert never runs at all, so nothing can
-// be learned from its output. This is the NORMAL state of a daemon restarted
-// onto a new release, not an edge case.
+// TestEnsureCerts_WarmCertsSkipMkcert pins both halves of the short-circuit:
+// with the cert files already on disk, mkcert never runs at all — no subprocess
+// on the registration path — and therefore nothing is learned about the CA.
+// That silence is the accepted blind spot, not an oversight.
 func TestEnsureCerts_WarmCertsSkipMkcert(t *testing.T) {
 	fake := newFakeMkcert(t, fakeMkcertOpts{Stdout: mkcertSystemNote + "\n"})
 	tr := NewTrustResolver()
@@ -256,7 +211,7 @@ func TestEnsureCerts_WarmCertsSkipMkcert(t *testing.T) {
 	assert.Equal(t, paths, got)
 	assert.Empty(t, lines, "nothing was generated, so there is no output to report")
 	assert.Empty(t, fake.callArgs(t), "mkcert must not run when the certs are already on disk")
-	assert.False(t, tr.verdict().Known, "and therefore nothing is known about the CA yet")
+	assert.False(t, tr.Verdict().Known, "and therefore nothing is known about the CA yet")
 }
 
 // TestCAUntrustedWarning_PinnedShape pins the ONE constructor both producers go
@@ -269,51 +224,11 @@ func TestCAUntrustedWarning_PinnedShape(t *testing.T) {
 	assert.Equal(t, "run 'mkcert -install' and restart prox", w.Hint)
 }
 
-// TestTrustResolver_ProbesWhenCertsAreWarm is the test for the step that makes
-// the feature work at all: with nothing generated, the resolver asks mkcert
-// directly rather than reporting nothing.
-func TestTrustResolver_ProbesWhenCertsAreWarm(t *testing.T) {
+// TestTrustResolver_GenerationAnswers pins the only way this process ever
+// learns anything: a real generation ran, mkcert spoke, and every later read of
+// the verdict returns what it said without asking anyone again.
+func TestTrustResolver_GenerationAnswers(t *testing.T) {
 	fake := newFakeMkcert(t, fakeMkcertOpts{Stdout: mkcertCreatedNote + "\n" + mkcertSystemNote + "\n"})
-	tr := NewTrustResolver()
-
-	v := tr.Resolve(context.Background())
-	require.True(t, v.Known)
-	require.NotNil(t, v.Warning)
-	assert.Equal(t, mkcertSystemNote, v.Warning.Message)
-	assert.Equal(t, domain.WarningCodeMkcertCAUntrusted, v.Warning.Code)
-
-	gen := fake.generationCalls(t)
-	require.Len(t, gen, 1, "exactly one throwaway generation")
-	assert.Contains(t, gen[0], probeHostname, "the probe certifies an inert .invalid name, never a real one")
-
-	// The throwaway cert, its key, and their directory are gone.
-	for _, field := range []string{"-cert-file", "-key-file"} {
-		path := argAfter(t, gen[0], field)
-		assert.NoFileExists(t, path, "the probe must not leave %s behind", field)
-		assert.NoDirExists(t, filepath.Dir(path), "the probe must delete its temp dir")
-	}
-}
-
-// TestTrustResolver_SkipsProbeWithoutRootCA is a safety property, not an
-// optimisation: mkcert CREATES a local CA when it finds none, and prox must
-// never create one as the side effect of a diagnostic — installing nothing and
-// explaining nothing.
-func TestTrustResolver_SkipsProbeWithoutRootCA(t *testing.T) {
-	fake := newFakeMkcert(t, fakeMkcertOpts{NoCA: true, Stdout: mkcertSystemNote + "\n"})
-	tr := NewTrustResolver()
-
-	v := tr.Resolve(context.Background())
-	assert.False(t, v.Known, "no CA means no verdict — not a guess in either direction")
-	assert.Nil(t, v.Warning)
-	assert.Empty(t, fake.generationCalls(t), "mkcert must never be asked to generate, which would create a CA")
-	assert.NoFileExists(t, filepath.Join(fake.caroot, caRootFile))
-}
-
-// TestTrustResolver_GoodGenerationAnswersWithoutProbing pins the free path: a
-// real generation said the CA IS installed, which is final for the process, so
-// no probe ever runs.
-func TestTrustResolver_GoodGenerationAnswersWithoutProbing(t *testing.T) {
-	fake := newFakeMkcert(t, fakeMkcertOpts{Stdout: mkcertCreatedNote + "\n"})
 	tr := NewTrustResolver()
 	m := NewManagerWithTrust(t.TempDir(), "test.dev", tr)
 
@@ -321,122 +236,14 @@ func TestTrustResolver_GoodGenerationAnswersWithoutProbing(t *testing.T) {
 	require.NoError(t, err)
 
 	for range 3 {
-		v := tr.Resolve(context.Background())
+		v := tr.Verdict()
 		require.True(t, v.Known)
-		require.Nil(t, v.Warning)
+		require.NotNil(t, v.Warning)
+		assert.Equal(t, mkcertSystemNote, v.Warning.Message)
+		assert.Equal(t, domain.WarningCodeMkcertCAUntrusted, v.Warning.Code)
 	}
-
-	gen := fake.generationCalls(t)
-	require.Len(t, gen, 1, "a settled good verdict must never pay for a probe again")
-	assert.NotContains(t, gen[0], probeHostname)
-}
-
-// TestTrustResolver_BadVerdictIsReAsked is the anti-lying test, and it is the
-// reason the latch is not simply "once per process".
-//
-// The warning's own hint tells the user to run `mkcert -install` and restart
-// prox. In shared mode the DAEMON holds this verdict and outlives that restart,
-// so a latched "untrusted" would keep being reported at a machine the user had
-// already fixed — prox stating something untrue, which is the same bug as
-// stating nothing at all, pointed the other way. So while the answer is bad it
-// is re-asked, and the moment mkcert says the CA is installed the warning is
-// withdrawn and the probing stops for good.
-func TestTrustResolver_BadVerdictIsReAsked(t *testing.T) {
-	fake := newFakeMkcert(t, fakeMkcertOpts{
-		Stdout: mkcertCreatedNote + "\n" + mkcertSystemNote + "\n",
-	})
-	tr := NewTrustResolver()
-	// Drive the clock rather than sleep: re-probing a bad verdict is throttled
-	// by reProbeInterval so a broken machine does not shell out on every single
-	// registration (CodeRabbit, PR #110), and this test is about the re-ask
-	// happening at all, not about how long it waits.
-	clock := time.Now()
-	tr.now = func() time.Time { return clock }
-
-	v := tr.Resolve(context.Background())
-	require.NotNil(t, v.Warning, "precondition: the CA is reported untrusted")
-
-	// Inside the throttle window the held verdict stands, and no subprocess
-	// runs -- the warning is still reported, just not re-derived.
-	before := len(fake.generationCalls(t))
-	v = tr.Resolve(context.Background())
-	require.NotNil(t, v.Warning, "the warning keeps being reported while throttled")
-	require.Equal(t, before, len(fake.generationCalls(t)),
-		"a re-ask inside the throttle window must not shell out")
-
-	// Past the window: still broken, so prox asks again rather than trusting a
-	// stale verdict.
-	clock = clock.Add(reProbeInterval + time.Second)
-	v = tr.Resolve(context.Background())
-	require.NotNil(t, v.Warning)
-	require.GreaterOrEqual(t, len(fake.generationCalls(t)), 2,
-		"a bad verdict must be re-asked, or the user can never be told they fixed it")
-
-	// The user runs `mkcert -install`: mkcert stops printing the note.
-	fake.setStdout(t, mkcertCreatedNote+"\n")
-	clock = clock.Add(reProbeInterval + time.Second)
-
-	v = tr.Resolve(context.Background())
-	require.True(t, v.Known)
-	assert.Nil(t, v.Warning, "the warning must be withdrawn once mkcert says the CA is installed")
-
-	// ...and having settled good, it stops probing -- even well past the
-	// throttle window, because a good verdict is final for the process.
-	clock = clock.Add(10 * reProbeInterval)
-	settled := len(fake.generationCalls(t))
-	require.Nil(t, tr.Resolve(context.Background()).Warning)
-	assert.Equal(t, settled, len(fake.generationCalls(t)))
-}
-
-// TestTrustResolver_ProbesAtMostOncePerProcess pins the latch. The probe is a
-// subprocess; running it per registration would put mkcert on the hot path of
-// every project joining the daemon.
-func TestTrustResolver_ProbesAtMostOncePerProcess(t *testing.T) {
-	// Exit 1: the probe FAILS, which is the case that most easily degenerates
-	// into retrying forever.
-	fake := newFakeMkcert(t, fakeMkcertOpts{ExitCode: 1})
-	tr := NewTrustResolver()
-
-	for range 5 {
-		v := tr.Resolve(context.Background())
-		assert.False(t, v.Known, "a failed probe yields no verdict")
-		assert.Nil(t, v.Warning)
-	}
-	assert.Len(t, fake.generationCalls(t), 1, "one attempt, however often it is asked")
-}
-
-// TestTrustResolver_ProbeBoundedByContext proves a wedged mkcert cannot stall
-// startup: the probe is dropped when its context expires, and dropped means
-// unknown — no warning, no error.
-func TestTrustResolver_ProbeBoundedByContext(t *testing.T) {
-	newFakeMkcert(t, fakeMkcertOpts{SleepSeconds: 30, Stdout: mkcertSystemNote + "\n"})
-	tr := NewTrustResolver()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	v := tr.Resolve(ctx)
-	elapsed := time.Since(start)
-
-	assert.False(t, v.Known)
-	assert.Nil(t, v.Warning)
-	// Generous but far below both the fake's 60s stall and the resolver's own
-	// 5s cap: the point is that cancellation actually RETURNS. Without
-	// probeWaitDelay this took the full 60s, because the stalled child still
-	// held the capture pipe after mkcert itself was killed.
-	assert.Less(t, elapsed, 2*time.Second, "the probe must not outlive its context")
-}
-
-// TestTrustResolver_NoMkcertIsSilent covers the user who has no mkcert at all:
-// prox already reports that separately, and a probe has nothing to say.
-func TestTrustResolver_NoMkcertIsSilent(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	tr := NewTrustResolver()
-
-	v := tr.Resolve(context.Background())
-	assert.False(t, v.Known)
-	assert.Nil(t, v.Warning)
+	assert.Len(t, fake.callArgs(t), 1,
+		"the generation is the whole cost: reading the verdict must never add another mkcert call")
 }
 
 // TestTrustResolver_TrustedVerdictWithdrawsWarning pins the anti-lying half:
@@ -445,19 +252,60 @@ func TestTrustResolver_NoMkcertIsSilent(t *testing.T) {
 func TestTrustResolver_TrustedVerdictWithdrawsWarning(t *testing.T) {
 	tr := NewTrustResolver()
 	tr.observe([]string{mkcertCreatedNote, mkcertSystemNote})
-	require.NotNil(t, tr.verdict().Warning, "precondition: the CA was untrusted")
+	require.NotNil(t, tr.Verdict().Warning, "precondition: the CA was untrusted")
 
 	// The user ran `mkcert -install`; the next mkcert run says nothing.
 	tr.observe([]string{mkcertCreatedNote})
 
-	v := tr.verdict()
+	v := tr.Verdict()
 	assert.True(t, v.Known)
 	assert.Nil(t, v.Warning, "a fixed problem must stop being reported")
 }
 
+// TestTrustResolver_VerdictNeverExecs pins the reason plan 029 exists: Verdict
+// must be a pure mutex read in EVERY verdict state, never an exec. Plan 028's
+// probe generated a throwaway certificate purely to answer this same question
+// when certs were already warm — measured at ~217ms and 2 subprocesses inside
+// the daemon's register() under lifecycleMu, where every other project's
+// registration waited on it. This test is what stops an exec path from
+// quietly returning to the verdict read: the fake mkcert on PATH records
+// every invocation, and the assertion is that Verdict() never adds one, no
+// matter which state it is read from.
+func TestTrustResolver_VerdictNeverExecs(t *testing.T) {
+	fake := newFakeMkcert(t, fakeMkcertOpts{Stdout: mkcertCreatedNote + "\n" + mkcertSystemNote + "\n"})
+	tr := NewTrustResolver()
+
+	// State 1: fresh, nothing observed yet.
+	for range 3 {
+		v := tr.Verdict()
+		assert.False(t, v.Known, "no generation has run yet")
+		assert.Nil(t, v.Warning)
+	}
+
+	// State 2: observed an untrusted-CA generation.
+	tr.observe([]string{mkcertCreatedNote, mkcertSystemNote})
+	for range 3 {
+		v := tr.Verdict()
+		require.True(t, v.Known)
+		require.NotNil(t, v.Warning)
+		assert.Equal(t, mkcertSystemNote, v.Warning.Message)
+	}
+
+	// State 3: observed a clean generation — the CA is trusted.
+	tr.observe([]string{mkcertCreatedNote})
+	for range 3 {
+		v := tr.Verdict()
+		require.True(t, v.Known)
+		assert.Nil(t, v.Warning)
+	}
+
+	assert.Empty(t, fake.callArgs(t),
+		"Verdict() must never invoke mkcert, in any verdict state")
+}
+
 // TestSharedTrust_IsProcessWide pins that production callers share one verdict —
-// the property that lets one component's real generation spare every other
-// component the probe.
+// the property that lets one component's real generation answer for every other
+// component, which generates nothing and would otherwise know nothing.
 func TestSharedTrust_IsProcessWide(t *testing.T) {
 	assert.Same(t, SharedTrust(), SharedTrust())
 	m := NewManager(t.TempDir(), "test.dev")
@@ -471,17 +319,4 @@ func TestNotableLines(t *testing.T) {
 	assert.Nil(t, notableLines(""))
 	assert.Nil(t, notableLines("\n\n  \n"))
 	assert.Equal(t, []string{"one", "two"}, notableLines("one\n\n  two  \n\n"))
-}
-
-// argAfter returns the token following flag in a recorded invocation line.
-func argAfter(t *testing.T, call, flag string) string {
-	t.Helper()
-	fields := strings.Fields(call)
-	for i, f := range fields {
-		if f == flag && i+1 < len(fields) {
-			return fields[i+1]
-		}
-	}
-	t.Fatalf("no %s in %q", flag, call)
-	return ""
 }
