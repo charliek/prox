@@ -79,11 +79,15 @@ All notable changes to this project will be documented in this file.
   followed by the hint `run 'mkcert -install' and restart prox`. It still
   implements no trust-store detection of its own — that stays entirely
   mkcert's job, correctly, per OS/browser — and it withdraws the warning
-  automatically once mkcert reports the CA as trusted again. Because mkcert
-  only speaks when it *generates* a certificate, and a warm cert cache (the
-  normal case, since `CLAUDE.md`/`RELEASING.md` require a daemon restart
-  after every release) would otherwise never re-trigger it, a lightweight
-  probe re-asks mkcert directly whenever the last known verdict was bad.
+  automatically once mkcert reports the CA as trusted again. Detection happens
+  at generation time only: mkcert speaks when it generates a certificate, and
+  that's the note prox carries. A machine whose certs already exist but whose
+  CA later broke (OS reinstall, keychain reset) is not detected until
+  something triggers a real generation — an accepted trade-off, since the
+  probe that used to cover that gap cost ~217ms and two subprocesses inside
+  the daemon's registration critical path (under `lifecycleMu`, delaying
+  every other project's registration). The hint (`run 'mkcert -install' and
+  restart prox`) still names the fix.
 
 - **`prox` now warns when a registered hostname does not resolve** (plan
   028, #98). `prox up` prints `Registered domains: app.sec.test`, which

@@ -144,7 +144,7 @@ Only `failed` trips the exit-1 contract (see [`prox status`](cli.md#status) for 
 | `message` | One or more complete, user-facing sentences describing what is wrong |
 | `hint` | The next action to take, when there is one; omitted otherwise |
 
-`warnings_sealed` reports whether every startup warning producer for this session has finished. Some producers (the mkcert trust probe, the hostname resolution check) run asynchronously and can still be in flight when a `prox up -d` parent takes its post-readiness status snapshot; polling this flag (rather than trusting a single fetch) is how that parent avoids silently losing a warning to the race. Always present (unlike `warnings`, it is not `omitempty`): `false` is itself the meaningful value a poller is waiting to flip.
+`warnings_sealed` reports whether every startup warning producer for this session has finished. Some producers (the hostname resolution check) run asynchronously and can still be in flight when a `prox up -d` parent takes its post-readiness status snapshot; polling this flag (rather than trusting a single fetch) is how that parent avoids silently losing a warning to the race. Always present (unlike `warnings`, it is not `omitempty`): `false` is itself the meaningful value a poller is waiting to flip.
 
 **A warning never changes any exit code.** `prox status`, `prox up`, and `prox up -d` all render `warnings` the same way (`Warning: <message>`, with `<hint>` indented underneath) and none of their exit contracts consult it.
 
