@@ -1,7 +1,6 @@
 package proxyd
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"strings"
@@ -25,10 +24,10 @@ import (
 // EnsureDomain short-circuits on its own loaded-cert cache, so a daemon that
 // starts with certs already on disk — the normal case, since a release requires
 // restarting the daemon while its certs dir persists — may never re-enter
-// generation. The verdict therefore comes from certs.TrustResolver (a real
-// generation's output when there was one, a probe when there was not), and
-// EnsureDomain re-applies it on every registration so it keeps answering for
-// registrations that generate nothing.
+// generation. The verdict therefore comes from certs.TrustResolver, which holds
+// what the process's real generations reported, and EnsureDomain re-applies it
+// on every registration so the one generation that did run keeps answering for
+// the registrations that generate nothing.
 //
 // Its mutex is a leaf: it is never held across mkcert, file I/O, or any other
 // lock, and in particular it is NOT MultiDomainCertManager.mu — recording a
@@ -123,17 +122,16 @@ type MultiDomainCertManager struct {
 	// layer (see certWarningHolder). Guarded by its own mutex, never by mu.
 	warnings certWarningHolder
 
-	// trust answers "is mkcert's local CA installed in the trust stores?" once
-	// per process — from a real generation's output when there was one, from a
-	// probe when the certs were already warm. It is the SOURCE of every warning
-	// in `warnings` above, and it is handed to each per-domain certs.Manager so
-	// their generations feed the same verdict.
+	// trust holds what this process's real mkcert generations said about the
+	// local CA. It is the SOURCE of every warning in `warnings` above, and it is
+	// handed to each per-domain certs.Manager so their generations feed the same
+	// verdict.
 	trust *certs.TrustResolver
 
 	// resolveTrust reads that verdict. Set once in the constructor; overridable
-	// in tests ONLY (like generate above), so a test can pin the record/clear
-	// wiring without a real mkcert on PATH — what mkcert's output MEANS is
-	// tested where it is parsed, in internal/proxy/certs.
+	// in tests ONLY (like generate above), so a test can INJECT a verdict and
+	// drive the record/clear wiring — what mkcert's output MEANS is tested where
+	// it is parsed, in internal/proxy/certs.
 	resolveTrust func() certs.TrustVerdict
 }
 
@@ -146,7 +144,7 @@ func NewMultiDomainCertManager(certsDir string) *MultiDomainCertManager {
 		trust:    certs.SharedTrust(),
 	}
 	m.generate = m.generateViaMkcert
-	m.resolveTrust = func() certs.TrustVerdict { return m.trust.Resolve(context.Background()) }
+	m.resolveTrust = m.trust.Verdict
 	return m
 }
 
@@ -173,10 +171,10 @@ func (m *MultiDomainCertManager) EnsureDomain(baseDomain string) error {
 	// (CodeRabbit review). Here it runs whenever a project registers, which is
 	// exactly when a user would expect prox to notice they fixed it.
 	//
-	// It is cheap in the case that matters: Resolve returns a settled GOOD
-	// verdict without touching a subprocess, so the steady state costs one map
-	// read. Only a machine that is actually broken pays for a probe, and only
-	// until it is fixed.
+	// It is free: Verdict is a mutex read of what a real generation already
+	// reported, so putting it on every registration costs nothing. Plan 028 had
+	// it shell out to mkcert here (~217ms, 2 subprocesses, under lifecycleMu
+	// while every other project's registration waited); plan 029 removed that.
 	m.applyCATrust()
 
 	// Fast path: already loaded — RLock only, never blocks on generation.
@@ -212,21 +210,15 @@ func (m *MultiDomainCertManager) EnsureDomain(baseDomain string) error {
 func (m *MultiDomainCertManager) generateViaMkcert(baseDomain string) (*tls.Certificate, error) {
 	mgr := m.managerFor(baseDomain)
 
-	// Ensure certs exist (generate via mkcert if needed). The captured mkcert
-	// output has already been handed to m.trust by EnsureCerts, so the verdict
-	// below is free whenever generation actually ran.
+	// Ensure certs exist (generate via mkcert if needed). A generation that
+	// actually ran has already handed its captured output to m.trust, which is
+	// the only way this process learns anything about the CA. Nothing is
+	// published here: applyCATrust runs in EnsureDomain, on every registration,
+	// so the verdict also reaches the registrations that generate nothing.
 	paths, _, err := mgr.EnsureCerts()
 	if err != nil {
 		return nil, fmt.Errorf("ensuring certs for %s: %w", baseDomain, err)
 	}
-
-	// Publish (or withdraw) the CA-trust warning for the client that cannot see
-	// this process's output. Doing it HERE, rather than only on the generation
-	// path, is what covers the warm-cert case: a daemon restarted onto a new
-	// release finds its certs already on disk, runs mkcert never, and would
-	// otherwise report nothing at all.
-	// (The trust verdict is applied by EnsureDomain, which runs on every
-	// registration — not only on the generations that reach here.)
 
 	// Load the certificate.
 	cert, err := tls.LoadX509KeyPair(paths.CertFile, paths.KeyFile)
@@ -243,13 +235,14 @@ func (m *MultiDomainCertManager) generateViaMkcert(baseDomain string) (*tls.Cert
 // Both directions matter. A verdict that could only be added would keep telling
 // a user their CA is untrusted after they fixed it, and prox reporting something
 // that is no longer true is the same class of bug as prox reporting nothing at
-// all. An UNKNOWN verdict (no mkcert, no CA yet, probe failed) touches neither:
-// it is not evidence of trust, so it must not retract a warning, and it is not
-// evidence of a problem, so it must not raise one.
+// all. An UNKNOWN verdict (nothing has generated a certificate in this process
+// yet) touches neither: it is not evidence of trust, so it must not retract a
+// warning, and it is not evidence of a problem, so it must not raise one.
 //
 // It is called at the top of EnsureDomain — before the cache fast path, so a
-// warm daemon that never generates again still re-checks — outside m.mu, and it
-// takes only the holder's leaf mutex, so it never blocks a TLS handshake.
+// warm daemon that never generates again still replays the verdict — outside
+// m.mu, and it reads the verdict and takes only the holder's leaf mutex, so it
+// never blocks a TLS handshake and never execs.
 func (m *MultiDomainCertManager) applyCATrust() {
 	v := m.resolveTrust()
 	switch {

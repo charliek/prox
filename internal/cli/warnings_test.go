@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -366,22 +365,10 @@ func TestRegisterTestWarningProducer_ReleaseBuildsCannotFabricateWarnings(t *tes
 	require.Len(t, s.Warnings(), 1, "a dev build still runs it, or the suite loses its only latch test")
 }
 
-// stubTrustResolver stands in for certs.SharedTrust in standalone mode, so this
-// test pins the CLI's translation of a verdict without a real mkcert. What
-// mkcert's output MEANS is tested where it is parsed (internal/proxy/certs).
-type stubTrustResolver struct {
-	verdict certs.TrustVerdict
-	ctx     context.Context
-}
-
-func (s *stubTrustResolver) Resolve(ctx context.Context) certs.TrustVerdict {
-	s.ctx = ctx
-	return s.verdict
-}
-
-// TestMkcertTrustWarnings covers the standalone half of the producer: with no
-// daemon to carry warnings, mkcert runs in THIS process and its verdict has to
-// reach the session's own sink.
+// TestMkcertTrustWarnings pins the CLI's translation of a verdict into what the
+// standalone session reports. Literal verdicts, no resolver: what mkcert's
+// output MEANS is tested where it is parsed (internal/proxy/certs), and a CLI
+// test must not drive the process-wide resolver to get here.
 func TestMkcertTrustWarnings(t *testing.T) {
 	untrusted := domain.Warning{
 		Code:    domain.WarningCodeMkcertCAUntrusted,
@@ -389,49 +376,31 @@ func TestMkcertTrustWarnings(t *testing.T) {
 		Hint:    "run 'mkcert -install' and restart prox",
 	}
 
-	t.Run("reports an untrusted CA", func(t *testing.T) {
-		r := &stubTrustResolver{verdict: certs.TrustVerdict{Known: true, Warning: &untrusted}}
-		assert.Equal(t, []domain.Warning{untrusted}, mkcertTrustWarnings(context.Background(), r))
-	})
-
-	t.Run("says nothing for a trusted CA", func(t *testing.T) {
-		r := &stubTrustResolver{verdict: certs.TrustVerdict{Known: true}}
-		assert.Nil(t, mkcertTrustWarnings(context.Background(), r))
-	})
-
-	t.Run("says nothing when the verdict is unknown", func(t *testing.T) {
-		// No mkcert, no CA, or a probe that failed: prox must not invent a
-		// warning it has no evidence for, and must not error either.
-		r := &stubTrustResolver{}
-		assert.Nil(t, mkcertTrustWarnings(context.Background(), r))
-	})
-
-	t.Run("passes the session context through", func(t *testing.T) {
-		// The probe shells out to mkcert; a cancelled session must be able to
-		// cut it short rather than hold up shutdown.
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		r := &stubTrustResolver{}
-		mkcertTrustWarnings(ctx, r)
-		assert.Equal(t, ctx, r.ctx)
-	})
-}
-
-// TestMkcertTrustWarnings_FeedsTheSink pins the wiring shape startProxy uses:
-// the producer runs through warningSink.Go, so a slow probe cannot delay
-// startup, and its result still lands before the session seals.
-func TestMkcertTrustWarnings_FeedsTheSink(t *testing.T) {
-	untrusted := domain.Warning{
-		Code:    domain.WarningCodeMkcertCAUntrusted,
-		Message: "Note: the local CA is not installed in the system trust store! ⚠️",
-		Hint:    "run 'mkcert -install' and restart prox",
+	tests := []struct {
+		name    string
+		verdict certs.TrustVerdict
+		want    []domain.Warning
+	}{
+		{
+			name:    "reports an untrusted CA",
+			verdict: certs.TrustVerdict{Known: true, Warning: &untrusted},
+			want:    []domain.Warning{untrusted},
+		},
+		{
+			name:    "says nothing for a trusted CA",
+			verdict: certs.TrustVerdict{Known: true},
+		},
+		{
+			// Nothing generated a certificate this run, so prox has no evidence:
+			// it must not invent a warning, and must not error either.
+			name:    "says nothing when the verdict is unknown",
+			verdict: certs.TrustVerdict{},
+		},
 	}
-	r := &stubTrustResolver{verdict: certs.TrustVerdict{Known: true, Warning: &untrusted}}
 
-	s := newWarningSink()
-	s.Go(func() []domain.Warning { return mkcertTrustWarnings(context.Background(), r) })
-	require.True(t, s.Wait(2*time.Second), "the producer must finish well inside the join budget")
-	s.Seal()
-
-	assert.Equal(t, []domain.Warning{untrusted}, s.Warnings())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, mkcertTrustWarnings(tc.verdict))
+		})
+	}
 }

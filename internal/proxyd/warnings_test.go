@@ -177,12 +177,10 @@ func TestRegister_WarningsSurviveWarmCertGeneration(t *testing.T) {
 		m.RecordWarning(testWarning) // the producer seam, fired during generation
 		return generateWildcardCert(d)
 	}
-	// applyCATrust runs on EVERY EnsureDomain now, so the verdict source has to
-	// be pinned here for two reasons: an UNKNOWN verdict touches the holder
+	// The real resolver is left in place: nothing in this test generates a
+	// certificate, so its verdict is UNKNOWN and applyCATrust touches the holder
 	// neither way, leaving this test's synthetic RecordWarning to stand for the
-	// producer; and without it the real resolver would shell out to the
-	// developer's actual mkcert, which no unit test may do.
-	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
+	// producer.
 	s := newProxyServerWithCertMgr(t, m)
 	port := freePort(t)
 
@@ -300,13 +298,11 @@ func TestClientRegister_PassesWarningsThrough(t *testing.T) {
 // snapshot must be a copy the caller can mutate without corrupting the holder.
 func TestCertWarningHolder_Concurrent(t *testing.T) {
 	m := NewMultiDomainCertManager(t.TempDir())
-	// Never shell to mkcert from a test: swap in the in-memory generator AND
-	// pin the trust verdict. applyCATrust runs on every EnsureDomain, so the
-	// generator override alone no longer keeps the real mkcert out of a unit
-	// test — and an UNKNOWN verdict leaves this test's own RecordWarning
-	// standing, which is what it is measuring.
+	// Never shell to mkcert from a test: swap in the in-memory generator. The
+	// trust verdict is left real — nothing here generates a certificate, so it
+	// stays UNKNOWN and leaves this test's own RecordWarning standing, which is
+	// what it is measuring.
 	m.generate = func(d string) (*tls.Certificate, error) { return generateWildcardCert(d) }
-	m.resolveTrust = func() certs.TrustVerdict { return certs.TrustVerdict{} }
 	backendHost, backendPort := backendTarget(t)
 	s := newProxyServerWithCertMgr(t, m)
 
@@ -459,9 +455,9 @@ func warmCertManager(t *testing.T, baseDomain string, v certs.TrustVerdict) *Mul
 
 // TestGenerateViaMkcert_PublishesWarmCertVerdict is the case the daemon exists
 // to cover: certs already on disk, mkcert never runs, and the warning still
-// reaches the client. Before the trust probe this path could only ever report
-// nothing, which — given RELEASING.md requires restarting the daemon after every
-// release — is the state most users would have been in.
+// reaches the client: the verdict a real generation recorded earlier in this
+// process is replayed on every registration, so a warm cert load still publishes
+// it.
 func TestGenerateViaMkcert_PublishesWarmCertVerdict(t *testing.T) {
 	untrusted := testWarning
 	m := warmCertManager(t, "warmwarn.test", certs.TrustVerdict{Known: true, Warning: &untrusted})
@@ -484,9 +480,9 @@ func TestGenerateViaMkcert_TrustedVerdictWithdrawsWarning(t *testing.T) {
 }
 
 // TestGenerateViaMkcert_UnknownVerdictChangesNothing pins the third state. An
-// unknown verdict (no mkcert, no CA yet, a probe that failed) is not evidence
-// of trust, so it must not retract a warning, and not evidence of a problem, so
-// it must not raise one.
+// unknown verdict (nothing has generated a certificate in this process yet) is
+// not evidence of trust, so it must not retract a warning, and not evidence of
+// a problem, so it must not raise one.
 func TestGenerateViaMkcert_UnknownVerdictChangesNothing(t *testing.T) {
 	m := warmCertManager(t, "unknown.test", certs.TrustVerdict{})
 	m.RecordWarning(testWarning)
