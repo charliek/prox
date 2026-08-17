@@ -194,6 +194,16 @@ func (m *MultiDomainCertManager) EnsureDomain(baseDomain string) error {
 		return err // already wrapped by m.generate
 	}
 
+	// Re-apply AFTER a generation: the read at the top of this function ran
+	// before mkcert had said anything, so on a cold-cert registration the
+	// verdict it saw was Unknown and it recorded nothing. The generation that
+	// just ran is the process's first (and possibly only) chance to learn the
+	// CA is untrusted — without this second read, THIS registration would
+	// return no warning and the user who just watched their certs generate
+	// would learn about the broken CA one `prox up` too late (CodeRabbit,
+	// PR #111). Still free: another mutex read, no subprocess.
+	m.applyCATrust()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.loaded[baseDomain]; ok { // double-check: a concurrent caller won
@@ -213,8 +223,10 @@ func (m *MultiDomainCertManager) generateViaMkcert(baseDomain string) (*tls.Cert
 	// Ensure certs exist (generate via mkcert if needed). A generation that
 	// actually ran has already handed its captured output to m.trust, which is
 	// the only way this process learns anything about the CA. Nothing is
-	// published here: applyCATrust runs in EnsureDomain, on every registration,
-	// so the verdict also reaches the registrations that generate nothing.
+	// published here: applyCATrust runs in EnsureDomain — before the cache
+	// fast path on every registration, and again right after this function
+	// returns from a real generation — so the verdict reaches both the
+	// registrations that generate nothing and the one that just did.
 	paths, _, err := mgr.EnsureCerts()
 	if err != nil {
 		return nil, fmt.Errorf("ensuring certs for %s: %w", baseDomain, err)

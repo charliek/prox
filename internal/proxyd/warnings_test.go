@@ -453,6 +453,31 @@ func warmCertManager(t *testing.T, baseDomain string, v certs.TrustVerdict) *Mul
 	return m
 }
 
+// TestEnsureDomain_ColdGenerationWarnsOnFirstRegistration pins the ordering
+// CodeRabbit caught on PR #111: the verdict read at the top of EnsureDomain
+// runs BEFORE generation, so on a cold-cert path it sees Unknown and records
+// nothing — the generation itself is what first learns the CA is untrusted.
+// EnsureDomain must re-apply the verdict after a successful generation, or the
+// registration that just generated returns without the warning and the user
+// learns about their broken CA one `prox up` too late.
+func TestEnsureDomain_ColdGenerationWarnsOnFirstRegistration(t *testing.T) {
+	untrusted := testWarning
+	m := NewMultiDomainCertManager(t.TempDir())
+
+	// The verdict flips from Unknown to untrusted only when generation runs,
+	// exactly as a real mkcert run flips the shared resolver via observe.
+	verdict := certs.TrustVerdict{}
+	m.resolveTrust = func() certs.TrustVerdict { return verdict }
+	m.generate = func(domain string) (*tls.Certificate, error) {
+		verdict = certs.TrustVerdict{Known: true, Warning: &untrusted}
+		return generateWildcardCert(domain)
+	}
+
+	require.NoError(t, m.EnsureDomain("coldwarn.test"))
+	assert.Equal(t, []domain.Warning{untrusted}, m.Warnings(),
+		"the registration whose own generation discovered the untrusted CA must report it, not defer it to the next one")
+}
+
 // TestGenerateViaMkcert_PublishesWarmCertVerdict is the case the daemon exists
 // to cover: certs already on disk, mkcert never runs, and the warning still
 // reaches the client: the verdict a real generation recorded earlier in this
