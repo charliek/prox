@@ -262,6 +262,47 @@ func TestTrustResolver_TrustedVerdictWithdrawsWarning(t *testing.T) {
 	assert.Nil(t, v.Warning, "a fixed problem must stop being reported")
 }
 
+// TestTrustResolver_VerdictNeverExecs pins the reason plan 029 exists: Verdict
+// must be a pure mutex read in EVERY verdict state, never an exec. Plan 028's
+// probe generated a throwaway certificate purely to answer this same question
+// when certs were already warm — measured at ~217ms and 2 subprocesses inside
+// the daemon's register() under lifecycleMu, where every other project's
+// registration waited on it. This test is what stops an exec path from
+// quietly returning to the verdict read: the fake mkcert on PATH records
+// every invocation, and the assertion is that Verdict() never adds one, no
+// matter which state it is read from.
+func TestTrustResolver_VerdictNeverExecs(t *testing.T) {
+	fake := newFakeMkcert(t, fakeMkcertOpts{Stdout: mkcertCreatedNote + "\n" + mkcertSystemNote + "\n"})
+	tr := NewTrustResolver()
+
+	// State 1: fresh, nothing observed yet.
+	for range 3 {
+		v := tr.Verdict()
+		assert.False(t, v.Known, "no generation has run yet")
+		assert.Nil(t, v.Warning)
+	}
+
+	// State 2: observed an untrusted-CA generation.
+	tr.observe([]string{mkcertCreatedNote, mkcertSystemNote})
+	for range 3 {
+		v := tr.Verdict()
+		require.True(t, v.Known)
+		require.NotNil(t, v.Warning)
+		assert.Equal(t, mkcertSystemNote, v.Warning.Message)
+	}
+
+	// State 3: observed a clean generation — the CA is trusted.
+	tr.observe([]string{mkcertCreatedNote})
+	for range 3 {
+		v := tr.Verdict()
+		require.True(t, v.Known)
+		assert.Nil(t, v.Warning)
+	}
+
+	assert.Empty(t, fake.callArgs(t),
+		"Verdict() must never invoke mkcert, in any verdict state")
+}
+
 // TestSharedTrust_IsProcessWide pins that production callers share one verdict —
 // the property that lets one component's real generation answer for every other
 // component, which generates nothing and would otherwise know nothing.
