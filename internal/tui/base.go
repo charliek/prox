@@ -1097,8 +1097,21 @@ func (b *BaseModel) sessionLogOriginIdx(entries []domain.LogEntry) int {
 // Callers MUST gate this on the input value actually changing: cursor-movement
 // keys (left/right/home/end) leave the term alone and must not re-run the scan
 // or re-seek (see handleSearchKey).
+//
+// The view is taken from the SESSION, not from b.viewMode, so the query this
+// writes and the origin restoreSearchOrigin puts back can never name different
+// views — Esc clearing one view's search while restoring the other's position
+// is the failure that makes structural. Nothing can switch views while the bar
+// is open today (tab is consumed as text, non-menu mouse is ignored, a menu
+// open commits the bar first); this stops that from being load-bearing. Without
+// an active session — a caller that set ModeSearch directly — there is no
+// press-time view to honor, so the live one stands.
 func (b *BaseModel) liveApplySearch(value string) {
-	if b.viewMode == ViewModeRequests {
+	view := b.viewMode
+	if b.searchSession.active {
+		view = b.searchSession.view
+	}
+	if view == ViewModeRequests {
 		b.requestSearchQuery = value
 		b.restoreSearchOrigin()
 		if value != "" {
@@ -1164,6 +1177,28 @@ func (b *BaseModel) sessionRequestOriginIdx(requests []proxy.RequestRecord) int 
 	return clampIndex(s.requestCursorIdx, n)
 }
 
+// cancelLiveSearch ends a `/` session DISCARDING it (Esc in the bar, plan 030
+// WS3): the ACTIVE view's query and cursor go away and the view returns to the
+// origin — scroll row, cursor row and follow as of the `/` press, with the same
+// eviction fallbacks every other restore uses (logs anchor gone → oldest
+// retained; requests record gone → nearest index; restored follow wins and
+// re-lands newest).
+//
+// It IS the empty-bar live preview, made permanent: running through
+// liveApplySearch("") is what keeps cancel and backspacing-to-nothing one
+// behavior rather than two that drift. Clearing the query before that path's
+// render also matters — the marker columns must be gone from the wrap math
+// before the spans the scroll restore reads are rebuilt.
+//
+// Scoped to the active view: the other view's search survives, mirroring the `s`
+// bar's Esc. Normal-mode Esc, which clears BOTH views, is untouched.
+func (b *BaseModel) cancelLiveSearch() {
+	b.liveApplySearch("")
+	b.mode = ModeNormal
+	b.textInput.Blur()
+	b.searchSession = searchSession{}
+}
+
 // commitLiveSearch ends a `/` session KEEPING the live-applied query, then exits
 // the bar. The re-apply is the true mirror of the `s` bar's Enter: idempotent
 // once every keystroke has gone through liveApplySearch, but it guarantees a
@@ -1177,14 +1212,17 @@ func (b *BaseModel) commitLiveSearch() {
 }
 
 // handleSearchKey handles keys in search mode. The `/` bar is LIVE (plan 030):
-// every keystroke that changes the term applies it and jumps the cursor,
-// Enter keeps the live result and exits, and Esc exits the bar.
+// every keystroke that changes the term applies it and jumps the cursor, Enter
+// keeps the live result and exits, and Esc cancels — clearing the active view's
+// search and putting the view back where `/` was pressed.
 func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		b.mode = ModeNormal
-		b.textInput.Blur()
-		b.searchSession = searchSession{}
+		// Cancel: the search is undone, not merely left as typed (WS3). A
+		// previously committed query for this view goes with it — accepted and
+		// user-pinned: with the bar seeded from that query, "keep the old
+		// search" is Enter.
+		b.cancelLiveSearch()
 		return true, nil
 
 	case "enter":
