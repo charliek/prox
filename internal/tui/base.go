@@ -1316,6 +1316,15 @@ func (b *BaseModel) activeFilterRaw() string {
 	return b.logsFilter.RawQuery
 }
 
+// activeSearchQuery returns the active view's committed `/` term — what `/`
+// seeds its bar with (plan 030 WS4), mirroring activeFilterRaw for the `s` bar.
+func (b *BaseModel) activeSearchQuery() string {
+	if b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail {
+		return b.requestSearchQuery
+	}
+	return b.logSearchQuery
+}
+
 // activeFilterParseErr returns the active view's ParseErr.
 func (b *BaseModel) activeFilterParseErr() error {
 	if b.viewMode == ViewModeRequests || b.viewMode == ViewModeRequestDetail {
@@ -1574,13 +1583,29 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 	case "/":
 		if b.viewMode != ViewModeRequestDetail {
-			// Capture the origin FIRST: the search is live from here on, and
-			// every keystroke restores to what the view looks like right now
-			// (plan 030 WS1).
+			// ORDER IS LOAD-BEARING (plan 030 WS1/WS4): capture the origin, then
+			// seed, then apply. The search is live from here on and the seed
+			// applies ITSELF — an origin captured after that apply would be the
+			// seed's landing rather than the pre-search position, and every
+			// later keystroke would seek from there.
 			b.captureSearchSession()
 			b.mode = ModeSearch
-			b.textInput.SetValue("")
+			seed := b.activeSearchQuery()
+			b.textInput.SetValue(seed)
+			b.textInput.CursorEnd()
 			b.textInput.Focus()
+			if seed != "" {
+				// Reopening shows the seeded term's live state at once. The seek
+				// is at-or-after an origin that INCLUDES any cursor the term
+				// parked, so reopening over a match lands back on it and the view
+				// does not move. It can move when the prior search ended
+				// no-match: that cleared the cursor, so this seeks from the
+				// viewport instead and entries streamed in since may now match —
+				// accepted, and arguably what the user wants to see.
+				b.liveApplySearch(seed)
+			}
+			// An empty seed applies nothing at all: no render, no cursor touch —
+			// opening a fresh bar must be visually inert.
 		}
 		return true, nil
 
