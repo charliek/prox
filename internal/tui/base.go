@@ -149,6 +149,12 @@ type BaseModel struct {
 	// filteredEntries() at keypress time (D6-D8).
 	logSearchQuery string
 
+	// searchSession is the open `/` bar's origin — where the view sat when `/`
+	// was pressed — so every live keystroke seeks from there instead of from
+	// the previous keystroke's landing (plan 030 WS1). Zero value = no bar
+	// open; see searchSession and captureSearchSession.
+	searchSession searchSession
+
 	// logSeq is a session-local monotonic counter stamped onto each ingested
 	// LogEntry.DisplaySeq. The logs cursor is anchored by DisplaySeq, not index,
 	// so it rides the 1000-entry front-eviction ring without drifting (a bare
@@ -893,41 +899,308 @@ func (b *BaseModel) requestIsStale(req proxy.RequestRecord) bool {
 	return req.StaleAt(time.Now())
 }
 
-// handleSearchKey handles keys in search mode
+// searchSession is one open `/` bar: where the view sat when `/` was pressed
+// (plan 030 WS1). Live search is restore-then-seek — every keystroke puts the
+// view back here before scanning — so shrinking a term or fixing a typo finds
+// matches an earlier keystroke had already scrolled past, instead of the classic
+// broken-incsearch feel of seeking from the previous landing.
+//
+// Every anchor is an IDENTITY, never a raw index or viewport offset: entries and
+// records stream in and evict while the bar is open, so an offset captured at
+// press time decays into a different row mid-typing. Logs anchor by DisplaySeq
+// (the same idiom as logCursorSeq), requests by record ID with the index as the
+// eviction fallback. The zero value (active false) means no bar is open, and
+// every restore against it is a no-op.
+type searchSession struct {
+	active bool
+	// view is the view `/` was pressed in. The bar cannot change views (tab is
+	// consumed as text), so this is also the view every live apply writes to.
+	view ViewMode
+	// followMode as of the press. Restoring it takes PRECEDENCE over the
+	// positional anchors: a session that started under follow re-lands on
+	// newest, which is where follow would have dragged the view anyway.
+	followMode bool
+
+	// Logs origin. logCursorSeq is any cursor a PRIOR search had parked (0 when
+	// there was none); logAnchorSeq is the scroll anchor — the newest entry
+	// under follow, else the top visible row. Seq alone, with no paired index:
+	// an evicted logs anchor resolves to the oldest retained line, never to a
+	// remembered index (see sessionLogOriginIdx).
+	logCursorSeq int64
+	logAnchorSeq int64
+
+	// Requests origin: the cursor row's identity ("" / -1 on an empty list).
+	requestCursorID  string
+	requestCursorIdx int
+}
+
+// captureSearchSession records the active view's origin at the moment `/` is
+// pressed. It must run BEFORE anything the `/` handler does that could move the
+// view, since the origin is precisely the pre-search position.
+func (b *BaseModel) captureSearchSession() {
+	s := searchSession{active: true, view: b.viewMode, followMode: b.followMode}
+	switch b.viewMode {
+	case ViewModeRequests:
+		s.requestCursorID = b.cursorID
+		s.requestCursorIdx = b.cursorIdx
+	default:
+		entries := b.filteredEntries()
+		s.logCursorSeq = b.logCursorSeq
+		s.logAnchorSeq = b.logScrollAnchor(entries)
+	}
+	b.searchSession = s
+}
+
+// logScrollAnchor is the DisplaySeq of the entry the logs viewport is anchored
+// on: the newest entry under follow (the row follow keeps pinned — resolved AT
+// THE PRESS, not re-resolved later against whatever has streamed in since), else
+// the top visible row. Returns 0, the no-entry sentinel, for an empty list.
+func (b *BaseModel) logScrollAnchor(entries []domain.LogEntry) int64 {
+	n := len(entries)
+	if n == 0 {
+		return 0
+	}
+	idx := n - 1
+	if !b.followMode {
+		idx = b.entryIndexContainingRow(entries, b.viewport.YOffset)
+	}
+	return entries[idx].DisplaySeq
+}
+
+// restoreSearchOrigin puts cursor, scroll and follow state back to the open
+// session's origin. Live search calls it before every seek; the empty-bar path
+// calls it to preview a cleared search. It is deliberately standalone — the same
+// restore, with the same fallbacks, serves both.
+//
+// Restores are best-effort against a list that streamed and evicted while the
+// bar was open — the per-view helpers below carry the index fallbacks. A
+// restored followMode of true wins over the positional anchors. Without an open
+// session this is a no-op.
+func (b *BaseModel) restoreSearchOrigin() {
+	s := b.searchSession
+	if !s.active {
+		return
+	}
+	switch s.view {
+	case ViewModeRequests:
+		b.restoreRequestSearchOrigin(s)
+	default:
+		b.restoreLogSearchOrigin(s)
+	}
+}
+
+// restoreRequestSearchOrigin re-anchors the requests cursor on the session's
+// origin row — the same anchoring resolveRequestCursor does at render time, but
+// against the SESSION's identity rather than the live one. There is no scroll to
+// restore: updateViewport's ensure-visible clamp derives YOffset from the
+// cursor, so cursor identity plus follow fully determine the restored view.
+func (b *BaseModel) restoreRequestSearchOrigin(s searchSession) {
+	b.followMode = s.followMode
+	b.anchorRequestCursor(b.filteredProxyRequests(), s.requestCursorID, s.requestCursorIdx)
+}
+
+// restoreLogSearchOrigin re-anchors the logs cursor and scroll on the session's
+// origin. A session that began with no parked cursor restores to the no-cursor
+// sentinel, so an empty bar renders exactly like no search at all.
+func (b *BaseModel) restoreLogSearchOrigin(s searchSession) {
+	entries := b.filteredEntries()
+	b.followMode = s.followMode
+	if s.logCursorSeq != 0 {
+		// An evicted origin cursor lands on the oldest retained line — where the
+		// origin now sits relative to everything left — matching the scroll
+		// anchor's fallback rather than logIndexForSeq's mid-list clamp.
+		b.setLogCursor(entries, max(entryIndexOfSeq(entries, s.logCursorSeq), 0))
+	} else {
+		b.setLogCursor(nil, 0) // resets to the no-cursor sentinel
+	}
+	b.restoreLogSearchScroll()
+}
+
+// restoreLogSearchScroll re-applies the session's logs scroll anchor (follow
+// wins; else the anchor's row). It is split out of restoreLogSearchOrigin
+// because the offset is derived from logRowSpans, which every render rebuilds:
+// the ""↔non-empty query transition adds or removes the 2-column marker prefix
+// and so MOVES wrap points, leaving an offset computed against the previous
+// render's spans a few rows off. Paths that end with the query cleared re-apply
+// it after updateViewport, against fresh spans; paths that land a match need no
+// re-apply because ensureLogCursorVisible corrects them.
+func (b *BaseModel) restoreLogSearchScroll() {
+	s := b.searchSession
+	if !s.active {
+		return
+	}
+	if s.followMode {
+		b.viewport.GotoBottom()
+		return
+	}
+	b.viewport.SetYOffset(b.logOriginOffset(b.filteredEntries(), s.logAnchorSeq))
+}
+
+// logOriginOffset is the viewport row offset that restores the logs scroll
+// anchor stamped anchorSeq. Row spans are rebuilt by every render, so this
+// translates the anchor's DisplaySeq through the LAST render's spans: exact
+// while the bar sits over a settled view, and self-correcting on the next render
+// otherwise. An evicted anchor falls back to the oldest retained line.
+func (b *BaseModel) logOriginOffset(entries []domain.LogEntry, anchorSeq int64) int {
+	if len(entries) == 0 || anchorSeq == 0 {
+		return 0
+	}
+	idx := entryIndexOfSeq(entries, anchorSeq)
+	if idx < 0 {
+		return 0 // anchor evicted: oldest retained line
+	}
+	if sp, ok := b.logRowSpans[anchorSeq]; ok {
+		return sp.First
+	}
+	return idx // spans missing (no render yet): 1-entry==1-row
+}
+
+// sessionLogOriginIdx resolves the session's logs origin to an index in the
+// current filtered list: the cursor a prior search had parked, else the scroll
+// anchor. Both are press-time identities, so entries arriving while the bar is
+// open never move the origin — they only shift its index.
+//
+// An origin that is GONE resolves to 0, the oldest retained line, and so does an
+// origin that never existed (empty list at the press). Both say the same thing:
+// the ring evicts from the front and nothing arrives before the press, so every
+// line still retained is at-or-after the origin — starting anywhere else would
+// skip the true first match. This is deliberately NOT logIndexForSeq's clamped
+// last-known index, which for a front-evicted anchor points mid-list.
+func (b *BaseModel) sessionLogOriginIdx(entries []domain.LogEntry) int {
+	s := b.searchSession
+	if !s.active {
+		// No open bar: the ordinary cursor-derived origin, which is what n/N use.
+		return b.logSearchOriginIdx(entries)
+	}
+	seq := s.logCursorSeq
+	if seq == 0 {
+		seq = s.logAnchorSeq
+	}
+	if seq == 0 {
+		return 0 // nothing on screen at the press: everything arrived after it
+	}
+	if i := entryIndexOfSeq(entries, seq); i >= 0 {
+		return i
+	}
+	return 0 // origin evicted: it sat before the oldest line still retained
+}
+
+// liveApplySearch applies the `/` bar's current value to the ACTIVE view on
+// every keystroke (plan 030 WS1). It writes the committed query field, so every
+// existing consumer — inline highlight, row marker, selection band, the
+// follow-park guard, the footer indicator — works unmodified, and then
+// restore-then-seeks from the session origin.
+//
+// An empty value previews a cleared search: no query, no cursor, view back at
+// the origin — visually identical to never having searched.
+//
+// Callers MUST gate this on the input value actually changing: cursor-movement
+// keys (left/right/home/end) leave the term alone and must not re-run the scan
+// or re-seek (see handleSearchKey).
+func (b *BaseModel) liveApplySearch(value string) {
+	if b.viewMode == ViewModeRequests {
+		b.requestSearchQuery = value
+		b.restoreSearchOrigin()
+		if value != "" {
+			// Seek from the SESSION origin, not from the just-restored cursor:
+			// under follow the restore pins that cursor to the CURRENT newest
+			// row — right for the view — while the search must still start on
+			// the row `/` was pressed on, or records arriving mid-typing would
+			// flip the landing from keystroke to keystroke (D12).
+			requests := b.filteredProxyRequests()
+			b.seekRequestSearchMatchFrom(requests, b.sessionRequestOriginIdx(requests), 0)
+		}
+		b.updateViewport()
+		return
+	}
+	b.logSearchQuery = value
+	b.restoreSearchOrigin()
+	if value == "" {
+		// An empty bar leaves NO parked cursor behind: the marker is not
+		// rendered without a query anyway, but a lingering anchor would keep `y`
+		// copying a row nothing shows as selected. The session still holds the
+		// origin, so typing again re-anchors from it.
+		b.setLogCursor(nil, 0)
+		b.updateViewport()
+		// Dropping the query dropped the marker columns with it, so re-apply the
+		// scroll against the spans that render just rebuilt (see
+		// restoreLogSearchScroll).
+		b.restoreLogSearchScroll()
+		return
+	}
+	// Seek from the SESSION origin rather than seekLogSearchMatch's
+	// cursor-derived one: a session that started with no parked cursor restores
+	// none to seek from, and under follow the origin is the row that was newest
+	// AT THE PRESS, not whatever has streamed in since.
+	entries := b.filteredEntries()
+	b.seekLogSearchMatchFrom(entries, b.sessionLogOriginIdx(entries), 0)
+	b.updateViewport()
+	// One-shot scroll to the landed match (no-op on the no-cursor sentinel),
+	// mirroring the n/N handlers.
+	b.ensureLogCursorVisible()
+}
+
+// sessionRequestOriginIdx resolves the session's requests origin to an index in
+// the current filtered list: the press-time cursor RECORD, falling back to its
+// clamped index when that row is gone (trimmed or filtered out) and to the
+// oldest row when there was no cursor at all — an empty list at the press means
+// everything now on screen arrived after it. Falls back to the live cursor when
+// no bar is open.
+func (b *BaseModel) sessionRequestOriginIdx(requests []proxy.RequestRecord) int {
+	n := len(requests)
+	if n == 0 {
+		return 0
+	}
+	s := b.searchSession
+	if !s.active {
+		return clampIndex(b.cursorIdx, n)
+	}
+	if s.requestCursorID == "" {
+		return 0
+	}
+	if i := requestIndexOfID(requests, s.requestCursorID); i >= 0 {
+		return i
+	}
+	return clampIndex(s.requestCursorIdx, n)
+}
+
+// commitLiveSearch ends a `/` session KEEPING the live-applied query, then exits
+// the bar. The re-apply is the true mirror of the `s` bar's Enter: idempotent
+// once every keystroke has gone through liveApplySearch, but it guarantees a
+// value that reached the textinput without per-keystroke handling still commits
+// with its jump. Enter and a mouse menu-open (which blurs the bar) share it.
+func (b *BaseModel) commitLiveSearch() {
+	b.liveApplySearch(b.textInput.Value())
+	b.mode = ModeNormal
+	b.textInput.Blur()
+	b.searchSession = searchSession{}
+}
+
+// handleSearchKey handles keys in search mode. The `/` bar is LIVE (plan 030):
+// every keystroke that changes the term applies it and jumps the cursor,
+// Enter keeps the live result and exits, and Esc exits the bar.
 func (b *BaseModel) handleSearchKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		b.mode = ModeNormal
 		b.textInput.Blur()
+		b.searchSession = searchSession{}
 		return true, nil
 
 	case "enter":
-		b.mode = ModeNormal
-		b.textInput.Blur()
-		if b.viewMode == ViewModeRequests {
-			// Requests view: `/` is navigation, not filtration. Commit the query
-			// to requestSearchQuery (`s` filter untouched) and jump the cursor
-			// to the first match at-or-after it (D12).
-			b.requestSearchQuery = b.textInput.Value()
-			b.jumpToRequestSearchMatch()
-			b.updateViewport()
-			return true, nil
-		}
-		// Logs view: `/` is navigation, not filtration (D6/D8) — it mirrors the
-		// requests view. Commit the query to logSearchQuery (`s` filter
-		// untouched) and jump the cursor to the first match at-or-after the
-		// current position, wrapping. The scroll-to-match is a one-shot here
-		// rather than wired into updateViewport, which also runs on streaming
-		// arrivals and free j/k scroll where re-scrolling would fight the reader.
-		b.logSearchQuery = b.textInput.Value()
-		b.seekLogSearchMatch(0)
-		b.updateViewport()
-		b.ensureLogCursorVisible()
+		// `/` is navigation, not filtration, in BOTH views (D6/D8/D12): the
+		// query lands in logSearchQuery / requestSearchQuery and the `s` filter
+		// is untouched. commitLiveSearch routes by view.
+		b.commitLiveSearch()
 		return true, nil
 	}
 
+	before := b.textInput.Value()
 	var cmd tea.Cmd
 	b.textInput, cmd = b.textInput.Update(msg)
+	if value := b.textInput.Value(); value != before {
+		b.liveApplySearch(value)
+	}
 	return true, cmd
 }
 
@@ -1263,6 +1536,10 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 	case "/":
 		if b.viewMode != ViewModeRequestDetail {
+			// Capture the origin FIRST: the search is live from here on, and
+			// every keystroke restores to what the view looks like right now
+			// (plan 030 WS1).
+			b.captureSearchSession()
 			b.mode = ModeSearch
 			b.textInput.SetValue("")
 			b.textInput.Focus()
@@ -1477,17 +1754,6 @@ func requestDurationSearchText(req proxy.RequestRecord, stale bool) string {
 	}
 }
 
-// jumpToRequestSearchMatch moves the cursor to the first row matching
-// requestSearchQuery at-or-after the current cursor, wrapping (D12). "At-or-after"
-// is deliberate: a fresh search may already sit on the best match; n advances.
-// No-op when the query is empty or nothing matches (cursor unmoved). A match
-// disengages follow so the jump sticks (resolveRequestCursor would otherwise
-// re-pin to the newest row); it never RE-engages follow — a search jump is
-// positioning, not scrolling intent (D13).
-func (b *BaseModel) jumpToRequestSearchMatch() {
-	b.seekRequestSearchMatch(0)
-}
-
 // cycleRequestSearchMatch moves the cursor to the next (dir +1) or previous
 // (dir -1) matching row STRICTLY past the current cursor, wrapping (D13).
 func (b *BaseModel) cycleRequestSearchMatch(dir int) {
@@ -1495,22 +1761,39 @@ func (b *BaseModel) cycleRequestSearchMatch(dir int) {
 }
 
 // seekRequestSearchMatch scans the filtered list for a matching row and moves
-// the cursor to it. dir 0 = at-or-after the cursor (the `/`-commit jump,
-// includes the cursor's own row); dir +1/-1 = strictly next/previous (n/N).
-// Derived at keypress time — no match list is ever stored (D13).
+// the cursor to it, starting from the CURSOR (the n/N origin). dir 0 =
+// at-or-after the cursor, dir +1/-1 = strictly next/previous. Derived at
+// keypress time — no match list is ever stored (D13).
 func (b *BaseModel) seekRequestSearchMatch(dir int) {
 	if b.requestSearchQuery == "" {
 		return
 	}
 	requests := b.filteredProxyRequests()
+	if len(requests) == 0 {
+		return
+	}
+	b.seekRequestSearchMatchFrom(requests, b.cursorIdx, dir)
+}
+
+// seekRequestSearchMatchFrom is seekRequestSearchMatch's scan with an EXPLICIT
+// start index — live search (plan 030) seeks from the session origin, so a
+// second keystroke does not start where the first one landed.
+//
+// dir 0 is at-or-after start, wrapping, and includes start's own row: a fresh
+// search may already sit on the best match; n advances (D12). No-op when the
+// query is empty or nothing matches (cursor unmoved). A match disengages follow
+// so the jump sticks (resolveRequestCursor would otherwise re-pin to the newest
+// row); it never RE-engages follow — a search jump is positioning, not scrolling
+// intent (D13).
+func (b *BaseModel) seekRequestSearchMatchFrom(requests []proxy.RequestRecord, start, dir int) {
+	if b.requestSearchQuery == "" {
+		return
+	}
 	n := len(requests)
 	if n == 0 {
 		return
 	}
-	start := b.cursorIdx
-	if start < 0 {
-		start = 0
-	}
+	start = clampIndex(start, n)
 	if dir == 0 {
 		// At-or-after: offsets 0..n-1 forward, cursor row first.
 		for i := 0; i < n; i++ {
@@ -1582,11 +1865,21 @@ func (b *BaseModel) seekLogSearchMatch(dir int) {
 		return
 	}
 	entries := b.filteredEntries()
+	b.seekLogSearchMatchFrom(entries, b.logSearchOriginIdx(entries), dir)
+}
+
+// seekLogSearchMatchFrom is seekLogSearchMatch's scan with an EXPLICIT start
+// index. Live search (plan 030) seeks from the session origin rather than from
+// the parked cursor, so a second keystroke does not start where the first one
+// landed; the n/N path keeps the cursor-derived origin. It owns the empty-list
+// and empty-query guards for both paths, so start may be any int (it is clamped
+// here) and callers need not pre-check the slice.
+func (b *BaseModel) seekLogSearchMatchFrom(entries []domain.LogEntry, start, dir int) {
 	n := len(entries)
-	if n == 0 {
+	if b.logSearchQuery == "" || n == 0 {
 		return
 	}
-	start := b.logSearchOriginIdx(entries)
+	start = clampIndex(start, n)
 	if dir == 0 {
 		// At-or-after: offsets 0..n-1 forward, origin row first.
 		for i := 0; i < n; i++ {
@@ -1623,13 +1916,7 @@ func (b *BaseModel) seekLogSearchMatch(dir int) {
 func (b *BaseModel) logSearchOriginIdx(entries []domain.LogEntry) int {
 	n := len(entries)
 	if b.logCursorSeq != 0 {
-		for i, e := range entries {
-			if e.DisplaySeq == b.logCursorSeq {
-				return i
-			}
-		}
-		// Anchored line evicted: fall back to the clamped last-known index.
-		return clampIndex(b.logCursorIdx, n)
+		return logIndexForSeq(entries, b.logCursorSeq, b.logCursorIdx)
 	}
 	if b.followMode {
 		return n - 1
@@ -1658,6 +1945,36 @@ func (b *BaseModel) entryIndexContainingRow(entries []domain.LogEntry, row int) 
 		}
 	}
 	return clampIndex(row, n)
+}
+
+// logIndexForSeq resolves a DisplaySeq to its current index in entries — the
+// anchor surviving the eviction ring — and falls back to the clamped last-known
+// index when the line itself has been evicted. That fallback is bounded DRIFT,
+// not a position: it keeps the LIVE cursor in range (its only requirement) and
+// is wrong for a press-time anchor, which must resolve to the oldest retained
+// line instead (see sessionLogOriginIdx). An empty list yields 0, which every
+// caller feeds to setLogCursor, i.e. the no-cursor sentinel.
+func logIndexForSeq(entries []domain.LogEntry, seq int64, fallbackIdx int) int {
+	n := len(entries)
+	if n == 0 {
+		return 0
+	}
+	if i := entryIndexOfSeq(entries, seq); i >= 0 {
+		return i
+	}
+	return clampIndex(fallbackIdx, n)
+}
+
+// entryIndexOfSeq returns the index of the entry stamped with seq, or -1 when
+// that line is no longer retained. Callers that have a fallback index want
+// logIndexForSeq; this raw form is for the ones that must distinguish "evicted".
+func entryIndexOfSeq(entries []domain.LogEntry, seq int64) int {
+	for i, e := range entries {
+		if e.DisplaySeq == seq {
+			return i
+		}
+	}
+	return -1
 }
 
 // clampIndex clamps idx into [0, n-1] for a non-empty n (callers guard n > 0).
@@ -1726,14 +2043,8 @@ func (b *BaseModel) resolveLogCursor(entries []domain.LogEntry) {
 		b.setLogCursor(entries, len(entries)-1)
 		return
 	}
-	for i, e := range entries {
-		if e.DisplaySeq == b.logCursorSeq {
-			b.setLogCursor(entries, i)
-			return
-		}
-	}
-	// Anchored line evicted: clamp the last-known index and re-anchor.
-	b.setLogCursor(entries, b.logCursorIdx)
+	// Present: its current index; evicted: the clamped last-known index.
+	b.setLogCursor(entries, logIndexForSeq(entries, b.logCursorSeq, b.logCursorIdx))
 }
 
 // ensureLogCursorVisible scrolls the logs viewport the minimum amount needed to
@@ -1828,6 +2139,21 @@ func (b *BaseModel) setRequestCursor(requests []proxy.RequestRecord, idx int) {
 	b.cursorID = requests[idx].ID
 }
 
+// requestIndexOfID returns the index of the record carrying id, or -1 when that
+// row is no longer in the list (trimmed, or filtered out). "" is the no-cursor
+// sentinel — never a real ID — and reports -1 like any other absent row.
+func requestIndexOfID(requests []proxy.RequestRecord, id string) int {
+	if id == "" {
+		return -1
+	}
+	for i, req := range requests {
+		if req.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
 // resolveRequestCursor re-anchors the cursor against the current filtered list
 // at the render choke point, so every mutation source (upsert, append+trim,
 // live filter keystrokes, esc clear, follow toggles, view transitions) lands
@@ -1839,6 +2165,15 @@ func (b *BaseModel) setRequestCursor(requests []proxy.RequestRecord, idx int) {
 //     sits at that index (trim/filter removed the old row; empty→non-empty with
 //     follow off lands on row 0).
 func (b *BaseModel) resolveRequestCursor(requests []proxy.RequestRecord) {
+	b.anchorRequestCursor(requests, b.cursorID, b.cursorIdx)
+}
+
+// anchorRequestCursor is the cursor-anchoring rule itself, applied to an
+// (id, idx) pair: follow first, then the ID if that row is still present, then
+// the clamped last-known index. Shared by the render-time resolve (the live
+// cursor) and the `/` session restore (the press-time origin), which differ only
+// in whose identity they anchor on.
+func (b *BaseModel) anchorRequestCursor(requests []proxy.RequestRecord, id string, idx int) {
 	if len(requests) == 0 {
 		b.setRequestCursor(requests, 0) // resets to the no-cursor sentinel
 		return
@@ -1847,17 +2182,13 @@ func (b *BaseModel) resolveRequestCursor(requests []proxy.RequestRecord) {
 		b.setRequestCursor(requests, len(requests)-1)
 		return
 	}
-	if b.cursorID != "" { // "" is the no-cursor sentinel; never a real ID
-		for i, req := range requests {
-			if req.ID == b.cursorID {
-				b.setRequestCursor(requests, i)
-				return
-			}
-		}
+	if i := requestIndexOfID(requests, id); i >= 0 {
+		b.setRequestCursor(requests, i)
+		return
 	}
-	// Stale cursor (row filtered/trimmed away) or first anchor with follow off:
-	// clamp the last-known index and re-anchor to the row now there.
-	b.setRequestCursor(requests, b.cursorIdx)
+	// Row gone (filtered/trimmed away) or first anchor with follow off: clamp
+	// the last-known index and re-anchor to the row now there.
+	b.setRequestCursor(requests, idx)
 }
 
 // ensureCursorVisible scrolls the viewport the minimum amount needed to bring

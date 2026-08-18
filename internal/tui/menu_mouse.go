@@ -39,9 +39,14 @@ func (b *BaseModel) handleMenuMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
 	hits := b.mustHits()
 
 	// Mouse-open while a textinput mode is active: blur → ModeNormal first (Codex #4).
+	// For the live `/` bar the blur is Enter-equivalent (plan 030 WS2): the
+	// live-applied query stands and the session is cleared — the same contract
+	// the `s` bar already has here, its query likewise already live-applied.
 	blurTextMode := func() {
 		switch b.mode {
-		case ModeSearch, ModeStringFilter:
+		case ModeSearch:
+			b.commitLiveSearch()
+		case ModeStringFilter:
 			b.mode = ModeNormal
 			b.textInput.Blur()
 		}
