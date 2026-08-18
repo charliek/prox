@@ -58,7 +58,7 @@ Toggle the menu bar with `m`, the process panel with `p`. View preferences persi
 
 A single footer row carries everything that used to split across status and hint rows:
 
-- **Left:** typed status — mode prompts (`Search:` / `Filter:` while typing), committed search/filter/solo text, connection or restart messages, or the idle hint. Errors render as `✗ …` on the footer background.
+- **Left:** typed status — mode prompts (`Search:` / `Filter:` while typing — search applies live, jumping the cursor to matches on every keystroke), committed search/filter/solo text, connection or restart messages, or the idle hint. Errors render as `✗ …` on the footer background.
 - **Right:** `[Logs]` / `[Requests]` / `[Request Detail]`, `[FOLLOW]` / `[PAUSED]`, visible/total count, then two-tone key hints (`? help · m menu · / search · s filter · q stop`).
 
 The last hint is mode-aware: `q stop` under `prox up`, where quitting stops the processes, and `q quit` under `prox attach`, where it only detaches. The `?` help modal spells the same thing out in full.
@@ -159,7 +159,7 @@ Click a process chip in the panel (logs view) to solo that process — the same 
 | `p` | Toggle process panel |
 | `T` | Toggle timestamps in log lines |
 | `w` | Toggle soft-wrap in logs |
-| `Esc` | Clear filters/search/solo; back from detail |
+| `Esc` | Clear filters/search/solo; back from detail; while typing `/`, cancels the live search and restores the view to where `/` was pressed |
 | `q` | Quit (Normal mode) — under `prox up` this also stops the processes, under `prox attach` it only detaches; close help without quitting (Help mode); typed into search/filter bars while editing |
 | `ctrl+c` | Quit from any mode (including help and text entry), with the same stop-vs-detach meaning as `q` |
 
@@ -171,7 +171,7 @@ When the menu bar is visible:
 - Hover a sibling menu cell while a dropdown is open to slide the menu across the bar; hover dropdown rows to move the highlight.
 - With a menu open: `←`/`→`/`Tab` switch between menus; `↑`/`↓`/`j`/`k` navigate rows (separators skipped); the scroll wheel moves the highlight; `Enter`/`Space` activate; any other key closes the menu (except `?`, which closes the menu and opens help).
 - Long menus clamp to the frame with “… N more …” indicator rows; wheel scrolls the visible window.
-- Opening a menu by mouse while typing in a filter/search bar blurs the input first.
+- Opening a menu by mouse while typing in a filter/search bar blurs the input first — for the `/` bar this commits the live search (keeps what you typed), the same as `Enter`.
 
 Menu choices persist view toggles, theme, and (in Requests view) column visibility to `~/.prox/tui/config.toml` (`theme`, `[view]` keys: `process_panel`, `timestamps`, `wrap`, `menu_bar`, plus `[requests]` column booleans).
 
@@ -182,7 +182,7 @@ Menu choices persist view toggles, theme, and (in Requests view) column visibili
 | `1-9` | Solo process (toggle) |
 | `s` | Filter bar — query language, applied live |
 | `f` | Filter menu — process checks + log levels |
-| `/` | Search — jumps cursor to match (does not filter) |
+| `/` | Search — applied live as you type (does not filter); `Enter` keeps it, `Esc` cancels & restores; reopens seeded with the last committed search |
 | `n` / `N` | Next/previous search match |
 | `y` | Copy parked line (after click or `/` search cursor) |
 | `r` | Restart the soloed process |
@@ -234,7 +234,7 @@ Open the **View** menu (`v`) for a **Columns** checkbox section (Requests and Re
 | `G` / `End` | Cursor to bottom (resumes follow) |
 | `s` | Filter bar — query language |
 | `f` | Filter menu — status class + methods |
-| `/` | Search visible columns (navigate only) |
+| `/` | Search visible columns — applied live as you type (navigate only, not filter); `Enter` keeps it, `Esc` cancels & restores; reopens seeded with the last committed search |
 | `n` / `N` | Next/previous match |
 | `Enter` | Open detail for cursor row |
 | `y` | Copy full request ID |
@@ -279,7 +279,7 @@ Detail views live-update when the open request completes.
 
 ## Search vs. Filter
 
-- **`/`** navigates: jumps the cursor to matches without hiding rows/lines. Composes with an active `s` filter.
+- **`/`** navigates: applies live as you type, jumping the cursor to matches without hiding rows/lines. `Enter` keeps the result and exits the bar; `Esc` cancels and restores the view to where `/` was pressed. Composes with an active `s` filter. Reopening `/` seeds the bar with the view's last committed search.
 - **`s`** filters: hides non-matching entries using the query language above. Each view keeps its own filter across `Tab` switches.
 - The merged footer left side shows committed search as `/<query> (i/n)` (cursor on match *i* of *n*) or `/<query> (n matches)`, filter as `Filter: <query>`, or the idle hint. While typing, `Search:` / `Filter:` prompts take precedence.
 
