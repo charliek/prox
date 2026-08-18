@@ -228,3 +228,93 @@ func viewSweepLabel(mode ViewMode) string {
 		return "logs"
 	}
 }
+
+// TestFrameContract_LiveSearchStates covers the state combination plan 030
+// introduced and nothing before it could reach: ModeSearch (the typing bar in
+// the footer) with the view's committed query ALREADY non-empty, so the logs
+// pane carries the 2-column marker gutter, a ❯ cursor row and inline highlight
+// runs WHILE the input is focused. Every row of a prox frame is exactly
+// terminal-width wide, so a single mis-counted row or over-wide footer wraps,
+// scrolls the terminal, and (because the renderer only repaints changed rows)
+// never heals — the failure mode the plan-030 PTY smoke went looking for.
+//
+// TestFrameContract_Sweep does not reach here: it drives views, settings, help
+// and menus, but never a text-input mode. Wrap is included because the marker
+// gutter is the one thing that genuinely moves wrap points, and the sizes go
+// narrow because the footer carries the fixed-width search input next to the
+// status bands.
+func TestFrameContract_LiveSearchStates(t *testing.T) {
+	sizes := []struct{ w, h int }{{120, 35}, {80, 24}, {40, 12}, {20, 8}}
+	for _, sz := range sizes {
+		for _, wrap := range []bool{false, true} {
+			cfg := DefaultSettings()
+			cfg.Wrap = wrap
+			name := fmt.Sprintf("w%dh%d_wrap%t", sz.w, sz.h, wrap)
+
+			t.Run("logs_"+name, func(t *testing.T) {
+				m := primedFrameModel(t, sz.w, sz.h, cfg, ViewModeLogs)
+				for i := 0; i < 30; i++ {
+					m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+						Process: "web", Line: fmt.Sprintf("line %02d hello world", i),
+					}))
+				}
+
+				// (a) bar open with a live query parked on a match (the smoke's F3).
+				m = clientUpdate(m, keyRune('/'))
+				m = typeSearch(m, "hello")
+				require.Equal(t, ModeSearch, m.mode)
+				require.NotEmpty(t, m.logSearchQuery, "the new combo: typing bar AND committed query")
+				require.GreaterOrEqual(t, m.logCursorIdx, 0, "a match is parked, so the ❯ gutter is rendered")
+				assertFrameContract(t, m)
+
+				// (b) the same, after entries arrive while the bar is open.
+				for i := 0; i < 5; i++ {
+					m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+						Process: "web", Line: fmt.Sprintf("arrival %02d hello", i),
+					}))
+				}
+				assertFrameContract(t, m)
+
+				// (c) after Esc cancels back to the origin (the smoke's F4).
+				m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+				require.Equal(t, ModeNormal, m.mode)
+				require.Empty(t, m.logSearchQuery)
+				assertFrameContract(t, m)
+
+				// (d) committed query, then reopened seeded (the smoke's F5/F6).
+				m = commitSearch(m, "hello")
+				require.Equal(t, "hello", m.logSearchQuery)
+				assertFrameContract(t, m)
+				m = clientUpdate(m, keyRune('/'))
+				require.Equal(t, "hello", m.textInput.Value(), "reopened seeded")
+				assertFrameContract(t, m)
+			})
+
+			t.Run("requests_"+name, func(t *testing.T) {
+				m := primedFrameModel(t, sz.w, sz.h, cfg, ViewModeRequests)
+				for i := 0; i < 20; i++ {
+					m = clientUpdate(m, ProxyRequestMsg(newArrival(
+						fmt.Sprintf("req-%03d", i), fmt.Sprintf("/hello/%02d", i))))
+				}
+
+				m = clientUpdate(m, keyRune('/'))
+				m = typeSearch(m, "hello")
+				require.Equal(t, ModeSearch, m.mode)
+				require.NotEmpty(t, m.requestSearchQuery)
+				assertFrameContract(t, m)
+
+				m = clientUpdate(m, ProxyRequestMsg(newArrival("req-late", "/hello/late")))
+				assertFrameContract(t, m)
+
+				m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+				require.Empty(t, m.requestSearchQuery)
+				assertFrameContract(t, m)
+
+				m = commitSearch(m, "hello")
+				assertFrameContract(t, m)
+				m = clientUpdate(m, keyRune('/'))
+				assertFrameContract(t, m)
+			})
+		}
+	}
+}
