@@ -279,7 +279,7 @@ Detail views live-update when the open request completes.
 
 ## Search vs. Filter
 
-- **`/`** navigates: applies live as you type, jumping the cursor to matches without hiding rows/lines. `Enter` keeps the result and exits the bar; `Esc` cancels and restores the view to where `/` was pressed. Composes with an active `s` filter. Reopening `/` seeds the bar with the view's last committed search.
+- **`/`** navigates: applies live as you type, jumping the cursor to matches without hiding rows/lines. `Enter` keeps the result and exits the bar; `Esc` cancels — clearing the view's search, including a previously committed query the bar was seeded with, and restoring cursor, scroll, and follow to where `/` was pressed. Composes with an active `s` filter. Reopening `/` seeds the bar with the view's last committed search.
 - **`s`** filters: hides non-matching entries using the query language above. Each view keeps its own filter across `Tab` switches.
 - The merged footer left side shows committed search as `/<query> (i/n)` (cursor on match *i* of *n*) or `/<query> (n matches)`, filter as `Filter: <query>`, or the idle hint. While typing, `Search:` / `Filter:` prompts take precedence.
 

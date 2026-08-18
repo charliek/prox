@@ -141,7 +141,7 @@ func (b *BaseModel) requestsHelpSections() []helpSection {
 				{key: "f", desc: "Filter menu (status class, methods)"},
 				{key: "/", desc: "Search visible columns (live, navigate — not filter)"},
 				{key: "n/N", desc: "Next/previous search match"},
-				{key: "Esc", desc: "Back from detail, clear filters/search, or cancel while typing"},
+				{key: "Esc", desc: "Back from detail, clear filters/search (typing: cancel & restore)"},
 			},
 		},
 		{
