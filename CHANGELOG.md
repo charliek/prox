@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.4.0
+
+The first-impression release. Foreground `prox up` now opens the TUI by
+default and exits when the whole stack is dead (plan 026, plan 028); the
+daemon grew a warning channel that puts mkcert's own untrusted-CA note and
+unresolvable-hostname warnings in front of the user (plan 028, #97, #98) —
+with CA detection kept off the critical path: the trust probe plan 028
+introduced was removed again after measurement, in favor of generation-time
+detection only (plan 029). Underneath: the integration suite was rebuilt for
+isolation and truthfulness (plan 027), and the docs moved to Zensical with
+the shared StrideLabs theme (plan 025).
 
 ### Changed
 
