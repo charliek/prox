@@ -71,9 +71,9 @@ func (b *BaseModel) logsHelpSections() []helpSection {
 				{key: "s", desc: "Filter bar (query language, live)"},
 				{key: "", desc: "e.g. proc:api level:error -health"},
 				{key: "f", desc: "Filter menu (process + level checks)"},
-				{key: "/", desc: "Search — jump cursor to match (does not hide lines)"},
+				{key: "/", desc: "Search (live) — cursor jumps as you type (does not hide lines)"},
 				{key: "n/N", desc: "Next/previous search match"},
-				{key: "Esc", desc: "Clear filters, search, and solo"},
+				{key: "Esc", desc: "Clear filters, search, and solo (while typing: cancel & restore)"},
 			},
 		},
 		{
@@ -139,9 +139,9 @@ func (b *BaseModel) requestsHelpSections() []helpSection {
 				{key: "s", desc: "Filter bar (query language, live)"},
 				{key: "", desc: "e.g. method:GET status:5xx host:api url:/orders"},
 				{key: "f", desc: "Filter menu (status class, methods)"},
-				{key: "/", desc: "Search visible columns (navigate, not filter)"},
+				{key: "/", desc: "Search visible columns (live, navigate — not filter)"},
 				{key: "n/N", desc: "Next/previous search match"},
-				{key: "Esc", desc: "Back from detail, or clear filters/search"},
+				{key: "Esc", desc: "Back from detail, clear filters/search (typing: cancel & restore)"},
 			},
 		},
 		{

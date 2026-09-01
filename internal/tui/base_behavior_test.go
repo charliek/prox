@@ -1698,3 +1698,960 @@ func finalRecordFor(id string) proxy.RequestRecord {
 		},
 	}
 }
+
+// --- Live (incremental) `/` search tests (plan 030 C1 / WS1-WS2) ---
+
+// typeSearch drives REAL per-rune keystrokes into an open `/` bar. The live path
+// runs off textinput value changes, so it must be exercised keystroke by
+// keystroke — commitSearch's SetValue deliberately bypasses it and only the
+// Enter re-apply saves it (plan 030 WS2).
+func typeSearch(m ClientModel, term string) ClientModel {
+	for _, r := range term {
+		m = clientUpdate(m, keyRune(r))
+	}
+	return m
+}
+
+// backspaceSearch is typeSearch's inverse: n real backspace keystrokes, the
+// keys that shrink a term back toward the origin.
+func backspaceSearch(m ClientModel, n int) ClientModel {
+	for i := 0; i < n; i++ {
+		m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	return m
+}
+
+// liveSearchRequests builds requests whose URLs make prefix typing meaningful:
+// "a" and "ab" first match q1, "abc" only q3. IDs, method, status and duration
+// carry none of those letters, so a one-rune term can only match a URL.
+func liveSearchRequests() []proxy.RequestRecord {
+	base := time.Unix(0, 0)
+	urls := []string{"/zero", "/ab-hit", "/filler", "/abc-hit", "/end"}
+	reqs := make([]proxy.RequestRecord, len(urls))
+	for i, u := range urls {
+		reqs[i] = proxy.RequestRecord{
+			ID: fmt.Sprintf("q%d", i), Timestamp: base.Add(time.Duration(i) * time.Second),
+			Method: "GET", URL: u, StatusCode: 200, Duration: 5 * time.Millisecond,
+		}
+	}
+	return reqs
+}
+
+func TestLiveSearch_LogsSeeksFromOriginPerKeystroke(t *testing.T) {
+	m := newLogsModel(20, []string{"zero", "ab hit", "filler", "abc hit", "tail"})
+	m = clientUpdate(m, keyRune('g')) // top, follow off -> origin is row 0
+	m = clientUpdate(m, keyRune('/'))
+
+	// Each keystroke applies the term and jumps — no Enter involved.
+	m = typeSearch(m, "a")
+	assert.Equal(t, "a", m.logSearchQuery, "the keystroke writes the committed query field")
+	assert.Equal(t, "ab hit", logCursorLine(t, m))
+	m = typeSearch(m, "b")
+	assert.Equal(t, "ab hit", logCursorLine(t, m))
+	m = typeSearch(m, "c")
+	assert.Equal(t, "abc hit", logCursorLine(t, m), "a narrower term seeks on from the ORIGIN, not from row 1")
+
+	// Backspacing to a shorter term must find the match the previous landing had
+	// already passed — the whole point of restore-then-seek. Seeking from the
+	// cursor would strand it on "abc hit", which also contains "ab".
+	m = backspaceSearch(m, 1)
+	assert.Equal(t, "ab", m.logSearchQuery)
+	assert.Equal(t, "ab hit", logCursorLine(t, m), "backspace re-seeks from the origin")
+}
+
+func TestLiveSearch_RequestsSeeksFromOriginPerKeystroke(t *testing.T) {
+	m := newSearchModel(20, liveSearchRequests())
+	m = clientUpdate(m, keyRune('g')) // cursor q0, follow off -> origin is q0
+	require.Equal(t, "q0", m.cursorID)
+	m = clientUpdate(m, keyRune('/'))
+
+	m = typeSearch(m, "a")
+	assert.Equal(t, "a", m.requestSearchQuery)
+	assert.Equal(t, "q1", m.cursorID)
+	m = typeSearch(m, "b")
+	assert.Equal(t, "q1", m.cursorID)
+	m = typeSearch(m, "c")
+	assert.Equal(t, "q3", m.cursorID, "a narrower term seeks on from the ORIGIN row")
+
+	m = backspaceSearch(m, 1)
+	assert.Equal(t, "q1", m.cursorID, "backspace re-seeks from the origin")
+
+	// Emptying the bar previews a cleared search: no query, cursor back on the
+	// origin row, `s` filter never touched.
+	m = backspaceSearch(m, 2)
+	assert.Empty(t, m.requestSearchQuery)
+	assert.Equal(t, "q0", m.cursorID, "an empty bar leaves the cursor at the origin")
+	assert.Empty(t, m.requestsFilter.RawQuery)
+}
+
+func TestLiveSearch_EmptyInputRestoresOriginView(t *testing.T) {
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	lines[20] = "abc target"
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	require.False(t, m.followMode)
+	m.viewport.SetYOffset(2) // origin: top visible row 2, no parked cursor
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "abc")
+	require.Equal(t, 20, m.logCursorIdx)
+	require.NotEqual(t, 2, m.viewport.YOffset, "the live jump scrolled away from the origin")
+
+	// Backspace the term away: identical to no search at the origin.
+	m = backspaceSearch(m, 3)
+	assert.Empty(t, m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx, "an empty bar leaves no cursor")
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.Equal(t, 2, m.viewport.YOffset, "the view is back at the origin scroll position")
+	assert.NotContains(t, m.viewport.View(), "❯", "no marker renders without a query")
+}
+
+func TestLiveSearch_NoMatchWhileTypingClearsCursorAtOrigin(t *testing.T) {
+	m := newLogsModel(20, []string{"alpha", "hit here", "gamma"})
+	m = clientUpdate(m, keyRune('g')) // origin: row 0, follow off
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "hit")
+	require.Equal(t, "hit here", logCursorLine(t, m))
+
+	m = typeSearch(m, "z") // "hitz" matches nothing
+	assert.Equal(t, "hitz", m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx, "a no-match keystroke clears the cursor")
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.Equal(t, 0, m.viewport.YOffset, "the view stays at the origin")
+
+	// A no-match keystroke must NOT disengage follow: only a jump that lands off
+	// the newest row does that, and there is no jump here (setLogCursor never
+	// touches followMode).
+	m2 := newLogsModel(20, []string{"a", "b", "c"})
+	require.True(t, m2.followMode)
+	m2 = clientUpdate(m2, keyRune('/'))
+	m2 = typeSearch(m2, "zzz")
+	assert.True(t, m2.followMode, "a no-match keystroke leaves follow engaged")
+	assert.Equal(t, -1, m2.logCursorIdx)
+}
+
+func TestLiveSearch_LogsArrivalsWhileBarOpen(t *testing.T) {
+	// The origin under follow is the row that was newest AT THE PRESS, not
+	// whatever has streamed in since: the at-or-after seek must find the ARRIVED
+	// match rather than wrapping around to the older one.
+	m := newLogsModel(20, []string{"a needle", "b", "c"})
+	require.True(t, m.followMode)
+	m = clientUpdate(m, keyRune('/'))
+
+	for i, line := range []string{"d needle", "e"} {
+		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+			Timestamp: time.Unix(int64(10+i), 0),
+			Process:   "p",
+			Line:      line,
+		}))
+	}
+
+	m = typeSearch(m, "needle")
+	assert.Equal(t, "d needle", logCursorLine(t, m),
+		"the seek starts at the press-time newest row, so the arrival is the first match at-or-after it")
+}
+
+func TestLiveSearch_LogsEvictionWhileBarOpen(t *testing.T) {
+	// Sized like any logs model, but fed DIRECTLY (not through clientUpdate):
+	// this test needs ~1200 entries to push past the eviction ring, and a full
+	// re-render per line would dominate its runtime.
+	m := newLogsModel(5, nil)
+	feed := func(line string) {
+		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
+	}
+	for i := 0; i < 300; i++ {
+		feed(fmt.Sprintf("log %04d", i))
+	}
+	feed("NEEDLE row")
+	for i := 0; i < 300; i++ {
+		feed(fmt.Sprintf("log %04d", 300+i))
+	}
+
+	m = clientUpdate(m, keyRune('g')) // origin: oldest retained line, follow off
+	m = clientUpdate(m, keyRune('/'))
+	originSeq := m.searchSession.logAnchorSeq
+	require.NotZero(t, originSeq)
+
+	// Stream past the ring while the bar is open: the origin anchor is evicted
+	// outright, so the restore falls back to the oldest retained line.
+	for i := 0; i < 600; i++ {
+		feed(fmt.Sprintf("flood %04d", i))
+	}
+	require.Len(t, m.logEntries, maxLogEntries)
+	for _, e := range m.logEntries {
+		require.NotEqual(t, originSeq, e.DisplaySeq, "the origin anchor has been evicted")
+	}
+
+	m = typeSearch(m, "NEEDLE")
+	require.GreaterOrEqual(t, m.logCursorIdx, 0, "the search still lands with an evicted origin")
+	assert.Contains(t, logCursorLine(t, m), "NEEDLE")
+	sp, ok := m.logRowSpans[m.logCursorSeq]
+	require.True(t, ok)
+	assert.True(t, sp.Last >= m.viewport.YOffset && sp.First < m.viewport.YOffset+m.viewport.Height,
+		"the live jump scrolled the match into view")
+}
+
+func TestLiveSearch_LogsEvictedOriginSeeksFromOldestRetained(t *testing.T) {
+	// The ring evicts from the FRONT, so an evicted origin sat before every line
+	// still retained: the at-or-after scan has to start at the oldest retained
+	// line. Resuming from the origin's remembered INDEX would point mid-list and
+	// skip the true first match — which is why the session anchors carry no
+	// index at all (see sessionLogOriginIdx).
+	m := newLogsModel(5, nil)
+	feed := func(line string) {
+		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
+	}
+	for i := 0; i < maxLogEntries; i++ {
+		switch i {
+		case 400:
+			feed("NEEDLE early")
+		case 900:
+			feed("NEEDLE late")
+		default:
+			feed(fmt.Sprintf("log %04d", i))
+		}
+	}
+
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	m.viewport.SetYOffset(200)        // origin: entry 200, well into the list
+	m = clientUpdate(m, keyRune('/'))
+	originSeq := m.searchSession.logAnchorSeq
+	require.NotZero(t, originSeq)
+
+	// Flood past the origin while the bar is open: it is evicted, BOTH matches
+	// survive, and the origin's old index now points between them.
+	for i := 0; i < 300; i++ {
+		feed(fmt.Sprintf("flood %04d", i))
+	}
+	entries := m.filteredEntries()
+	require.Equal(t, -1, entryIndexOfSeq(entries, originSeq), "the origin anchor was evicted")
+	require.Contains(t, entries[100].Line, "NEEDLE early")
+	require.Contains(t, entries[600].Line, "NEEDLE late")
+
+	m = typeSearch(m, "NEEDLE")
+	assert.Equal(t, "NEEDLE early", logCursorLine(t, m),
+		"an evicted origin seeks from the oldest retained line, not from a stale index")
+}
+
+func TestLiveSearch_EmptyListAtPressSeeksFromFirstArrival(t *testing.T) {
+	// Nothing on screen when `/` was pressed, so every line retained now arrived
+	// AFTER the press: the at-or-after origin is the oldest of them. Degrading to
+	// the ordinary follow-mode origin (the newest row) would wrap and land on the
+	// LAST match instead of the first.
+	m := newLogsModel(20, nil)
+	require.True(t, m.followMode)
+	require.Empty(t, m.filteredEntries())
+
+	m = clientUpdate(m, keyRune('/'))
+	require.Zero(t, m.searchSession.logAnchorSeq, "an empty list has no anchor to capture")
+
+	for i, line := range []string{"first needle", "second needle"} {
+		m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+			Timestamp: time.Unix(int64(i), 0),
+			Process:   "p",
+			Line:      line,
+		}))
+	}
+
+	m = typeSearch(m, "needle")
+	assert.Equal(t, "first needle", logCursorLine(t, m),
+		"the origin is the oldest line that arrived after the press")
+}
+
+func TestLiveSearch_RequestsArrivalsWhileBarOpen(t *testing.T) {
+	// The requests origin is the cursor row's ID, so a rebuild that drops older
+	// rows (a reconnect sync) shifts every index without moving the origin.
+	reqs := []proxy.RequestRecord{
+		newArrival("r0", "/needle-old"),
+		newArrival("r1", "/x1"),
+		newArrival("r2", "/x2"),
+		newArrival("r3", "/needle-mid"),
+		newArrival("r4", "/x4"),
+	}
+	m := newSearchModel(20, reqs)
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j'))
+	m = clientUpdate(m, keyRune('j'))
+	require.Equal(t, "r2", m.cursorID, "origin: the r2 row")
+	m = clientUpdate(m, keyRune('/'))
+
+	// A live arrival, then a sync rebuild that drops the two oldest rows: r2 is
+	// now index 0, and the old index 2 holds r4.
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("r5", "/needle-new")))
+	m = clientUpdate(m, RequestsSyncMsg{Snapshot: []proxy.RequestRecord{
+		reqs[2], reqs[3], reqs[4], newArrival("r5", "/needle-new"),
+	}})
+	require.Equal(t, "r2", m.cursorID, "the ID-anchored cursor rode the rebuild")
+
+	m = typeSearch(m, "needle")
+	assert.Equal(t, "r3", m.cursorID,
+		"the seek starts at the origin RECORD (now index 0), not at its old index")
+}
+
+func TestLiveSearch_ComposesWithStringFilter(t *testing.T) {
+	m := newLogsModel(20, []string{
+		"keep needle-a", "drop needle-b", "keep plain", "keep needle-c", "drop needle-d",
+	})
+	m.setLogsFilterQuery("keep") // active `s` filter -> rows 0,2,3 survive
+	m.followMode = false
+	m.updateViewport()
+	m = clientUpdate(m, keyRune('g')) // origin: top of the FILTERED list
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "needle")
+	assert.Equal(t, "keep needle-a", logCursorLine(t, m), "live search runs within the filtered set")
+	m = typeSearch(m, "-c")
+	assert.Equal(t, "keep needle-c", logCursorLine(t, m), "narrowing skips the filtered-out drop rows")
+	assert.Equal(t, "keep", m.logsFilter.RawQuery, "the `s` filter is untouched")
+	assert.Len(t, m.filteredEntries(), 3, "search never hides lines the filter kept")
+}
+
+func TestLiveSearch_EnterOnEmptyBarClearsCommittedSearch(t *testing.T) {
+	m := newLogsModel(20, []string{"aaa", "needle", "bbb"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.logSearchQuery)
+	require.Equal(t, 1, m.logCursorIdx)
+
+	// Reopen (the bar comes up seeded — plan 030 WS4), clear it, and commit the
+	// empty bar: a committed CLEARED search.
+	m = clientUpdate(m, keyRune('/'))
+	require.Equal(t, "needle", m.textInput.Value(), "the reopened bar carries the previous term")
+	m = backspaceSearch(m, len("needle"))
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Empty(t, m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.False(t, m.searchSession.active, "the session is cleared on exit")
+	assert.NotContains(t, m.viewport.View(), "❯")
+}
+
+func TestLiveSearch_EnterKeepsLandingAndNextPrevCycleFromIt(t *testing.T) {
+	m := newLogsModel(20, []string{"needle a", "x", "needle b", "z"})
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "needle")
+	require.Equal(t, 0, m.logCursorIdx)
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Equal(t, "needle", m.logSearchQuery, "Enter keeps the live-applied query")
+	assert.Equal(t, 0, m.logCursorIdx, "and the live landing")
+	assert.False(t, m.searchSession.active)
+
+	m = clientUpdate(m, keyRune('n'))
+	assert.Equal(t, 2, m.logCursorIdx, "n cycles on from the live landing")
+	m = clientUpdate(m, keyRune('n'))
+	assert.Equal(t, 0, m.logCursorIdx, "n wraps")
+	m = clientUpdate(m, keyRune('N'))
+	assert.Equal(t, 2, m.logCursorIdx)
+}
+
+func TestLiveSearch_CursorMovementKeysDoNotReseek(t *testing.T) {
+	// Cursor-movement keys leave the term alone, so they must re-run neither the
+	// O(n) scan nor the restore — the live apply is gated on the value actually
+	// changing. Parking the search cursor somewhere a re-seek would move it away
+	// from is what makes the no-op observable.
+	m := newLogsModel(20, []string{"zero", "ab hit", "filler", "abc hit", "tail"})
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "abc")
+	require.Equal(t, 3, m.logCursorIdx)
+	m.setLogCursor(m.filteredEntries(), 0)
+
+	for _, kt := range []tea.KeyType{tea.KeyLeft, tea.KeyRight, tea.KeyHome, tea.KeyEnd} {
+		m = clientUpdate(m, tea.KeyMsg{Type: kt})
+	}
+	assert.Equal(t, "abc", m.logSearchQuery, "movement keys are not text")
+	assert.Equal(t, 0, m.logCursorIdx, "movement keys must not re-seek")
+	assert.Equal(t, ModeSearch, m.mode)
+}
+
+func TestLiveSearch_MouseMenuOpenCommitsLiveQuery(t *testing.T) {
+	// Mouse-open blurs the bar; for `/` that is Enter-equivalent (plan 030 WS2):
+	// the live-applied query stands and the session is cleared.
+	m := newLogsModel(20, []string{"alpha", "needle here", "gamma"})
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "needle")
+	require.Equal(t, 1, m.logCursorIdx)
+
+	_ = m.View() // record hit-rects for the menu bar
+	require.NotEmpty(t, m.mustHits().menuCells)
+	hit := m.mustHits().menuCells[0]
+	m = clientUpdate(m, tea.MouseMsg{
+		X:      hit.Rect.X,
+		Y:      hit.Rect.Y,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.True(t, m.menuOpen())
+	assert.Equal(t, "needle", m.logSearchQuery, "the live query stands after the blur")
+	assert.Equal(t, 1, m.logCursorIdx, "and so does its landing")
+	assert.False(t, m.searchSession.active, "the session is cleared")
+}
+
+func TestLiveSearch_RequestsFollowArrivalsSeekFromPressTimeNewest(t *testing.T) {
+	// Under follow the restore pins the CURSOR to the current newest row — right
+	// for the view, which is what follow means — but the seek must still start on
+	// the row `/` was pressed on. Seeking from the restored cursor would wrap
+	// past the arrival onto the older match, and flip the landing on every
+	// arrival mid-typing.
+	m := newSearchModel(20, []proxy.RequestRecord{
+		newArrival("r0", "/match-a"),
+		newArrival("r1", "/x1"),
+		newArrival("r2", "/x2"),
+	})
+	require.True(t, m.followMode)
+	require.Equal(t, "r2", m.cursorID, "follow pins the cursor to the press-time newest row")
+
+	m = clientUpdate(m, keyRune('/'))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("r3", "/match-b")))
+	m = clientUpdate(m, ProxyRequestMsg(newArrival("r4", "/x4")))
+	require.Equal(t, "r4", m.cursorID, "follow moved the live cursor to the newest arrival")
+
+	m = typeSearch(m, "match")
+	assert.Equal(t, "r3", m.cursorID,
+		"the seek starts at the press-time newest row, so the arrival is the first match at-or-after it")
+	assert.False(t, m.followMode, "the jump landed off the newest row")
+}
+
+func TestLiveSearch_EmptyInputRestoresOriginViewUnderWrap(t *testing.T) {
+	// With wrap on, the 2-column marker prefix a non-empty query adds MOVES wrap
+	// points — these lines are sized to flip from one display row to two — so the
+	// row spans the restore translates its anchor through are stale the moment
+	// the query changes. Emptying the bar must land on the anchor's row in the
+	// render the user actually sees, not in the marker-era one.
+	lines := make([]string, 40)
+	for i := range lines {
+		lines[i] = strings.Repeat("x", 38)
+	}
+	lines[30] = "abc" + strings.Repeat("x", 35)
+	m := newLogsModelNarrow(60, 6, lines)
+	m.settings.Wrap = true
+	m.followMode = false
+	m.updateViewport()
+	m.viewport.SetYOffset(20)
+
+	m = clientUpdate(m, keyRune('/'))
+	anchorSeq := m.searchSession.logAnchorSeq
+	require.NotZero(t, anchorSeq)
+	require.Equal(t, 20, m.logRowSpans[anchorSeq].First, "one row per entry while no query is set")
+
+	m = typeSearch(m, "abc")
+	require.Equal(t, 30, m.logCursorIdx, "the live jump moved the view off the origin")
+	require.Equal(t, 40, m.logRowSpans[anchorSeq].First, "the marker prefix wrapped every entry onto two rows")
+
+	m = backspaceSearch(m, 3)
+	require.Empty(t, m.logSearchQuery)
+	assert.Equal(t, m.logRowSpans[anchorSeq].First, m.viewport.YOffset,
+		"the restored offset is the anchor's row in the CURRENT (marker-free) render")
+	assert.Equal(t, 20, m.viewport.YOffset)
+}
+
+// --- `/` bar Esc-cancel tests (plan 030 C2 / WS3) ---
+
+func TestLiveSearch_EscRestoresLogsOrigin(t *testing.T) {
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	lines[20] = "abc target"
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	m.viewport.SetYOffset(2)          // origin: top visible row 2, no parked cursor
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "abc")
+	require.Equal(t, 20, m.logCursorIdx)
+	require.NotEqual(t, 2, m.viewport.YOffset, "the live jump scrolled away from the origin")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Empty(t, m.logSearchQuery, "esc cancels the search, not just the edit")
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.Equal(t, 2, m.viewport.YOffset, "the view is back where `/` was pressed")
+	assert.False(t, m.followMode, "follow as of the press")
+	assert.False(t, m.searchSession.active, "the session is cleared")
+	assert.NotContains(t, m.viewport.View(), "❯", "a cancelled search renders as if it never happened")
+}
+
+func TestLiveSearch_EscRestoresRequestsOrigin(t *testing.T) {
+	m := newSearchModel(20, liveSearchRequests())
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j'))
+	require.Equal(t, "q1", m.cursorID, "origin: the q1 row, follow off")
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "abc")
+	require.Equal(t, "q3", m.cursorID, "the live jump moved the cursor off the origin")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Empty(t, m.requestSearchQuery)
+	assert.Equal(t, "q1", m.cursorID, "the cursor is back on the origin row")
+	assert.False(t, m.followMode)
+	assert.False(t, m.searchSession.active)
+}
+
+func TestLiveSearch_EscScopedToActiveView(t *testing.T) {
+	// Esc cancels the ACTIVE view's search only — the `s` bar's Esc scoping.
+	// Clearing both views is normal-mode Esc's job, and it is untouched.
+	m := newLogsModel(20, []string{"alpha", "needle here", "gamma"})
+	m.proxyRequests = makeTestRequests(6)
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.logSearchQuery)
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyTab})
+	require.Equal(t, ViewModeRequests, m.viewMode)
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "path/003")
+	require.Equal(t, "req-003", m.cursorID)
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.requestSearchQuery, "the active view's search is cancelled")
+	assert.Equal(t, "needle", m.logSearchQuery, "the other view's committed search survives")
+}
+
+func TestLiveSearch_EscEvictedLogsOriginRestoresOldestRetained(t *testing.T) {
+	// Best-effort restore: the ring evicted the row the view was anchored on
+	// while the bar was open, so the closest truth left is the oldest line still
+	// retained.
+	m := newLogsModel(5, nil)
+	feed := func(line string) {
+		m.handleLogEntry(domain.LogEntry{Timestamp: time.Unix(0, 0), Process: "p", Line: line})
+	}
+	for i := 0; i < maxLogEntries; i++ {
+		if i == 400 {
+			feed("NEEDLE row")
+			continue
+		}
+		feed(fmt.Sprintf("log %04d", i))
+	}
+
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	m.viewport.SetYOffset(200)        // origin: entry 200, well into the list
+	m = clientUpdate(m, keyRune('/'))
+	originSeq := m.searchSession.logAnchorSeq
+	require.NotZero(t, originSeq)
+	m = typeSearch(m, "NEEDLE")
+	require.GreaterOrEqual(t, m.logCursorIdx, 0)
+
+	// The origin scrolls out of the ring while the bar is still open.
+	for i := 0; i < 300; i++ {
+		feed(fmt.Sprintf("flood %04d", i))
+	}
+	require.Equal(t, -1, entryIndexOfSeq(m.filteredEntries(), originSeq), "the origin anchor was evicted")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.Equal(t, 0, m.viewport.YOffset, "an evicted origin restores to the oldest retained line")
+	assert.False(t, m.followMode, "and not by silently re-engaging follow")
+}
+
+func TestLiveSearch_EscDroppedRequestsOriginFallsBackToNearestIndex(t *testing.T) {
+	reqs := []proxy.RequestRecord{
+		newArrival("r0", "/x0"),
+		newArrival("r1", "/x1"),
+		newArrival("r2", "/x2"),
+		newArrival("r3", "/x3"),
+		newArrival("r4", "/x4"),
+		newArrival("r5", "/hit-far"),
+	}
+	m := newSearchModel(20, reqs)
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('j'))
+	m = clientUpdate(m, keyRune('j'))
+	require.Equal(t, "r2", m.cursorID, "origin: the r2 row, follow off")
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "hit")
+	require.Equal(t, "r5", m.cursorID, "the live jump moved the cursor off the origin")
+
+	// A reconnect sync rebuilds the list without the origin record.
+	m = clientUpdate(m, RequestsSyncMsg{Snapshot: []proxy.RequestRecord{
+		reqs[0], reqs[1], reqs[3], reqs[4], reqs[5],
+	}})
+	require.Equal(t, -1, requestIndexOfID(m.filteredProxyRequests(), "r2"), "the origin record is gone")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.requestSearchQuery)
+	assert.Equal(t, "r3", m.cursorID, "a dropped origin record falls back to its index, now r3")
+	assert.False(t, m.followMode)
+}
+
+func TestLiveSearch_EscRestoresFollow(t *testing.T) {
+	// A live jump off the newest row disengages follow (it has to, or the pin to
+	// newest would undo the jump). Cancelling gives follow back, both views, and
+	// the view re-lands on newest — the restored follow WINS over the positional
+	// anchor.
+	m := newLogsModel(20, []string{"a", "hit mid", "c", "d"})
+	require.True(t, m.followMode)
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "hit")
+	require.Equal(t, 1, m.logCursorIdx)
+	require.False(t, m.followMode, "the live jump landed off the newest row")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.True(t, m.followMode, "esc restores follow as of the press")
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.True(t, m.viewport.AtBottom(), "restored follow re-lands on newest")
+
+	// And the cancelled search leaves no parked guard behind: arrivals follow
+	// again, exactly as they did before `/` was pressed.
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Unix(9, 0), Process: "p", Line: "e newest",
+	}))
+	assert.True(t, m.followMode, "an arrival after a cancelled search still follows")
+
+	reqs := makeTestRequests(6)
+	reqs[2].URL = "/hit/mid"
+	m2 := newSearchModel(20, reqs)
+	require.True(t, m2.followMode)
+	m2 = clientUpdate(m2, keyRune('/'))
+	m2 = typeSearch(m2, "hit")
+	require.Equal(t, 2, m2.cursorIdx)
+	require.False(t, m2.followMode)
+
+	m2 = clientUpdate(m2, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.True(t, m2.followMode)
+	assert.Equal(t, "req-005", m2.cursorID, "restored follow re-pins the cursor to newest")
+}
+
+func TestLiveSearch_EscClearsPreviouslyCommittedSearch(t *testing.T) {
+	// Accepted, user-pinned behavior (WS3): Esc cancels the SEARCH, not merely
+	// the edit, so a query committed by an earlier Enter goes with it. Once `/`
+	// seeds the bar with that query (C3), keeping it is what Enter is for.
+	m := newLogsModel(20, []string{"aaa", "needle", "bbb"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.logSearchQuery)
+	require.Equal(t, 1, m.logCursorIdx)
+
+	m = clientUpdate(m, keyRune('/'))
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Empty(t, m.logSearchQuery, "the previously committed query is cancelled too")
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.NotContains(t, m.viewport.View(), "❯")
+}
+
+func TestLiveSearch_EscRestoresOriginViewUnderWrap(t *testing.T) {
+	// Sibling of TestLiveSearch_EmptyInputRestoresOriginViewUnderWrap: cancelling
+	// clears the query BEFORE the final render, so the scroll restore reads spans
+	// with the marker columns already gone.
+	lines := make([]string, 40)
+	for i := range lines {
+		lines[i] = strings.Repeat("x", 38)
+	}
+	lines[30] = "abc" + strings.Repeat("x", 35)
+	m := newLogsModelNarrow(60, 6, lines)
+	m.settings.Wrap = true
+	m.followMode = false
+	m.updateViewport()
+	m.viewport.SetYOffset(20)
+
+	m = clientUpdate(m, keyRune('/'))
+	anchorSeq := m.searchSession.logAnchorSeq
+	require.NotZero(t, anchorSeq)
+	m = typeSearch(m, "abc")
+	require.Equal(t, 30, m.logCursorIdx)
+	require.Equal(t, 40, m.logRowSpans[anchorSeq].First, "the marker prefix wrapped every entry onto two rows")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	require.Empty(t, m.logSearchQuery)
+	assert.Equal(t, m.logRowSpans[anchorSeq].First, m.viewport.YOffset,
+		"the restored offset is the anchor's row in the CURRENT (marker-free) render")
+	assert.Equal(t, 20, m.viewport.YOffset)
+}
+
+func TestLiveSearch_EscOnDrainedRequestsListLandsOnSentinel(t *testing.T) {
+	// Everything the origin could name is gone: a reconnect sync drained the list
+	// while the bar was open. The restore has no row to land on, so it must reach
+	// the no-cursor sentinel rather than clamping onto an index that no longer
+	// exists.
+	m := newSearchModel(5, makeTestRequests(30))
+	m = clientUpdate(m, keyRune('G')) // newest, follow on
+	m = clientUpdate(m, keyRune('k')) // origin: req-028, follow off
+	require.Equal(t, "req-028", m.cursorID)
+	require.Positive(t, m.viewport.YOffset, "the origin is scrolled well down the list")
+
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "path/02")
+	require.NotEmpty(t, m.requestSearchQuery)
+
+	m = clientUpdate(m, RequestsSyncMsg{}) // empty snapshot: the list is drained
+	require.Empty(t, m.filteredProxyRequests())
+	require.Equal(t, 0, m.viewport.YOffset, "the drain itself already reset the view")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Empty(t, m.requestSearchQuery)
+	assert.Equal(t, -1, m.cursorIdx, "no-cursor sentinel")
+	assert.Empty(t, m.cursorID)
+	assert.Equal(t, 0, m.viewport.YOffset, "esc must not resurrect the pre-drain scroll position")
+	assert.False(t, m.searchSession.active)
+}
+
+func TestLiveSearch_LiveApplyRoutesByTheSessionView(t *testing.T) {
+	// Guards an INVARIANT, not a reachable state: nothing switches views while
+	// the bar is open today. The clear and the origin restore must name the same
+	// view, so liveApplySearch routes by the session's view rather than the live
+	// one — force them apart and the logs session still owns both halves.
+	m := newLogsModel(20, []string{"alpha", "needle here", "gamma"})
+	m = clientUpdate(m, keyRune('g'))
+	m = clientUpdate(m, keyRune('/'))
+	m = typeSearch(m, "needle")
+	require.Equal(t, 1, m.logCursorIdx)
+	m.proxyRequests = makeTestRequests(4)
+	m.requestSearchQuery = "committed"
+
+	m.viewMode = ViewModeRequests // only a test can do this mid-bar
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+
+	assert.Empty(t, m.logSearchQuery, "the SESSION's view is the one cancelled")
+	assert.Equal(t, -1, m.logCursorIdx, "and the one whose cursor is restored")
+	assert.Equal(t, "committed", m.requestSearchQuery, "the other view is left alone")
+}
+
+func TestLiveSearch_EscMatchesBackspaceToEmpty(t *testing.T) {
+	// Cancel IS the empty-bar preview made permanent (cancelLiveSearch runs
+	// through liveApplySearch("")), so backspacing a term away and then pressing
+	// Esc must land in exactly the state Esc alone would have reached — one
+	// behavior, not two that drift.
+	build := func() ClientModel {
+		lines := make([]string, 30)
+		for i := range lines {
+			lines[i] = fmt.Sprintf("row %02d", i)
+		}
+		lines[20] = "abc target"
+		m := newLogsModel(5, lines)
+		m = clientUpdate(m, keyRune('k')) // disengage follow
+		m.viewport.SetYOffset(2)
+		m = clientUpdate(m, keyRune('/'))
+		return typeSearch(m, "abc")
+	}
+
+	viaBackspace := clientUpdate(backspaceSearch(build(), 3), tea.KeyMsg{Type: tea.KeyEscape})
+	direct := clientUpdate(build(), tea.KeyMsg{Type: tea.KeyEscape})
+
+	assert.Equal(t, direct.logSearchQuery, viaBackspace.logSearchQuery)
+	assert.Equal(t, direct.logCursorIdx, viaBackspace.logCursorIdx)
+	assert.Equal(t, direct.logCursorSeq, viaBackspace.logCursorSeq)
+	assert.Equal(t, direct.followMode, viaBackspace.followMode)
+	assert.Equal(t, direct.viewport.YOffset, viaBackspace.viewport.YOffset)
+	assert.Equal(t, direct.mode, viaBackspace.mode)
+	assert.Equal(t, direct.searchSession, viaBackspace.searchSession)
+	// ...and that shared state is the origin, not merely equal to itself.
+	assert.Empty(t, direct.logSearchQuery)
+	assert.Equal(t, -1, direct.logCursorIdx)
+	assert.Equal(t, 2, direct.viewport.YOffset)
+}
+
+// --- `/` seeds the previous term (plan 030 C3 / WS4) ---
+
+func TestLiveSearch_SlashSeedsPreviousTerm(t *testing.T) {
+	m := newLogsModel(20, []string{"aaa", "needle here", "bbb"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "needle")
+	require.Equal(t, "needle", m.logSearchQuery)
+
+	// Leave the input cursor mid-term before reopening: SetValue only re-homes it
+	// when it sat at 0 or past the end, so this is what makes CursorEnd load-bearing.
+	m = clientUpdate(m, keyRune('/'))
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyLeft})
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyLeft})
+	require.Equal(t, len("needle")-2, m.textInput.Position())
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	m = clientUpdate(m, keyRune('/'))
+	assert.Equal(t, ModeSearch, m.mode)
+	assert.Equal(t, "needle", m.textInput.Value(), "the bar reopens seeded with the committed term")
+	assert.Equal(t, len("needle"), m.textInput.Position(), "cursor at the end, ready to extend")
+
+	// So typing EXTENDS the previous term rather than starting a fresh one.
+	m = typeSearch(m, "!")
+	assert.Equal(t, "needle!", m.logSearchQuery)
+
+	// With nothing committed there is nothing to seed: a first search opens empty.
+	fresh := newLogsModel(20, []string{"x"})
+	fresh = clientUpdate(fresh, keyRune('/'))
+	assert.Empty(t, fresh.textInput.Value())
+	assert.Equal(t, -1, fresh.logCursorIdx, "an empty seed applies nothing at all")
+}
+
+func TestLiveSearch_ReopenOverParkedMatchDoesNotMoveView(t *testing.T) {
+	// The seed applies itself, and its at-or-after seek starts from an origin
+	// that INCLUDES the cursor the term already parked — so it lands back on that
+	// same row and reopening the bar is visually inert.
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	lines[20] = "abc target"
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	m.viewport.SetYOffset(2)
+	m = commitSearch(m, "abc")
+	require.Equal(t, 20, m.logCursorIdx)
+	seq, yOffset, follow := m.logCursorSeq, m.viewport.YOffset, m.followMode
+
+	m = clientUpdate(m, keyRune('/'))
+	assert.Equal(t, "abc", m.textInput.Value())
+	assert.Equal(t, 20, m.logCursorIdx, "the parked cursor stays put")
+	assert.Equal(t, seq, m.logCursorSeq)
+	assert.Equal(t, yOffset, m.viewport.YOffset, "and the scroll position with it")
+	assert.Equal(t, follow, m.followMode)
+
+	reqs := makeTestRequests(20)
+	reqs[7].URL = "/hit/here"
+	m2 := newSearchModel(5, reqs)
+	m2 = clientUpdate(m2, keyRune('g'))
+	m2 = commitSearch(m2, "hit")
+	require.Equal(t, "req-007", m2.cursorID)
+	yOffset2 := m2.viewport.YOffset
+
+	m2 = clientUpdate(m2, keyRune('/'))
+	assert.Equal(t, "hit", m2.textInput.Value())
+	assert.Equal(t, "req-007", m2.cursorID, "the requests cursor stays on its match")
+	assert.Equal(t, yOffset2, m2.viewport.YOffset)
+}
+
+func TestLiveSearch_ReopenAfterNoMatchMayJump(t *testing.T) {
+	// Accepted qualifier (WS4): a search that ended with NO match cleared its
+	// cursor, so the seed's apply seeks from the viewport origin instead — and
+	// entries that streamed in since may now match. Reopening therefore CAN move
+	// the view, which is arguably what the user wants to see.
+	m := newLogsModel(20, []string{"aaa", "bbb", "ccc"})
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "zzz")
+	require.Equal(t, -1, m.logCursorIdx, "no match: no cursor")
+
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Unix(9, 0), Process: "p", Line: "zzz now here",
+	}))
+	require.Equal(t, -1, m.logCursorIdx, "the committed no-match search still has no cursor")
+
+	m = clientUpdate(m, keyRune('/'))
+	assert.Equal(t, "zzz", m.textInput.Value())
+	assert.Equal(t, "zzz now here", logCursorLine(t, m), "the seed's apply lands on the arrival")
+}
+
+func TestLiveSearch_SeedApplyDoesNotDestroyTheOrigin(t *testing.T) {
+	// The pinned order (capture → seed → apply). The seed's own seek MOVES the
+	// view here, so an origin captured after it would be the seed's landing and
+	// Esc would "restore" to the very position the reopen introduced. The origin
+	// must be the pre-seed position — where `/` was actually pressed.
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k')) // disengage follow
+	m.viewport.SetYOffset(2)
+	m = commitSearch(m, "zzz")
+	require.Equal(t, -1, m.logCursorIdx, "no match: no cursor to seek from later")
+	require.Equal(t, 2, m.viewport.YOffset)
+
+	m = clientUpdate(m, LogEntryMsg(domain.LogEntry{
+		Timestamp: time.Unix(99, 0), Process: "p", Line: "zzz arrived",
+	}))
+	require.Equal(t, 2, m.viewport.YOffset, "the arrival did not move a parked search")
+
+	m = clientUpdate(m, keyRune('/'))
+	require.Equal(t, "zzz arrived", logCursorLine(t, m), "the seed's apply jumped to the arrival")
+	require.NotEqual(t, 2, m.viewport.YOffset, "...and scrolled the view to it")
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+	assert.Equal(t, 2, m.viewport.YOffset, "esc restores the PRE-seed position")
+	assert.Empty(t, m.logSearchQuery)
+	assert.Equal(t, -1, m.logCursorIdx)
+}
+
+func TestLiveSearch_SeedThenEscClearsEverything(t *testing.T) {
+	// Composes with C2: Esc cancels the search the bar was SEEDED with, exactly
+	// as it cancels one typed from scratch, and restores the position as of this
+	// `/` press — not the position from before the original search.
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	lines[20] = "abc target"
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k'))
+	m.viewport.SetYOffset(2)
+	m = commitSearch(m, "abc")
+	require.Equal(t, 20, m.logCursorIdx)
+	pressOffset := m.viewport.YOffset
+	require.NotEqual(t, 2, pressOffset)
+
+	m = clientUpdate(m, keyRune('/'))
+	require.Equal(t, "abc", m.textInput.Value())
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEscape})
+
+	assert.Empty(t, m.logSearchQuery, "the seeded query does not survive the cancel")
+	assert.Equal(t, -1, m.logCursorIdx)
+	assert.Equal(t, int64(0), m.logCursorSeq)
+	assert.Equal(t, pressOffset, m.viewport.YOffset, "restored to where THIS `/` was pressed")
+	assert.NotContains(t, m.viewport.View(), "❯")
+}
+
+func TestLiveSearch_SeedThenEnterRoundTrips(t *testing.T) {
+	// Reopen-and-commit with no edit is a no-op: same query, same landing, same
+	// scroll. Enter's re-apply runs over the seeded value, and restore-then-seek
+	// from an origin that already sits on the match returns it unchanged.
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("row %02d", i)
+	}
+	lines[20] = "abc target"
+	m := newLogsModel(5, lines)
+	m = clientUpdate(m, keyRune('k'))
+	m.viewport.SetYOffset(2)
+	m = commitSearch(m, "abc")
+	query, seq, yOffset, follow := m.logSearchQuery, m.logCursorSeq, m.viewport.YOffset, m.followMode
+
+	m = clientUpdate(m, keyRune('/'))
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	assert.Equal(t, ModeNormal, m.mode)
+	assert.Equal(t, query, m.logSearchQuery)
+	assert.Equal(t, seq, m.logCursorSeq)
+	assert.Equal(t, 20, m.logCursorIdx)
+	assert.Equal(t, yOffset, m.viewport.YOffset)
+	assert.Equal(t, follow, m.followMode)
+	assert.False(t, m.searchSession.active)
+}
+
+func TestLiveSearch_SeedsPerView(t *testing.T) {
+	// Each view seeds from its OWN committed term, like the `s` bar seeds from
+	// the active view's RawQuery.
+	m := newLogsModel(20, []string{"alpha one", "beta two", "gamma"})
+	m.proxyRequests = makeTestRequests(6)
+	m = clientUpdate(m, keyRune('g'))
+	m = commitSearch(m, "alpha")
+	require.Equal(t, "alpha", m.logSearchQuery)
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyTab})
+	require.Equal(t, ViewModeRequests, m.viewMode)
+	m = commitSearch(m, "path/004")
+	require.Equal(t, "path/004", m.requestSearchQuery)
+
+	m = clientUpdate(m, keyRune('/'))
+	assert.Equal(t, "path/004", m.textInput.Value(), "the requests bar seeds the requests term")
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	m = clientUpdate(m, tea.KeyMsg{Type: tea.KeyTab})
+	require.Equal(t, ViewModeLogs, m.viewMode)
+	m = clientUpdate(m, keyRune('/'))
+	assert.Equal(t, "alpha", m.textInput.Value(), "the logs bar seeds the logs term")
+}
