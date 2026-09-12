@@ -941,7 +941,7 @@ func freeLoopbackAddr(t *testing.T) string {
 // rules internal/config applies to a project's own prox.yaml — plus the bounds
 // a local config file never needed.
 func TestHubRegister_BoundsAndValidatesTheBody(t *testing.T) {
-	_, base := newHubServer(t, HubConfig{Token: "tok"})
+	s, base := newHubServer(t, HubConfig{Token: "tok"})
 
 	badRequests := []struct {
 		name string
@@ -991,6 +991,14 @@ func TestHubRegister_BoundsAndValidatesTheBody(t *testing.T) {
 			req: hubRegisterRequest("popos", `C:\work\app`,
 				map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}}),
 		},
+		{
+			// Plan 031, review B6: a host longer than DNS allows. The hostname
+			// rules said what characters were legal and nothing about how many,
+			// so a host of any length passed.
+			name: "target host is longer than a DNS name may be",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"app": {Host: strings.Repeat("a", 64) + ".example.com", Port: 3000}}),
+		},
 	}
 	for _, tt := range badRequests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1012,20 +1020,36 @@ func TestHubRegister_BoundsAndValidatesTheBody(t *testing.T) {
 	})
 
 	t.Run("an oversized body is refused rather than buffered", func(t *testing.T) {
-		// A body far past maxControlRequestBytes. MaxBytesReader fails the
-		// decode partway rather than reading it all into memory.
-		var buf bytes.Buffer
-		buf.WriteString(`{"project_dir":"/home/dev/`)
-		buf.WriteString(strings.Repeat("a", maxControlRequestBytes+1024))
-		buf.WriteString(`"}`)
-		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/register", bytes.NewReader(buf.Bytes()))
+		// The body is a PERFECTLY VALID registration, padded past
+		// maxControlRequestBytes with a field the decoder would otherwise
+		// ignore. That is the point (plan 031, review B8): the earlier version
+		// of this test padded the project_dir, which every later validator
+		// would have rejected anyway, so it could not distinguish "the size cap
+		// refused this" from "some other rule did". This one registers
+		// successfully if MaxBytesReader is removed, so only the cap can be
+		// what fails it.
+		valid, err := json.Marshal(hubRegisterRequest("popos", "/home/dev/big",
+			map[string]ServiceTarget{"big": {Host: "localhost", Port: 3000}}))
+		require.NoError(t, err)
+		padded := append([]byte(nil), valid[:len(valid)-1]...) // drop the closing brace
+		padded = append(padded, []byte(`,"ignored_padding":"`)...)
+		padded = append(padded, bytes.Repeat([]byte("a"), maxControlRequestBytes+1024)...)
+		padded = append(padded, []byte(`"}`)...)
+
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/register", bytes.NewReader(padded))
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer tok")
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := hubClient().Do(req)
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "BAD_REQUEST", errorCode(t, resp))
+
+		// And nothing was registered: the request was refused, not truncated
+		// into a smaller registration.
+		assert.False(t, s.registry.HasProject(HubProjectKey("popos", "/home/dev/big")),
+			"an over-cap body must register nothing at all")
 	})
 
 	t.Run("trailing JSON is refused", func(t *testing.T) {
@@ -1408,10 +1432,23 @@ func TestStartHub_RefusesDomainOrPortChangeWithPublishers(t *testing.T) {
 func TestHubLifecycle_StartDoesNotOverwriteAConcurrentRotation(t *testing.T) {
 	s, _ := newHubServer(t, HubConfig{Token: ""}) // real token, from the token file
 
+	// Both loops start together (plan 031, review B8). Two goroutines each
+	// racing away from `go` is not a race the test controls — the first can
+	// easily finish its twenty iterations before the second is scheduled, and
+	// then nothing ever interleaved. A start barrier makes the overlap the
+	// point of the test rather than a hope about the scheduler.
+	base := "http://" + s.HubListenAddr()
+	start := make(chan struct{})
+	// accepted collects every superseded token the hub was still willing to
+	// accept AFTER a newer one had replaced it — the exact symptom of the bug.
+	accepted := make(chan string, 64)
+	rotations := 0
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		<-start
 		for i := 0; i < 20; i++ {
 			cfg := s.hubConfigSnapshot().cfg
 			cfg.Token = "" // as `prox hub start` sends it: the daemon resolves the token
@@ -1420,17 +1457,53 @@ func TestHubLifecycle_StartDoesNotOverwriteAConcurrentRotation(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
+		<-start
+		prev := ""
 		for i := 0; i < 20; i++ {
 			rec := httptest.NewRecorder()
 			s.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/hub/token", nil))
+			var body HubTokenResponse
+			if json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.Token == "" {
+				continue
+			}
+			rotations++
+			// D18: rotation has NO grace. The token that was just superseded
+			// must be refused from the very next call — including when a
+			// concurrent `hub start` read it a moment ago and is about to
+			// commit it. This is the assertion the test was named for and did
+			// not make (plan 031, review B8), and it has to happen DURING the
+			// race: a stale token that is re-admitted for a few milliseconds
+			// and then corrected is invisible to any check made at the end.
+			if prev != "" && prev != body.Token {
+				req, err := http.NewRequest(http.MethodGet, base+"/api/v1/routes", nil)
+				if err == nil {
+					req.Header.Set("Authorization", "Bearer "+prev)
+					resp, err := hubClient().Do(req)
+					if err == nil {
+						if resp.StatusCode == http.StatusOK {
+							accepted <- prev
+						}
+						resp.Body.Close()
+					}
+				}
+			}
+			prev = body.Token
 		}
 	}()
+	close(start)
 	wg.Wait()
+	close(accepted)
+
+	var stale []string
+	for token := range accepted {
+		stale = append(stale, token)
+	}
+	assert.Empty(t, stale,
+		"a rotated-away token must be refused immediately, even when a concurrent hub start had already read it")
+	assert.GreaterOrEqual(t, rotations, 2, "the rotation loop must actually have rotated")
 
 	onDisk, err := ReadHubToken()
 	require.NoError(t, err)
-
-	base := "http://" + s.HubListenAddr()
 	resp := hubDo(t, http.MethodGet, base+"/api/v1/routes", onDisk, nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode,
 		"the hub must accept the token that is on disk, whatever order start and rotate ran in")
@@ -1487,12 +1560,28 @@ func TestHubRebind_ClosesTheReplacedServerAndKeepsTunnels(t *testing.T) {
 
 	// The replaced server's shutdown is bounded and then forced, so the SSE
 	// handler's connection ends rather than living on.
-	buf := make([]byte, 256)
-	require.Eventually(t, func() bool {
-		_, rerr := streamResp.Body.Read(buf)
-		return rerr != nil
-	}, constants.HubShutdownGrace+10*time.Second, 100*time.Millisecond,
-		"the replaced server must eventually Close its handlers rather than leaking them")
+	//
+	// The read happens on its own goroutine, and the BOUND is this select
+	// (plan 031, review B8). require.Eventually cannot bound a condition
+	// function that blocks: Body.Read on a stream nobody is closing returns
+	// only when the connection ends, so an Eventually around it would wait
+	// forever — a test that could hang but never fail.
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			if _, rerr := streamResp.Body.Read(buf); rerr != nil {
+				readErr <- rerr
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-readErr:
+		require.Error(t, err)
+	case <-time.After(constants.HubShutdownGrace + 10*time.Second):
+		t.Fatal("the replaced server never closed its SSE handler: the forced Close after the grace did not happen")
+	}
 	assert.Less(t, time.Since(start), constants.HubShutdownGrace+15*time.Second)
 
 	// And the tunnel attached through the replaced server is untouched: same

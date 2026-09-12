@@ -136,11 +136,11 @@ Supervisor status.
 | Field | Description |
 |-------|-------------|
 | `alias` | The hub alias this project resolved (never the literal `"default"`, which is expanded before this is populated) |
-| `state` | The publisher state machine's current state: `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or one of the terminal states `displaced`, `protocol_mismatch`, `auth_failed` |
+| `state` | The publisher state machine's current state: `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or one of the terminal states `displaced`, `protocol_mismatch`, `auth_failed`, `name_held` |
 | `domain` | The hub's own domain (the hub owns it, not the publisher); empty until a register has succeeded at least once |
 | `routes` | How many hostnames the hub published for this project |
 | `since` | When the current state was entered — what a `reconnecting, down 12s` rendering counts from. Omitted for a state with no interesting age |
-| `detail` | The state-specific tail of the rendered line: the holder's identity for `displaced`, the two protocol versions for `protocol_mismatch`, the failure reason for `reconnecting`. Omitted when there is none |
+| `detail` | The state-specific tail of the rendered line: the holder's identity for `displaced` and `name_held`, the two protocol versions for `protocol_mismatch`, the failure reason for `reconnecting`. Omitted when there is none |
 
 A degraded hub is **advisory only**: it renders in `prox status`'s `Hub:` line but never changes its exit code, because hub publishing is additive — see [`prox status`](cli.md#status).
 

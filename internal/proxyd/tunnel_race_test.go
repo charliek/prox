@@ -1,8 +1,10 @@
 package proxyd
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -126,6 +128,83 @@ func TestTunnelRace_FrozenPublisherConcurrentRequests(t *testing.T) {
 
 	for i, status := range statuses {
 		assert.Equal(t, http.StatusServiceUnavailable, status, "request %d", i)
+	}
+}
+
+// TestTunnelRace_FrozenPublisherDoesNotGrowGoroutines is plan 031 review B4.
+//
+// The F7 fix made the CLIENT-visible symptom right — concurrent requests to a
+// frozen publisher get prompt 503s instead of hanging — by racing each
+// OpenStream against the dial deadline on its own goroutine. That moved the
+// cost somewhere nobody was looking: past yamux's 256 inflight-SYN slots, every
+// abandoned attempt stayed parked inside OpenStream until the session died, so
+// sustained traffic to one frozen route accumulated goroutines without bound.
+// A hub is a long-lived daemon; "unbounded, but only while a publisher is
+// frozen" is still unbounded.
+//
+// The measurement is deliberately coarse and the bound deliberately generous:
+// the claim is not "N goroutines" but "the count tracks CONCURRENCY, not the
+// number of requests ever made". Rounds of the same size, all completed, must
+// not each leave another pile behind.
+func TestTunnelRace_FrozenPublisherDoesNotGrowGoroutines(t *testing.T) {
+	h := newTunnelHub(t)
+	h.server.tunnels.setDialTimeout(100 * time.Millisecond)
+
+	services := map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}}
+	key := registerAndFreeze(t, h, "shed", "/home/dev/app", services)
+	session := h.server.tunnels.get(key)
+	require.NotNil(t, session)
+
+	// Dial the session directly rather than through the HTTPS data plane: this
+	// test is about the stream-acquisition path, and a round trip through
+	// net/http would add its own (bounded, but noisy) goroutines to the count.
+	round := func(n int) {
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				conn, err := session.dial(ctx, "127.0.0.1", 1)
+				if err == nil {
+					_ = conn.Close()
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	// Well past yamux's AcceptBacklog (256), so the acquisition path this is
+	// about is genuinely entered.
+	const perRound = 400
+
+	round(perRound) // warm up: one round's worth of parked attempts is expected
+	settle()
+	base := runtime.NumGoroutine()
+
+	for i := 0; i < 3; i++ {
+		round(perRound)
+	}
+	settle()
+	after := runtime.NumGoroutine()
+
+	// The budget is one session's worth of outstanding attempts plus slack. The
+	// unbounded version accumulated ~2 goroutines per abandoned request, so
+	// 1200 further requests put it thousands over.
+	limit := tunnelMaxPendingStreamOpens + 200
+	assert.Less(t, after-base, limit,
+		"goroutines must track concurrency, not cumulative requests: %d → %d after %d more requests",
+		base, after, 3*perRound)
+}
+
+// settle gives finished goroutines a moment to actually exit before
+// runtime.NumGoroutine() is sampled. It is a measurement aid, not a barrier:
+// every goroutine the test cares about has already been joined.
+func settle() {
+	for i := 0; i < 20; i++ {
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -381,6 +460,14 @@ func TestTunnelRace_HubStopRacesSessionCloseAndSweep(t *testing.T) {
 // immediately before the lease carry. The attach must land on one side of the
 // replacement or the other, never inside it, and afterwards the registration's
 // generation must be the one the session manager actually holds.
+//
+// The barrier is a real synchronization point, not a sleep (plan 031, review
+// B8). It used to signal "go" and then sleep 20ms, which asserted nothing about
+// where the concurrent attach had actually reached — on a loaded machine the
+// attach might not have started, and the test would have passed without ever
+// exercising the window. Now the replacement WAITS until the attach has reached
+// MarkConnected, so the interleaving the test is named for is the one that
+// happens.
 func TestTunnelRace_AttachDuringReplaceIsNotLost(t *testing.T) {
 	h := newTunnelHub(t)
 	key := HubProjectKey("shed", "/home/dev/app")
@@ -392,12 +479,29 @@ func TestTunnelRace_AttachDuringReplaceIsNotLost(t *testing.T) {
 
 	attaching := make(chan struct{})
 	attached := make(chan *tunnelSession, 1)
+
+	// Fires when the attach reaches MarkConnected — i.e. when it is about to
+	// take the registry lock this replacement is holding.
+	reachedRegistry := make(chan struct{})
+	var once sync.Once
+	h.registry.beforeMarkConnected = func(k string, _ uint64) {
+		if k == key {
+			once.Do(func() { close(reachedRegistry) })
+		}
+	}
+
 	h.registry.beforeReplaceCommit = func() {
 		// Runs with the registry lock held, immediately before the lease carry.
-		// The attach below therefore BLOCKS here, which is the point: under the
-		// old code it would have completed and then been overwritten.
+		// The attach below therefore BLOCKS on that lock, which is the point:
+		// under the old code it would have completed and then been overwritten.
 		close(attaching)
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-reachedRegistry:
+		case <-time.After(10 * time.Second):
+			// Not t.Fatal: this runs on the register's goroutine, and the
+			// assertions below will report the real failure.
+			t.Error("the concurrent attach never reached the registry")
+		}
 	}
 
 	go func() {

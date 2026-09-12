@@ -355,14 +355,27 @@ var hubFileWriter = domain.AtomicWriter{TempPattern: ".prox-hub-*.tmp"}
 // model already accepts (a forged origin reaches another publisher's
 // registration; see validateHubOrigin). So the classes are:
 //
-//   - ENCRYPTED: loopback (127.0.0.0/8, ::1) and CGNAT 100.64/10, the range
-//     Tailscale assigns. Loopback never leaves the machine, and a tailnet
-//     address is reachable only over WireGuard, so the token is never in
+//   - ENCRYPTED: loopback (127.0.0.0/8, ::1), and a CGNAT 100.64/10 address
+//     THAT SITS ON A TUNNEL INTERFACE. Loopback never leaves the machine, and a
+//     tailnet address is reachable only over WireGuard, so the token is never in
 //     cleartext on a wire a stranger shares. These are the DEFAULT.
+//
+//     The interface test is not decoration (plan 031, review B5). 100.64/10 is
+//     the CGNAT range, and Tailscale is only one of its users: a phone hotspot,
+//     a carrier-grade-NAT ISP, and plenty of campus networks hand out addresses
+//     in it on an ORDINARY interface. Treating the range itself as evidence of
+//     encryption would auto-select such an address by default and put the
+//     bearer token on a plaintext carrier network. What actually distinguishes
+//     a tailnet address is the device it lives on — a point-to-point tunnel
+//     (tailscale0, utunN, wg0), never a broadcast LAN interface — so that is
+//     what is tested, and a CGNAT address anywhere else is treated as plain LAN
+//     and needs the same explicit opt-in.
+//
 //   - UNENCRYPTED LAN: 10/8, 172.16/12, 192.168/16, fc00::/7. Still supported,
 //     but only with an explicit opt-in (hub.yaml `allow_unencrypted_lan: true`
 //     or `prox hub start --allow-unencrypted-lan`), because "private" is not
 //     "confidential".
+//
 //   - REFUSED: everything else, including the UNSPECIFIED addresses 0.0.0.0 and
 //     :: — the dangerous typo, since they bind every interface including a
 //     public one — and any public address. No flag opts into those.
@@ -374,7 +387,73 @@ const (
 	hubListenUnencryptedLAN
 )
 
+// isCGNATv4 reports whether a 4-byte address is in 100.64.0.0/10, the range
+// Tailscale assigns — and the range carrier-grade NAT and some campus networks
+// assign too, which is why membership alone decides nothing (review B5).
+func isCGNATv4(v4 net.IP) bool {
+	return v4[0] == 100 && v4[1]&0xc0 == 64
+}
+
+// tunnelInterfaceAddrs returns the addresses this machine holds on a
+// point-to-point TUNNEL interface, as a set of IP strings (plan 031, review B5).
+//
+// Two signals, either of which is enough:
+//
+//   - The interface NAME: "tailscale0" on Linux/BSD/Windows, "utunN" on macOS
+//     (where Tailscale uses a generic utun device), "wgN" for a bare WireGuard
+//     interface.
+//   - The point-to-point FLAG with no broadcast, which is what a tun device is
+//     and what an Ethernet or Wi-Fi interface is not. This is the OS-agnostic
+//     half, and the one that keeps the rule honest on a system that names its
+//     tailnet device something else.
+//
+// A failure to enumerate yields an empty set, which is the SAFE direction: a
+// CGNAT address then classifies as plain LAN and needs the explicit opt-in.
+//
+// It is a variable so the classification tests can pin the decision without
+// depending on the machine they run on.
+var tunnelInterfaceAddrs = func() map[string]struct{} {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for _, iface := range ifaces {
+		if !isTunnelInterface(iface) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok {
+				out[ipNet.IP.String()] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// isTunnelInterface applies the name-or-flags test described on
+// tunnelInterfaceAddrs.
+func isTunnelInterface(iface net.Interface) bool {
+	name := strings.ToLower(iface.Name)
+	switch {
+	case strings.HasPrefix(name, "tailscale"), strings.HasPrefix(name, "utun"), strings.HasPrefix(name, "wg"):
+		return true
+	}
+	return iface.Flags&net.FlagPointToPoint != 0 && iface.Flags&net.FlagBroadcast == 0
+}
+
 func classifyHubListenAddr(ip net.IP) hubListenClass {
+	return classifyHubListenAddrWith(ip, tunnelInterfaceAddrs())
+}
+
+// classifyHubListenAddrWith is classifyHubListenAddr's PURE body: every input is
+// passed in, so the rules can be table-tested (including the CGNAT split) rather
+// than being a function of whatever interfaces the test machine happens to have.
+func classifyHubListenAddrWith(ip net.IP, tunnelAddrs map[string]struct{}) hubListenClass {
 	if ip == nil {
 		return hubListenRefused
 	}
@@ -388,8 +467,14 @@ func classifyHubListenAddr(ip net.IP) hubListenClass {
 	}
 	if v4 := ip.To4(); v4 != nil {
 		switch {
-		case v4[0] == 100 && v4[1]&0xc0 == 64:
-			return hubListenEncrypted // 100.64.0.0/10 (CGNAT / tailnet)
+		case isCGNATv4(v4):
+			// 100.64.0.0/10. A tailnet address only when it lives on a tunnel
+			// device; otherwise it is a carrier or LAN address that merely
+			// shares the range, and it needs the LAN opt-in like any other.
+			if _, ok := tunnelAddrs[ip.String()]; ok {
+				return hubListenEncrypted
+			}
+			return hubListenUnencryptedLAN
 		case v4[0] == 10:
 			return hubListenUnencryptedLAN // 10.0.0.0/8
 		case v4[0] == 172 && v4[1]&0xf0 == 16:
@@ -421,16 +506,19 @@ func isPrivateListenAddr(ip net.IP) bool {
 // this machine will be able to publish.
 func DefaultHubListenAddr() (addr string, tailnet bool) {
 	port := strconv.Itoa(constants.HubDefaultPort)
-	for _, ip := range localPrivateAddrs() {
-		if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1]&0xc0 == 64 {
-			return net.JoinHostPort(ip.String(), port), true
-		}
+	// The candidates are the ENCRYPTED ones, not merely the ones in 100.64/10
+	// (plan 031, review B5): a CGNAT address handed out by a carrier or a
+	// hotspot is in the same range and is not a tailnet address, and picking it
+	// by default would put the bearer token on a plaintext network with no flag
+	// and no question asked.
+	for _, ip := range localEncryptedAddrs() {
+		return net.JoinHostPort(ip.String(), port), true
 	}
 	return net.JoinHostPort("127.0.0.1", port), false
 }
 
 // localPrivateAddrs returns this machine's non-loopback interface addresses
-// that the hub is allowed to bind, CGNAT (tailnet) ones first so the refusal
+// that the hub is allowed to bind, ENCRYPTED (tailnet) ones first so the refusal
 // message and the default both name the most useful address. Interface
 // enumeration failures yield an empty list rather than an error: every caller
 // treats this as advisory.
@@ -439,23 +527,25 @@ func localPrivateAddrs() []net.IP {
 	if err != nil {
 		return nil
 	}
-	var cgnat, other []net.IP
+	tunnelAddrs := tunnelInterfaceAddrs()
+	var encrypted, other []net.IP
 	for _, a := range ifaceAddrs {
 		ipNet, ok := a.(*net.IPNet)
 		if !ok {
 			continue
 		}
 		ip := ipNet.IP
-		if ip.IsLoopback() || !isPrivateListenAddr(ip) {
+		if ip.IsLoopback() {
 			continue
 		}
-		if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1]&0xc0 == 64 {
-			cgnat = append(cgnat, ip)
-			continue
+		switch classifyHubListenAddrWith(ip, tunnelAddrs) {
+		case hubListenEncrypted:
+			encrypted = append(encrypted, ip)
+		case hubListenUnencryptedLAN:
+			other = append(other, ip)
 		}
-		other = append(other, ip)
 	}
-	return append(cgnat, other...)
+	return append(encrypted, other...)
 }
 
 // validateHubListenAddr checks a configured listen address against D6's rule as
@@ -557,9 +647,10 @@ func hubListenAdvice() string {
 // localEncryptedAddrs returns this machine's tailnet (CGNAT) addresses — the
 // non-loopback ones the hub may bind with no opt-in.
 func localEncryptedAddrs() []net.IP {
+	tunnelAddrs := tunnelInterfaceAddrs()
 	var out []net.IP
 	for _, ip := range localPrivateAddrs() {
-		if classifyHubListenAddr(ip) == hubListenEncrypted {
+		if classifyHubListenAddrWith(ip, tunnelAddrs) == hubListenEncrypted {
 			out = append(out, ip)
 		}
 	}

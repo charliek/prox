@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 )
 
 // The naming rules a registration must satisfy, in the one place BOTH sides of
@@ -61,6 +62,18 @@ func ValidateHost(host string) error {
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return nil
+	}
+	// DNS's own limits, which the regex above does not express (plan 031,
+	// review B6): without them a megabyte of perfectly valid characters is a
+	// valid "host", and on the hub's network mount that string becomes a stored
+	// route target and a CONNECT preamble it can never fit.
+	if len(host) > 253 {
+		return fmt.Errorf("host too long (max 253 characters)")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) > 63 {
+			return fmt.Errorf("host label %q too long (max 63 characters)", label)
+		}
 	}
 	if !hostnameRegex.MatchString(host) {
 		return fmt.Errorf("invalid host format %q", host)

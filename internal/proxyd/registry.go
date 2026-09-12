@@ -169,6 +169,16 @@ type Registry struct {
 	// probeClock does for the on-502 probe.
 	now func() time.Time
 
+	// beforeMarkConnected, when non-nil, runs at the TOP of MarkConnected,
+	// before the registry lock is taken. It is the other half of the attach
+	// barrier the replacement test needs (plan 031, review B8): the old test
+	// signalled "go" and then SLEPT 20ms, which proved nothing about where the
+	// concurrent attach had actually got to. This seam lets the replacement wait
+	// until the attach has demonstrably reached the registry call it is racing,
+	// so the barrier is a synchronization point rather than a guess about
+	// scheduling. Nil in production.
+	beforeMarkConnected func(key string, gen uint64)
+
 	// beforeReplaceCommit, when non-nil, runs inside ReplaceRegistration while
 	// the registry lock is HELD, immediately before the replaced lease is
 	// carried onto the successor. It is a test seam and nothing else: the
@@ -510,6 +520,82 @@ func (r *Registry) Deregister(projectDir string) (removedHostnames []string, emp
 	return r.deregisterLocked(projectDir)
 }
 
+// DeregisterResult is what a guarded deregistration did, including the LEASE
+// GENERATION the removed registration was holding (plan 031, review B1).
+//
+// The generation is the load-bearing field. A deregister used to remove by key
+// and then close the key's tunnel blind, so an old `prox up` shutting down after
+// its successor had already re-registered and attached would close the
+// SUCCESSOR's session. Reporting which generation was actually removed lets the
+// caller close that exact session and nothing else.
+type DeregisterResult struct {
+	// Removed is false when nothing was removed — either the project is not
+	// registered at all, or it is registered to a different owner (Mismatch).
+	Removed bool
+	// Mismatch distinguishes "somebody else owns this key now" from "nothing
+	// there", so the caller can log the difference rather than guess.
+	Mismatch   bool
+	Hostnames  []string
+	EmptyPorts []int
+	// SessionGen is the removed registration's lease generation; 0 for a local
+	// registration and for a remote one that never attached a tunnel.
+	SessionGen uint64
+}
+
+// DeregisterOwned removes a project's routes only when pid still names the
+// registration's OWNER, and reports the lease generation it removed (plan 031,
+// review B1).
+//
+// The guard is the deregister half of the identity discipline the sweep
+// (DeregisterIfIdentity) and the lease sweep (DeregisterIfDisconnected) already
+// have. Without it, `prox down` in a process whose registration has since been
+// replaced — a crashed-and-restarted `prox up` in the same directory, a
+// publisher that re-registered under a new PID — deleted its successor's
+// registration, which the caller then compounded by closing the successor's
+// tunnel.
+//
+// A pid of 0 on EITHER side means "no identity claim" and the removal proceeds
+// unguarded: the register handler requires a positive PID, so a zero on the
+// registration can only come from a test or a future caller, and a zero from the
+// wire is a client that never learned to send one. Narrowing further would turn
+// a missing field into an un-deregisterable project.
+func (r *Registry) DeregisterOwned(key string, pid int) DeregisterResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok {
+		return DeregisterResult{}
+	}
+	if pid > 0 && proj.PID > 0 && proj.PID != pid {
+		return DeregisterResult{Mismatch: true}
+	}
+	gen := proj.SessionGen
+	hostnames, emptyPorts := r.deregisterLocked(key)
+	return DeregisterResult{Removed: true, Hostnames: hostnames, EmptyPorts: emptyPorts, SessionGen: gen}
+}
+
+// SnapshotAndDeregister takes a project's snapshot and removes it under ONE lock
+// acquisition (plan 031, review B3).
+//
+// Doing it as snapshotProject followed by Deregister left a window between the
+// two in which a tunnel could attach: the snapshot then carried a lease older
+// than the session the manager had just installed, and restoring it after a
+// failed takeover left the registration claiming a generation nobody held —
+// permanently "connected", unserveable, and unsweepable. One lock acquisition
+// removes the window rather than narrowing it.
+func (r *Registry) SnapshotAndDeregister(key string) (snap projectSnapshot, removedHostnames []string, emptyPorts []int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	snap, ok = r.snapshotProjectLocked(key)
+	if !ok {
+		return projectSnapshot{}, nil, nil, false
+	}
+	removedHostnames, emptyPorts = r.deregisterLocked(key)
+	return snap, removedHostnames, emptyPorts, true
+}
+
 // DeregisterIfIdentity removes a project's routes only if its CURRENT
 // registration matches BOTH pid and startTime. The check and removal happen
 // under one lock acquisition, closing the reused-PID teardown race: the
@@ -598,6 +684,9 @@ func decideLease(now, disconnectedAt, reservedUntil time.Time, sessionGen, curre
 // has already been replaced — applying it would roll the registration back onto
 // a dead tunnel.
 func (r *Registry) MarkConnected(key string, gen uint64) bool {
+	if r.beforeMarkConnected != nil {
+		r.beforeMarkConnected(key, gen)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -628,6 +717,29 @@ func (r *Registry) MarkDisconnected(key string, gen uint64, at time.Time) bool {
 		return false
 	}
 	proj.DisconnectedAt = at
+	return true
+}
+
+// RefreshRemoteOwner records the PID and start token of the process that most
+// recently registered a REMOTE key (plan 031, review B1).
+//
+// A remote registration's identity is its composed key, not its PID — the
+// publisher's PID means nothing on this host — so a same-key re-register with an
+// unchanged config takes the idempotent no-op arm and changes nothing. But the
+// PID it carries is still the answer to "which process is publishing this
+// now?", and the deregister guard needs that answer to be current: without this,
+// a registration would keep the PID of the FIRST process that ever published it,
+// so the process actually publishing today could not deregister its own
+// registration, while the long-dead original still could.
+func (r *Registry) RefreshRemoteOwner(key string, pid int, startTime int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || pid <= 0 {
+		return false
+	}
+	proj.PID = pid
+	proj.StartTime = startTime
 	return true
 }
 

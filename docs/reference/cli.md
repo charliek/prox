@@ -197,6 +197,7 @@ prox status --json
 | Displaced (another publisher took over a name via `--hub-takeover`) | `Hub: llt (displaced: auth held by mac:/home/c/slauth)` |
 | Protocol mismatch | `Hub: llt (protocol mismatch: hub 2, this prox 1)` |
 | Auth rejected | `Hub: llt (auth failed)` |
+| Name held, and this run declined to take it over | `Hub: llt (name held: auth.llt.stridelabs.ai held by mac:/home/c/slauth)` |
 
 The line is absent entirely when no hub is configured for the run, so hub-less `prox status` output is unchanged. **A degraded hub never changes `prox status`'s exit code** — hub publishing is additive, and the exit-1 contract above stays reserved for the local proxy and the processes themselves. See [`status.proxy.hub`](api.md#get-status) for the underlying JSON shape and [Remote Proxy Hub](../guides/remote-hub.md) for the full walkthrough and security posture.
 
@@ -559,9 +560,13 @@ publishers are registered — their hostnames and ports were fixed when they
 registered. Run `prox hub stop` first and let publishers re-register once the
 hub is back.
 
-By default the hub's listen address must be loopback or a tailnet
-(`100.64.0.0/10`) address, whose traffic is encrypted end to end; a plain
-private-LAN address needs `--allow-unencrypted-lan`. See
+By default the hub's listen address must be loopback or a tailnet address —
+a CGNAT (`100.64.0.0/10`) address **on a tunnel interface**
+(`tailscale0`/`utunN`/`wgN`, or any point-to-point link), whose traffic is
+encrypted end to end. A CGNAT address on an ordinary interface (a
+carrier-grade-NAT lease, a phone hotspot) is not a tailnet address and is
+treated like any other plain private-LAN address, which needs
+`--allow-unencrypted-lan`. See
 [Security](../guides/remote-hub.md#security) in the Remote Proxy Hub guide
 before turning that on, and before running a hub at all.
 

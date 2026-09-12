@@ -130,11 +130,11 @@ serves, which is a separate object reached only via `prox hub status`.
 | Field | Description |
 |-------|-------------|
 | `alias` | The resolved hub alias (never the literal `"default"`) |
-| `state` | `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or a terminal `displaced` / `protocol_mismatch` / `auth_failed` |
+| `state` | `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or a terminal `displaced` / `protocol_mismatch` / `auth_failed` / `name_held` |
 | `domain` | The hub's own domain; empty until a register has succeeded once |
 | `routes` | Hostnames the hub published for this project |
 | `since` | When the current state was entered; omitted for a state with no interesting age |
-| `detail` | State-specific tail: the holder for `displaced`, both versions for `protocol_mismatch`, the reason for `reconnecting`; omitted when there is none |
+| `detail` | State-specific tail: the holder for `displaced` and `name_held`, both versions for `protocol_mismatch`, the reason for `reconnecting`; omitted when there is none |
 
 A degraded hub only ever renders `prox status`'s `Hub:` line — it never
 changes any exit code, because hub publishing is additive to the local proxy.

@@ -607,7 +607,7 @@ allow_unencrypted_lan: false    # true: also accept a plain private-LAN listen a
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `domain` | string | required (first start) | Base domain remote hostnames are published under |
-| `listen` | string | this machine's first tailnet (`100.64.0.0/10`) address, port `8443`; loopback if none found | Control-plane + tunnel bind address. `host:0` binds an ephemeral port |
+| `listen` | string | this machine's first tailnet address — a CGNAT (`100.64.0.0/10`) address on a tunnel interface — port `8443`; loopback if none found | Control-plane + tunnel bind address. `host:0` binds an ephemeral port. A CGNAT address that is NOT on a tunnel interface (carrier-grade NAT, a hotspot) counts as a plain LAN address and needs `allow_unencrypted_lan` |
 | `https_port` | int | `443` | Data-plane HTTPS port hub routes are published on. `0` disables it |
 | `http_port` | int | `0` (off) | Data-plane HTTP port hub routes are published on |
 | `auth` | string | `token` | `token` requires the bearer token in `~/.prox/hub.token`; `none` is an explicit "this network is trusted" opt-out |

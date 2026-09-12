@@ -353,10 +353,14 @@ type registerOutcome struct {
 	status int
 	body   any
 	// displaced names remote publishers whose registrations this call removed
-	// and COMMITTED. Their tunnels are closed by the caller, outside the lock.
+	// and COMMITTED, each paired with the lease GENERATION its registration
+	// held. Their tunnels are closed by the caller, outside the lock, and only
+	// at that exact generation (plan 031, review B1): a publisher that already
+	// re-registered and reattached between the removal here and the close there
+	// owns a newer session that this call has no business touching.
 	// A takeover that later failed and was rolled back names nobody here — its
 	// losers are back in the registry and must keep their tunnels (plan 031 F6).
-	displaced []string
+	displaced []tunnelRef
 	// restored names registrations put back from a snapshot: the newcomer's own
 	// prior registration after a failed re-register, or displaced holders after
 	// a failed takeover. Their lease is re-checked against the session manager
@@ -375,9 +379,11 @@ type registerOutcome struct {
 // wrapper acts once the lock is released.
 func (s *Server) register(req RegisterRequest) (int, any) {
 	out := s.registerTransaction(req)
-	for _, key := range out.displaced {
-		s.closeTunnel(key)
-		s.logger.Info("closed the tunnel of a displaced publisher", "project", key)
+	for _, ref := range out.displaced {
+		if s.closeTunnelGen(ref.key, ref.gen) {
+			s.logger.Info("closed the tunnel of a displaced publisher",
+				"project", ref.key, "generation", ref.gen)
+		}
 	}
 	for _, key := range out.restored {
 		s.reconcileTunnelLease(key)
@@ -397,20 +403,49 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 // what is actually installed, once, closes that.
 //
 // It runs OUTSIDE lifecycleMu, which is what keeps the session mutex a leaf.
+//
+// It COMPARES GENERATIONS rather than accepting any installed session (plan 031,
+// review B3). "A tunnel exists for this key" is not the question — a tunnel of a
+// DIFFERENT generation than the one the restored lease names is a different
+// session entirely, and treating it as proof of connectedness is how a
+// registration ends up pinned to a generation nobody holds: connected forever,
+// unserveable, and unsweepable, because MarkDisconnected no-ops on a generation
+// mismatch and the sweep needs a DisconnectedAt only it can set.
 func (s *Server) reconcileTunnelLease(key string) {
 	if s.registry == nil {
 		return
 	}
 	lease, ok := s.registry.RemoteLease(key)
-	if !ok || lease.SessionGen == 0 || !lease.DisconnectedAt.IsZero() {
+	if !ok {
 		return
 	}
-	if s.tunnels.get(key) != nil {
+	t := s.tunnels.get(key)
+
+	if t == nil {
+		// Nothing installed. A lease that claims a live session is claiming one
+		// that closed while the registration was briefly out of the registry.
+		if lease.SessionGen == 0 || !lease.DisconnectedAt.IsZero() {
+			return
+		}
+		if s.registry.MarkDisconnected(key, lease.SessionGen, time.Now()) {
+			s.logger.Info("marked a restored registration disconnected: its tunnel closed while it was being replaced",
+				"project", key, "generation", lease.SessionGen)
+		}
 		return
 	}
-	if s.registry.MarkDisconnected(key, lease.SessionGen, time.Now()) {
-		s.logger.Info("marked a restored registration disconnected: its tunnel closed while it was being replaced",
-			"project", key, "generation", lease.SessionGen)
+
+	if t.gen == lease.SessionGen && lease.DisconnectedAt.IsZero() {
+		return // already in sync with the session that is actually installed
+	}
+	// A session IS installed, under a generation the restored lease does not
+	// name (or names as disconnected). The installed session is the truth:
+	// adopt it, so the registration is connected to the tunnel that exists
+	// instead of to the one the snapshot remembered. MarkConnected refuses an
+	// OLDER generation, which is the guard that keeps this from rolling a live
+	// registration backwards.
+	if s.registry.MarkConnected(key, t.gen) {
+		s.logger.Info("re-synced a restored registration onto the tunnel that is actually installed",
+			"project", key, "lease_generation", lease.SessionGen, "session_generation", t.gen)
 	}
 }
 
@@ -435,6 +470,44 @@ func (s *Server) registerTransaction(req RegisterRequest) (out registerOutcome) 
 			Error: "daemon is shutting down; retry to start a fresh daemon",
 			Code:  "SHUTTING_DOWN",
 		}}
+	}
+
+	// D4 — and the ATOMICITY of D4 (plan 031, review B2). The hub's domain and
+	// data-plane ports are read HERE, inside the lifecycle transaction, and the
+	// routes are committed a few dozen lines below without ever releasing the
+	// lock. startHub takes the same lock around its publisher-count check and its
+	// commit, so the two can no longer interleave: previously the handler
+	// snapshotted the config, startHub saw zero publishers, and this transaction
+	// then committed routes built from the config startHub had already replaced —
+	// the "status reports a config the routes do not use" state the reconfigure
+	// guard exists to prevent.
+	var hubInfo *RegisterHubInfo
+	if req.Origin != "" {
+		hub := s.hubConfigSnapshotLocked()
+		if !hub.enabled {
+			// Belt and braces: the listener is torn down before this can be
+			// observed, but a request in flight during StopHub must not register.
+			return registerOutcome{status: http.StatusServiceUnavailable, body: ErrorResponse{
+				Error: "hub mode is not enabled",
+				Code:  "HUB_DISABLED",
+			}}
+		}
+		req.Domain = hub.cfg.Domain
+		req.HTTPSPort = hub.cfg.HTTPSPort
+		req.HTTPPort = hub.cfg.HTTPPort
+		// The publisher has no way to know where its names were published, since
+		// the three facts above were just overwritten. Hand them back on the
+		// success body — the only place they are added, so every socket response
+		// is untouched (plan 031 C5).
+		hubInfo = &RegisterHubInfo{
+			Domain:    hub.cfg.Domain,
+			HTTPSPort: hub.cfg.HTTPSPort,
+			HTTPPort:  hub.cfg.HTTPPort,
+		}
+	}
+	// successBody builds a 200 body, attaching the hub facts for a remote caller.
+	successBody := func(hostnames []string) RegisterResponse {
+		return RegisterResponse{Registered: hostnames, Warnings: s.currentWarnings(), Hub: hubInfo}
 	}
 
 	// Cross-publisher name collisions are settled BEFORE the registry sees the
@@ -517,14 +590,19 @@ func (s *Server) registerTransaction(req RegisterRequest) (out registerOutcome) 
 				// not have attached yet, and without the renewal the sweep or a
 				// newcomer could remove the very registration just confirmed.
 				s.registry.RenewAttachReservation(conflict.Dir, constants.HubAttachGrace)
+				// The PUBLISHING PROCESS may have changed even though the config
+				// did not — a `prox up` restarted in the same directory
+				// re-registers the same services under a new PID. Recording it
+				// is what keeps the deregister guard meaningful (plan 031,
+				// review B1): whoever registered last is who may deregister, so
+				// an older generation's teardown cannot delete its successor,
+				// and the current one can still remove its own.
+				s.registry.RefreshRemoteOwner(conflict.Dir, req.PID, req.StartTime)
 				s.logger.Info("idempotent remote re-register: config unchanged, no-op refresh",
 					"project", conflict.Dir, "origin", req.Origin)
 				return registerOutcome{
-					status: http.StatusOK,
-					body: RegisterResponse{
-						Registered: s.registry.ProjectHostnames(conflict.Dir),
-						Warnings:   s.currentWarnings(),
-					},
+					status:    http.StatusOK,
+					body:      successBody(s.registry.ProjectHostnames(conflict.Dir)),
 					displaced: s.commitDisplacedLocked(displacedSnaps),
 				}
 			}
@@ -582,11 +660,8 @@ func (s *Server) registerTransaction(req RegisterRequest) (out registerOutcome) 
 				// ones. This is the self-heal path (cli.proxy_runtime), and a client
 				// reconnecting here is exactly a client that has not seen them yet.
 				return registerOutcome{
-					status: http.StatusOK,
-					body: RegisterResponse{
-						Registered: s.registry.ProjectHostnames(conflict.Dir),
-						Warnings:   s.currentWarnings(),
-					},
+					status:    http.StatusOK,
+					body:      successBody(s.registry.ProjectHostnames(conflict.Dir)),
 					displaced: s.commitDisplacedLocked(displacedSnaps),
 				}
 			}
@@ -637,16 +712,6 @@ func (s *Server) registerTransaction(req RegisterRequest) (out registerOutcome) 
 				restored: restored,
 			}
 		}
-	}
-
-	// A freshly accepted remote registration is reserved for HubAttachGrace, and
-	// so is a re-registered one whose lease was just carried across a replace:
-	// the carried ReservedUntil belongs to the PREVIOUS registration and may
-	// already have lapsed (plan 031 F5). Renewing here covers every arm that
-	// reaches the commit; RenewAttachReservation no-ops on a connected
-	// registration, whose tunnel is its lease.
-	if req.Origin != "" {
-		s.registry.RenewAttachReservation(req.ProjectDir, constants.HubAttachGrace)
 	}
 
 	// The registry now holds this project's routes, so the hot path can resolve
@@ -723,13 +788,32 @@ func (s *Server) registerTransaction(req RegisterRequest) (out registerOutcome) 
 	// the effective daemon-wide bound and enforce it (#69). Covers the fresh,
 	// changed-config, and stale-replacement register arms (all reach here).
 	s.syncCaptureBudget()
+
+	// A freshly accepted remote registration is reserved for HubAttachGrace, and
+	// so is a re-registered one whose lease was just carried across a replace:
+	// the carried ReservedUntil belongs to the PREVIOUS registration and may
+	// already have lapsed (plan 031 F5). RenewAttachReservation no-ops on a
+	// connected registration, whose tunnel is its lease.
+	//
+	// It happens HERE, immediately before the successful return, rather than
+	// before the cert and listener phases (plan 031, review B7). Certificate
+	// generation can take seconds on a cold certs directory and a listener bind
+	// retries briefly; a reservation started before them can be most of the way
+	// through its 10s grace by the time the publisher reads the 200, which would
+	// answer "you are registered" about a registration a sweep or a newcomer
+	// could already take. Starting the clock when the answer is sent gives the
+	// publisher the whole grace to attach.
+	if req.Origin != "" {
+		s.registry.RenewAttachReservation(req.ProjectDir, constants.HubAttachGrace)
+	}
+
 	// The newcomer is committed, so the displaced holders are finally beyond
 	// recovery: destroy their rings and let the caller close their tunnels
 	// (plan 031 F6). Nothing before this point could have needed them back.
 	displaced := s.commitDisplacedLocked(displacedSnaps)
 	return registerOutcome{
 		status:    http.StatusOK,
-		body:      RegisterResponse{Registered: hostnames, Warnings: s.currentWarnings()},
+		body:      successBody(hostnames),
 		displaced: displaced,
 	}
 }
@@ -781,18 +865,22 @@ func (s *Server) resolveHubNameCollisionsLocked(req RegisterRequest) (displaced 
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		// SNAPSHOT BEFORE REMOVING (plan 031 F6). The newcomer has not
-		// registered, generated a cert, or bound a listener yet, and any of
-		// those can still fail — at which point every holder displaced here must
-		// go back exactly as it was. Their RINGS are kept (removeProjectLocked
-		// purges records but leaves the manager) and their TUNNELS are left open
-		// for the same reason; both are finalized by commitDisplacedLocked once
-		// the newcomer is committed.
-		snap, ok := s.registry.snapshotProject(key)
+		// SNAPSHOT AND REMOVE IN ONE REGISTRY OPERATION (plan 031 F6, tightened
+		// by review B3). The newcomer has not registered, generated a cert, or
+		// bound a listener yet, and any of those can still fail — at which point
+		// every holder displaced here must go back exactly as it was. Their
+		// RINGS are kept (removeDisplacedLocked purges nothing) and their
+		// TUNNELS are left open for the same reason; both are finalized by
+		// commitDisplacedLocked once the newcomer is committed.
+		//
+		// The two halves were once two registry calls, and a tunnel attaching
+		// between them left the snapshot carrying a lease older than the session
+		// the manager had just installed — so a rollback restored a registration
+		// pinned to a generation nobody held.
+		snap, removed, ports, ok := s.removeDisplacedLocked(key)
 		if !ok {
 			continue
 		}
-		removed, ports := s.removeDisplacedLocked(key)
 		displaced = append(displaced, snap)
 		s.logger.Warn("removed a hub registration that lost a name collision",
 			"project", key, "takeover", req.Takeover,
@@ -815,11 +903,14 @@ func (s *Server) resolveHubNameCollisionsLocked(req RegisterRequest) (displaced 
 // files exactly as the ordinary path would have. Listeners the removal emptied
 // ARE closed here, because restoreSnapshotLocked re-opens them and because the
 // newcomer usually wants the very same port.
-func (s *Server) removeDisplacedLocked(key string) (removedHostnames []string, emptyPorts []int) {
+func (s *Server) removeDisplacedLocked(key string) (snap projectSnapshot, removedHostnames []string, emptyPorts []int, ok bool) {
 	if s.registry == nil {
-		return nil, nil
+		return projectSnapshot{}, nil, nil, false
 	}
-	removedHostnames, emptyPorts = s.registry.Deregister(key)
+	snap, removedHostnames, emptyPorts, ok = s.registry.SnapshotAndDeregister(key)
+	if !ok {
+		return projectSnapshot{}, nil, nil, false
+	}
 	s.lifecycleEpoch.Add(1)
 	if s.proxy != nil {
 		for _, port := range emptyPorts {
@@ -828,25 +919,26 @@ func (s *Server) removeDisplacedLocked(key string) (removedHostnames []string, e
 			}
 		}
 	}
-	return removedHostnames, emptyPorts
+	return snap, removedHostnames, emptyPorts, true
 }
 
 // commitDisplacedLocked finalizes the holders a successful takeover displaced
-// (plan 031 F6): their rings are destroyed here and their keys returned so the
-// caller can close their tunnels once lifecycleMu is released. It runs ONLY
+// (plan 031 F6): their rings are destroyed here and their keys — each with the
+// lease GENERATION its registration held — returned so the caller can close
+// exactly those tunnels once lifecycleMu is released (review B1). It runs ONLY
 // after the newcomer has committed — before that point every one of them may
 // still have to be restored. lifecycleMu must be held.
-func (s *Server) commitDisplacedLocked(displaced []projectSnapshot) []string {
+func (s *Server) commitDisplacedLocked(displaced []projectSnapshot) []tunnelRef {
 	if len(displaced) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(displaced))
+	refs := make([]tunnelRef, 0, len(displaced))
 	for _, snap := range displaced {
 		s.destroyProjectManager(snap.proj.Dir)
-		keys = append(keys, snap.proj.Dir)
+		refs = append(refs, tunnelRef{key: snap.proj.Dir, gen: snap.proj.SessionGen})
 	}
 	s.syncCaptureBudget()
-	return keys
+	return refs
 }
 
 // removeDisconnectedRemote is the lease sweep's removal path (plan 031 D3/D17):
@@ -919,7 +1011,18 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // and schedules the empty-daemon shutdown check. The CALLER resolves the key,
 // which is the whole authorization story on the network mount (plan 031 D15).
 func (s *Server) deregisterProject(w http.ResponseWriter, projectKey string, pid int) {
-	removedHostnames, emptyPorts := s.removeProject(projectKey)
+	// GUARDED by the caller's own PID, and reporting the lease generation it
+	// removed (plan 031, review B1). Both halves close the same race from
+	// opposite ends: a `prox down` whose registration has already been replaced
+	// — a crashed-and-restarted `prox up` in the same directory, a publisher
+	// that re-registered under a new PID — used to delete its SUCCESSOR's
+	// registration, and then close the successor's tunnel on the way out.
+	res := s.removeProjectOwned(projectKey, pid)
+
+	if res.Mismatch {
+		s.logger.Warn("ignored a deregister from a process that no longer owns the registration",
+			"project", projectKey, "pid", pid)
+	}
 
 	// An explicit deregister ends the publisher's lease, so its tunnel has
 	// nothing left to serve (plan 031 F10). Leaving it open leaked a yamux
@@ -928,20 +1031,25 @@ func (s *Server) deregisterProject(w http.ResponseWriter, projectKey string, pid
 	// disconnect or the hub stopped — and `prox down` followed by `prox up` on a
 	// long-lived hub did it every time.
 	//
-	// OUTSIDE lifecycleMu, which removeProject has already released: the session
-	// mutex is a leaf and a session close is I/O (D17). A no-op for a local key,
-	// which never has a session.
-	s.closeTunnel(projectKey)
+	// Only the generation this deregister actually removed is closed: a session
+	// installed since then belongs to a registration this call never touched.
+	//
+	// OUTSIDE lifecycleMu, which removeProjectOwned has already released: the
+	// session mutex is a leaf and a session close is I/O (D17). A no-op for a
+	// local key, which never has a session.
+	if res.Removed {
+		s.closeTunnelGen(projectKey, res.SessionGen)
+	}
 
 	s.logger.Info("deregistered project",
 		"project", projectKey,
 		"pid", pid,
-		"removed_hostnames", removedHostnames,
-		"closed_ports", emptyPorts,
+		"removed_hostnames", res.Hostnames,
+		"closed_ports", res.EmptyPorts,
 	)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"removed": removedHostnames,
+		"removed": res.Hostnames,
 	})
 
 	// If registry is empty, schedule a graced shutdown check.
@@ -1012,6 +1120,34 @@ func (s *Server) removeProject(projectDir string) (removedHostnames []string, em
 	// (a departing project can only relax the daemon-wide min) (#69).
 	s.syncCaptureBudget()
 	return removedHostnames, emptyPorts
+}
+
+// removeProjectOwned is removeProject for an explicit deregister: the removal is
+// guarded on pid still naming the registration's owner, and it reports the lease
+// generation the removed registration held so the caller can close that exact
+// tunnel session (plan 031, review B1). A guarded no-op leaves the live
+// generation's routes, ring and tunnel completely untouched.
+func (s *Server) removeProjectOwned(projectKey string, pid int) DeregisterResult {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	// Once teardown has begun, physical cleanup is the exiting daemon's job (see
+	// removeProject).
+	if s.isShuttingDown() || s.registry == nil {
+		return DeregisterResult{}
+	}
+	res := s.registry.DeregisterOwned(projectKey, pid)
+	if !res.Removed {
+		return res
+	}
+	s.lifecycleEpoch.Add(1)
+	s.finishRemoval(projectKey, res.EmptyPorts)
+	// Genuine deregister: tear down the project's per-project ring after
+	// finishRemoval purged its records.
+	s.destroyProjectManager(projectKey)
+	// The project left the registry; recompute the effective capture disk budget
+	// (a departing project can only relax the daemon-wide min) (#69).
+	s.syncCaptureBudget()
+	return res
 }
 
 // removeProjectLocked is removeProject's body; lifecycleMu must be held. It lets

@@ -181,8 +181,26 @@ func newWarningSink() *warningSink { return &warningSink{} }
 // Identity is domain.DedupeWarnings' identity — Code AND Message, hint excluded
 // — so the two producers of the same advisory cannot make it appear twice.
 func (s *warningSink) Add(ws ...domain.Warning) []domain.Warning {
+	added, _ := s.AddSealed(ws...)
+	return added
+}
+
+// AddSealed is Add plus the seal latch AS IT WAS WHEN THE WARNING LANDED, read
+// in the same critical section that recorded it (plan 031, review A4).
+//
+// That atomicity is the whole point. A producer that raises a warning late in
+// startup has to know whether the session's one render has already happened: if
+// it has, the producer must log the warning itself or nobody sees it; if it has
+// not, logging it would print it twice. Asking Add and then WarningsSealed left
+// a window between the two, and a warning landing in that window was either lost
+// from both the terminal and the log, or printed in both.
+//
+// sealed=true means "startup has already rendered what it had; this one is on
+// you". SealAndSnapshot seals and snapshots under this same lock, so the two
+// answers cannot disagree.
+func (s *warningSink) AddSealed(ws ...domain.Warning) (added []domain.Warning, sealed bool) {
 	if s == nil || len(ws) == 0 {
-		return nil
+		return nil, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -192,11 +210,11 @@ func (s *warningSink) Add(ws ...domain.Warning) []domain.Warning {
 	// everything past `before` is genuinely new.
 	s.warnings = domain.DedupeWarnings(append(s.warnings, ws...))
 	if len(s.warnings) == before {
-		return nil
+		return nil, s.sealed
 	}
-	added := make([]domain.Warning, len(s.warnings)-before)
+	added = make([]domain.Warning, len(s.warnings)-before)
 	copy(added, s.warnings[before:])
-	return added
+	return added, s.sealed
 }
 
 // Warnings returns a COPY of the collected warnings, nil when there are none so
@@ -234,6 +252,31 @@ func (s *warningSink) Seal() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sealed = true
+}
+
+// SealAndSnapshot seals the session and returns what the render must print, in
+// ONE critical section (plan 031, review A4).
+//
+// Snapshot-then-seal was two of them, and a warning landing between the two was
+// in neither: not in the snapshot the render was about to print, and not
+// logged by its producer, which had asked an unsealed sink whether startup had
+// already rendered. Sealing FIRST and copying under the same lock makes every
+// warning fall cleanly on one side — either it is in the returned slice (and
+// its producer was told sealed=false), or it arrives after and its producer was
+// told sealed=true and logged it itself.
+func (s *warningSink) SealAndSnapshot() []domain.Warning {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sealed = true
+	if len(s.warnings) == 0 {
+		return nil
+	}
+	out := make([]domain.Warning, len(s.warnings))
+	copy(out, s.warnings)
+	return out
 }
 
 // WarningsSealed reports the completion latch (see Seal).

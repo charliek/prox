@@ -23,7 +23,22 @@ import (
 // boundary — a café LAN is 192.168/16. The two unspecified addresses are the
 // cases that matter most: binding 0.0.0.0 or :: would expose the hub on EVERY
 // interface, and no flag opts into that.
+//
+// The CGNAT rows are the review-B5 split: 100.64/10 is Tailscale's range AND a
+// carrier-grade-NAT range, so membership alone proves nothing about encryption.
+// An address there is encrypted only when it sits on a TUNNEL interface; the
+// same address on an ordinary LAN interface is a plaintext wire and needs the
+// opt-in like any other. The set of tunnel addresses is injected so these rows
+// assert the rule rather than the interfaces of whatever machine runs them.
 func TestClassifyHubListenAddr(t *testing.T) {
+	// Everything in this table that is NOT the CGNAT split is classified the
+	// same either way, so one set covers the whole table: 100.64.0.1 and
+	// 100.82.128.123 are "on a tunnel", 100.127.255.254 is not.
+	tunnelAddrs := map[string]struct{}{
+		"100.64.0.1":     {},
+		"100.82.128.123": {},
+	}
+
 	tests := []struct {
 		name string
 		addr string
@@ -32,9 +47,12 @@ func TestClassifyHubListenAddr(t *testing.T) {
 		{"loopback v4", "127.0.0.1", hubListenEncrypted},
 		{"loopback v4 elsewhere in /8", "127.9.9.9", hubListenEncrypted},
 		{"loopback v6", "::1", hubListenEncrypted},
-		{"cgnat 100.64/10 low", "100.64.0.1", hubListenEncrypted},
+		{"cgnat 100.64/10 low, on a tunnel interface", "100.64.0.1", hubListenEncrypted},
 		{"cgnat 100.64/10 tailnet", "100.82.128.123", hubListenEncrypted},
-		{"cgnat 100.64/10 high", "100.127.255.254", hubListenEncrypted},
+		// The B5 case: a CGNAT address that is NOT on a tunnel device — a
+		// carrier-grade-NAT lease, a hotspot, a campus LAN — is a plaintext
+		// wire and must not be auto-selected as if it were a tailnet address.
+		{"cgnat 100.64/10 high, on a plain interface", "100.127.255.254", hubListenUnencryptedLAN},
 
 		{"rfc1918 10/8", "10.1.2.3", hubListenUnencryptedLAN},
 		{"rfc1918 172.16/12 low", "172.16.0.1", hubListenUnencryptedLAN},
@@ -57,10 +75,54 @@ func TestClassifyHubListenAddr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ip := net.ParseIP(tt.addr)
 			require.NotNil(t, ip, "test address must parse")
-			assert.Equal(t, tt.want, classifyHubListenAddr(ip))
+			assert.Equal(t, tt.want, classifyHubListenAddrWith(ip, tunnelAddrs))
 			assert.Equal(t, tt.want != hubListenRefused, isPrivateListenAddr(ip))
 		})
 	}
+}
+
+// TestIsTunnelInterface pins the device test review B5 rests on: a tailnet
+// device is recognized by NAME (tailscale0, utunN, wgN) or by being a
+// point-to-point link with no broadcast, and an ordinary Ethernet or Wi-Fi
+// interface is neither — which is exactly why a CGNAT address on one of those
+// is not evidence of encryption.
+func TestIsTunnelInterface(t *testing.T) {
+	tests := []struct {
+		name  string
+		iface net.Interface
+		want  bool
+	}{
+		{"tailscale0 by name", net.Interface{Name: "tailscale0", Flags: net.FlagUp | net.FlagPointToPoint}, true},
+		{"macOS utun by name", net.Interface{Name: "utun3", Flags: net.FlagUp}, true},
+		{"wireguard by name", net.Interface{Name: "wg0", Flags: net.FlagUp}, true},
+		{"unnamed point-to-point tun", net.Interface{Name: "tun9", Flags: net.FlagUp | net.FlagPointToPoint}, true},
+		{"ethernet", net.Interface{Name: "eth0", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast}, false},
+		{"wifi", net.Interface{Name: "wlp3s0", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast}, false},
+		{"macOS en0", net.Interface{Name: "en0", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast}, false},
+		{"docker bridge", net.Interface{Name: "docker0", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isTunnelInterface(tt.iface))
+		})
+	}
+}
+
+// TestDefaultHubListenAddr_IgnoresANonTunnelCGNATAddress is the consequence of
+// B5 that a user would actually meet: on a machine whose ISP hands out a
+// carrier-grade-NAT address, a first `prox hub start` must fall back to loopback
+// and say so, NOT silently bind the carrier address and put the bearer token on
+// a network the carrier's other customers share.
+func TestDefaultHubListenAddr_IgnoresANonTunnelCGNATAddress(t *testing.T) {
+	restore := tunnelInterfaceAddrs
+	t.Cleanup(func() { tunnelInterfaceAddrs = restore })
+
+	// No tunnel interfaces at all: whatever this machine holds in 100.64/10 is
+	// a carrier address as far as the rule is concerned.
+	tunnelInterfaceAddrs = func() map[string]struct{} { return nil }
+	addr, tailnet := DefaultHubListenAddr()
+	assert.False(t, tailnet, "a CGNAT address off a tunnel device is not a tailnet address")
+	assert.Equal(t, "127.0.0.1:8443", addr)
 }
 
 // TestValidateHubListenAddr covers the wrapper the config path actually calls:
@@ -75,9 +137,26 @@ func TestValidateHubListenAddr(t *testing.T) {
 	})
 
 	t.Run("keeps an explicit port, including 0", func(t *testing.T) {
-		got, err := validateHubListenAddr("100.64.1.2:0", false)
+		got, err := validateHubListenAddr("127.0.0.1:0", false)
 		require.NoError(t, err)
-		assert.Equal(t, "100.64.1.2:0", got)
+		assert.Equal(t, "127.0.0.1:0", got)
+	})
+
+	// Review B5, through the wrapper the config path actually calls: a CGNAT
+	// address that is not on a tunnel device is refused with the LAN advice
+	// rather than accepted as a tailnet address, and the opt-in still takes it.
+	t.Run("a CGNAT address off a tunnel device needs the LAN opt-in", func(t *testing.T) {
+		restore := tunnelInterfaceAddrs
+		t.Cleanup(func() { tunnelInterfaceAddrs = restore })
+		tunnelInterfaceAddrs = func() map[string]struct{} { return nil }
+
+		_, err := validateHubListenAddr("100.64.1.2:8443", false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "plain LAN address")
+
+		got, err := validateHubListenAddr("100.64.1.2:8443", true)
+		require.NoError(t, err)
+		assert.Equal(t, "100.64.1.2:8443", got)
 	})
 
 	// Plan 031: an out-of-range listen port is a CONFIG error, caught here, not

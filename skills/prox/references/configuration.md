@@ -467,8 +467,9 @@ default` / `hub: default` resolve to.
 
 **On the hub HOST**, `~/.prox/hub.yaml` (written by `prox hub start`, or by
 hand) configures the hub itself: `domain` (required, first start), `listen`
-(control-plane address; default: this machine's tailnet `100.64.0.0/10`
-address, else loopback), `https_port`/`http_port` (data-plane ports for
+(control-plane address; default: this machine's tailnet address — a CGNAT
+`100.64.0.0/10` address on a tunnel interface — else loopback; a CGNAT address
+on an ordinary interface counts as plain LAN), `https_port`/`http_port` (data-plane ports for
 published routes), `auth` (`token` | `none`), `autostart`, and
 `allow_unencrypted_lan` (opt-in for a plain private-LAN listen address — the
 control plane is plain HTTP, so this matters; see the

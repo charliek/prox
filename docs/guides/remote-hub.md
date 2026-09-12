@@ -115,8 +115,10 @@ it: `~/.prox/hub.token` is a file on the hub host and names nothing on a
 publisher machine.
 
 If this machine has no tailnet address, `prox hub start` falls back to
-loopback and says so — only processes on the hub host itself can publish
-until you re-run it with `--listen <address>:8443` naming a reachable one.
+loopback and says so — only processes on the hub host itself can publish until
+you re-run it with `--listen <address>:8443` naming a reachable one. On a plain
+LAN address that also needs `--allow-unencrypted-lan` (see
+[Security](#security)).
 
 Certificates need no setup: the hub generates an mkcert wildcard certificate
 for `llt.stridelabs.ai` on first registration, exactly as the local proxy
@@ -281,8 +283,18 @@ prox up -d --hub llt   # warns and starts WITHOUT the hub route
 ```
 
 `prox up -d` (or any non-interactive run) never blocks waiting for an answer
-— it warns and continues locally. A foreground `prox up` in a real terminal
-asks instead:
+— it warns and continues locally. B's own `prox status` then reports the
+collision rather than pretending no hub was configured:
+
+```text
+Hub: llt (name held: auth.llt.stridelabs.ai held by mac-a:/home/charlie/auth)
+```
+
+That state is terminal for the run: B publishes nothing to the hub, keeps
+every local route it would have had anyway, and does not retry. Re-run with
+`--hub-takeover` (below) or stop the other publisher.
+
+A foreground `prox up` in a real terminal asks instead:
 
 ```text
 Hub llt already publishes 1 service name(s) this project registers:
@@ -332,8 +344,11 @@ Warning: hub llt unreachable (connection refused); continuing with local proxy o
 Hub: llt (reconnecting, down 12s)
 ```
 
-and prox keeps retrying, silently, in the background — nothing further is
-printed to the terminal, but each state change is logged to `.prox/prox.log`.
+and prox keeps retrying, silently, in the background. That session gets exactly
+one `Warning:` line from the hub, whatever happens afterwards: a later change
+of state — the hub coming back, the name being taken over, a credential being
+refused — is recorded in `.prox/prox.log` and shown in `prox status`, never
+printed as a second warning.
 When the hub comes up, the routes appear on their own, with no command to
 re-run:
 
@@ -377,9 +392,15 @@ is a documented decision rather than an unnoticed hole.
 **The control plane is plain HTTP, not HTTPS.** The register/deregister/
 tunnel endpoints speak unencrypted HTTP with the bearer token in an
 `Authorization` header. That is why the hub's listen address defaults to
-loopback and the CGNAT range (`100.64.0.0/10`) only — traffic on a tailnet is
-already encrypted end to end at the network layer (WireGuard, in Tailscale's
-case), so the token is never in cleartext on a wire a stranger shares. Any
+loopback and to a CGNAT (`100.64.0.0/10`) address **that sits on a tunnel
+interface** — a `tailscale0`/`utunN`/`wgN` device, or any point-to-point link
+— because traffic on a tailnet is already encrypted end to end at the network
+layer (WireGuard, in Tailscale's case), so the token is never in cleartext on
+a wire a stranger shares. The interface check matters: Tailscale is not the
+only user of `100.64.0.0/10`, and a carrier-grade-NAT lease or a hotspot can
+hand your machine an address in the same range on an ordinary LAN interface.
+Such an address is treated as a plain LAN address and needs the same explicit
+opt-in below. Any
 other private range — plain LAN addresses like `10.0.0.0/8`, `172.16.0.0/12`,
 `192.168.0.0/16`, or IPv6 **ULA** (Unique Local Address, `fc00::/7` — the
 IPv6 equivalent of a private range) — needs an explicit opt-in
@@ -406,9 +427,12 @@ publishing across an untrusted boundary.
 ## Troubleshooting
 
 **`prox hub start` refuses my listen address.** By default only loopback and
-CGNAT (tailnet) addresses are accepted — see the security section above. Add
-`--allow-unencrypted-lan` if you've deliberately decided a plain LAN address
-is acceptable, or use a tailnet address instead.
+tailnet addresses are accepted — a CGNAT (`100.64.0.0/10`) address counts as
+a tailnet address only when it is on a tunnel interface, so a carrier-grade-NAT
+or hotspot address in the same range is refused like any other LAN address.
+See the security section above. Add `--allow-unencrypted-lan` if you've
+deliberately decided a plain LAN address is acceptable, or use a tailnet
+address instead.
 
 **A publisher gets `401`.** The token it's using doesn't match what the hub
 currently accepts — check `prox hub token` on the hub host against the

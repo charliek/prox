@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -260,20 +263,115 @@ func refusedHubURL(t *testing.T) string {
 	return "http://" + addr
 }
 
+// fakeTunnelRunner stands in for runHubTunnel.
+//
+// It is a real runner in the three ways the assertions depend on (plan 031,
+// review A11). The previous stand-in only incremented a counter and returned,
+// so `wantRetries` proved that a function had been called once — not that
+// anything retries, not that exactly one owner exists, and not that cancelling
+// joins anything. This one:
+//
+//   - counts STARTS, so "one goroutine owns the publisher state machine" (D19)
+//     is an assertion rather than an assumption;
+//   - actually LOOPS, counting attempts, so "retries forever" is observed
+//     happening rather than inferred from a single call;
+//   - returns only when its context is cancelled, and says so on finished, so a
+//     test can join it exactly as hubPublisher.Shutdown does.
+type fakeTunnelRunner struct {
+	mu       sync.Mutex
+	starts   int
+	attempts int
+	once     sync.Once
+	finished chan struct{}
+}
+
+func newFakeTunnelRunner() *fakeTunnelRunner {
+	return &fakeTunnelRunner{finished: make(chan struct{})}
+}
+
+func (f *fakeTunnelRunner) run(ctx context.Context, _ *hubPublisher, _ *proxy.RequestManager) {
+	f.mu.Lock()
+	f.starts++
+	f.mu.Unlock()
+	defer f.once.Do(func() { close(f.finished) })
+
+	for {
+		f.mu.Lock()
+		f.attempts++
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func (f *fakeTunnelRunner) counts() (starts, attempts int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.starts, f.attempts
+}
+
+// captureLogOutput redirects the stdlib logger — the channel every hub advisory
+// that is NOT going through the startup render uses — into a buffer, so a test
+// can count the lines a user would actually see.
+//
+// It exists because "exactly one warning" is a claim about OUTPUT, and the
+// tests that asserted it were reading the sink instead (plan 031, review A5).
+func captureLogOutput(t *testing.T) *syncBuffer {
+	t.Helper()
+	buf := &syncBuffer{}
+	prevOut, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	})
+	return buf
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's goroutine and the test's.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // hubPublishHarness wires a runtime, a warning sink and a recording tunnel
 // runner around startHubPublishing.
 type hubPublishHarness struct {
-	rt      *proxyRuntime
-	sink    *warningSink
-	started int
-	pre     *startupPreamble
+	rt     *proxyRuntime
+	sink   *warningSink
+	runner *fakeTunnelRunner
+	pre    *startupPreamble
 }
 
 func newHubPublishHarness() *hubPublishHarness {
 	rt := newProxyRuntime()
 	sink := newWarningSink()
 	rt.SetWarningSink(sink)
-	return &hubPublishHarness{rt: rt, sink: sink, pre: newStartupPreamble(false)}
+	return &hubPublishHarness{rt: rt, sink: sink, runner: newFakeTunnelRunner(), pre: newStartupPreamble(false)}
+}
+
+// starts is how many times the tunnel runner was launched.
+func (h *hubPublishHarness) starts() int {
+	starts, _ := h.runner.counts()
+	return starts
 }
 
 func (h *hubPublishHarness) publish(t *testing.T, ctx context.Context, hubURL string, opts ...func(*hubPublishOptions)) *hubPublisher {
@@ -296,9 +394,7 @@ func (h *hubPublishHarness) publish(t *testing.T, ctx context.Context, hubURL st
 		Preamble: h.pre,
 		Stdin:    strings.NewReader(""),
 		Stdout:   io.Discard,
-		Run: func(context.Context, *hubPublisher, *proxy.RequestManager) {
-			h.started++
-		},
+		Run:      h.runner.run,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -328,7 +424,9 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 		wantRetries  bool
 		// wantState is the expected `Hub:` state; "" means NO hub state at all.
 		wantState string
-		wantNil   bool
+		// wantDetail, when set, is the exact detail the state carries.
+		wantDetail string
+		wantNil    bool
 	}{
 		{
 			name: "retryable: connection refused",
@@ -393,6 +491,9 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 			wantState:   hubStateAuthFailed,
 		},
 		{
+			// Review A7: a declined collision keeps a TERMINAL, visible state.
+			// It used to erase the hub from `prox status` entirely, which says
+			// "no hub was configured" — the one thing that is not true here.
 			name: "terminal: name held, declined (non-interactive)",
 			url: func(t *testing.T) string {
 				return startFakeHub(t, &fakeHubRegister{status: http.StatusConflict, body: heldBody})
@@ -402,8 +503,8 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 				"         Re-run with --hub-takeover to take the name(s), or stop the other publisher.",
 			},
 			wantRetries: false,
-			wantState:   "",
-			wantNil:     true,
+			wantState:   hubStateNameHeld,
+			wantDetail:  "auth.llt.test held by mac:/home/c/slauth",
 		},
 		{
 			name: "success",
@@ -428,6 +529,12 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 			defer cancel()
 
 			h := newHubPublishHarness()
+			// Every user-visible line this session produces, captured: AC11
+			// counts WARNING LINES the user sees, and a sink entry is not one
+			// (review A5). logWarning writes through the stdlib logger, which
+			// is the terminal in plain mode and the TUI's log pane otherwise.
+			logged := captureLogOutput(t)
+
 			start := time.Now()
 			p := h.publish(t, ctx, tc.url(t))
 			elapsed := time.Since(start)
@@ -435,7 +542,7 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 			// Exit code: startHubPublishing returns no error at all, so there
 			// is nothing here that can fail `prox up` (§3.1).
 			if tc.wantNil {
-				assert.Nil(t, p, "a declined collision publishes nothing")
+				assert.Nil(t, p, "this row publishes nothing")
 			} else {
 				require.NotNil(t, p)
 			}
@@ -444,12 +551,35 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 			for _, w := range h.sink.Warnings() {
 				lines = append(lines, formatWarning(w)...)
 			}
-			assert.Equal(t, tc.wantWarnings, lines)
+			assert.Equal(t, tc.wantWarnings, lines, "the warnings the startup render will print")
+
+			// And the same count as USER-VISIBLE lines: the sink is rendered
+			// once by runUp, so nothing may have been printed on top of it
+			// while the session was still unsealed.
+			assert.Equal(t, 0, strings.Count(logged.String(), warningPrefix),
+				"a warning raised before the startup render must reach the user through the sink, not twice")
 
 			if tc.wantRetries {
-				assert.Equal(t, 1, h.started, "the tunnel loop must own the retries")
+				// A real retry loop: one owner, and attempts that keep coming.
+				require.Eventually(t, func() bool {
+					starts, attempts := h.runner.counts()
+					return starts == 1 && attempts >= 3
+				}, 5*time.Second, 2*time.Millisecond,
+					"the tunnel loop must own the retries and keep retrying")
+				// Cancelling joins it, which is what shutdown depends on.
+				cancel()
+				select {
+				case <-h.runner.finished:
+				case <-time.After(5 * time.Second):
+					t.Fatal("cancelling the run context did not stop the tunnel loop")
+				}
+				starts, _ := h.runner.counts()
+				assert.Equal(t, 1, starts, "exactly one tunnel loop, ever")
 			} else {
-				assert.Equal(t, 0, h.started, "a terminal failure must not retry")
+				// A terminal failure starts nothing at all. Give it a moment:
+				// "did not happen" needs a window to not happen in.
+				time.Sleep(50 * time.Millisecond)
+				assert.Equal(t, 0, h.starts(), "a terminal failure must not retry")
 			}
 
 			state := h.rt.HubState()
@@ -458,6 +588,9 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 			} else {
 				require.NotNil(t, state)
 				assert.Equal(t, tc.wantState, state.State)
+				if tc.wantDetail != "" {
+					assert.Equal(t, tc.wantDetail, state.Detail)
+				}
 			}
 
 			// AC11: `prox up` must not be delayed beyond HubConnectTimeout
@@ -471,14 +604,28 @@ func TestHubFailureClassification_Section31(t *testing.T) {
 
 // TestHubPublish_WarnsOnlyOnce pins D19's "exactly one warning on the FIRST
 // entry into a non-connected state": every later transition logs instead.
+//
+// It asserts on the OUTPUT, not on the sink (plan 031, review A5). AC11 promises
+// the user one warning line, and the sink is only one of the two places a line
+// can come from — the other is logWarning, which writes a fully rendered
+// `Warning:` line straight to the terminal (or the TUI's log pane). Counting
+// sink entries passed happily while later transitions printed more of them.
 func TestHubPublish_WarnsOnlyOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	h := newHubPublishHarness()
+	logged := captureLogOutput(t)
 	p := h.publish(t, ctx, refusedHubURL(t))
 	require.NotNil(t, p)
 	require.Len(t, h.sink.Warnings(), 1)
+
+	// visibleWarnings is what the user ends up seeing: the sink, rendered once
+	// by runUp at the end of startup, plus anything written to the log since.
+	visibleWarnings := func() int {
+		return len(h.sink.Warnings()) + strings.Count(logged.String(), warningPrefix)
+	}
+	require.Equal(t, 1, visibleWarnings(), "the first outage is the one warning")
 
 	outageStart := h.rt.HubState().Since
 
@@ -487,6 +634,7 @@ func TestHubPublish_WarnsOnlyOnce(t *testing.T) {
 		p.ForwarderConnectFailed(fmt.Errorf("still down"))
 	}
 	assert.Len(t, h.sink.Warnings(), 1, "the retry loop is silent after the first warning")
+	assert.Equal(t, 1, visibleWarnings(), "and prints nothing on top of it")
 	assert.Equal(t, hubStateReconnecting, h.rt.HubState().State)
 	// "down <t>" must measure the OUTAGE, so a retry that fails the same way
 	// does not restart the clock.
@@ -495,7 +643,7 @@ func TestHubPublish_WarnsOnlyOnce(t *testing.T) {
 	// And a recovery flips the state without adding anything.
 	p.ForwarderConnected()
 	assert.Equal(t, hubStateConnected, h.rt.HubState().State)
-	assert.Len(t, h.sink.Warnings(), 1)
+	assert.Equal(t, 1, visibleWarnings())
 
 	// A LATER outage is a real transition — it logs and restarts the outage
 	// clock — but it still adds no second warning: the sink is what a
@@ -503,8 +651,236 @@ func TestHubPublish_WarnsOnlyOnce(t *testing.T) {
 	// its one advisory.
 	p.ForwarderConnectFailed(fmt.Errorf("down again"))
 	assert.Equal(t, hubStateReconnecting, h.rt.HubState().State)
-	assert.Len(t, h.sink.Warnings(), 1)
+	assert.Equal(t, 1, visibleWarnings())
 	assert.True(t, h.rt.HubState().Since.After(outageStart))
+
+	// A DIFFERENT advisory entirely — a later transition into another
+	// non-connected state, which is where the second `Warning:` line used to
+	// come from. It is recorded in the log, without the label.
+	p.degrade(hubStateDisplaced, "auth.llt.test held by mac:/a",
+		hubDisplacedWarning("llt", &proxyd.DaemonAPIError{Code: "HUB_NAME_HELD", Status: 409}))
+	assert.Equal(t, hubStateDisplaced, h.rt.HubState().State)
+	assert.Equal(t, 1, visibleWarnings(),
+		"AC11 counts WARNING LINES the user sees: a later state change is not a second warning")
+	assert.Contains(t, logged.String(), "another publisher took over",
+		"but it is still recorded, which is what .prox/prox.log is for")
+}
+
+// recordingHub is a hub that records every call it receives, in order, and can
+// be scripted to fail registers. It is how the lifecycle findings (A1, A2, A3)
+// are asserted: each of them is a claim about WHICH calls this publisher makes,
+// with what, and in what order.
+type recordingHub struct {
+	mu sync.Mutex
+	// calls is "register(takeover=…)" / "deregister", in arrival order.
+	calls []string
+	// registerStatus is the status registers answer with; 200 means success.
+	registerStatus int
+	url            string
+}
+
+func startRecordingHub(t *testing.T, registerStatus int) *recordingHub {
+	t.Helper()
+	h := &recordingHub{registerStatus: registerStatus}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/register":
+			var req proxyd.RegisterRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			h.record(fmt.Sprintf("register(takeover=%t)", req.Takeover))
+			status := h.status()
+			w.WriteHeader(status)
+			if status == http.StatusOK {
+				_ = json.NewEncoder(w).Encode(proxyd.RegisterResponse{
+					Registered: []string{"auth.llt.test"},
+					Hub:        &proxyd.RegisterHubInfo{Domain: "llt.test", HTTPSPort: 443},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(proxyd.ErrorResponse{Error: "nope", Code: "INTERNAL"})
+		case "/api/v1/deregister":
+			h.record("deregister")
+			_, _ = w.Write([]byte(`{"removed":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h.url = srv.URL
+	return h
+}
+
+func (h *recordingHub) record(call string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls = append(h.calls, call)
+}
+
+func (h *recordingHub) status() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.registerStatus
+}
+
+func (h *recordingHub) setStatus(status int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.registerStatus = status
+}
+
+func (h *recordingHub) seen() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.calls...)
+}
+
+// TestHubPublish_TakeoverSurvivesToTheRetryPath is plan 031 review A1.
+//
+// The case the flag exists for is a hub that is DOWN when `prox up` runs: the
+// first register never reaches anybody, the tunnel loop takes over, and the
+// register that finally meets the held name is the RE-register. reregister()
+// hard-coded takeover:false, so `--hub-takeover` was silently dropped exactly
+// when the user needed it and the publisher went `displaced` instead.
+//
+// The second half is just as deliberate: once a registration has succeeded, the
+// flag is spent. A publisher that kept re-asserting takeover would fight every
+// later displacement, and two such publishers take the name from each other
+// forever.
+func TestHubPublish_TakeoverSurvivesToTheRetryPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The hub is down for the FIRST register (500 → retryable), which is the
+	// state a publisher that starts before its hub is in.
+	hub := startRecordingHub(t, http.StatusInternalServerError)
+
+	h := newHubPublishHarness()
+	p := h.publish(t, ctx, hub.url, func(o *hubPublishOptions) { o.Takeover = true })
+	require.NotNil(t, p)
+	require.Equal(t, []string{"register(takeover=false)"}, hub.seen(),
+		"the first register deliberately asks without takeover, so a collision can be reported")
+
+	// The hub comes up. This is RunTunnel's 404 NOT_REGISTERED callback.
+	hub.setStatus(http.StatusOK)
+	require.NoError(t, p.reregister())
+	assert.Equal(t, []string{"register(takeover=false)", "register(takeover=true)"}, hub.seen(),
+		"--hub-takeover must reach the register that actually lands")
+
+	// And it is spent: a later re-register does not fight for the name again.
+	require.NoError(t, p.reregister())
+	assert.Equal(t, []string{
+		"register(takeover=false)",
+		"register(takeover=true)",
+		"register(takeover=false)",
+	}, hub.seen(), "a takeover is honored once, not asserted forever")
+}
+
+// TestHubPublish_ShutdownJoinsWorkersBeforeDeregistering is plan 031 review A2.
+//
+// D6c's ordering — cancel the tunnel, THEN deregister — was documented and not
+// enforced: both workers were launched with a bare `go`, so a re-register
+// already in flight when the cancel landed could reach the hub AFTER the
+// deregister and leave the registration behind for its whole lease.
+func TestHubPublish_ShutdownJoinsWorkersBeforeDeregistering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hub := startRecordingHub(t, http.StatusOK)
+
+	h := newHubPublishHarness()
+	// A runner that re-registers on its way OUT, slowly — the in-flight
+	// re-register the ordering exists to defeat.
+	stopped := make(chan struct{})
+	p := h.publish(t, ctx, hub.url, func(o *hubPublishOptions) {
+		o.Run = func(ctx context.Context, p *hubPublisher, _ *proxy.RequestManager) {
+			<-ctx.Done()
+			time.Sleep(200 * time.Millisecond)
+			_ = p.reregister()
+			close(stopped)
+		}
+	})
+	require.NotNil(t, p)
+
+	p.Shutdown(5 * time.Second)
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("the runner had not finished when Shutdown returned, so it was never joined")
+	}
+
+	calls := hub.seen()
+	require.NotEmpty(t, calls)
+	assert.Equal(t, "deregister", calls[len(calls)-1],
+		"the deregister must be the LAST word: a re-register landing after it would resurrect the registration")
+}
+
+// TestHubPublish_TunnelAttachProvesRegistration is plan 031 review A3.
+//
+// `registered` was set only by a fully decoded 200, so a register that timed out
+// or came back malformed AFTER the hub committed left a registration nothing
+// would ever clean up — it sat until the lease expired. A tunnel that attaches
+// is proof the registration exists: the hub answers the upgrade 404
+// NOT_REGISTERED otherwise.
+func TestHubPublish_TunnelAttachProvesRegistration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Registers fail, so nothing is ever confirmed by the register path.
+	hub := startRecordingHub(t, http.StatusInternalServerError)
+
+	h := newHubPublishHarness()
+	p := h.publish(t, ctx, hub.url)
+	require.NotNil(t, p)
+	require.False(t, p.everRegistered())
+
+	// The tunnel attaches anyway: the registration DID land, this process just
+	// never got to read the answer.
+	p.ForwarderConnected()
+	assert.True(t, p.everRegistered(), "a tunnel only attaches to a registration that exists")
+
+	p.Shutdown(5 * time.Second)
+	assert.Contains(t, hub.seen(), "deregister",
+		"a registration proven by the tunnel must be removed at shutdown")
+}
+
+// TestHubPublish_AmbiguousRegisterIsCleanedUp is A3's second half: a register
+// whose outcome is UNKNOWN — a timeout, a connection cut mid-response — may have
+// been committed, so shutdown tries to remove it. A register that was REFUSED
+// (connection refused, or a complete error response) was not committed and is
+// left alone, which is what keeps the AC11 "hub is down" teardown quiet.
+func TestHubPublish_AmbiguousRegisterIsCleanedUp(t *testing.T) {
+	t.Run("a complete error response is not ambiguous", func(t *testing.T) {
+		assert.False(t, registerMayHaveLanded(&proxyd.DaemonAPIError{Status: 500, Code: "INTERNAL"}))
+	})
+	t.Run("connection refused is not ambiguous", func(t *testing.T) {
+		assert.False(t, registerMayHaveLanded(fmt.Errorf("dial: %w", syscall.ECONNREFUSED)))
+	})
+	t.Run("a DNS failure is not ambiguous", func(t *testing.T) {
+		assert.False(t, registerMayHaveLanded(fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host"})))
+	})
+	t.Run("a timeout IS ambiguous", func(t *testing.T) {
+		assert.True(t, registerMayHaveLanded(context.DeadlineExceeded))
+	})
+
+	// End to end: a hub that accepts the connection and never answers leaves the
+	// publisher unsure, and shutdown cleans up rather than leaving a
+	// registration to sit out its lease.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := newHubPublishHarness()
+	p := h.publish(t, ctx, startBlackHoleHub(t))
+	require.NotNil(t, p)
+	assert.False(t, p.everRegistered())
+	assert.True(t, p.mayBeRegistered(), "a register that timed out may well have been committed")
+
+	// And a REFUSED hub leaves nothing to clean up, so teardown stays silent.
+	h2 := newHubPublishHarness()
+	p2 := h2.publish(t, ctx, refusedHubURL(t))
+	require.NotNil(t, p2)
+	assert.False(t, p2.mayBeRegistered())
 }
 
 // --- D10: the collision prompt ---
@@ -566,12 +942,51 @@ func TestAskHubTakeover(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(strings.TrimSpace(tc.answer), func(t *testing.T) {
 			var out strings.Builder
-			got := askHubTakeover(&out, strings.NewReader(tc.answer), "llt", holders)
+			got := askHubTakeover(context.Background(), &out, strings.NewReader(tc.answer), "llt", holders)
 			assert.Equal(t, tc.want, got)
 			assert.Contains(t, out.String(), "Take it over? [y/N]")
 			assert.Contains(t, out.String(), "auth.llt.test")
 		})
 	}
+
+	// Review A8: `prox up` has already called signal.Notify by the time this
+	// prompt appears, so SIGINT no longer terminates the process — the prompt
+	// has to honor the run context itself or Ctrl-C leaves startup wedged in
+	// ReadString until somebody presses enter. A reader that never produces a
+	// line stands in for a terminal nobody is typing at.
+	t.Run("a cancelled context declines without a keystroke", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var out strings.Builder
+		// The reader is released at cleanup rather than blocking forever: a
+		// test helper that parks a goroutine for the life of the binary is the
+		// leak this branch keeps re-learning about.
+		stdin := neverReader{release: make(chan struct{})}
+		t.Cleanup(func() { close(stdin.release) })
+		done := make(chan bool, 1)
+		go func() { done <- askHubTakeover(ctx, &out, stdin, "llt", holders) }()
+
+		select {
+		case <-done:
+			t.Fatal("the prompt returned before the context was cancelled")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		cancel()
+		select {
+		case got := <-done:
+			assert.False(t, got, "a cancelled prompt must decline")
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancelling the run context did not release the takeover prompt")
+		}
+	})
+}
+
+// neverReader blocks until released, like a terminal with nobody at it.
+type neverReader struct{ release chan struct{} }
+
+func (r neverReader) Read([]byte) (int, error) {
+	<-r.release
+	return 0, io.EOF
 }
 
 // TestHubPublish_TakeoverResendsWithTakeover pins that answering yes (or
@@ -634,7 +1049,8 @@ func TestHubPublish_TakeoverResendsWithTakeover(t *testing.T) {
 			assert.Empty(t, h.sink.Warnings(), "a takeover the user asked for is not an advisory")
 			require.NotNil(t, h.rt.HubState())
 			assert.Equal(t, hubStateConnecting, h.rt.HubState().State)
-			assert.Equal(t, 1, h.started)
+			require.Eventually(t, func() bool { return h.starts() == 1 }, 5*time.Second, 2*time.Millisecond,
+				"exactly one tunnel loop owns the publisher")
 		})
 	}
 }
@@ -687,6 +1103,18 @@ func TestHubStatusLine_EveryState(t *testing.T) {
 			"Hub: llt (auth failed)",
 		},
 		{
+			// Review A7: a declined collision is a visible terminal state, not
+			// an erased hub. The detail names who holds the name.
+			"name held, declined",
+			&api.HubStatusResponse{Alias: "llt", State: hubStateNameHeld, Detail: "auth.llt.test held by mac:/home/c/slauth"},
+			"Hub: llt (name held: auth.llt.test held by mac:/home/c/slauth)",
+		},
+		{
+			"name held with no holders",
+			&api.HubStatusResponse{Alias: "llt", State: hubStateNameHeld},
+			"Hub: llt (name held)",
+		},
+		{
 			"a transient state renders verbatim",
 			&api.HubStatusResponse{Alias: "llt", State: hubStateConnecting},
 			"Hub: llt (connecting)",
@@ -712,6 +1140,7 @@ func TestHubStatus_NeverChangesExitCode(t *testing.T) {
 	for _, state := range []string{
 		hubStateConnected, hubStateConnecting, hubStateReconnecting,
 		hubStateDisplaced, hubStateProtocolMismatch, hubStateAuthFailed,
+		hubStateNameHeld,
 	} {
 		t.Run(state, func(t *testing.T) {
 			p := &api.ProxyStatusResponse{
@@ -735,22 +1164,39 @@ func TestHubStatus_NeverChangesExitCode(t *testing.T) {
 	assert.Error(t, statusExitError(false, []string{"web"}, nil, nil))
 }
 
-// TestProxyRuntime_HubBlockAbsentWithoutAHub is AC1's negative space: a run
-// with no hub emits no `hub` key under status.proxy at all.
+// TestProxyRuntime_HubBlockAbsentWithoutAHub is AC1's negative space, asserted
+// BYTE FOR BYTE (plan 031, review A12).
+//
+// "Marshal it and check the string does not contain \"hub\"" is a weaker claim
+// than AC1 makes: it would pass for a payload that had gained some other key,
+// or lost one, or renamed one — any of which breaks a client that predates hub
+// mode just as thoroughly. The golden document below is the whole payload, so
+// ANY drift in a hub-less run fails here, and the hub key's absence is one
+// consequence of that rather than the only thing checked.
 func TestProxyRuntime_HubBlockAbsentWithoutAHub(t *testing.T) {
 	rt := newProxyRuntime()
 	rt.SetMode(proxyModeStandalone)
-	assert.Nil(t, rt.ProxyStatus().Hub)
 
-	encoded, err := json.Marshal(rt.ProxyStatus())
+	got, err := json.Marshal(rt.ProxyStatus())
 	require.NoError(t, err)
-	assert.NotContains(t, string(encoded), "\"hub\"")
 
+	// Every key a hub-less status carries, in struct order. Update this only
+	// when the payload is INTENTIONALLY changed for everyone.
+	want := `{"mode":"standalone","daemon_reachable":false,` +
+		`"consecutive_failures":0,"dropped_events":0,"backfill_failures":0,"capture_enabled":false}`
+	assert.Equal(t, want, string(got),
+		"a run with no hub must serialize exactly as it did before hub mode existed")
+
+	// And the hub key appears only once a hub state exists.
 	rt.SetHubState(&hubRuntimeState{Alias: "llt", State: hubStateConnected, Routes: 2})
-	got := rt.ProxyStatus().Hub
-	require.NotNil(t, got)
-	assert.Equal(t, "llt", got.Alias)
-	assert.Equal(t, 2, got.Routes)
+	withHub, err := json.Marshal(rt.ProxyStatus())
+	require.NoError(t, err)
+	assert.Contains(t, string(withHub), `"hub":{`)
+
+	hub := rt.ProxyStatus().Hub
+	require.NotNil(t, hub)
+	assert.Equal(t, "llt", hub.Alias)
+	assert.Equal(t, 2, hub.Routes)
 }
 
 // --- classification and rendering helpers ---

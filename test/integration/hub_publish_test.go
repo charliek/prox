@@ -211,6 +211,22 @@ func TestHubPublish_UnreachableHubIsNeverFatal(t *testing.T) {
 
 	env := newHubPublishEnv(t)
 
+	// The BASELINE: the same launch with no hub at all. AC11's real claim is
+	// "a hub must not delay startup", and the only honest way to measure that
+	// is against a run of the same command that never touches one (plan 031,
+	// review A10). The old absolute bound — HubConnectTimeout + 25s — was loose
+	// enough to pass with the 3s bound removed entirely, since the client's own
+	// 10s response-header timeout would simply take over.
+	baselineFixture := env.fixtureFor(t, "baseline.test", "http://"+reservedHubAddr(t), "llt")
+	baselineStart := time.Now()
+	baselineRun := baselineFixture.StartDetached(t, binary, "up", "-d", "--no-hub")
+	baseline := time.Since(baselineStart)
+	if code := baselineRun.ExitCode(t); code != 0 {
+		t.Fatalf("baseline prox up -d --no-hub exit code = %d\n%s", code, baselineRun.Output())
+	}
+	shutdownAndAwait(t, baselineRun)
+	t.Logf("no-hub baseline startup: %s", baseline)
+
 	for _, tc := range []struct {
 		name   string
 		hubURL func(t *testing.T) string
@@ -248,12 +264,14 @@ func TestHubPublish_UnreachableHubIsNeverFatal(t *testing.T) {
 				t.Fatalf("got %d AC11 warning lines, want exactly 1\noutput:\n%s", n, out)
 			}
 
-			// Bounded: a black-holed hub must not hold startup past
-			// HubConnectTimeout. The launcher also waits for readiness and a
-			// process settle window, so the bound is generous — what it rules
-			// out is an UNBOUNDED wait on the hub.
-			if max := constants.HubConnectTimeout + 25*time.Second; elapsed > max {
-				t.Fatalf("prox up -d took %s, want under %s", elapsed, max)
+			// Bounded AGAINST THE NO-HUB BASELINE (plan 031, review A10). The
+			// launcher's readiness wait and process settle window are in both
+			// numbers, so what is left is what the hub cost. A black hole may
+			// cost HubConnectTimeout and no more; with that bound removed the
+			// 10s response-header timeout takes over, which this rules out.
+			if max := baseline + constants.HubConnectTimeout + 4*time.Second; elapsed > max {
+				t.Fatalf("prox up -d took %s, want under %s (no-hub baseline %s + HubConnectTimeout %s + slack)",
+					elapsed, max, baseline, constants.HubConnectTimeout)
 			}
 
 			// The local route works exactly as it would with no hub at all.
@@ -387,13 +405,21 @@ func TestHubPublish_TwoPublishersCollide(t *testing.T) {
 	if got := driveProxy(t, env.proxyPort, "app.two.test", http.MethodGet, "/", nil); got != "backend-ok" {
 		t.Fatalf("publisher B local route = %q, want backend-ok", got)
 	}
-	// And B reports no hub at all, rather than a degraded one.
+	// And B reports the collision as a terminal, VISIBLE state (plan 031,
+	// review A7). This assertion used to say the opposite — that a declined
+	// collision leaves no `Hub:` line at all — which contradicted both the rule
+	// that a non-fatal hub failure stays visible in `prox status` and the API
+	// contract that a missing hub object means none was configured. The user
+	// asked for a hub; "why is nothing published?" has to be answerable.
 	statusB, code := second.Run(t, binary, "status")
 	if code != 0 {
 		t.Fatalf("publisher B status exit code = %d, want 0\n%s", code, statusB)
 	}
-	if strings.Contains(statusB, "Hub:") {
-		t.Fatalf("a declined collision leaves NO hub state:\n%s", statusB)
+	if !strings.Contains(statusB, "Hub: llt (name held") {
+		t.Fatalf("a declined collision must report a terminal name_held state:\n%s", statusB)
+	}
+	if !strings.Contains(statusB, "app.llt.test held by") {
+		t.Fatalf("the name-held line should name the holder:\n%s", statusB)
 	}
 	shutdownAndAwait(t, runB)
 

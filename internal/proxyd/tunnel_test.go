@@ -1340,36 +1340,69 @@ func TestHubCollision_RestoredHolderIsMarkedDisconnectedIfItsTunnelWentAway(t *t
 // arrives, and then does NOTHING: it never writes a response and never closes.
 // It is not a straw man — it is every server that treats a half-close as
 // "the peer is still there" — and it is the exact shape plan 031 F11 is about.
-func newDeafBackend(t *testing.T) (host string, port int) {
+//
+// It also reports, on `reading`, that a connection has reached the drain — so a
+// test can wait for the publisher to be inside its copy loop instead of
+// sleeping and hoping (plan 031, review B8).
+//
+// Nothing here parks a goroutine forever: the old version ended each connection
+// handler in `select {}`, which leaked one goroutine per connection for the life
+// of the test binary — in a test whose whole subject is a leak. The handlers now
+// end when the connection is closed at cleanup.
+func newDeafBackend(t *testing.T) (host string, port int, reading <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+
+	// Cleanups run LIFO, so the JOIN is registered first and therefore runs
+	// last: the goroutines below end only once the accepted connections and the
+	// listener have been closed.
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
 	t.Cleanup(func() { _ = ln.Close() })
 
 	var mu sync.Mutex
 	var conns []net.Conn
+	closed := false
 	t.Cleanup(func() {
 		mu.Lock()
 		defer mu.Unlock()
+		closed = true
 		for _, c := range conns {
 			_ = c.Close()
 		}
 	})
 
+	connected := make(chan struct{}, 8)
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			conn, aerr := ln.Accept()
 			if aerr != nil {
 				return
 			}
 			mu.Lock()
+			if closed {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
 			conns = append(conns, conn)
 			mu.Unlock()
+
+			wg.Add(1)
 			go func() {
-				// Drain and then hold the connection open forever, answering
-				// nothing — not even to an EOF on the request side.
+				defer wg.Done()
+				select {
+				case connected <- struct{}{}:
+				default:
+				}
+				// Drain, answering nothing — not even an EOF on the request
+				// side. The Copy returns only when the conn is closed at
+				// cleanup, so the goroutine is joinable rather than parked.
 				_, _ = io.Copy(io.Discard, conn)
-				select {}
 			}()
 		}
 	}()
@@ -1378,7 +1411,7 @@ func newDeafBackend(t *testing.T) (host string, port int) {
 	require.NoError(t, err)
 	p, err := strconv.Atoi(portStr)
 	require.NoError(t, err)
-	return hostStr, p
+	return hostStr, p, connected
 }
 
 // TestTunnel_ShutdownForceClosesADeafBackend is plan 031 F11: cancelling a
@@ -1392,7 +1425,7 @@ func newDeafBackend(t *testing.T) (host string, port int) {
 // (and the daemon shutdown behind it) forever. The fix force-closes both
 // endpoints on either stop signal, which is what actually unblocks the copy.
 func TestTunnel_ShutdownForceClosesADeafBackend(t *testing.T) {
-	backendHost, backendPort := newDeafBackend(t)
+	backendHost, backendPort, backendReading := newDeafBackend(t)
 
 	h := newTunnelHub(t)
 	services := map[string]ServiceTarget{"web": {Host: backendHost, Port: backendPort}}
@@ -1408,14 +1441,19 @@ func TestTunnel_ShutdownForceClosesADeafBackend(t *testing.T) {
 	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
 	require.NoError(t, err)
 
-	// Give the publisher a moment to be inside pipeConns rather than still
-	// finishing its handshake; the assertion below does not depend on it, but
-	// without it the test could pass without exercising anything.
+	// The publisher must be INSIDE pipeConns, not still finishing its
+	// handshake, or this test proves nothing (plan 031, review B8). The
+	// backend reporting that it has a connection to drain is that fact
+	// directly, so no sleep is needed to approximate it.
+	select {
+	case <-backendReading:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the publisher never dialed the backend, so nothing was piping")
+	}
 	require.Eventually(t, func() bool {
 		lease, ok := h.registry.RemoteLease(key)
 		return ok && lease.SessionGen == session.gen
 	}, 5*time.Second, 2*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
 
 	done := make(chan struct{})
 	go func() {

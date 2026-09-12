@@ -291,11 +291,11 @@ func TestApplyHubStartFlags_LaterStarts(t *testing.T) {
 
 	t.Run("a flag overwrites its own key only", func(t *testing.T) {
 		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{
-			listen: "100.64.0.5:9443", listenSet: true,
+			listen: "127.0.0.1:9443", listenSet: true,
 		})
 		require.NoError(t, err)
 		assert.True(t, changed)
-		assert.Equal(t, "100.64.0.5:9443", cfg.Listen)
+		assert.Equal(t, "127.0.0.1:9443", cfg.Listen)
 		assert.Equal(t, stored.Domain, cfg.Domain)
 		assert.Equal(t, stored.HTTPSPort, cfg.HTTPSPort)
 		assert.True(t, cfg.Autostart, "autostart is not a `hub start` flag and must survive")

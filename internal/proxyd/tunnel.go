@@ -68,6 +68,14 @@ func tunnelYamuxConfig() *yamux.Config {
 	return cfg
 }
 
+// tunnelMaxPendingStreamOpens is how many OpenStream attempts may be
+// outstanding against ONE session at a time (plan 031, review B4). It is
+// yamux's own inflight-SYN budget, read from the config both ends run, because
+// that is the number of attempts that can be in flight in the session below us:
+// a 257th goroutine would only be a more expensive way of waiting for the same
+// slot.
+var tunnelMaxPendingStreamOpens = tunnelYamuxConfig().AcceptBacklog
+
 // readPreambleLine reads ONE "\n"-terminated line from r, refusing anything
 // longer than max bytes.
 //
@@ -201,6 +209,9 @@ type tunnelSession struct {
 	transport   *http.Transport
 	connectedAt time.Time
 	dialTimeout time.Duration
+	// openSlots bounds how many OpenStream attempts may be outstanding against
+	// this session at once (plan 031, review B4). See openStream.
+	openSlots chan struct{}
 }
 
 // dial opens a stream, performs the CONNECT handshake, and returns the
@@ -263,7 +274,8 @@ type openedStream struct {
 	err    error
 }
 
-// openStream acquires a yamux stream under the dial deadline (plan 031 F7).
+// openStream acquires a yamux stream under the dial deadline (plan 031 F7,
+// bounded by review B4).
 //
 // yamux caps INFLIGHT (unACKed) SYNs at AcceptBacklog — 256 — and OpenStream
 // BLOCKS on that budget with no context, no deadline, and no way to give up:
@@ -275,29 +287,53 @@ type openedStream struct {
 // 503" outcome the offline page exists to prevent. Applying the deadline only
 // AFTER OpenStream returned could not see any of that.
 //
-// A plain semaphore in front of OpenStream cannot fix it, which is why this
-// costs a goroutine instead: our slot would have to be held for exactly as long
-// as yamux holds ITS slot, and yamux releases on ACK or full close — neither of
-// which is observable here, and neither of which happens at all for a stream
-// abandoned against a frozen peer. Racing the call against the deadline needs
-// no such accounting.
+// So the call is raced against the deadline on a goroutine — and the goroutines
+// are BOUNDED by openSlots, which is the correction review B4 asked for. The
+// first fix made the client-visible symptom right (prompt 503s) and moved the
+// cost somewhere invisible: sustained traffic to one frozen route accumulated a
+// goroutine per abandoned attempt, forever, because each one stayed parked
+// inside OpenStream until the session died. openSlots has exactly as many
+// permits as yamux has SYN slots, which is the most attempts that can be
+// USEFULLY outstanding: past that point every further attempt is queued behind
+// the same budget anyway, so waiting for a permit — cancellably, under the same
+// deadline — is strictly better than spawning a goroutine to wait for the
+// budget uncancellably. A caller that cannot get a permit before its deadline
+// gets the same 503 it would have got at the end of a stream open it was never
+// going to win.
 //
-// The abandoned attempt is not leaked: the goroutine always finishes (yamux
-// returns ErrSessionShutdown once the session closes, which the session's own
-// StreamOpenTimeout guarantees) and whatever it produces is closed.
+// The abandoned attempt is not leaked either: the goroutine hands its result to
+// whoever is still listening and otherwise closes the stream itself, then
+// releases its permit.
 func (t *tunnelSession) openStream(ctx context.Context, deadline time.Time) (net.Conn, error) {
-	ch := make(chan openedStream, 1)
-	go func() {
-		stream, err := t.sess.OpenStream()
-		if err != nil {
-			ch <- openedStream{err: err}
-			return
-		}
-		ch <- openedStream{stream: stream}
-	}()
-
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
+
+	// The permit, taken BEFORE the goroutine exists so that nothing is spawned
+	// for an attempt that has already run out of time.
+	select {
+	case t.openSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("opening a tunnel stream to %s: %w", t.key, ctx.Err())
+	case <-timer.C:
+		return nil, fmt.Errorf("timed out waiting for a tunnel stream slot to %s: the publisher is not acknowledging new streams", t.key)
+	}
+
+	// ch is UNBUFFERED on purpose: the goroutine's send can only complete while
+	// this function is still receiving, so "the caller took it" and "the caller
+	// gave up" are mutually exclusive without any shared flag between them.
+	ch := make(chan openedStream)
+	abandoned := make(chan struct{})
+	go func() {
+		defer func() { <-t.openSlots }()
+		stream, err := t.sess.OpenStream()
+		select {
+		case ch <- openedStream{stream: stream, err: err}:
+		case <-abandoned:
+			if err == nil {
+				_ = stream.Close()
+			}
+		}
+	}()
 
 	select {
 	case got := <-ch:
@@ -306,20 +342,11 @@ func (t *tunnelSession) openStream(ctx context.Context, deadline time.Time) (net
 		}
 		return got.stream, nil
 	case <-ctx.Done():
-		go discardStream(ch)
+		close(abandoned)
 		return nil, fmt.Errorf("opening a tunnel stream to %s: %w", t.key, ctx.Err())
 	case <-timer.C:
-		go discardStream(ch)
+		close(abandoned)
 		return nil, fmt.Errorf("timed out acquiring a tunnel stream to %s: the publisher is not acknowledging new streams", t.key)
-	}
-}
-
-// discardStream drains an abandoned openStream attempt and closes whatever it
-// eventually produced, so giving up on the deadline leaks neither the stream
-// nor the goroutine holding it.
-func discardStream(ch <-chan openedStream) {
-	if got := <-ch; got.err == nil {
-		_ = got.stream.Close()
 	}
 }
 
@@ -377,6 +404,10 @@ func (ts *tunnelSessions) attach(key string, sess *yamux.Session) (attached, rep
 		sess:        sess,
 		connectedAt: time.Now(),
 		dialTimeout: ts.dialTimeout,
+		// Exactly as many permits as yamux has inflight-SYN slots: one attempt
+		// per slot is the most that can make progress, and the rest wait here —
+		// cancellably — instead of in a goroutine apiece (review B4).
+		openSlots: make(chan struct{}, tunnelMaxPendingStreamOpens),
 	}
 	t.transport = &http.Transport{
 		// Every connection this transport makes goes through the tunnel; the
@@ -435,12 +466,27 @@ func (ts *tunnelSessions) detach(key string, gen uint64) bool {
 }
 
 // remove takes key's session out unconditionally and returns it for the caller
-// to close (takeover, `prox hub stop`). nil when key had none.
+// to close (`prox hub stop`, teardown). nil when key had none.
 func (ts *tunnelSessions) remove(key string) *tunnelSession {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	t, ok := ts.sessions[key]
 	if !ok {
+		return nil
+	}
+	delete(ts.sessions, key)
+	return t
+}
+
+// removeGen takes key's session out only when the installed generation is still
+// gen, and returns it for the caller to close (deregister, takeover). nil when
+// key has no session or has moved on to a newer one — which is exactly the case
+// a blind removal used to get wrong (plan 031, review B1).
+func (ts *tunnelSessions) removeGen(key string, gen uint64) *tunnelSession {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	t, ok := ts.sessions[key]
+	if !ok || t.gen != gen {
 		return nil
 	}
 	delete(ts.sessions, key)
@@ -509,9 +555,13 @@ func (s *Server) handleHubTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := strings.TrimSpace(r.Header.Get("X-Prox-Project-Dir"))
-	if dir == "" {
+	// The SAME rule register, deregister and the capture endpoints apply (plan
+	// 031, review B9). This was the one key-composition path that only checked
+	// for emptiness, so a header no other endpoint would accept could still be
+	// composed into a lookup key here.
+	if err := validateHubProjectDir(dir); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "X-Prox-Project-Dir is required",
+			Error: fmt.Sprintf("X-Prox-Project-Dir: %v", err),
 			Code:  "BAD_REQUEST",
 		})
 		return
@@ -632,13 +682,34 @@ func (s *Server) watchTunnel(t *tunnelSession) {
 	s.logger.Info("tunnel detached", "project", t.key, "generation", t.gen)
 }
 
-// closeTunnel removes and closes key's session, if any. Callers must NOT hold
-// lifecycleMu or the registry lock (D17: the session mutex is a leaf and a
-// close is I/O).
-func (s *Server) closeTunnel(key string) {
-	if t := s.tunnels.remove(key); t != nil {
-		t.close()
+// tunnelRef names one session precisely: its key AND the generation it was
+// attached under (plan 031, review B1). A key alone is not an identity — a
+// publisher that reconnects gets a new generation under the same key — so every
+// deliberate close carries both.
+type tunnelRef struct {
+	key string
+	gen uint64
+}
+
+// closeTunnelGen removes and closes key's session only when the installed
+// session is still the generation gen names, and reports whether it did.
+//
+// The generation is the whole point (plan 031, review B1). A deregister or a
+// takeover decides to close a tunnel while holding lifecycleMu and performs the
+// close after releasing it (D17: the session mutex is a leaf and a close is
+// I/O), and in that gap the publisher can re-register and reattach. Closing by
+// key would then kill the session belonging to the registration that replaced
+// the one this call removed. A gen of 0 — a registration that never attached —
+// matches no installed session and closes nothing.
+//
+// Callers must NOT hold lifecycleMu or the registry lock.
+func (s *Server) closeTunnelGen(key string, gen uint64) bool {
+	t := s.tunnels.removeGen(key, gen)
+	if t == nil {
+		return false
 	}
+	t.close()
+	return true
 }
 
 // closeAllTunnels tears every session down (`prox hub stop`, teardown).

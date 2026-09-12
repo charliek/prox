@@ -468,9 +468,17 @@ func runHubStart(cmd *cobra.Command, args []string) error {
 	printHubStatus(*status)
 	if !exists {
 		if _, tailnet := proxyd.DefaultHubListenAddr(); !tailnet && !flags.listenSet {
+			// The remediation has to name a command that WORKS (plan 031,
+			// review B10). A bare `--listen <private ip>:8443` is refused
+			// without --allow-unencrypted-lan, so telling a user to run it sent
+			// them straight into an error — and the reason they have no tailnet
+			// address is usually that Tailscale is not installed, which is the
+			// option worth naming first.
 			fmt.Println()
 			fmt.Println("Note: no tailnet (100.64/10) address was found, so the hub is bound to loopback")
-			fmt.Println("      and only this machine can publish through it. Re-run with --listen <private ip>:8443.")
+			fmt.Println("      and only this machine can publish through it. Install Tailscale and re-run,")
+			fmt.Println("      or — on a LAN you trust, where anyone can read the bearer token off the wire —")
+			fmt.Println("      re-run with --listen <private ip>:8443 --allow-unencrypted-lan.")
 		}
 	}
 	fmt.Println()

@@ -136,6 +136,16 @@ func validateHubRegistration(req RegisterRequest) error {
 		if err := domain.ValidatePort(target.Port); err != nil {
 			return fmt.Errorf("service %q port: %w", name, err)
 		}
+		// The target must fit the TUNNEL's framing, checked against the line the
+		// hub would actually send rather than against the host in isolation
+		// (plan 031, review B6). A registration whose CONNECT preamble cannot be
+		// framed is a route that can be looked up, certificated and served — and
+		// then fails every single dial. Refusing it at registration is the one
+		// moment the publisher can be told why.
+		if n := len(formatConnectLine(target.Host, target.Port)); n > tunnelPreambleMaxBytes {
+			return fmt.Errorf("service %q target %s:%d does not fit the tunnel's %d-byte CONNECT framing (needs %d)",
+				name, target.Host, target.Port, tunnelPreambleMaxBytes, n)
+		}
 	}
 	if req.MaxBodySize < 0 {
 		return fmt.Errorf("max_body_size must not be negative, got %d", req.MaxBodySize)
@@ -256,22 +266,12 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.hubConfigSnapshot()
-	if !cfg.enabled {
-		// Belt and braces: the listener is torn down before this can be
-		// observed, but a request in flight during StopHub must not register.
-		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
-			Error: "hub mode is not enabled",
-			Code:  "HUB_DISABLED",
-		})
-		return
-	}
-
-	// D4: the hub owns the domain and the data-plane ports. Whatever the
-	// publisher's own prox.yaml says about them is irrelevant here.
-	req.Domain = cfg.cfg.Domain
-	req.HTTPSPort = cfg.cfg.HTTPSPort
-	req.HTTPPort = cfg.cfg.HTTPPort
+	// D4's rewrite — domain and both data-plane ports — is NOT done here. It
+	// happens inside the register lifecycle transaction, under the same lock
+	// that commits the routes and that `prox hub start` takes around its own
+	// publisher-count check and commit (plan 031, review B2). Reading the config
+	// here and committing routes from it later was two lock scopes with a
+	// reconfiguration-shaped hole between them.
 
 	// The capture DISK BUDGET is the hub host's own disk and none of a
 	// publisher's business (plan 031 F9). It is not a per-project setting at
@@ -310,20 +310,9 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	req.Origin = origin
 	req.ProjectDir = HubProjectKey(origin, req.ProjectDir)
 
+	// The transaction applies D4 and reports the domain and ports it actually
+	// published under on the success body (RegisterResponse.Hub).
 	status, body := s.register(req)
-	// D4 again, from the publisher's side: the hub just overwrote the domain and
-	// both data-plane ports, so the publisher has no way to know where its
-	// service names were actually published. Hand those three facts back on the
-	// success body — the ONLY place they are added, so every socket response is
-	// untouched (plan 031 C5).
-	if resp, ok := body.(RegisterResponse); ok {
-		resp.Hub = &RegisterHubInfo{
-			Domain:    cfg.cfg.Domain,
-			HTTPSPort: cfg.cfg.HTTPSPort,
-			HTTPPort:  cfg.cfg.HTTPPort,
-		}
-		body = resp
-	}
 	writeJSON(w, status, body)
 }
 
@@ -459,7 +448,23 @@ func (s *Server) startHub(cfg HubConfig, persist bool) error {
 		}
 		cfg.Token = token
 	}
-	if err := s.checkHubReconfigureAllowed(cfg); err != nil {
+
+	// ONE LIFECYCLE TRANSACTION (plan 031, review B2). The publisher-count
+	// check, the bind, the file write and the swap of the live config all happen
+	// under lifecycleMu — the same lock a remote register holds while it reads
+	// this config and commits its routes. Without it the check could see zero
+	// publishers while a register that had already read the OLD domain went on
+	// to commit routes under it, leaving `prox hub status` describing a config
+	// the routes do not use: precisely the state checkHubReconfigureAllowed
+	// exists to prevent.
+	//
+	// Lock order (D17, and scheduleShutdownWhenEmpty's own precedent):
+	// hubLifecycleMu → lifecycleMu → registry.mu, with hubMu below all of them.
+	// StopHub takes the same pair in the same order through removeProject.
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if err := s.checkHubReconfigureAllowedLocked(cfg); err != nil {
 		return err
 	}
 
@@ -569,7 +574,10 @@ func (s *Server) commitHubConfig(cfg HubConfig, persist bool) error {
 // one thing. `prox hub stop` first is one extra command and says what it does.
 // Changing only the LISTEN address (or the auth mode) is unaffected — those do
 // not appear in any route.
-func (s *Server) checkHubReconfigureAllowed(cfg HubConfig) error {
+// checkHubReconfigureAllowedLocked must be called with lifecycleMu held, so the
+// publisher count it reads cannot change between the check and the commit
+// (plan 031, review B2).
+func (s *Server) checkHubReconfigureAllowedLocked(cfg HubConfig) error {
 	s.hubMu.RLock()
 	running := s.hubServer != nil
 	current := s.hubCfg
@@ -719,6 +727,15 @@ func (s *Server) hubConfigSnapshot() hubRuntimeView {
 	s.hubMu.RLock()
 	defer s.hubMu.RUnlock()
 	return hubRuntimeView{enabled: s.hubServer != nil, cfg: s.hubCfg}
+}
+
+// hubConfigSnapshotLocked is hubConfigSnapshot for a caller that already holds
+// lifecycleMu — the register transaction, which must read the hub's domain and
+// ports inside the same transaction that commits routes built from them (plan
+// 031, review B2). hubMu sits BELOW lifecycleMu in the lock order, so taking it
+// here is the permitted direction.
+func (s *Server) hubConfigSnapshotLocked() hubRuntimeView {
+	return s.hubConfigSnapshot()
 }
 
 // hubStatus renders the hub HOST's view (plan 031 D20). Enabled is false with

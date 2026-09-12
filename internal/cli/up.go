@@ -768,8 +768,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	if !warnings.Wait(warningProducerJoinTimeout) {
 		log.Printf("prox: startup warning checks did not finish within %s; continuing", warningProducerJoinTimeout)
 	}
-	reportStartupWarnings(warnings.Warnings(), preamble, os.Stderr)
-	warnings.Seal()
+	// Seal and snapshot are ONE operation (plan 031, review A4): a warning that
+	// lands between them would otherwise be in neither the render nor its
+	// producer's own log line, because the producer decides which of the two it
+	// is by asking whether the sink is sealed.
+	reportStartupWarnings(warnings.SealAndSnapshot(), preamble, os.Stderr)
 
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.

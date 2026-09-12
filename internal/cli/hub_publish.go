@@ -55,6 +55,15 @@ const (
 	hubStateDisplaced        = "displaced"
 	hubStateProtocolMismatch = "protocol_mismatch"
 	hubStateAuthFailed       = "auth_failed"
+	// hubStateNameHeld is a collision this run DECLINED to take over: terminal,
+	// like the other three, and visible (plan 031, review A7).
+	//
+	// It used to erase the hub state instead, which said "no hub was
+	// configured" — the one thing that was not true. A hub the user configured
+	// and that this run could not publish through is a non-fatal hub failure
+	// like every other, and §3.1's contract is that those stay visible in
+	// `prox status` rather than vanishing.
+	hubStateNameHeld = "name_held"
 )
 
 // Warning codes for the advisories this file raises. They are local to the CLI
@@ -69,6 +78,9 @@ const (
 	warningCodeHubDisplaced        = "hub_displaced"
 	warningCodeHubInlineToken      = "hub_inline_token"
 	warningCodeHubNoProxy          = "hub_no_proxy"
+	// warningCodeHubDeregisterFailed is raised at teardown, through the sink
+	// rather than straight to stderr (plan 031, review A9).
+	warningCodeHubDeregisterFailed = "hub_deregister_failed"
 )
 
 // --- D8: flag/env/config precedence ---
@@ -381,6 +393,26 @@ type hubPublisher struct {
 	// registered records that at least one register has succeeded, which is
 	// what makes a deregister at shutdown worth sending at all.
 	registered bool
+	// maybeRegistered records a register whose OUTCOME IS UNKNOWN — a timeout,
+	// a broken connection, a response that did not decode (plan 031, review A3).
+	// The hub may well have committed it, so shutdown attempts a bounded
+	// deregister anyway; it stays quiet about failing, because the likeliest
+	// reason for an ambiguous register is a hub that was never reachable.
+	maybeRegistered bool
+	// takeoverPending is --hub-takeover, honored until the FIRST successful
+	// registration and cleared by it (plan 031, review A1).
+	//
+	// The flag has to survive the retry path, because the case it exists for is
+	// a hub that is DOWN when `prox up` runs: the first register never reaches
+	// anyone, the tunnel loop takes over, and the re-register that finally lands
+	// is the one that meets the held name. reregister() hard-coded false, so an
+	// explicit --hub-takeover was silently dropped exactly when the user needed
+	// it and the publisher went `displaced` instead.
+	//
+	// Clearing it on the first success is the other half, and is just as
+	// deliberate: a LATER displacement must not be fought. Two publishers that
+	// both re-register with takeover:true take the name from each other forever.
+	takeoverPending bool
 	// state/detail/since are the published state machine position. since is the
 	// instant the STATE was entered, not the last attempt within it, so
 	// "reconnecting, down 12s" measures the outage rather than the gap since
@@ -393,28 +425,54 @@ type hubPublisher struct {
 	// tunnelCtx is the context the tunnel and forwarder run under; the
 	// reregister callback uses it so a teardown cancels an in-flight retry.
 	tunnelCtx context.Context
+	// workers joins the long-lived goroutines this publisher OWNS (plan 031,
+	// review A2). D6c's ordering — cancel, then deregister — is only real if
+	// the cancel is waited on: a re-register already in flight when the cancel
+	// lands would otherwise put the registration back moments after the
+	// deregister removed it, and the forwarder would outlive teardown.
+	workers sync.WaitGroup
+	// regGate is a one-permit channel held for the duration of every register
+	// call, so shutdown can wait for an IN-FLIGHT registration (review A2) and
+	// so no register can start once shutdown holds it.
+	regGate chan struct{}
 
-	// run starts the two long-lived goroutines. It is a field, defaulting to
-	// runHubTunnel, so the §3.1 classification table can pin WHETHER a given
-	// failure retries without standing up real tunnels for every row.
+	// run starts the long-lived goroutines and RETURNS WHEN THEY ARE DONE. It
+	// is a field, defaulting to runHubTunnel, so the §3.1 classification table
+	// can pin WHETHER a given failure retries without standing up real tunnels
+	// for every row.
 	run tunnelRunner
 }
 
-// tunnelRunner starts a publisher's reverse tunnel and request forwarder under
-// ctx. See hubPublisher.run.
+// tunnelRunner runs a publisher's reverse tunnel and request forwarder under
+// ctx, returning only once both have stopped. See hubPublisher.run.
 type tunnelRunner func(ctx context.Context, p *hubPublisher, localRM *proxy.RequestManager)
 
 // runHubTunnel is the production runner: the reverse tunnel (D2) plus the
 // request forwarder that bridges hub-side captured records into this project's
 // TUI and API, exactly as the local shared-daemon path does.
+//
+// It JOINS both before returning (plan 031, review A2). The publisher runs it on
+// one goroutine it owns and waits for that goroutine at shutdown, so "cancel
+// before deregister" is enforced by the structure rather than asserted by a
+// comment.
 func runHubTunnel(ctx context.Context, p *hubPublisher, localRM *proxy.RequestManager) {
-	go proxyd.RunTunnel(ctx, p.client, p.key, p.baseReq.Services, p.reregister, p)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		proxyd.RunTunnel(ctx, p.client, p.key, p.baseReq.Services, p.reregister, p)
+	}()
 	if localRM != nil {
-		// nil sink and nil heal: the hub forwarder must NOT drive the publisher
-		// state machine (the tunnel owns it, D19) and must never re-ensure a
-		// LOCAL daemon on a remote hub's behalf.
-		go proxyd.ForwardRequestsWithClient(ctx, p.client, p.key, localRM, nil, nil)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// nil sink and nil heal: the hub forwarder must NOT drive the
+			// publisher state machine (the tunnel owns it, D19) and must never
+			// re-ensure a LOCAL daemon on a remote hub's behalf.
+			proxyd.ForwardRequestsWithClient(ctx, p.client, p.key, localRM, nil, nil)
+		}()
 	}
+	wg.Wait()
 }
 
 // setState publishes the state machine's position to the runtime (and
@@ -470,29 +528,50 @@ func (p *hubPublisher) degrade(state, detail string, w domain.Warning) {
 }
 
 // warnOnce raises w through the session's warning SINK the first time this
-// publisher leaves the happy path, and logs it on every later occasion.
+// publisher leaves the happy path. Every later occasion is LOGGED WITHOUT THE
+// "Warning:" LABEL — the state change is recorded, but the user is not warned a
+// second time.
+//
+// That distinction is AC11's, not a cosmetic one (plan 031, review A5). AC11
+// promises exactly one warning, and a warning is something the user SEES: a
+// `Warning:` line on the terminal, or in the log pane, or replayed by a
+// `prox up -d` parent. Logging later advisories through formatWarning put more
+// of those lines in front of the user while the sink still held one entry, so
+// the promise held only for whatever inspected the sink. It is the sink that is
+// the implementation detail, and the line that is the contract.
 //
 // The sink, never fmt.Printf (D19): startup renders the sink once, on runUp's
 // own goroutine, and publishes it on GET /status, which is the only way a
-// `prox up -d` child's advisory reaches the parent's terminal. A warning raised
-// AFTER startup has already rendered would otherwise be invisible until
-// somebody ran `prox status`, so it is additionally logged — the sink's own
-// sealed latch is exactly the "startup has rendered" signal, and the forwarder
-// self-heal path (proxyRuntime.heal) resolves the same question the same way.
+// `prox up -d` child's advisory reaches the parent's terminal. A FIRST warning
+// raised after startup has already rendered would otherwise be invisible until
+// somebody ran `prox status`, so it — and only it — is additionally logged with
+// its label. AddSealed answers "did this land after the render?" in the same
+// critical section that records it (review A4), so the answer cannot race the
+// seal.
 func (p *hubPublisher) warnOnce(w domain.Warning) {
 	p.mu.Lock()
 	first := !p.warned
 	p.warned = true
 	p.mu.Unlock()
 
-	sink := p.rt.WarningSink()
 	if !first {
-		logWarning(w)
+		logHubAdvisory(p.alias, w)
 		return
 	}
-	added := sink.Add(w)
-	if len(added) > 0 && sink.WarningsSealed() {
+	added, sealed := p.rt.WarningSink().AddSealed(w)
+	if len(added) > 0 && sealed {
 		logWarning(w)
+	}
+}
+
+// logHubAdvisory records a later advisory in .prox/prox.log WITHOUT the
+// `Warning:` label, which is what D19 means by "every later transition goes to
+// .prox/prox.log only" (plan 031, review A5). The state it describes is in
+// `prox status` either way.
+func logHubAdvisory(alias string, w domain.Warning) {
+	log.Printf("prox: hub %s: %s", alias, w.Message)
+	if w.Hint != "" {
+		log.Printf("prox: hub %s: %s", alias, w.Hint)
 	}
 }
 
@@ -505,7 +584,9 @@ func logWarning(w domain.Warning) {
 	}
 }
 
-// recordRegistration remembers a successful registration's published facts.
+// recordRegistration remembers a successful registration's published facts, and
+// retires the pending takeover: the name is ours, so a LATER collision is a
+// displacement to report rather than one to fight (plan 031, review A1).
 func (p *hubPublisher) recordRegistration(resp *proxyd.RegisterResponse) {
 	p.mu.Lock()
 	if resp.Hub != nil {
@@ -513,6 +594,19 @@ func (p *hubPublisher) recordRegistration(resp *proxyd.RegisterResponse) {
 	}
 	p.routes = len(resp.Registered)
 	p.registered = true
+	p.takeoverPending = false
+	p.mu.Unlock()
+}
+
+// markRegistered records that a registration demonstrably EXISTS on the hub
+// without this process having decoded the response that created it (plan 031,
+// review A3). A tunnel that attached is exactly that proof: the hub answers the
+// upgrade with 404 NOT_REGISTERED unless the key is registered, so a 101 says
+// the registration is there and shutdown must remove it.
+func (p *hubPublisher) markRegistered() {
+	p.mu.Lock()
+	p.registered = true
+	p.takeoverPending = false
 	p.mu.Unlock()
 }
 
@@ -523,11 +617,68 @@ func (p *hubPublisher) everRegistered() bool {
 	return p.registered
 }
 
+// mayBeRegistered reports whether a registration might exist on the hub even
+// though none was confirmed — an ambiguous register (review A3).
+func (p *hubPublisher) mayBeRegistered() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.maybeRegistered
+}
+
+// pendingTakeover reports whether --hub-takeover is still owed to a register
+// (review A1).
+func (p *hubPublisher) pendingTakeover() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.takeoverPending
+}
+
 // register sends one register to the hub, bounded by ctx.
+//
+// It holds regGate for the whole call, which is what makes shutdown's
+// cancel-then-deregister ordering enforceable: Shutdown waits for the same
+// permit, so it cannot deregister underneath a registration that is in flight,
+// and no registration can start once it holds the permit (plan 031, review A2).
 func (p *hubPublisher) register(ctx context.Context, takeover bool) (*proxyd.RegisterResponse, error) {
+	select {
+	case p.regGate <- struct{}{}:
+		defer func() { <-p.regGate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	req := p.baseReq
 	req.Takeover = takeover
-	return p.client.RegisterWithContext(ctx, req)
+	resp, err := p.client.RegisterWithContext(ctx, req)
+	if err != nil && registerMayHaveLanded(err) {
+		// The hub may have committed this registration and told us so on a
+		// connection that then broke (review A3). Record the doubt so shutdown
+		// cleans up rather than leaving a registration to sit out its lease.
+		p.mu.Lock()
+		p.maybeRegistered = true
+		p.mu.Unlock()
+	}
+	return resp, err
+}
+
+// registerMayHaveLanded reports whether a failed register might nevertheless
+// have been committed by the hub (plan 031, review A3).
+//
+// A *DaemonAPIError means the hub answered in full and said no — nothing was
+// committed, since every hub-side failure arm rolls its registration back. A
+// connection that was refused or a name that did not resolve never reached a
+// hub at all. Everything else — a timeout, a reset mid-response, a body that
+// did not decode — is genuinely ambiguous, and ambiguity is what this is for.
+func registerMayHaveLanded(err error) bool {
+	var apiErr *proxyd.DaemonAPIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	return !errors.As(err, &dnsErr)
 }
 
 // --- proxyd.ForwarderStatusSink: the tunnel drives the last two states ---
@@ -537,15 +688,38 @@ func (p *hubPublisher) register(ctx context.Context, takeover bool) (*proxyd.Reg
 // `connecting`, because until the tunnel attaches the hub has routes it cannot
 // serve.
 func (p *hubPublisher) ForwarderConnected() {
+	// A tunnel only attaches to a key the hub has a registration for — anything
+	// else is answered 404 NOT_REGISTERED before the upgrade — so this is proof
+	// that a registration exists, whatever this process managed to decode when
+	// it created one (plan 031, review A3). Recording it is what makes shutdown
+	// deregister a registration whose own 200 was lost.
+	p.markRegistered()
 	p.setState(hubStateConnected, "")
 }
 
-// ForwarderConnectFailed fires on every failed tunnel connect. It is the
-// retryable row of §3.1 in its steady state: one warning the first time,
-// silence (well — a log line) forever after, and `reconnecting` in
-// `prox status` the whole time.
+// ForwarderConnectFailed fires on every failed tunnel connect.
+//
+// It classifies exactly as the registration path does (plan 031, review A6).
+// The tunnel upgrade carries the same bearer token and the same protocol
+// version as a register, so it can fail the same two TERMINAL ways — and
+// reporting a 401 through the generic connect-failed path meant a token changed
+// between register and attach produced `reconnecting` forever instead of
+// `auth failed`: a retry loop against a credential no amount of retrying can
+// fix, and a `prox status` line that named the wrong problem.
+//
+// Everything else is §3.1's retryable row in its steady state: one warning the
+// first time, a log line forever after, and `reconnecting` the whole time.
 func (p *hubPublisher) ForwarderConnectFailed(err error) {
-	p.degrade(hubStateReconnecting, hubFailureReason(err), hubUnreachableWarning(p.alias, err))
+	switch classifyHubFailure(err) {
+	case hubFailureAuth:
+		p.degrade(hubStateAuthFailed, "", hubAuthWarning(p.alias))
+		p.stop()
+	case hubFailureProtocol:
+		p.degrade(hubStateProtocolMismatch, hubProtocolDetail(err), hubProtocolWarning(p.alias, err))
+		p.stop()
+	default:
+		p.degrade(hubStateReconnecting, hubFailureReason(err), hubUnreachableWarning(p.alias, err))
+	}
 }
 
 // ForwarderBackfillFailed is not a publisher-state event: the tunnel never
@@ -566,7 +740,12 @@ func (p *hubPublisher) reregister() error {
 	ctx, cancel := context.WithTimeout(p.tunnelCtx, constants.HubUnaryTimeout)
 	defer cancel()
 
-	resp, err := p.register(ctx, false)
+	// --hub-takeover, if it is still owed (plan 031, review A1). A hub that was
+	// DOWN at startup is the whole reason the flag has to reach this path: the
+	// first register never got an answer, so the first register that meets the
+	// held name is this one. Once any register has succeeded the flag is
+	// cleared, so a later displacement is reported rather than fought.
+	resp, err := p.register(ctx, p.pendingTakeover())
 	if err != nil {
 		switch classifyHubFailure(err) {
 		case hubFailureNameHeld:
@@ -601,31 +780,116 @@ func (p *hubPublisher) start(ctx context.Context, localRM *proxy.RequestManager)
 	p.cancel = cancel
 	p.tunnelCtx = tctx
 	p.rt.SetHubCancel(cancel)
-	p.run(tctx, p, localRM)
+	// The publisher OWNS the worker goroutine and joins it at shutdown (plan
+	// 031, review A2), which is what turns D6c's documented ordering into an
+	// enforced one.
+	p.workers.Add(1)
+	go func() {
+		defer p.workers.Done()
+		p.run(tctx, p, localRM)
+	}()
 }
 
 // Shutdown stops the tunnel and deregisters from the hub, bounded by timeout.
 //
 // It follows the same D6c ordering the local path uses and for the same reason:
 // cancel the tunnel FIRST, so its reregister callback cannot put the
-// registration back a moment after the deregister removed it.
+// registration back a moment after the deregister removed it. Unlike the
+// earlier version it ENFORCES that ordering rather than documenting it (plan
+// 031, review A2): the workers are joined and any in-flight registration is
+// waited out — both bounded, so a wedged hub cannot hold teardown open —
+// before the deregister is sent.
 func (p *hubPublisher) Shutdown(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
 	p.stop()
+	p.joinWorkers(time.Until(deadline))
+
+	// The in-flight registration barrier. Holding the permit across the
+	// deregister below also means a register that somehow starts afterwards
+	// waits for the deregister rather than racing it — and it will fail
+	// immediately anyway, since its context is derived from the cancelled one.
+	if p.acquireRegisterGate(time.Until(deadline)) {
+		defer func() { <-p.regGate }()
+	}
 
 	// A publisher that never registered has nothing on the hub to remove, and
 	// the hub is usually the reason it never registered — so calling anyway
 	// would put a failed-deregister warning on the terminal of every teardown
 	// of the AC11 "hub is down" session, for a call that could not have
 	// succeeded and would not have mattered if it had.
-	if !p.everRegistered() {
+	//
+	// An AMBIGUOUS register is the third case (review A3): the hub may hold a
+	// registration this process never confirmed, so the call is made, and a
+	// failure is silent because "the hub was unreachable" is by far its
+	// likeliest explanation.
+	confirmed := p.everRegistered()
+	if !confirmed && !p.mayBeRegistered() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), max(time.Until(deadline), time.Second))
 	defer cancel()
-	if err := p.client.DeregisterWithContext(ctx, p.deregisterReq); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to deregister from hub %s: %v\n", p.alias, err)
+	if err := p.client.DeregisterWithContext(ctx, p.deregisterReq); err != nil && confirmed {
+		// Through the warning channel, never straight to os.Stderr (D19, review
+		// A9): in a `prox up -d` child, stderr IS .prox/prox.log, so a bare
+		// Fprintf reached nobody who was looking. The sink publishes it on
+		// GET /status and the log line puts it where every other teardown
+		// message goes.
+		p.reportShutdownWarning(domain.Warning{
+			Code:    warningCodeHubDeregisterFailed,
+			Message: fmt.Sprintf("failed to deregister from hub %s: %s", p.alias, oneLine(err.Error())),
+			Hint:    "The hub drops the registration on its own once the lease expires.",
+		})
 	}
+}
+
+// joinWorkers waits for the publisher's worker goroutine, bounded. A worker that
+// misses the budget is left to finish on its own: teardown must stay bounded,
+// and the process is exiting.
+func (p *hubPublisher) joinWorkers(budget time.Duration) {
+	if budget <= 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		p.workers.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Printf("prox: hub %s: tunnel did not stop within %s; continuing teardown", p.alias, budget)
+	}
+}
+
+// acquireRegisterGate takes the register permit within budget, reporting whether
+// it got it. A register wedged past the budget is not worth blocking teardown
+// for — the hub's lease removes the registration either way.
+func (p *hubPublisher) acquireRegisterGate(budget time.Duration) bool {
+	if budget <= 0 {
+		budget = time.Millisecond
+	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case p.regGate <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// reportShutdownWarning puts a teardown advisory through the warning channel:
+// the sink (so GET /status and a `prox up -d` parent can see it) and the log
+// (so it reaches the terminal or .prox/prox.log). It is deliberately NOT
+// warnOnce's latch — the state machine's "exactly one warning" is about the
+// states this session passed through, and a deregister that failed at teardown
+// is a different fact that happens once.
+func (p *hubPublisher) reportShutdownWarning(w domain.Warning) {
+	p.rt.WarningSink().Add(w)
+	logWarning(w)
 }
 
 // --- warnings ---
@@ -773,22 +1037,46 @@ func formatHubHolders(alias string, holders []proxyd.HubHolder) []string {
 // askHubTakeover prints the holder listing and reads one line from in. Anything
 // but an explicit yes declines: taking a name away from a running publisher is
 // not a default.
-func askHubTakeover(out io.Writer, in io.Reader, alias string, holders []proxyd.HubHolder) bool {
+//
+// It is CANCELABLE (plan 031, review A8). `prox up` has already called
+// signal.Notify by the time this prompt appears, which disables Go's default
+// terminating behavior for SIGINT — so a Ctrl-C at the prompt did nothing at
+// all and startup sat in ReadString until somebody pressed enter. The read runs
+// on its own goroutine and ctx (the run's, cancelled by the signal handler)
+// declines on its own. The goroutine is left holding its read on stdin: it
+// cannot be interrupted, and the process is on its way out.
+func askHubTakeover(ctx context.Context, out io.Writer, in io.Reader, alias string, holders []proxyd.HubHolder) bool {
 	for _, line := range formatHubHolders(alias, holders) {
 		fmt.Fprintln(out, line)
 	}
 	fmt.Fprint(out, "Take it over? [y/N]: ")
 
-	reader := bufio.NewReader(in)
-	answer, err := reader.ReadString('\n')
-	if err != nil && answer == "" {
+	answers := make(chan string, 1)
+	go func() {
+		answer, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil && answer == "" {
+			answers <- ""
+			return
+		}
+		answers <- answer
+	}()
+
+	select {
+	case answer := <-answers:
+		if answer == "" {
+			// Nothing to read (a closed stdin): the prompt's own line never got
+			// its newline, so supply one.
+			fmt.Fprintln(out)
+			return false
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+			return true
+		default:
+			return false
+		}
+	case <-ctx.Done():
 		fmt.Fprintln(out)
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(answer)) {
-	case "y", "yes":
-		return true
-	default:
 		return false
 	}
 }
@@ -952,17 +1240,12 @@ func (p *hubPublisher) resolveCollision(ctx context.Context, err error, opts hub
 		// should leave a trace.
 		log.Printf("prox: hub %s: taking over %s (--hub-takeover)", p.alias, hubHolderDetail(err))
 	case hubCollisionAsk:
-		take = askHubTakeover(opts.Stdout, opts.Stdin, p.alias, holders)
+		take = askHubTakeover(ctx, opts.Stdout, opts.Stdin, p.alias, holders)
 	case hubCollisionDecline:
 	}
 
 	if !take {
-		// §3.1's "HUB_NAME_HELD declined" row: one warning, no retry, and NO
-		// `Hub:` state — this run simply is not publishing, which is a
-		// different thing from publishing badly.
-		p.rt.SetHubState(nil)
-		p.warnOnce(hubNameHeldWarning(p.alias, err))
-		return nil
+		return p.declineCollision(err)
 	}
 
 	resp, rerr := p.registerBounded(ctx, true)
@@ -976,9 +1259,7 @@ func (p *hubPublisher) resolveCollision(ctx context.Context, err error, opts hub
 	case hubFailureNameHeld:
 		// Still held even with takeover:true — D10's local holder, which a
 		// remote publisher never displaces.
-		p.rt.SetHubState(nil)
-		p.warnOnce(hubNameHeldWarning(p.alias, rerr))
-		return nil
+		return p.declineCollision(rerr)
 	case hubFailureProtocol:
 		p.degrade(hubStateProtocolMismatch, hubProtocolDetail(rerr), hubProtocolWarning(p.alias, rerr))
 		return p
@@ -990,6 +1271,21 @@ func (p *hubPublisher) resolveCollision(ctx context.Context, err error, opts hub
 		p.start(ctx, opts.LocalRM)
 		return p
 	}
+}
+
+// declineCollision is §3.1's "HUB_NAME_HELD declined" row: one warning, no
+// retry, and a TERMINAL `name_held` state (plan 031, review A7).
+//
+// The state is the correction. This used to call SetHubState(nil), which erases
+// the hub from `prox status` and from status.proxy — and a nil hub object is the
+// API's way of saying "no hub was configured", which is false here and in the
+// one case where the difference matters most: the user asked for a hub, and the
+// answer to "why is nothing published?" has to be visible somewhere. Every other
+// non-fatal hub failure leaves a state behind; this one now does too, carrying
+// the holders so the line can say who has the name.
+func (p *hubPublisher) declineCollision(err error) *hubPublisher {
+	p.degrade(hubStateNameHeld, hubHolderDetail(err), hubNameHeldWarning(p.alias, err))
+	return p
 }
 
 // registerBounded is the startup-path register: bounded by HubConnectTimeout so
@@ -1024,10 +1320,14 @@ func newHubPublisher(opts hubPublishOptions) *hubPublisher {
 	}
 
 	return &hubPublisher{
-		rt:     opts.Runtime,
-		client: opts.Res.Client,
-		alias:  hub.Alias,
-		run:    run,
+		rt:      opts.Runtime,
+		client:  opts.Res.Client,
+		alias:   hub.Alias,
+		run:     run,
+		regGate: make(chan struct{}, 1),
+		// --hub-takeover survives until the first successful registration
+		// (review A1), so a hub that was down at startup still honors it.
+		takeoverPending: opts.Takeover,
 		// The hub composes this same key from the origin and dir it is sent
 		// (D15); computing it here from the identical two strings is what makes
 		// the tunnel, the request stream and the registration provably address
@@ -1131,6 +1431,13 @@ func hubStateDescription(h *api.HubStatusResponse, now time.Time) string {
 		return "protocol mismatch"
 	case hubStateAuthFailed:
 		return "auth failed"
+	case hubStateNameHeld:
+		// Review A7: a declined collision is reported, not erased. The detail
+		// names who holds the name, which is the only actionable half.
+		if h.Detail != "" {
+			return "name held: " + h.Detail
+		}
+		return "name held"
 	default:
 		// resolving / registering / connecting, and anything a newer daemon
 		// might report: show the state verbatim rather than inventing wording
