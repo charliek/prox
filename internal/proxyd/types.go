@@ -47,6 +47,27 @@ type RegisterRequest struct {
 	// a generation discriminator, not a timestamp. 0 means the client could not
 	// read it, so the daemon falls back to bare-PID liveness for this holder.
 	StartTime int64 `json:"start_time,omitempty"`
+
+	// --- network (hub) mount only (plan 031 §4.3) ---
+	// These three fields are read ONLY by the hub's network control plane. The
+	// Unix socket mount clears Origin and Takeover on arrival and ignores
+	// ProtocolVersion, so a socket registration can never claim an origin (and
+	// therefore never composes an origin-qualified registry key).
+
+	// Origin is the publisher machine's name. The hub composes the registry key
+	// itself as HubProjectKey(origin, project_dir) (D5/D15) — it NEVER accepts a
+	// pre-qualified key from the wire — so this is the caller's own identity,
+	// not a target selector.
+	Origin string `json:"origin,omitempty"`
+	// ProtocolVersion is the publisher's hub wire version, checked against
+	// constants.HubProtocolVersion on the network mount only (D7).
+	ProtocolVersion int `json:"protocol_version,omitempty"`
+	// Takeover asks the hub to displace a CONNECTED holder of a colliding
+	// service name (D10). Connection state arrives with the tunnel in C4, so
+	// this commit carries the field on the wire without acting on it: with no
+	// sessions yet, nothing is ever connected and the cross-publisher
+	// collision path is still the registry's plain route conflict.
+	Takeover bool `json:"takeover,omitempty"`
 }
 
 // RegisterResponse is returned after a successful registration.
@@ -75,6 +96,12 @@ type RegisterResponse struct {
 type DeregisterRequest struct {
 	ProjectDir string `json:"project_dir"`
 	PID        int    `json:"pid"`
+	// Origin is the caller's own machine name on the NETWORK mount (plan 031
+	// D15). The hub composes HubProjectKey(origin, project_dir) itself, so a
+	// publisher can only ever deregister its own registration — never another
+	// publisher's, and never a LOCAL project (whose key is a bare dir that no
+	// origin composition can produce). Ignored on the socket mount.
+	Origin string `json:"origin,omitempty"`
 }
 
 // RouteInfo describes a single registered route.
@@ -86,6 +113,18 @@ type RouteInfo struct {
 	ProjectDir   string        `json:"project_dir"`
 	PID          int           `json:"pid"`
 	RegisteredAt time.Time     `json:"registered_at"`
+	// Origin is the publishing machine for a hub-registered route, empty for a
+	// LOCAL one (plan 031 D5). It is what `prox proxy routes` renders as the
+	// SOURCE column, and what tells the data plane a route's target lives
+	// through a tunnel rather than on this host. ProjectDir for such a route is
+	// the composed key "<origin>:<dir>".
+	Origin string `json:"origin,omitempty"`
+	// Connected reports whether the route can currently be served. It is always
+	// true for a local route (the daemon dials the target directly). For a hub
+	// route it reflects the publisher's tunnel, which arrives in C4 — until
+	// then a remote route reports false, because there is no session to serve
+	// it through.
+	Connected bool `json:"connected"`
 }
 
 // DaemonStatusResponse is returned by the status endpoint.
@@ -122,6 +161,54 @@ type DaemonStatusResponse struct {
 	// available or the daemon predates this field.
 	CaptureAvailable bool   `json:"capture_available"`
 	CaptureError     string `json:"capture_error,omitempty"`
+	// Hub is the hub HOST's view of hub mode (plan 031 D20), present only while
+	// hub mode is ON — a daemon with no hub emits no `hub` key at all, so
+	// hub-less status output is unchanged. This is NOT the publisher-side hub
+	// object: that one lives on the project API's status.proxy.hub and
+	// describes a project's own publishing state (C5).
+	Hub *HubStatus `json:"hub,omitempty"`
+}
+
+// HubStatus is the hub HOST's view of hub mode (plan 031 D20), returned by the
+// socket endpoints GET /api/v1/hub/status and GET /api/v1/status. Enabled is
+// false with every other field zero when hub mode is off.
+type HubStatus struct {
+	Enabled bool   `json:"enabled"`
+	Domain  string `json:"domain"`
+	// Listen is the address the control plane is ACTUALLY bound to, not the
+	// configured one: `--listen host:0` binds an ephemeral port and this is
+	// where the operator (and the tests) read it back (plan 031 D14/P15).
+	Listen    string    `json:"listen"`
+	HTTPSPort int       `json:"https_port"`
+	HTTPPort  int       `json:"http_port"`
+	Auth      string    `json:"auth"` // "token" | "none"
+	StartedAt time.Time `json:"started_at,omitempty"`
+	// Publishers lists every remote registration currently held, newest-key
+	// order not guaranteed — the CLI sorts.
+	Publishers []HubPublisher `json:"publishers"`
+}
+
+// HubPublisher is one remote registration as the hub operator sees it.
+type HubPublisher struct {
+	// Origin is the publishing machine, ProjectDir the publisher's OWN
+	// directory, and Key the composed registry key "<origin>:<dir>" the hub
+	// actually stores it under (plan 031 D5).
+	Origin     string `json:"origin"`
+	ProjectDir string `json:"project_dir"`
+	Key        string `json:"key"`
+	// Connected reflects the publisher's tunnel; sessions arrive in C4, so this
+	// commit always reports false for a registration that has no session layer
+	// to consult.
+	Connected    bool      `json:"connected"`
+	RegisteredAt time.Time `json:"registered_at"`
+	Routes       int       `json:"routes"`
+}
+
+// HubTokenResponse is the socket POST /api/v1/hub/token (rotate) reply: the
+// freshly written token and the file it was written to (plan 031 D18).
+type HubTokenResponse struct {
+	Token string `json:"token"`
+	Path  string `json:"path"`
 }
 
 // ErrorResponse is the standard error format for daemon API responses.

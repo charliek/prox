@@ -181,8 +181,18 @@ func decideProbe(st *probeState, now time.Time, minInterval time.Duration) (spaw
 // promptly: it only takes probeMu to update the frozen identity and run the pure
 // gate, then spawns the probe chain (if any) on its own goroutine. It never
 // blocks on the OS liveness check or the removal callback.
-func (dp *DynamicProxy) triggerDeadRouteProbe(dir string, pid int, startTime int64) {
+func (dp *DynamicProxy) triggerDeadRouteProbe(dir string, pid int, startTime int64, origin string) {
 	if dp.deadRouteRemover == nil {
+		return
+	}
+	if origin != "" {
+		// Remote (hub) route: the PID on this registration belongs to a process
+		// on the PUBLISHER's machine. Probing it here would either read as dead
+		// while the publisher is healthy, or — worse — find some unrelated local
+		// process that happens to hold that PID and declare the route live.
+		// Neither answer means anything, so a remote route is never PID-probed
+		// (plan 031 P4); its liveness is the tunnel, swept on the disconnect
+		// grace in C4.
 		return
 	}
 	dp.probeMu.Lock()
@@ -474,7 +484,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			// reap run on a separate goroutine, so the data plane never blocks.
 			// A live owner (flapping backend) probes alive and is a structural
 			// no-op; only a dead `prox up` owner converges the route.
-			dp.triggerDeadRouteProbe(route.ProjectDir, route.PID, route.StartTime)
+			dp.triggerDeadRouteProbe(route.ProjectDir, route.PID, route.StartTime, route.Origin)
 		}
 
 		// buildRecord is the single field-parity point for the two-phase

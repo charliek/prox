@@ -407,7 +407,7 @@ func TestDeadRouteProbe_UnregisteredDirNoOp(t *testing.T) {
 	registerProbeRoute(t, s, "/projects/live", 1, 0, "127.0.0.1", 2)
 
 	// Probe a dir that was never registered (route removed before the probe).
-	dp.triggerDeadRouteProbe("/projects/gone", deadPid, deadToken)
+	dp.triggerDeadRouteProbe("/projects/gone", deadPid, deadToken, "")
 
 	require.True(t, waitFor(t, time.Second, func() bool {
 		exists, _, _ := probeSnapshot(dp, "/projects/gone")
@@ -436,7 +436,7 @@ func TestDeadRouteProbe_StaleGenerationGuarded(t *testing.T) {
 
 	// A 502 from the old generation reaches the probe after re-registration: the
 	// frozen identity is the OLD dead one.
-	dp.triggerDeadRouteProbe("/projects/gen", oldPid, oldToken)
+	dp.triggerDeadRouteProbe("/projects/gen", oldPid, oldToken, "")
 
 	require.True(t, waitFor(t, time.Second, func() bool {
 		exists, _, _ := probeSnapshot(dp, "/projects/gen")
@@ -602,7 +602,7 @@ func TestDeadRouteProbe_Concurrency_RegisterVsProbe(t *testing.T) {
 			// Frozen dead identity (bare-PID token 0), matching the sweep guard:
 			// the live restart (os.Getpid) reads as a different identity and is
 			// left alone.
-			dp.triggerDeadRouteProbe("/projects/dead", dead, 0)
+			dp.triggerDeadRouteProbe("/projects/dead", dead, 0, "")
 		}()
 		wg.Wait()
 

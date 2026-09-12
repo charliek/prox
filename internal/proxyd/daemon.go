@@ -127,6 +127,38 @@ func startDaemon() error {
 	return nil
 }
 
+// autostartHub turns hub mode on at daemon start when ~/.prox/hub.yaml has
+// autostart: true (plan 031 D13).
+//
+// Every failure here is NON-FATAL and deliberately so: a hub that cannot bind —
+// its address gone with a changed network, its port taken, its config
+// hand-edited into something invalid — must still leave the daemon serving this
+// machine's LOCAL projects. Hub mode is additive; losing it can never cost a
+// developer their own `prox up`. The reason is logged, because the daemon's
+// stdout goes nowhere.
+//
+// Split out of RunDaemon so it can be tested directly: RunDaemon itself blocks
+// until a signal or a shutdown request and has no seam for "start, then
+// inspect".
+func autostartHub(server *Server, logger *slog.Logger) {
+	cfg, err := LoadHubConfig()
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("could not read hub config; hub mode stays off", "error", err)
+		}
+		return
+	}
+	if !cfg.Autostart {
+		return
+	}
+	if err := server.StartHub(cfg); err != nil {
+		logger.Error("hub autostart failed; continuing without hub mode",
+			"listen", cfg.Listen, "error", err)
+		return
+	}
+	logger.Info("hub mode autostarted", "listen", server.HubListenAddr(), "domain", cfg.Domain)
+}
+
 // RunDaemon is the main entry point for the proxy daemon process.
 // It sets up logging, the registry, proxy, and socket server, then waits
 // for a shutdown signal (no routes remaining or SIGTERM).
@@ -262,6 +294,12 @@ func RunDaemon(ctx context.Context) error {
 		}
 	})
 
+	// Hub mode at daemon start (plan 031 D13): ~/.prox/hub.yaml with
+	// autostart: true turns the network control plane on as the daemon comes up,
+	// so a rebooted hub host is publishing again without anyone typing
+	// `prox hub start`.
+	autostartHub(server, logger)
+
 	// Handle OS signals
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -337,6 +375,11 @@ func RunDaemon(ctx context.Context) error {
 	// the flag was set completes atomically, and every later one self-gates to a
 	// no-op before we start closing listeners and records.
 	server.quiesceForTeardown()
+	// Close the hub control plane before the data plane and the socket, so a
+	// publisher's in-flight call cannot register into a daemon that is exiting.
+	// StopHub's registry cleanup is a no-op under the shutdown flag — teardown
+	// owns physical cleanup from here.
+	server.StopHub()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/charliek/prox/internal/config"
+	"github.com/charliek/prox/internal/proxyd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -145,4 +146,144 @@ func TestHubCmd_List_NoHubsConfigured(t *testing.T) {
 		require.NoError(t, runHubList(hubListCmd, nil))
 	})
 	assert.Contains(t, stdout, "No hubs configured")
+}
+
+// resetHubStartFlags restores the package-level `prox hub start` flag vars, for
+// tests that drive applyHubStartFlags directly rather than through cobra.
+func resetHubStartFlags() {
+	hubStartDomain = ""
+	hubStartListen = ""
+	hubStartHTTPSPort = 0
+	hubStartHTTPPort = 0
+	hubStartAuth = ""
+	hubStatusJSON = false
+	hubTokenRotate = false
+}
+
+// TestApplyHubStartFlags_FirstStartDefaults pins plan 031 D14's first-start
+// defaults: a bare `prox hub start --domain D` must produce a complete, valid
+// hub.yaml with no further questions asked.
+func TestApplyHubStartFlags_FirstStartDefaults(t *testing.T) {
+	resetHubStartFlags()
+	t.Cleanup(resetHubStartFlags)
+
+	cfg, changed, err := applyHubStartFlags(proxyd.HubConfig{}, false, hubStartFlagSet{
+		domain: "llt.example.com", domainSet: true,
+	})
+	require.NoError(t, err)
+	assert.True(t, changed, "a first start always writes the file")
+	assert.Equal(t, "llt.example.com", cfg.Domain)
+	assert.Equal(t, 443, cfg.HTTPSPort)
+	assert.Equal(t, 0, cfg.HTTPPort)
+	assert.Equal(t, proxyd.HubAuthToken, cfg.Auth)
+	assert.False(t, cfg.Autostart)
+
+	wantListen, _ := proxyd.DefaultHubListenAddr()
+	assert.Equal(t, wantListen, cfg.Listen)
+}
+
+// TestApplyHubStartFlags_FirstStartRequiresDomain: no default hostname is
+// guessable, so the one flag that cannot be defaulted is required.
+func TestApplyHubStartFlags_FirstStartRequiresDomain(t *testing.T) {
+	resetHubStartFlags()
+	t.Cleanup(resetHubStartFlags)
+
+	_, _, err := applyHubStartFlags(proxyd.HubConfig{}, false, hubStartFlagSet{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--domain is required")
+}
+
+// TestApplyHubStartFlags_LaterStarts covers D14's "the file is the source of
+// truth": with no flags nothing changes, and a given flag overwrites exactly
+// its own key -- including an explicit --http-port 0, which must be able to
+// switch the HTTP listener off rather than reading as "unset".
+func TestApplyHubStartFlags_LaterStarts(t *testing.T) {
+	resetHubStartFlags()
+	t.Cleanup(resetHubStartFlags)
+
+	stored := proxyd.HubConfig{
+		Domain:    "llt.example.com",
+		Listen:    "127.0.0.1:8443",
+		HTTPSPort: 443,
+		HTTPPort:  8080,
+		Auth:      proxyd.HubAuthToken,
+		Autostart: true,
+	}
+
+	t.Run("no flags is a no-op", func(t *testing.T) {
+		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{})
+		require.NoError(t, err)
+		assert.False(t, changed, "no flags must not rewrite hub.yaml")
+		assert.Equal(t, stored, cfg)
+	})
+
+	t.Run("a flag overwrites its own key only", func(t *testing.T) {
+		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			listen: "10.0.0.5:9443", listenSet: true,
+		})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, "10.0.0.5:9443", cfg.Listen)
+		assert.Equal(t, stored.Domain, cfg.Domain)
+		assert.Equal(t, stored.HTTPSPort, cfg.HTTPSPort)
+		assert.True(t, cfg.Autostart, "autostart is not a `hub start` flag and must survive")
+	})
+
+	t.Run("an explicit zero http-port switches HTTP off", func(t *testing.T) {
+		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			httpPort: 0, httpPortSet: true,
+		})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, 0, cfg.HTTPPort)
+	})
+
+	t.Run("auth none is accepted", func(t *testing.T) {
+		cfg, _, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			auth: proxyd.HubAuthNone, authSet: true,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, proxyd.HubAuthNone, cfg.Auth)
+	})
+
+	t.Run("a public listen address is refused", func(t *testing.T) {
+		_, _, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			listen: "93.184.216.34:8443", listenSet: true,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not allowed")
+	})
+}
+
+// TestHubAliasFromDomain: the paste-ready publisher line suggests the alias a
+// user would have typed anyway -- the domain's first label.
+func TestHubAliasFromDomain(t *testing.T) {
+	assert.Equal(t, "llt", hubAliasFromDomain("llt.stridelabs.ai"))
+	assert.Equal(t, "hub", hubAliasFromDomain(""))
+	assert.Equal(t, "internal", hubAliasFromDomain("internal"))
+}
+
+// TestPrintHubPublisherLine_CarriesTheTokenValue pins §4.2's requirement that
+// the line a user pastes on the PUBLISHER carries the token VALUE: the hub-side
+// token path names a file that does not exist over there, so printing it would
+// be actively misleading.
+func TestPrintHubPublisherLine_CarriesTheTokenValue(t *testing.T) {
+	stdout, _ := captureOutput(t, func() {
+		printHubPublisherLine(proxyd.HubStatus{
+			Domain: "llt.example.com", Listen: "100.82.128.123:8443", Auth: proxyd.HubAuthToken,
+		}, "s3cret")
+	})
+	assert.Contains(t, stdout, "prox hub add llt http://100.82.128.123:8443 --token s3cret --default")
+	assert.Contains(t, stdout, "secret")
+	assert.NotContains(t, stdout, "hub.token")
+
+	// With auth: none there is no token to carry, and the line says so by
+	// simply not having one.
+	stdout, _ = captureOutput(t, func() {
+		printHubPublisherLine(proxyd.HubStatus{
+			Domain: "llt.example.com", Listen: "100.82.128.123:8443", Auth: proxyd.HubAuthNone,
+		}, "")
+	})
+	assert.Contains(t, stdout, "prox hub add llt http://100.82.128.123:8443 --default")
+	assert.NotContains(t, stdout, "--token")
 }

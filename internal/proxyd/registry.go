@@ -41,6 +41,16 @@ type Route struct {
 	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
 	// proxy passes it as the per-call capture limit; 0 means the daemon default.
 	MaxBodySize int64
+	// Origin is the publishing machine for a hub-registered route and empty for
+	// a local one (plan 031 D5). It is the data plane's "this target lives
+	// through a tunnel, not on this host" flag and the reason the on-502
+	// dead-owner probe skips the route: a remote PID means nothing here (P4).
+	//
+	// Origin is the ONLY hub field on Route, deliberately (P5): Registry.Lookup
+	// hands the data plane a *Route it reads OUTSIDE the registry lock, so
+	// mutable connection state must never live here. It belongs to
+	// ProjectRegistration and (from C4) the session manager.
+	Origin string
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -63,6 +73,12 @@ type ProjectRegistration struct {
 	// consults it) — the daemon folds every capture-enabled project's budget into
 	// one effective daemon-wide bound via EffectiveCaptureDiskBudget.
 	DiskBudget int64
+	// Origin is the publishing machine for a hub registration, empty for a local
+	// one (plan 031 D5). Its presence is what makes this registration REMOTE,
+	// which has two consequences on the hub host: the stale-PID sweep skips it
+	// (a publisher's PID is meaningless here — P4) and Dir is the composed key
+	// "<origin>:<publisher dir>" rather than a bare directory.
+	Origin string
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -211,6 +227,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			RegisteredAt:   now,
 			CaptureEnabled: req.CaptureEnabled,
 			MaxBodySize:    req.MaxBodySize,
+			Origin:         req.Origin,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -238,6 +255,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		CaptureEnabled: req.CaptureEnabled,
 		MaxBodySize:    req.MaxBodySize,
 		DiskBudget:     req.DiskBudget,
+		Origin:         req.Origin,
 	}
 
 	for port, proto := range portsNeeded {
@@ -492,9 +510,58 @@ func (r *Registry) AllRoutes() []RouteInfo {
 			ProjectDir:   route.ProjectDir,
 			PID:          route.PID,
 			RegisteredAt: route.RegisteredAt,
+			Origin:       route.Origin,
+			// A local route is always serveable (the daemon dials the target
+			// itself); a hub route needs its publisher's tunnel, which the
+			// session manager tracks from C4. Until then a remote route is
+			// honestly reported as not connected (plan 031 D5).
+			Connected: route.Origin == "",
 		})
 	}
 	return routes
+}
+
+// RemotePublishers returns one entry per HUB (origin-qualified) registration,
+// for the hub operator's `prox hub status` (plan 031 §4.2). Local registrations
+// are never listed: this is the publisher roster, not the route table.
+func (r *Registry) RemotePublishers() []HubPublisher {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	publishers := make([]HubPublisher, 0)
+	for key, proj := range r.projects {
+		if proj.Origin == "" {
+			continue
+		}
+		publishers = append(publishers, HubPublisher{
+			Origin:     proj.Origin,
+			ProjectDir: hubKeyProjectDir(proj.Origin, key),
+			Key:        key,
+			// Connection state arrives with the tunnel (C4); see HubPublisher.
+			Connected:    false,
+			RegisteredAt: proj.RegisteredAt,
+			Routes:       len(proj.RouteKeys),
+		})
+	}
+	sort.Slice(publishers, func(i, j int) bool { return publishers[i].Key < publishers[j].Key })
+	return publishers
+}
+
+// RemoteProjectKeys returns the registry keys of every hub registration, so
+// `prox hub stop` can remove them all when the network control plane closes
+// (plan 031 §4.2). Sorted for deterministic teardown order.
+func (r *Registry) RemoteProjectKeys() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	keys := make([]string, 0)
+	for key, proj := range r.projects {
+		if proj.Origin != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // ListenerPorts returns all ports with active listeners.
@@ -573,7 +640,15 @@ type StaleProject struct {
 }
 
 // StalePIDs returns the registered projects whose owning process generation is
-// no longer running. Liveness is keyed on (PID, start token) so a reused PID
+// no longer running. REMOTE (hub) registrations are skipped entirely: a
+// publisher's PID identifies a process on ANOTHER machine, so probing it here
+// is meaningless in both directions — it may be dead on the hub host while the
+// publisher is perfectly healthy, or (worse) coincidentally alive as some
+// unrelated local process, making a genuinely gone publisher look live (plan
+// 031 P4/D3). A remote registration's liveness is its tunnel, swept on the
+// disconnect grace in C4.
+//
+// Liveness is keyed on (PID, start token) so a reused PID
 // naming a different process reads as dead (see daemon.IsProcessAlive). It only
 // detects — removal goes through the consolidated removeStaleProject path
 // (identity-guarded via DeregisterIfIdentity) so the crash path purges captured
@@ -592,6 +667,10 @@ func (r *Registry) StalePIDs() []StaleProject {
 	r.mu.RLock()
 	candidates := make([]candidate, 0, len(r.projects))
 	for dir, proj := range r.projects {
+		if proj.Origin != "" {
+			// Remote registration: its PID lives on another machine (P4).
+			continue
+		}
 		candidates = append(candidates, candidate{dir: dir, pid: proj.PID, token: proj.StartTime})
 	}
 	r.mu.RUnlock()

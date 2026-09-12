@@ -362,6 +362,69 @@ func (c *Client) Shutdown(force bool) error {
 	return nil
 }
 
+// HubStart asks the daemon to turn hub mode on (or reconfigure it) from
+// ~/.prox/hub.yaml and returns the resulting status, whose Listen is the
+// address actually bound (plan 031 D13/D14). Socket-only: the network mount
+// carries no hub/* routes at all.
+func (c *Client) HubStart() (*HubStatus, error) {
+	return c.hubCall(http.MethodPost, "/api/v1/hub/start")
+}
+
+// HubStop asks the daemon to close the network control plane, drop every remote
+// registration, and re-arm the ordinary empty-daemon shutdown check.
+func (c *Client) HubStop() (*HubStatus, error) {
+	return c.hubCall(http.MethodPost, "/api/v1/hub/stop")
+}
+
+// HubStatus returns the hub HOST's view (D20). Enabled is false when hub mode
+// is off; that is a normal answer, not an error.
+func (c *Client) HubStatus() (*HubStatus, error) {
+	return c.hubCall(http.MethodGet, "/api/v1/hub/status")
+}
+
+// HubRotateToken makes the daemon write a fresh token and accept ONLY it, with
+// no grace (D18), returning the new value and the file it landed in.
+func (c *Client) HubRotateToken() (*HubTokenResponse, error) {
+	resp, err := c.post("/api/v1/hub/token", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.readError(resp)
+	}
+	var result HubTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding hub token response: %w", err)
+	}
+	return &result, nil
+}
+
+// hubCall is the shared request/decode body of the three hub/* endpoints that
+// answer with a HubStatus.
+func (c *Client) hubCall(method, path string) (*HubStatus, error) {
+	var resp *http.Response
+	var err error
+	if method == http.MethodGet {
+		resp, err = c.get(path)
+	} else {
+		resp, err = c.post(path, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.readError(resp)
+	}
+	var result HubStatus
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding hub status response: %w", err)
+	}
+	return &result, nil
+}
+
 // Stream issues a GET on the UNBOUNDED client and returns the live response
 // without reading it, so the caller owns the body (and MUST close it). This is
 // the only way to open a response that outlives constants.HubUnaryTimeout: the

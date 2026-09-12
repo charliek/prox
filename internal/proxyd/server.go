@@ -73,6 +73,27 @@ type Server struct {
 	// initialized fine (or the daemon never tried, e.g. in older-shaped tests).
 	// Surfaced via /status as capture_available=false + capture_error.
 	captureInitErr string
+
+	// --- hub mode (plan 031 C3) ---
+	// hubMu guards the hub-mode fields below. It is a LEAF in the daemon's lock
+	// order (lifecycleMu → hubMu): hubEnabled() is consulted from inside
+	// lifecycle transactions, so hubMu must never be held while taking
+	// lifecycleMu, and never across I/O — StartHub binds its listener before
+	// taking it, and StopHub copies the server/listener out, releases the lock,
+	// and only THEN shuts the server down. Holding it across Shutdown would
+	// deadlock against an in-flight network handler waiting to read the token.
+	hubMu sync.RWMutex
+	// hubCfg is the configuration the running hub is serving (its Listen is the
+	// CONFIGURED address; HubListenAddr reports the bound one, which differs
+	// when the port is 0). Zero when hub mode is off.
+	hubCfg HubConfig
+	// hubToken is the bearer credential the network mount currently accepts.
+	// Rotation replaces it in place with no grace (D18), which is why the
+	// middleware reads it per request rather than closing over it.
+	hubToken     string
+	hubListener  net.Listener
+	hubServer    *http.Server
+	hubStartedAt time.Time
 }
 
 // ServerConfig holds configuration for creating a daemon server.
@@ -194,12 +215,7 @@ func (s *Server) quiesceForTeardown() {
 
 func (s *Server) registerRoutes() {
 	// Health check — no prefix, lightweight
-	s.router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":  "ok",
-			"version": s.version,
-		})
-	})
+	s.router.Get("/health", s.handleHealth)
 
 	s.router.Route("/api/v1", func(r chi.Router) {
 		r.Post("/register", s.handleRegister)
@@ -209,6 +225,25 @@ func (s *Server) registerRoutes() {
 		r.Post("/shutdown", s.handleShutdown)
 		r.Get("/requests/stream", s.handleStreamRequests)
 		r.Get("/requests", s.handleGetRequests)
+		// Hub-mode control is SOCKET-ONLY (plan 031 D6): a remote publisher must
+		// never be able to reconfigure, or switch off, the hub it publishes
+		// through. The network mount is a separate router that simply does not
+		// carry these routes (see hub_server.go), so this is structural rather
+		// than a subtraction someone can forget.
+		r.Post("/hub/start", s.handleHubStart)
+		r.Post("/hub/stop", s.handleHubStop)
+		r.Get("/hub/status", s.handleHubStatus)
+		r.Post("/hub/token", s.handleHubRotateToken)
+	})
+}
+
+// handleHealth answers /health on BOTH mounts. On the network mount it is the
+// one route that carries no bearer-token middleware, so a publisher can probe
+// reachability (and the hub's version) before it holds a credential.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"version": s.version,
 	})
 }
 
@@ -221,6 +256,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// The network-mount fields are not part of the socket contract (plan 031
+	// §4.3). Clearing Origin here is what keeps a local registration's key a
+	// BARE directory: a socket client cannot claim an origin, so it can never
+	// produce an origin-qualified key, and conversely no composed key can ever
+	// name a local project (D15).
+	req.Origin = ""
+	req.Takeover = false
 
 	// Version check: exact match required
 	if req.Version != s.version {
@@ -300,7 +343,32 @@ func (s *Server) register(req RegisterRequest) (int, any) {
 			// Route/validation conflict — a real error, never retried.
 			return http.StatusConflict, ErrorResponse{Error: err.Error(), Code: "REGISTRATION_CONFLICT"}
 		}
-		if daemon.IsProcessAlive(conflict.PID, conflict.StartTime) {
+		if req.Origin != "" {
+			// REMOTE conflict path (plan 031 P4/D17). The key is
+			// <origin>:<dir>, so a same-key conflict is by construction the SAME
+			// publisher re-registering — identity is settled by the key itself,
+			// and daemon.IsProcessAlive is never called: the holder's PID names
+			// a process on the publisher's machine, where "alive here" would be
+			// a coincidence and "dead here" would be a lie.
+			if s.registry.registrationMatches(req) {
+				// Config unchanged: a true no-op refresh, exactly like the local
+				// idempotent arm — no listener churn, no record purge.
+				s.logger.Info("idempotent remote re-register: config unchanged, no-op refresh",
+					"project", conflict.Dir, "origin", req.Origin)
+				return http.StatusOK, RegisterResponse{
+					Registered: s.registry.ProjectHostnames(conflict.Dir),
+					Warnings:   s.currentWarnings(),
+				}
+			}
+			// Config changed: replace, failure-atomically (the snapshot restores
+			// the previous registration if the retry below fails).
+			if snap, ok := s.registry.snapshotProject(conflict.Dir); ok {
+				restoreSnap = &snap
+			}
+			s.logger.Info("remote re-register: config changed, replacing registration",
+				"project", conflict.Dir, "origin", req.Origin)
+			s.removeProjectLocked(conflict.Dir)
+		} else if daemon.IsProcessAlive(conflict.PID, conflict.StartTime) {
 			// The same-dir holder is still live. Sub-cases:
 			//   - SAME generation as the requester (same PID AND matching non-zero
 			//     start token): an idempotent re-register (D6a) — the heal path
@@ -468,11 +536,22 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	removedHostnames, emptyPorts := s.removeProject(req.ProjectDir)
+	// The socket mount addresses projects by their bare dir; the network mount
+	// composes its key from the caller's own origin (deregisterProject is
+	// shared, the key derivation is not — D15).
+	s.deregisterProject(w, req.ProjectDir, req.PID)
+}
+
+// deregisterProject is the shared body of both mounts' deregister handler: it
+// removes the project the caller's key names, reports the removed hostnames,
+// and schedules the empty-daemon shutdown check. The CALLER resolves the key,
+// which is the whole authorization story on the network mount (plan 031 D15).
+func (s *Server) deregisterProject(w http.ResponseWriter, projectKey string, pid int) {
+	removedHostnames, emptyPorts := s.removeProject(projectKey)
 
 	s.logger.Info("deregistered project",
-		"project", req.ProjectDir,
-		"pid", req.PID,
+		"project", projectKey,
+		"pid", pid,
 		"removed_hostnames", removedHostnames,
 		"closed_ports", emptyPorts,
 	)
@@ -492,8 +571,17 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // deregister, the stale-PID sweep, and register rollback paths (an emptied
 // registry after a failed self-heal replace would otherwise strand an idle
 // daemon forever). No-op when the registry is non-empty at call time.
+// It is also a no-op while HUB MODE is on (plan 031 D13): a hub exists to be
+// available for publishers that are not registered yet, so "no routes left"
+// says nothing about whether the daemon is still needed. `prox hub stop` (or a
+// signal) is what ends a hub daemon's life, and it schedules this check itself
+// once the network listener is closed.
 func (s *Server) scheduleShutdownWhenEmpty() {
 	if s.registry == nil || !s.registry.IsEmpty() {
+		return
+	}
+	if s.hubEnabled() {
+		s.logger.Info("no routes registered, but hub mode is on; staying alive")
 		return
 	}
 	s.logger.Info("no routes registered, scheduling shutdown check")
@@ -503,10 +591,12 @@ func (s *Server) scheduleShutdownWhenEmpty() {
 		// Re-check under lifecycleMu so an in-flight register transaction
 		// finishes before the decision, and stand down if ANY lifecycle
 		// mutation happened since scheduling — a newer empty period gets its
-		// own timer with the full grace.
+		// own timer with the full grace. Hub mode is re-checked here too: it can
+		// be switched on during the grace, and a timer from before that must not
+		// take the daemon down under it.
 		s.lifecycleMu.Lock()
 		defer s.lifecycleMu.Unlock()
-		if s.lifecycleEpoch.Load() == epoch && s.registry.IsEmpty() {
+		if s.lifecycleEpoch.Load() == epoch && s.registry.IsEmpty() && !s.hubEnabled() {
 			s.RequestShutdown()
 		}
 	}()
@@ -732,6 +822,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.DroppedEvents = s.managers.droppedTotal()
 		resp.RecordCounts = s.managers.recordCounts()
 	}
+	// Hub mode is reported only while it is ON, so a hub-less daemon's status
+	// JSON is byte-for-byte what it was (plan 031 AC1).
+	if hub := s.hubStatus(); hub.Enabled {
+		resp.Hub = &hub
+	}
 	resp.CaptureAvailable = s.captureMgr != nil
 	if s.captureMgr != nil {
 		// Capture disk accounting for the one shared capture dir, read under a
@@ -793,6 +888,28 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
+	// Filter the stream by owning project (exact match). Scoping by project
+	// dir rather than hostname prevents cross-project record delivery when two
+	// projects own the same hostname on different ports. The param is
+	// mandatory: an empty ProjectDir filter would resolve no ring, so a caller
+	// that forgot the param would silently receive nothing.
+	projectDir := r.URL.Query().Get("project")
+	if projectDir == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: "project query parameter is required",
+			Code:  "BAD_REQUEST",
+		})
+		return
+	}
+	s.streamRequestsFor(w, r, projectDir)
+}
+
+// streamRequestsFor is the shared SSE body of both mounts' request stream. The
+// caller supplies the already-resolved registry key: the socket mount passes
+// the `project` param verbatim, the network mount passes
+// HubProjectKey(caller origin, project) so a publisher can only ever subscribe
+// to its own ring (plan 031 D15).
+func (s *Server) streamRequestsFor(w http.ResponseWriter, r *http.Request, projectDir string) {
 	if s.managers == nil {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error: "request manager not available",
@@ -806,20 +923,6 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error: "streaming not supported",
 			Code:  "STREAMING_NOT_SUPPORTED",
-		})
-		return
-	}
-
-	// Filter the stream by owning project (exact match). Scoping by project
-	// dir rather than hostname prevents cross-project record delivery when two
-	// projects own the same hostname on different ports. The param is
-	// mandatory: an empty ProjectDir filter would resolve no ring, so a caller
-	// that forgot the param would silently receive nothing.
-	projectDir := r.URL.Query().Get("project")
-	if projectDir == "" {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "project query parameter is required",
-			Code:  "BAD_REQUEST",
 		})
 		return
 	}
@@ -871,14 +974,6 @@ func (s *Server) handleStreamRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
-	if s.managers == nil {
-		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
-			Error: "request manager not available",
-			Code:  "NOT_READY",
-		})
-		return
-	}
-
 	// Mandatory for the same reason as the stream endpoint: an empty
 	// ProjectDir resolves no ring.
 	projectDir := r.URL.Query().Get("project")
@@ -886,6 +981,22 @@ func (s *Server) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: "project query parameter is required",
 			Code:  "BAD_REQUEST",
+		})
+		return
+	}
+	s.getRequestsFor(w, r, projectDir)
+}
+
+// getRequestsFor is the shared snapshot body of both mounts' requests endpoint.
+// As with the stream, the caller supplies the resolved registry key — the
+// network mount composes it from the caller's own origin (plan 031 D15), so a
+// publisher asking for another publisher's dir simply reads its OWN (empty)
+// ring rather than anyone else's captured bodies.
+func (s *Server) getRequestsFor(w http.ResponseWriter, r *http.Request, projectDir string) {
+	if s.managers == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "request manager not available",
+			Code:  "NOT_READY",
 		})
 		return
 	}

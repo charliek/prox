@@ -121,6 +121,21 @@ const (
 	// (plan 031 P1/D16).
 	HubUnaryTimeout = 30 * time.Second
 
+	// HubDisconnectGrace is how long a remote (hub-published) registration is
+	// kept after its tunnel closes before the daemon's stale sweep may remove it
+	// (plan 031 D3). During the grace the hub serves the offline page and a
+	// reattach by the same publisher reconnects with no route churn. Because the
+	// sweep runs every 30s, removal is observable at up to grace + one sweep
+	// interval (90s) — which is what the plan promises, not 60s (P11).
+	HubDisconnectGrace = 60 * time.Second
+
+	// HubAttachGrace is how long a freshly-accepted remote registration counts
+	// as connected for collision purposes before its tunnel attaches (plan 031
+	// D17/P3). It closes the register→attach window in which a second publisher
+	// could otherwise take the name out from under a publisher that is still
+	// completing its handshake.
+	HubAttachGrace = 10 * time.Second
+
 	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
 	// liveness probes for a single project (#74). When a route's backend
 	// transport fails, the daemon probes the owning `prox up` process's liveness
@@ -396,6 +411,24 @@ const (
 
 	// DefaultProxyMaxIdleConns is the maximum number of idle connections
 	DefaultProxyMaxIdleConns = 100
+)
+
+// Remote proxy hub (plan 031)
+const (
+	// HubProtocolVersion is the version of the hub's network JSON API and
+	// tunnel framing. A remote publisher sends it as `protocol_version` on the
+	// NETWORK mount and a mismatch is a 409 PROTOCOL_MISMATCH (plan 031 D7).
+	//
+	// It is deliberately NOT the binary version: machines upgrade at different
+	// times and only the wire contract has to agree across them. The Unix
+	// socket mount keeps its exact-binary-version rule unchanged, because a
+	// local project and its daemon are the same install.
+	HubProtocolVersion = 1
+
+	// HubDefaultPort is the default TCP port for a hub's network control plane
+	// (plan 031 D6). It is a high port on a private/tailnet address, so binding
+	// it needs no privilege.
+	HubDefaultPort = 8443
 )
 
 // File permissions
