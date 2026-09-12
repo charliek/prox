@@ -479,18 +479,26 @@ re-register".
 bearer token, so the Unix-socket daemon client and the hub client are the same
 type. The forwarder takes a `Client` rather than a socket path.
 
-**Status and inspection.** `prox hub status` (hub host) and `prox hub list` (publisher) sit beside `prox
-proxy status|routes` against the control API. `prox status` in a publishing
-project gains a `Hub:` line with the same connected/degraded/down states the
-`Proxy:` line has. Hub-side, a route whose tunnel is disconnected renders a
-small HTML "publisher offline since <t>" page with a `Retry-After`, not a bare
-502.
+**Status and inspection.** `prox hub status` is the hub HOST's view — on/off,
+domain, listen address, ports, auth mode, and every connected or disconnected
+publisher — and sits beside `prox proxy status|routes`. (`prox hub list` is
+not a control-plane query at all: it manages the publisher's own hub profiles
+in `~/.prox/hubs.yaml`, merged with the current project's `hubs:` block, and
+talks to nothing.) `prox status` in a publishing project gains a `Hub:` line
+with the same connected/degraded/down states the `Proxy:` line has. Hub-side,
+a route whose tunnel is disconnected renders a small HTML "publisher offline
+since <t>" page with a `Retry-After`, not a bare 502.
 
-**Certificates on the hub.** `hub.yaml` selects `certs.source: files | mkcert`
-(v1) with `acme` reserved for v2. `files` reuses the cert manager's existing
-prefer-existing-files behavior and adds a fsnotify-free periodic reload
-(mtime check on the SNI path) so a renewed cert is picked up without a
-restart.
+**Certificates on the hub.** *Original proposal, not what shipped:* `hub.yaml`
+selects `certs.source: files | mkcert` (v1) with `acme` reserved for v2, where
+`files` reuses the cert manager's existing prefer-existing-files behavior and
+adds a fsnotify-free periodic reload (mtime check on the SNI path) so a renewed
+cert is picked up without a restart.
+
+*What shipped:* `hub.yaml` has no certificate-source field. The hub generates
+mkcert certificates on demand exactly as the local proxy does (D13), and
+bring-your-own certificate files, the reload loop above, and ACME are all
+deferred past v1 (plan 031 §9).
 
 ## Resolved Decisions (proposed)
 
@@ -499,10 +507,10 @@ restart.
 | D1 | Placement | Reverse-tunnel hub (option C); direct dial (B) left as a possible later optimization |
 | D2 | Transport | One upgraded HTTPS connection multiplexed with yamux; `CONNECT <port>` preamble per stream |
 | D3 | Same binary and same daemon | Yes: hub mode is an additional interface on the existing shared daemon, switched on by `prox hub start`; no second process |
-| D4 | Certificates | Behind the front-door interface. `domain` door: v1 bring-your-own files (LE wildcard via DNS-01 cron) or mkcert, v2 built-in ACME. `tailscale-services` door: Tailscale provisions them |
+| D4 | Certificates | Behind the front-door interface. `domain` door: v1 bring-your-own files (LE wildcard via DNS-01 cron) or mkcert, v2 built-in ACME. `tailscale-services` door: Tailscale provisions them. **Shipped narrower:** mkcert only in v1 (see D13); bring-your-own files and ACME are deferred |
 | D5 | DNS | Behind the front-door interface. `domain` door: one public wildcard A record to the hub's tailnet IP. `tailscale-services` door: MagicDNS |
 | D5a | Front door | Pluggable hub-side interface from day one; ship one door in phase 1 (open question 6) |
-| D6 | Auth | Bearer token over TLS; tailnet is the perimeter |
+| D6 | Auth | Bearer token; tailnet is the perimeter. **Shipped without TLS:** the v1 control plane speaks plain HTTP, so the token is protected only by the transport underneath it — which is why the listen address is restricted to loopback and the CGNAT range unless `allow_unencrypted_lan` is set (see D12) |
 | D7 | Liveness | Lease held by the tunnel, 60s reconnect grace, then removal |
 | D8 | Versioning | Protocol version match, binary version informational |
 | D9 | Config | One `hubs:` schema accepted in both `prox.yaml` (project self-describing) and `~/.prox/hubs.yaml` (per user, with `default`), merged by alias with the project winning; `proxy.hub: <alias|default>`; `--hub[=alias]` / `PROX_HUB` / `--no-hub` override; explicit opt-in, default unchanged. `~/.prox/hub.yaml` on the host is machine-level and stays separate |

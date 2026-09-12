@@ -80,6 +80,20 @@ func TestValidateHubListenAddr(t *testing.T) {
 		assert.Equal(t, "100.64.1.2:0", got)
 	})
 
+	// Plan 031: an out-of-range listen port is a CONFIG error, caught here, not
+	// a bind failure discovered by net.Listen much later and reported as
+	// HUB_BIND_FAILED. 0 stays legal (ephemeral, above); everything else goes
+	// through the shared domain.ValidatePort rule.
+	t.Run("refuses a listen port outside the range", func(t *testing.T) {
+		for _, addr := range []string{"127.0.0.1:84433", "127.0.0.1:65536", "100.64.1.2:-1"} {
+			_, err := validateHubListenAddr(addr, false)
+			require.Error(t, err, addr)
+			assert.Contains(t, err.Error(), "invalid port", addr)
+			var cfgErr *hubConfigError
+			assert.ErrorAs(t, err, &cfgErr, "it must be a config error, so the API answers 400")
+		}
+	})
+
 	t.Run("refuses 0.0.0.0 with advice", func(t *testing.T) {
 		_, err := validateHubListenAddr("0.0.0.0:8443", false)
 		require.Error(t, err)
@@ -415,6 +429,22 @@ func TestNormalizeHubConfig(t *testing.T) {
 		_, err := NormalizeHubConfig(HubConfig{Domain: "a.test", Listen: "127.0.0.1:0", HTTPSPort: 8080, HTTPPort: 8080})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "cannot be the same")
+	})
+
+	// Plan 031: a data-plane port typo must be HUB_CONFIG_INVALID here, not a
+	// listener failure later. 0 keeps meaning "no listener of this kind".
+	t.Run("refuses a data-plane port outside the range", func(t *testing.T) {
+		for _, cfg := range []HubConfig{
+			{Domain: "a.test", Listen: "127.0.0.1:0", HTTPSPort: 65536},
+			{Domain: "a.test", Listen: "127.0.0.1:0", HTTPSPort: 4433, HTTPPort: 88888},
+			{Domain: "a.test", Listen: "127.0.0.1:0", HTTPSPort: -1},
+		} {
+			_, err := NormalizeHubConfig(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "between 1 and 65535")
+			var cfgErr *hubConfigError
+			assert.ErrorAs(t, err, &cfgErr, "it must be a config error, so the API answers 400")
+		}
 	})
 
 	t.Run("refuses a public listen address", func(t *testing.T) {

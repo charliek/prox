@@ -476,8 +476,20 @@ func validateHubListenAddr(addr string, allowUnencryptedLAN bool) (string, error
 	if host == "" {
 		return "", hubConfigErrorf("listen address %q has no host: %s", addr, hubListenAdvice())
 	}
-	if _, err := strconv.Atoi(port); err != nil {
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
 		return "", hubConfigErrorf("listen address %q has an invalid port %q", addr, port)
+	}
+	// Port 0 is the one value the shared rule refuses that IS meaningful here:
+	// it means "bind an ephemeral port", which is how the tests get a control
+	// plane without racing each other for a fixed number. Everything else goes
+	// through domain.ValidatePort, so a typo like 84433 is a 400
+	// HUB_CONFIG_INVALID from this one validation point rather than a 500
+	// HUB_BIND_FAILED from net.Listen much later (plan 031 D6).
+	if portNum != 0 {
+		if err := domain.ValidatePort(portNum); err != nil {
+			return "", hubConfigErrorf("listen address %q has an invalid port %q: %v", addr, port, err)
+		}
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
@@ -602,8 +614,19 @@ func NormalizeHubConfig(cfg HubConfig) (HubConfig, error) {
 	}
 	cfg.Listen = listen
 
-	if cfg.HTTPSPort < 0 || cfg.HTTPPort < 0 {
-		return HubConfig{}, hubConfigErrorf("hub https_port and http_port must not be negative")
+	// 0 means "no listener of this kind" (P15); every other value is a real
+	// port and follows the shared range rule, so an out-of-range number is
+	// refused here as HUB_CONFIG_INVALID instead of surviving to the listener.
+	for _, p := range []struct {
+		name string
+		port int
+	}{{"https_port", cfg.HTTPSPort}, {"http_port", cfg.HTTPPort}} {
+		if p.port == 0 {
+			continue
+		}
+		if err := domain.ValidatePort(p.port); err != nil {
+			return HubConfig{}, hubConfigErrorf("hub %s: %v", p.name, err)
+		}
 	}
 	if cfg.HTTPSPort == 0 && cfg.HTTPPort == 0 {
 		return HubConfig{}, hubConfigErrorf("hub must expose at least one data-plane port (https_port or http_port)")

@@ -284,6 +284,26 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	// (Registry.EffectiveCaptureDiskBudget), so neither half can be forgotten.
 	req.DiskBudget = 0
 
+	// The per-body capture cap is DiskBudget's sibling, and the hub host's own
+	// MEMORY (plan 031 F9). MaxBodySize is what a capture buffer will hold in
+	// memory before it spills — for the request and the response, on every
+	// concurrent request through the route — so a publisher asking for 4 GiB
+	// is asking this machine to buffer 4 GiB per body, and DiskBudget's cap on
+	// the spill files does nothing about it.
+	//
+	// Unlike DiskBudget this one IS genuinely per-project, so the arm is CLAMP
+	// rather than clear: a publisher that asks for less than the hub's own
+	// default keeps exactly what it asked for, and one that asks for more is
+	// held to the default rather than having an otherwise valid registration
+	// refused over a number its prox.yaml is entitled to carry. (A negative
+	// value is still rejected outright by validateHubRegistration — that one is
+	// not a preference, it is nonsense.)
+	if req.MaxBodySize > constants.DefaultCaptureMaxBodySize {
+		s.logger.Info("clamped a remote registration's capture body cap to the hub default",
+			"origin", origin, "requested", req.MaxBodySize, "max", constants.DefaultCaptureMaxBodySize)
+		req.MaxBodySize = constants.DefaultCaptureMaxBodySize
+	}
+
 	// D5/D15: the key is derived, never accepted. From here down, ProjectDir IS
 	// the composed key — the registry, the per-project ring, the request
 	// filters, and the publisher's own later deregister all use the same value.
@@ -443,20 +463,30 @@ func (s *Server) startHub(cfg HubConfig, persist bool) error {
 		return err
 	}
 
-	// Fast path: already serving this exact address. Update config/token under
-	// the lock and return — no rebind, no listener churn.
+	// Fast path: already serving this exact address — no rebind, no listener
+	// churn. Persist BEFORE swapping the live config and token, for the same
+	// reason the rebind arm below binds before it commits (plan 031 F13): a
+	// `prox hub start --auth none` whose save fails must answer 500 AND leave
+	// the running hub on the config it had. Committing the live fields first
+	// would give the operator an error and an already-reconfigured hub, with
+	// ~/.prox/hub.yaml still describing the old mode — the worst of both.
+	//
+	// Both critical sections sit under hubLifecycleMu (F14), so no concurrent
+	// start, stop or token rotation can interleave between them.
 	s.hubMu.Lock()
-	if s.hubServer != nil && s.hubCfg.Listen == cfg.Listen {
-		s.hubCfg = cfg
-		s.hubToken = cfg.Token
-		s.hubMu.Unlock()
+	inPlace := s.hubServer != nil && s.hubCfg.Listen == cfg.Listen
+	s.hubMu.Unlock()
+	if inPlace {
 		if err := s.commitHubConfig(cfg, persist); err != nil {
 			return err
 		}
+		s.hubMu.Lock()
+		s.hubCfg = cfg
+		s.hubToken = cfg.Token
+		s.hubMu.Unlock()
 		s.logger.Info("hub mode reconfigured in place", "listen", cfg.Listen, "domain", cfg.Domain)
 		return nil
 	}
-	s.hubMu.Unlock()
 
 	// Bind before touching the running hub, so a bind failure leaves the
 	// previous listener untouched (D14 rollback) and hub.yaml unwritten (F13).

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -611,7 +612,7 @@ func TestDeadRouteProbe_SkipsRemoteRoutes(t *testing.T) {
 	}
 
 	// Remote route: no probe, no reap.
-	newProxy().triggerDeadRouteProbe("popos:/home/dev/app", 4242, 1, "popos")
+	newProxy().triggerDeadRouteProbe(HubProjectKey("popos", "/home/dev/app"), 4242, 1, "popos")
 	select {
 	case dir := <-reaped:
 		t.Fatalf("a remote route must never be PID-probed or reaped, got %q", dir)
@@ -667,7 +668,8 @@ func TestHubStop_RemovesRemoteRegistrations(t *testing.T) {
 
 	s.StopHub()
 
-	assert.Nil(t, s.registry.ProjectHostnames("popos:/home/dev/app"), "remote registrations go with the hub")
+	assert.Nil(t, s.registry.ProjectHostnames(HubProjectKey("popos", "/home/dev/app")),
+		"remote registrations go with the hub")
 	assert.NotNil(t, s.registry.ProjectHostnames("/home/dev/local"), "local projects are untouched")
 	assert.False(t, s.hubEnabled())
 	assert.Empty(t, s.HubListenAddr())
@@ -1094,6 +1096,57 @@ func TestHubRegister_CannotLowerTheCaptureDiskBudget(t *testing.T) {
 	assert.Equal(t, int64(0), snap.proj.DiskBudget)
 }
 
+// TestHubRegister_ClampsTheCaptureBodyCap is DiskBudget's sibling (plan 031 F9).
+//
+// MaxBodySize is how many bytes a capture buffer holds in MEMORY before it
+// spills, per request and per response, on every concurrent request through the
+// route. Clearing DiskBudget bounds the spill files and nothing else, so an
+// unbounded MaxBodySize from a remote publisher is a memory-exhaustion lever on
+// a machine it does not own. A value at or below the hub's own default is the
+// publisher's business and is kept exactly as sent.
+func TestHubRegister_ClampsTheCaptureBodyCap(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok"})
+
+	// Each subtest registers its own service name and directory: two projects
+	// claiming one hostname is the takeover rule, which is a different test.
+	registerWithCap := func(t *testing.T, svc string, capBytes int64) int64 {
+		t.Helper()
+		dir := "/home/dev/" + svc
+		req := hubRegisterRequest("popos", dir,
+			map[string]ServiceTarget{svc: {Host: "localhost", Port: 3000}})
+		req.CaptureEnabled = true
+		req.MaxBodySize = capBytes
+		resp := hubDo(t, http.MethodPost, base+"/api/v1/register", "tok", req)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"the registration itself is fine — only an over-large cap is held down")
+		snap, ok := s.registry.snapshotProject(HubProjectKey("popos", dir))
+		require.True(t, ok)
+		return snap.proj.MaxBodySize
+	}
+
+	t.Run("an enormous cap is held to the hub default", func(t *testing.T) {
+		assert.Equal(t, int64(constants.DefaultCaptureMaxBodySize),
+			registerWithCap(t, "greedy", 4<<30))
+	})
+
+	t.Run("a modest cap is the publisher's own business", func(t *testing.T) {
+		assert.Equal(t, int64(64<<10), registerWithCap(t, "modest", 64<<10))
+	})
+
+	t.Run("zero still means the daemon default", func(t *testing.T) {
+		assert.Equal(t, int64(0), registerWithCap(t, "unset", 0))
+	})
+
+	t.Run("a negative cap is refused outright", func(t *testing.T) {
+		req := hubRegisterRequest("popos", "/home/dev/nonsense",
+			map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}})
+		req.MaxBodySize = -1
+		resp := hubDo(t, http.MethodPost, base+"/api/v1/register", "tok", req)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "BAD_REQUEST", errorCode(t, resp))
+	})
+}
+
 // TestHubCaptureForwarding_EndToEndOverTheHubMount is plan 031 F12's regression
 // test: a legitimate hub publisher must be able to read and stream its OWN
 // captured requests through the hub's network mount.
@@ -1253,6 +1306,43 @@ func TestHubStart_CommitsTheConfigOnlyAfterBinding(t *testing.T) {
 			"a config the daemon could not bind must not be left in hub.yaml for the next autostart to pick up")
 		assert.Equal(t, bound, s.HubListenAddr(), "the previous listener keeps serving")
 	})
+}
+
+// TestHubStart_InPlaceReconfigureCommitsBeforeLiveState is the SAME commit rule
+// on startHub's other arm (plan 031 F13).
+//
+// The rebind arm binds before it commits. The same-address fast path used to
+// assign s.hubCfg and s.hubToken and only THEN call commitHubConfig, so a
+// `prox hub start --auth none` whose save failed answered 500 while the live
+// hub had already switched to accepting unauthenticated calls — with
+// ~/.prox/hub.yaml still describing the old mode. An operator who sees an error
+// must be able to believe nothing changed.
+func TestHubStart_InPlaceReconfigureCommitsBeforeLiveState(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok", Domain: "llt.test", HTTPSPort: 16443})
+	current := s.hubConfigSnapshot().cfg
+	require.Equal(t, HubAuthToken, current.Auth)
+
+	// Fail the save at the rename: nothing is persisted, so hub.yaml and the
+	// live hub must agree on the OLD config afterwards.
+	restore := hubFileWriter
+	hubFileWriter.RenameFn = func(string, string) error { return errors.New("disk full") }
+	t.Cleanup(func() { hubFileWriter = restore })
+
+	next := current
+	next.Auth = HubAuthNone
+	rec := hubStartWithConfig(t, s, next)
+	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+
+	mode, token := s.hubAuthSnapshot()
+	assert.Equal(t, HubAuthToken, mode, "a failed save must not switch the live hub to auth: none")
+	assert.Equal(t, "tok", token)
+
+	// And on the wire, which is what the operator is actually exposed to.
+	assert.Equal(t, http.StatusUnauthorized,
+		hubDo(t, http.MethodGet, base+"/api/v1/routes", "", nil).StatusCode,
+		"the hub must still demand the token it was started with")
+	assert.Equal(t, http.StatusOK,
+		hubDo(t, http.MethodGet, base+"/api/v1/routes", "tok", nil).StatusCode)
 }
 
 // TestStartHub_RefusesDomainOrPortChangeWithPublishers is the other half of F13.

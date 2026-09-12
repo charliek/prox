@@ -224,6 +224,51 @@ var userHubsWriter = domain.AtomicWriter{TempPattern: ".prox-hubs-*.tmp"}
 // chosen, so callers match on this sentinel, never on message text.
 var ErrUnknownHub = errors.New("unknown hub")
 
+// UnknownHubError is the ErrUnknownHub failure with the alias that was actually
+// LOOKED UP attached, so a caller building remediation advice names the alias
+// the user has to add rather than the literal "default" (plan 031 D8).
+//
+// `proxy.hub: default` resolves through ~/.prox/hubs.yaml's `default:` key, so
+// a missing alias there is reported as `default` by the request and as, say,
+// `llt` by the lookup. Telling the user to run `prox hub add default <url>`
+// would be advice that cannot work: "default" is a reserved alias, not a hub
+// name. Callers match ErrUnknownHub as before (Unwrap keeps errors.Is working)
+// and reach for this type only when they need the resolved name.
+type UnknownHubError struct {
+	// Requested is the alias the caller asked for, which may be "default".
+	Requested string
+	// Alias is the alias the lookup actually missed: "default" already expanded
+	// through the user file. It is EMPTY in the one case where there is no
+	// alias to name — "default" was asked for and no default is set.
+	Alias string
+	// Defined is the rendered list of aliases this machine does define.
+	Defined string
+}
+
+func (e *UnknownHubError) Error() string {
+	if e.Alias == "" {
+		return fmt.Sprintf("%v: hub alias %q: no default is set in ~/.prox/hubs.yaml (run '%s')",
+			ErrUnknownHub, e.Requested, e.AddCommand())
+	}
+	via := ""
+	if e.Alias != e.Requested {
+		via = fmt.Sprintf(" (the default set in ~/.prox/hubs.yaml, named by %q)", e.Requested)
+	}
+	return fmt.Sprintf("%v: unknown hub alias %q%s (defined: %s)", ErrUnknownHub, e.Alias, via, e.Defined)
+}
+
+func (e *UnknownHubError) Unwrap() error { return ErrUnknownHub }
+
+// AddCommand is the `prox hub add` invocation that would make this resolution
+// succeed. It lives here rather than at the call site because only this package
+// knows whether the missing piece is an alias or the `default:` key itself.
+func (e *UnknownHubError) AddCommand() string {
+	if e.Alias == "" {
+		return "prox hub add <alias> <url> --default"
+	}
+	return "prox hub add " + e.Alias + " <url>"
+}
+
 // ResolvedHub is the fully-resolved hub selection for one `prox up --hub`/
 // `proxy.hub` run (plan 031 D8): a usable base URL, a token value already
 // read from whichever of token/token_file/token_env was set (or empty for
@@ -296,14 +341,21 @@ func ResolveHub(cfg *Config, configPath, alias string) (ResolvedHub, error) {
 	resolvedAlias := alias
 	if alias == "default" {
 		if userHubs.Default == "" {
-			return ResolvedHub{}, fmt.Errorf("%w: hub alias \"default\": no default is set in ~/.prox/hubs.yaml (run 'prox hub add <alias> <url> --default')", ErrUnknownHub)
+			return ResolvedHub{}, &UnknownHubError{Requested: alias, Defined: describeHubAliases(merged)}
 		}
 		resolvedAlias = userHubs.Default
 	}
 
 	entry, ok := merged[resolvedAlias]
 	if !ok {
-		return ResolvedHub{}, fmt.Errorf("%w: unknown hub alias %q (defined: %s)", ErrUnknownHub, alias, describeHubAliases(merged))
+		// The RESOLVED alias is what is missing and what has to be added. When
+		// "default" pointed at an alias nobody defined, reporting "default"
+		// would send the user after the wrong name entirely.
+		return ResolvedHub{}, &UnknownHubError{
+			Requested: alias,
+			Alias:     resolvedAlias,
+			Defined:   describeHubAliases(merged),
+		}
 	}
 	hub := entry.hub
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,6 +131,25 @@ func TestResolveHubPublishing_UnknownAliasSplit(t *testing.T) {
 		assert.Equal(t, warningCodeHubUnknownAlias, res.Warning.Code)
 	})
 
+	t.Run("proxy.hub: default names the RESOLVED alias in its remediation", func(t *testing.T) {
+		// `default:` points at an alias this machine does not define. The
+		// warning has to send the user after "llt" — "prox hub add default"
+		// would name a reserved alias that is never consulted (plan 031 D8).
+		require.NoError(t, config.SaveUserHubs(config.UserHubs{
+			Hubs:    map[string]config.HubConfig{"home": {URL: "http://b.example:8443"}},
+			Default: "llt",
+		}))
+		t.Cleanup(func() { require.NoError(t, config.SaveUserHubs(config.UserHubs{})) })
+
+		res, err := resolveHubPublishing(cfg, "prox.yaml", hubSelectionInputs{ConfigHub: "default"})
+		require.NoError(t, err)
+		assert.False(t, res.Enabled)
+		require.NotNil(t, res.Warning)
+		assert.Contains(t, res.Warning.Hint, "prox hub add llt <url>")
+		assert.NotContains(t, res.Warning.Hint, "prox hub add default")
+		assert.Contains(t, res.Warning.Message, `"llt"`)
+	})
+
 	t.Run("no hub at all resolves to nothing", func(t *testing.T) {
 		res, err := resolveHubPublishing(cfg, "prox.yaml", hubSelectionInputs{NoHub: true, ConfigHub: "ghost"})
 		require.NoError(t, err)
@@ -207,13 +227,23 @@ func startBlackHoleHub(t *testing.T) string {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
+		// The goroutine owns what it accepted and closes it on its own way
+		// out. t.Cleanup would be the wrong owner twice over: closing the
+		// listener unblocks Accept but leaves an already-accepted conn open,
+		// and a Cleanup appended from here can land after the cleanup runner
+		// has already drained its list.
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				_ = c.Close()
+			}
+		}()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			// Hold it open, say nothing. Closed by the listener's own close.
-			t.Cleanup(func() { _ = conn.Close() })
+			held = append(held, conn) // hold it open, say nothing
 		}
 	}()
 	return "http://" + ln.Addr().String()
@@ -550,11 +580,17 @@ func TestHubPublish_TakeoverResendsWithTakeover(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// seen is written by the server's handler goroutine and read by the test,
+	// so it needs a mutex: the HTTP response lifecycle orders the append before
+	// publish returns, but ordering is not synchronization and -race says so.
+	var seenMu sync.Mutex
 	var seen []bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req proxyd.RegisterRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		seenMu.Lock()
 		seen = append(seen, req.Takeover)
+		seenMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if !req.Takeover {
 			w.WriteHeader(http.StatusConflict)
@@ -583,11 +619,18 @@ func TestHubPublish_TakeoverResendsWithTakeover(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			seenMu.Lock()
 			seen = nil
+			seenMu.Unlock()
+
 			h := newHubPublishHarness()
 			p := h.publish(t, ctx, srv.URL, tc.opt)
 			require.NotNil(t, p)
-			assert.Equal(t, []bool{false, true}, seen, "first without takeover, then with")
+
+			seenMu.Lock()
+			got := append([]bool(nil), seen...)
+			seenMu.Unlock()
+			assert.Equal(t, []bool{false, true}, got, "first without takeover, then with")
 			assert.Empty(t, h.sink.Warnings(), "a takeover the user asked for is not an advisory")
 			require.NotNil(t, h.rt.HubState())
 			assert.Equal(t, hubStateConnecting, h.rt.HubState().State)

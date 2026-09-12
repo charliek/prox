@@ -38,9 +38,11 @@ All notable changes to this project will be documented in this file.
   explicit `allow_unencrypted_lan` opt-in. See the
   [Remote Proxy Hub guide](docs/guides/remote-hub.md) — including its
   security section, which every user of this feature should read — for the
-  full walkthrough, configuration, and the accepted v1 trust model (mutually
-  trusted machines sharing one token; a publisher that deliberately forges
-  another's identity can still reach that publisher's own registration).
+  full walkthrough, configuration, and the accepted v1 trust model: mutually
+  trusted machines sharing one token, where a publisher that deliberately
+  sends another publisher's `origin` reaches **that other publisher's**
+  registration — it can deregister it, read its captured requests, or take
+  over its tunnel.
 
 ## v0.4.0
 

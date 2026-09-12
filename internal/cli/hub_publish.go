@@ -207,10 +207,28 @@ func resolveHubPublishing(cfg *config.Config, configPath string, in hubSelection
 		// token_file, an unset token_env — is a config error the user must fix
 		// either way, so it is fatal regardless of how the alias was chosen.
 		if errors.Is(err, config.ErrUnknownHub) && !sel.Explicit {
+			// Name the alias the LOOKUP missed, not the one prox.yaml typed:
+			// `proxy.hub: default` resolves through ~/.prox/hubs.yaml, so a
+			// hint built from "default" would tell the user to add an alias
+			// that is reserved and would never be consulted (plan 031 D8).
+			named, add := sel.Alias, "prox hub add "+sel.Alias+" <url>"
+			var unknown *config.UnknownHubError
+			if errors.As(err, &unknown) {
+				if unknown.Alias != "" {
+					named = unknown.Alias
+				}
+				add = unknown.AddCommand()
+			}
+			via := ""
+			if named != sel.Alias {
+				via = fmt.Sprintf(" (%q in ~/.prox/hubs.yaml)", sel.Alias)
+			}
 			return hubResolution{Warning: &domain.Warning{
-				Code:    warningCodeHubUnknownAlias,
-				Message: fmt.Sprintf("proxy.hub names hub %q, which this machine does not define; continuing with local proxy only", sel.Alias),
-				Hint:    "Run 'prox hub add " + sel.Alias + " <url>' to publish through it, or remove proxy.hub from prox.yaml.",
+				Code: warningCodeHubUnknownAlias,
+				Message: fmt.Sprintf(
+					"proxy.hub names hub %q%s, which this machine does not define; continuing with local proxy only",
+					named, via),
+				Hint: "Run '" + add + "' to publish through it, or remove proxy.hub from prox.yaml.",
 			}}, nil
 		}
 		return hubResolution{}, err

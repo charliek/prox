@@ -548,6 +548,47 @@ func TestResolveHub_DefaultUnset(t *testing.T) {
 	assert.Contains(t, err.Error(), "no default is set")
 }
 
+// TestResolveHub_DefaultPointingAtAMissingAliasNamesTheResolvedOne is plan 031
+// D8's diagnostic rule: when `default:` names an alias nobody defines, the
+// failure must name THAT alias. Reporting "default" sends the user to add a
+// reserved name that would never be consulted.
+func TestResolveHub_DefaultPointingAtAMissingAliasNamesTheResolvedOne(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	require.NoError(t, SaveUserHubs(UserHubs{
+		Hubs:    map[string]HubConfig{"home": {URL: "http://b.example:8443"}},
+		Default: "llt",
+	}))
+
+	_, err := ResolveHub(&Config{}, "", "default")
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrUnknownHub, "callers still split on the sentinel")
+
+	var unknown *UnknownHubError
+	require.ErrorAs(t, err, &unknown)
+	assert.Equal(t, "llt", unknown.Alias, "the alias that is actually missing")
+	assert.Equal(t, "default", unknown.Requested)
+	assert.Equal(t, "prox hub add llt <url>", unknown.AddCommand())
+
+	assert.Contains(t, err.Error(), `unknown hub alias "llt"`)
+	assert.Contains(t, err.Error(), "home", "and it still lists what IS defined")
+}
+
+// TestResolveHub_DefaultUnsetCarriesNoAlias: "default" with no default set has
+// no resolved alias to name, so the remediation is about the default key.
+func TestResolveHub_DefaultUnsetCarriesNoAlias(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	require.NoError(t, SaveUserHubs(UserHubs{
+		Hubs: map[string]HubConfig{"llt": {URL: "http://hub.example:8443"}},
+	}))
+
+	_, err := ResolveHub(&Config{}, "", "default")
+	require.Error(t, err)
+	var unknown *UnknownHubError
+	require.ErrorAs(t, err, &unknown)
+	assert.Empty(t, unknown.Alias)
+	assert.Equal(t, "prox hub add <alias> <url> --default", unknown.AddCommand())
+}
+
 func TestResolveHub_UnknownAliasNamesDefined(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	require.NoError(t, SaveUserHubs(UserHubs{
