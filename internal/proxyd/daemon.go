@@ -260,6 +260,10 @@ func RunDaemon(ctx context.Context) error {
 	// syncCaptureBudget both tolerate that.
 	server.SetCaptureManager(captureMgr)
 	server.SetCaptureInitError(captureInitErr)
+	// Share the hub's tunnel session manager with the data plane (plan 031 C4):
+	// a route with an Origin is proxied through its publisher's session rather
+	// than dialed from this host.
+	dynamicProxy.SetTunnelSessions(server.tunnels)
 
 	// Wire the on-502 dead-owner probe's reap callback (#74). When a route's
 	// backend transport fails, the dynamic proxy probes the owning prox up
@@ -332,7 +336,33 @@ func RunDaemon(ctx context.Context) error {
 						"closed_ports", emptyPorts,
 					)
 				}
-				if len(stale) > 0 && registry.IsEmpty() {
+				// The hub disconnect lease rides the SAME tick (plan 031 D3):
+				// a remote registration whose tunnel closed is kept for
+				// HubDisconnectGrace — serving the offline page, and reattaching
+				// without route churn if the publisher comes back — and only
+				// then removed. Grace plus one sweep interval is why removal is
+				// promised at up to 90s rather than 60s (P11).
+				//
+				// The candidate list is advisory: DeregisterIfDisconnected
+				// re-runs the decision under the registry's write lock, guarded
+				// on the session generation the sweep observed, so a publisher
+				// that reattached between detection and removal survives (P2).
+				leaseRemoved := 0
+				for _, cand := range registry.ExpiredLeases() {
+					removed, hostnames, emptyPorts := server.removeDisconnectedRemote(cand.Key, cand.SessionGen)
+					if !removed {
+						continue
+					}
+					leaseRemoved++
+					logger.Warn("removed hub registration after its disconnect grace expired",
+						"project", cand.Key,
+						"session_generation", cand.SessionGen,
+						"removed_hostnames", hostnames,
+						"closed_ports", emptyPorts,
+					)
+				}
+
+				if (len(stale) > 0 || leaseRemoved > 0) && registry.IsEmpty() {
 					// Graced (not immediate) so a crash restart landing during
 					// this sweep — its self-heal replace completing just after —
 					// cancels the shutdown when the re-check sees its registration.

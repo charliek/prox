@@ -153,6 +153,32 @@ const (
 	// completing its handshake.
 	HubAttachGrace = 10 * time.Second
 
+	// HubDialTimeout bounds ONE tunnel dial end to end on the hub side (plan 031
+	// D16): open a yamux stream, write "CONNECT host:port\n", and read the
+	// publisher's one-line reply. On expiry the hub abandons the stream and
+	// serves the offline 503.
+	//
+	// This deadline — not TCP, and not yamux's own session-death detection — is
+	// what makes a frozen publisher produce a prompt 503 (P10). A SIGSTOPped
+	// publisher's kernel keeps ACKing, so the connection stays ESTABLISHED, and
+	// yamux's keepalive needs KeepAliveInterval + ConnectionWriteTimeout to
+	// notice. Only the application-level reply deadline is fast and deterministic.
+	HubDialTimeout = 3 * time.Second
+
+	// HubTunnelKeepAliveInterval, HubTunnelWriteTimeout, and
+	// HubTunnelStreamOpenTimeout are the yamux session settings BOTH ends of a
+	// hub tunnel run with (plan 031 D16). They are tuned well below yamux's own
+	// defaults (30s/10s/75s) so a dead peer is eventually torn down in ~15s
+	// rather than ~40s; the prompt failure path is still HubDialTimeout.
+	//
+	// HubTunnelStreamOpenTimeout additionally bounds how long a stream whose SYN
+	// the peer never ACKs may occupy yamux's inflight-SYN budget (AcceptBacklog,
+	// 256): once it expires yamux closes the whole session, which is the right
+	// outcome for a peer that has stopped answering entirely.
+	HubTunnelKeepAliveInterval = 5 * time.Second
+	HubTunnelWriteTimeout      = 10 * time.Second
+	HubTunnelStreamOpenTimeout = 30 * time.Second
+
 	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
 	// liveness probes for a single project (#74). When a route's backend
 	// transport fails, the daemon probes the owning `prox up` process's liveness

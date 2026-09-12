@@ -31,6 +31,7 @@ import (
 //	/api/v1/routes              unscoped, by decision (§8)
 //	/api/v1/requests            origin-scoped, key composed here (D15)
 //	/api/v1/requests/stream     origin-scoped, key composed here (D15)
+//	/api/v1/tunnel              origin-scoped, key composed here (D15)
 //
 // — and NOTHING else. In particular there is no /api/v1/shutdown (a publisher
 // must never be able to stop the daemon that serves everyone else) and no
@@ -55,6 +56,12 @@ func (s *Server) newHubRouter() *chi.Mux {
 			r.Get("/routes", s.handleRoutes)
 			r.Get("/requests", s.handleHubGetRequests)
 			r.Get("/requests/stream", s.handleHubStreamRequests)
+			// The reverse tunnel (plan 031 C4). It sits behind the same
+			// bearer middleware as everything else and composes its key
+			// from the caller's own headers, so a publisher can no more
+			// attach a tunnel to another publisher's registration than it
+			// can deregister one (D15).
+			r.Post("/tunnel", s.handleHubTunnel)
 		})
 	})
 
@@ -381,6 +388,13 @@ func (s *Server) StopHub() {
 	if srv == nil && ln == nil {
 		return // hub mode was not on
 	}
+
+	// Tunnels go BEFORE the registrations they belong to, and before
+	// lifecycleMu is taken by removeProject: the session mutex is a leaf in the
+	// lock order and a session close is I/O (plan 031 D17). Closing them here
+	// also means a publisher learns its tunnel is gone immediately rather than
+	// discovering it on the next request.
+	s.closeAllTunnels()
 
 	// Remote registrations outlive nothing: their publishers reach this daemon
 	// only through the listener that just closed.

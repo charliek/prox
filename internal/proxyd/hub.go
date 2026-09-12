@@ -85,6 +85,25 @@ func HubProjectKey(origin, dir string) string {
 	return origin + ":" + dir
 }
 
+// splitHubProjectKey is HubProjectKey's inverse, used by the publisher's tunnel
+// client to recover the two halves it must send as X-Prox-Origin and
+// X-Prox-Project-Dir (plan 031 §4.3).
+//
+// Deriving them from the key rather than carrying them separately is what makes
+// the §8 "the publisher must use the key consistently" risk structural: the
+// tunnel headers and the registered key are the same two strings by
+// construction, so the hub's own composition of the key is guaranteed to
+// reproduce the one the register call created. The split is exact because
+// validateHubOrigin forbids ":" in an origin, so the FIRST ":" is always the
+// separator.
+func splitHubProjectKey(key string) (origin, dir string, ok bool) {
+	origin, dir, found := strings.Cut(key, ":")
+	if !found || origin == "" || dir == "" {
+		return "", "", false
+	}
+	return origin, dir, true
+}
+
 // hubKeyProjectDir recovers the publisher's OWN directory from a composed key,
 // for display (`prox hub status`). It is exact by construction: HubProjectKey
 // joins with the single ":" that an origin may not itself contain.

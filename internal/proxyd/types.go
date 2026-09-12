@@ -62,11 +62,10 @@ type RegisterRequest struct {
 	// ProtocolVersion is the publisher's hub wire version, checked against
 	// constants.HubProtocolVersion on the network mount only (D7).
 	ProtocolVersion int `json:"protocol_version,omitempty"`
-	// Takeover asks the hub to displace a CONNECTED holder of a colliding
-	// service name (D10). Connection state arrives with the tunnel in C4, so
-	// this commit carries the field on the wire without acting on it: with no
-	// sessions yet, nothing is ever connected and the cross-publisher
-	// collision path is still the registry's plain route conflict.
+	// Takeover asks the hub to displace a CONNECTED (or reserved) holder of a
+	// colliding service name (D10). It removes the losing REMOTE registration
+	// entirely — including its non-conflicting names — and closes its tunnel; it
+	// never displaces a LOCAL holder, which always wins.
 	Takeover bool `json:"takeover,omitempty"`
 }
 
@@ -121,9 +120,8 @@ type RouteInfo struct {
 	Origin string `json:"origin,omitempty"`
 	// Connected reports whether the route can currently be served. It is always
 	// true for a local route (the daemon dials the target directly). For a hub
-	// route it reflects the publisher's tunnel, which arrives in C4 — until
-	// then a remote route reports false, because there is no session to serve
-	// it through.
+	// route it reflects the publisher's tunnel: false during the disconnect
+	// grace, when the hub serves the offline page instead (plan 031 D3).
 	Connected bool `json:"connected"`
 }
 
@@ -196,12 +194,33 @@ type HubPublisher struct {
 	Origin     string `json:"origin"`
 	ProjectDir string `json:"project_dir"`
 	Key        string `json:"key"`
-	// Connected reflects the publisher's tunnel; sessions arrive in C4, so this
-	// commit always reports false for a registration that has no session layer
-	// to consult.
-	Connected    bool      `json:"connected"`
-	RegisteredAt time.Time `json:"registered_at"`
-	Routes       int       `json:"routes"`
+	// Connected reflects the publisher's tunnel: true while a session is
+	// attached, false during the disconnect grace (plan 031 D3/D17).
+	Connected bool `json:"connected"`
+	// ConnectedAt is when the current (or most recent) tunnel attached, and
+	// DisconnectedAt when it closed — zero while connected. Together they are
+	// what `prox hub status` renders as "connected since" / "down since".
+	ConnectedAt    time.Time `json:"connected_at,omitempty"`
+	DisconnectedAt time.Time `json:"disconnected_at,omitempty"`
+	RegisteredAt   time.Time `json:"registered_at"`
+	Routes         int       `json:"routes"`
+}
+
+// HubHolder identifies one registration that already holds a service name a
+// remote register wanted (plan 031 D10/§4.3). Every conflicting holder is
+// reported, not just the first, because a project whose two services are held
+// by two different publishers needs both names in front of the user before they
+// can decide to take them over — and registration is all-or-nothing.
+type HubHolder struct {
+	Hostname string `json:"hostname"`
+	// Origin is the holding machine, empty for a LOCAL (socket-registered)
+	// holder — which is also the holder a remote registration can never
+	// displace, with or without takeover.
+	Origin string `json:"origin,omitempty"`
+	// ProjectDir is the holder's OWN directory (not the hub's composed key), so
+	// the message names a path the user recognizes.
+	ProjectDir string `json:"project_dir"`
+	Connected  bool   `json:"connected"`
 }
 
 // HubTokenResponse is the socket POST /api/v1/hub/token (rotate) reply: the
@@ -215,4 +234,8 @@ type HubTokenResponse struct {
 type ErrorResponse struct {
 	Error string `json:"error"`
 	Code  string `json:"code,omitempty"`
+	// Holders carries EVERY conflicting holder on a 409 HUB_NAME_HELD (plan 031
+	// D10/§4.3) and is absent on every other error, so no existing response
+	// changes shape. C5 renders it in the interactive takeover prompt.
+	Holders []HubHolder `json:"holders,omitempty"`
 }

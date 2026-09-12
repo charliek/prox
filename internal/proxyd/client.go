@@ -462,6 +462,30 @@ func (c *Client) Stream(ctx context.Context, path string) (*http.Response, error
 	return c.stream.Do(req)
 }
 
+// streamUpgrade issues a request with caller-supplied method and headers on the
+// UNBOUNDED client and returns the live response WITHOUT reading it, so the
+// caller owns the body (and MUST close it). It is the hub tunnel's HTTP/1.1
+// upgrade handshake: on a 101 the response body IS the raw connection, which
+// net/http hands back as an io.ReadWriteCloser.
+//
+// It must use the unbounded client for the same reason Stream does: a
+// whole-request timeout covers reading the body, so the bounded client would
+// sever every tunnel after constants.HubUnaryTimeout (plan 031 P1/D16). ctx is
+// the only bound, which is what lets a publisher's shutdown tear the tunnel
+// down promptly.
+func (c *Client) streamUpgrade(ctx context.Context, method, path string, headers http.Header) (*http.Response, error) {
+	req, err := c.newRequest(ctx, method, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	for name, values := range headers {
+		for _, v := range values {
+			req.Header.Add(name, v)
+		}
+	}
+	return c.stream.Do(req)
+}
+
 // newRequest builds a request against c.baseURL and attaches the bearer token
 // when one is configured. EVERY request this client issues is built here (get,
 // getWithContext, post, and Stream all funnel through it), so a method cannot

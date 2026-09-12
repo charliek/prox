@@ -3,6 +3,7 @@ package proxyd
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,73 @@ type ProjectRegistration struct {
 	// (a publisher's PID is meaningless here — P4) and Dir is the composed key
 	// "<origin>:<publisher dir>" rather than a bare directory.
 	Origin string
+
+	// --- hub lease state (plan 031 D17), meaningful only when Origin != "" ---
+	//
+	// This is where a remote registration's connection state LIVES, together
+	// with the session manager. It is deliberately NOT on Route: the data plane
+	// reads Registry.Lookup's *Route outside the registry lock, so a mutable
+	// field there would be a data race (P5).
+
+	// SessionGen is the generation of the tunnel session this registration is
+	// currently associated with, 0 before the first attach. It is the identity
+	// half of every lease decision: a removal or a disconnect that names an
+	// older generation is stale by definition and must be ignored, which is what
+	// keeps a sweep from deleting a publisher that reattached between detection
+	// and removal (P2).
+	SessionGen uint64
+	// ConnectedAt is when the current tunnel attached; zero when none ever has.
+	ConnectedAt time.Time
+	// DisconnectedAt is when the current tunnel closed; zero while connected.
+	// A registration is CONNECTED exactly when ConnectedAt is set and this is
+	// not — see ProjectRegistration.connected.
+	DisconnectedAt time.Time
+	// ReservedUntil is register time + HubAttachGrace for a freshly accepted
+	// remote registration (D17/P3). Until it expires the registration counts as
+	// connected for collision purposes even though no tunnel has attached yet,
+	// closing the register→attach window in which a second publisher could
+	// otherwise take the name out from under one still completing its handshake.
+	ReservedUntil time.Time
+}
+
+// connected reports whether this registration currently holds a tunnel.
+func (p *ProjectRegistration) connected() bool {
+	return !p.ConnectedAt.IsZero() && p.DisconnectedAt.IsZero()
+}
+
+// active reports whether this registration holds a name against a newcomer
+// (plan 031 D10): a LOCAL registration always does, and a remote one does while
+// it is connected or still inside its attach reservation.
+func (p *ProjectRegistration) active(now time.Time) bool {
+	if p.Origin == "" {
+		return true
+	}
+	return p.connected() || now.Before(p.ReservedUntil)
+}
+
+// hubLease is a remote registration's lease state, copied out under the registry
+// lock so a caller can reason about it without holding one.
+type hubLease struct {
+	SessionGen     uint64
+	ConnectedAt    time.Time
+	DisconnectedAt time.Time
+	ReservedUntil  time.Time
+}
+
+func leaseOf(p *ProjectRegistration) hubLease {
+	return hubLease{
+		SessionGen:     p.SessionGen,
+		ConnectedAt:    p.ConnectedAt,
+		DisconnectedAt: p.DisconnectedAt,
+		ReservedUntil:  p.ReservedUntil,
+	}
+}
+
+func applyLease(p *ProjectRegistration, l hubLease) {
+	p.SessionGen = l.SessionGen
+	p.ConnectedAt = l.ConnectedAt
+	p.DisconnectedAt = l.DisconnectedAt
+	p.ReservedUntil = l.ReservedUntil
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -94,6 +162,12 @@ type Registry struct {
 	routes    map[string]*Route               // key: "hostname:port"
 	projects  map[string]*ProjectRegistration // key: project dir
 	listeners map[int]*ListenerInfo           // key: port
+	// now is the clock every hub LEASE decision reads (plan 031 D17): the
+	// attach reservation, the disconnect grace, and the collision "is this
+	// holder active" test. Injectable so the grace-expiry tests drive it
+	// deterministically instead of sleeping, exactly as DynamicProxy's
+	// probeClock does for the on-502 probe.
+	now func() time.Time
 }
 
 // NewRegistry creates a new empty route registry.
@@ -102,6 +176,7 @@ func NewRegistry() *Registry {
 		routes:    make(map[string]*Route),
 		projects:  make(map[string]*ProjectRegistration),
 		listeners: make(map[int]*ListenerInfo),
+		now:       time.Now,
 	}
 }
 
@@ -131,6 +206,38 @@ func (e *ProjectConflictError) Error() string {
 		"project %s is already registered by a running prox up (PID %d); "+
 			"stop it or run 'prox proxy stop --force'",
 		e.Dir, e.PID,
+	)
+}
+
+// HubNameHeldError is returned when a remote registration collides with service
+// names an ACTIVE holder owns (plan 031 D10), analogous to
+// ProjectConflictError for the same-dir case. It carries EVERY conflicting
+// holder, because registration is all-or-nothing: a publisher whose two
+// services are held by two different publishers takes both names or neither,
+// and the user deciding whether to force it needs to see both.
+//
+// It is matched with errors.As; the register handler turns it into a
+// 409 HUB_NAME_HELD whose body carries the holder list.
+type HubNameHeldError struct {
+	Holders []HubHolder
+}
+
+func (e *HubNameHeldError) Error() string {
+	parts := make([]string, 0, len(e.Holders))
+	for _, h := range e.Holders {
+		who := h.Origin
+		if who == "" {
+			who = "this machine"
+		}
+		state := "disconnected"
+		if h.Connected {
+			state = "connected"
+		}
+		parts = append(parts, fmt.Sprintf("%s held by %s:%s (%s)", h.Hostname, who, h.ProjectDir, state))
+	}
+	return fmt.Sprintf(
+		"service name(s) already published on this hub: %s. Retry with --hub-takeover to take them",
+		strings.Join(parts, ", "),
 	)
 }
 
@@ -210,7 +317,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	// All checks passed — commit the registration.
-	now := time.Now()
+	now := r.now()
 	var routeKeys []string
 	portsNeeded := make(map[int]string) // port -> protocol
 
@@ -245,7 +352,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		}
 	}
 
-	r.projects[req.ProjectDir] = &ProjectRegistration{
+	proj := &ProjectRegistration{
 		Dir:            req.ProjectDir,
 		PID:            req.PID,
 		Domain:         req.Domain,
@@ -257,6 +364,16 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		DiskBudget:     req.DiskBudget,
 		Origin:         req.Origin,
 	}
+	if req.Origin != "" {
+		// A freshly accepted remote registration is RESERVED: it counts as
+		// connected for collision purposes until its tunnel has had
+		// HubAttachGrace to attach (plan 031 D17/P3). Without this, the window
+		// between register and attach is one in which nothing is connected, so
+		// D10's "inactive is replaceable" rule would let a second publisher take
+		// the name from one that is mid-handshake.
+		proj.ReservedUntil = now.Add(constants.HubAttachGrace)
+	}
+	r.projects[req.ProjectDir] = proj
 
 	for port, proto := range portsNeeded {
 		newPorts = append(newPorts, PortSpec{Port: port, Protocol: proto})
@@ -296,6 +413,255 @@ func (r *Registry) DeregisterIfIdentity(projectDir string, pid int, startTime in
 	}
 	removedHostnames, emptyPorts = r.deregisterLocked(projectDir)
 	return true, removedHostnames, emptyPorts
+}
+
+// --- hub lease (plan 031 D3/D17) ---
+
+// decideLease is the PURE lease-expiry decision, with every input passed in so
+// it can be table-tested against an injected clock — the same shape decideProbe
+// takes for the on-502 dead-owner gate.
+//
+// A remote registration may be removed only when ALL of the following hold:
+//
+//   - it is disconnected (disconnectedAt is set). A connected publisher is
+//     serving traffic; nothing about a sweep should touch it.
+//   - its attach reservation has expired. A registration inside HubAttachGrace
+//     has not had a fair chance to attach yet (P3).
+//   - the grace has elapsed since the disconnect. Below it the hub serves the
+//     offline page and a reattach costs no route churn (D3).
+//   - the generation the caller OBSERVED is still the current one. This is the
+//     P2 guard: a sweep that saw "disconnected past grace", then had the
+//     publisher reattach before it got the lock, would otherwise delete a live
+//     registration. A reattach bumps currentGen, so the stale decision falls
+//     through here instead.
+func decideLease(now, disconnectedAt, reservedUntil time.Time, sessionGen, currentGen uint64, grace time.Duration) bool {
+	if disconnectedAt.IsZero() {
+		return false
+	}
+	if sessionGen != currentGen {
+		return false
+	}
+	if now.Before(reservedUntil) {
+		return false
+	}
+	return !now.Before(disconnectedAt.Add(grace))
+}
+
+// MarkConnected records that a tunnel of generation gen attached for key. It
+// reports whether a remote registration was found and updated.
+//
+// An OLDER generation is refused. Generations are allocated monotonically by
+// the one session manager, so a lower number can only come from a session that
+// has already been replaced — applying it would roll the registration back onto
+// a dead tunnel.
+func (r *Registry) MarkConnected(key string, gen uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || gen < proj.SessionGen {
+		return false
+	}
+	proj.SessionGen = gen
+	proj.ConnectedAt = r.now()
+	proj.DisconnectedAt = time.Time{}
+	// The attach reservation has done its job; the tunnel itself now holds the
+	// name.
+	proj.ReservedUntil = time.Time{}
+	return true
+}
+
+// MarkDisconnected records that the tunnel of generation gen closed, starting
+// the disconnect grace. It is a NO-OP unless gen is still the registration's
+// current generation — the second half of the P2 gate, mirroring the session
+// manager's own generation check, so a replaced session's late close callback
+// can never disconnect its successor.
+func (r *Registry) MarkDisconnected(key string, gen uint64, at time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || proj.SessionGen != gen || !proj.DisconnectedAt.IsZero() {
+		return false
+	}
+	proj.DisconnectedAt = at
+	return true
+}
+
+// RemoteLease returns key's lease state, or ok=false when key is not a remote
+// registration. The data plane uses it to render "offline since <t>".
+func (r *Registry) RemoteLease(key string) (hubLease, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" {
+		return hubLease{}, false
+	}
+	return leaseOf(proj), true
+}
+
+// setLease restores lease state onto key's registration. It exists for ONE
+// caller: server.register's remote config-changed arm, which removes and
+// re-adds the registration and must not silently drop a live tunnel's
+// generation on the way through. Without it a publisher that re-registers with
+// a changed service map would look disconnected while its tunnel is still
+// attached, and that tunnel's eventual close callback — carrying a generation
+// the registration no longer knows — would be ignored forever.
+func (r *Registry) setLease(key string, l hubLease) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" {
+		return false
+	}
+	applyLease(proj, l)
+	return true
+}
+
+// LeaseCandidate is one remote registration whose disconnect grace has expired,
+// paired with the generation that was current when the sweep observed it.
+type LeaseCandidate struct {
+	Key        string
+	SessionGen uint64
+}
+
+// ExpiredLeases returns the remote registrations the sweep should remove. The
+// answer is advisory by design: it is computed under a read lock and acted on
+// later, so DeregisterIfDisconnected re-runs the same decision under the write
+// lock before removing anything (P2).
+func (r *Registry) ExpiredLeases() []LeaseCandidate {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := r.now()
+	var expired []LeaseCandidate
+	for key, proj := range r.projects {
+		if proj.Origin == "" {
+			continue
+		}
+		if decideLease(now, proj.DisconnectedAt, proj.ReservedUntil, proj.SessionGen, proj.SessionGen, constants.HubDisconnectGrace) {
+			expired = append(expired, LeaseCandidate{Key: key, SessionGen: proj.SessionGen})
+		}
+	}
+	sort.Slice(expired, func(i, j int) bool { return expired[i].Key < expired[j].Key })
+	return expired
+}
+
+// DeregisterIfDisconnected removes a remote registration only if it is STILL
+// disconnected past its grace AND its SessionGen is unchanged since the caller
+// observed it (plan 031 D17/P2).
+//
+// This is deliberately NOT removeStaleProject: that path's identity guard is
+// (dir, PID, start token), every element of which SURVIVES a tunnel reattach, so
+// a sweep that observed an expired lease would happily delete a publisher that
+// reconnected in between. The session generation is the only identity that
+// changes on reattach, which is why it — and not the PID — is the guard here.
+func (r *Registry) DeregisterIfDisconnected(key string, sessionGen uint64) (removed bool, removedHostnames []string, emptyPorts []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" {
+		return false, nil, nil
+	}
+	if !decideLease(r.now(), proj.DisconnectedAt, proj.ReservedUntil, sessionGen, proj.SessionGen, constants.HubDisconnectGrace) {
+		return false, nil, nil
+	}
+	removedHostnames, emptyPorts = r.deregisterLocked(key)
+	return true, removedHostnames, emptyPorts
+}
+
+// HasProject reports whether key names a registered project. The tunnel upgrade
+// handler uses it to answer 404 NOT_REGISTERED before hijacking a connection it
+// would only have to drop.
+func (r *Registry) HasProject(key string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.projects[key]
+	return ok
+}
+
+// --- hub name collisions (plan 031 D10) ---
+
+// hubNameCollision is one existing route that stands between a remote
+// registration and a service name it wants.
+type hubNameCollision struct {
+	// HolderKey is the registry key of the project that holds the name, used to
+	// remove the whole losing registration when it loses.
+	HolderKey string
+	// Holder is the wire-facing identity the 409 body reports.
+	Holder HubHolder
+	// Local marks a socket-registered holder, which is NEVER displaced by a
+	// remote registration (D10).
+	Local bool
+	// Active marks a holder that is connected or still inside its attach
+	// reservation — the holders that need consent (takeover) to displace.
+	Active bool
+}
+
+// HubNameCollisions reports every existing route that blocks req, classified so
+// the caller can apply D10 without re-deriving anything under its own lock.
+//
+// The desired route set mirrors Register's pending-route construction exactly;
+// keeping the two expressions adjacent is what makes "the collision check and
+// the registration agree about which names are wanted" checkable.
+func (r *Registry) HubNameCollisions(req RegisterRequest) []hubNameCollision {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := r.now()
+	seen := make(map[string]struct{})
+	var collisions []hubNameCollision
+
+	consider := func(hostname string, port int) {
+		route, ok := r.routes[routeKey(hostname, port)]
+		if !ok || route.ProjectDir == req.ProjectDir {
+			return
+		}
+		if _, dup := seen[route.ProjectDir+"|"+hostname]; dup {
+			return
+		}
+		seen[route.ProjectDir+"|"+hostname] = struct{}{}
+
+		holder := HubHolder{Hostname: hostname, ProjectDir: route.ProjectDir}
+		local := true
+		active := true
+		if proj, ok := r.projects[route.ProjectDir]; ok {
+			local = proj.Origin == ""
+			active = proj.active(now)
+			holder.Origin = proj.Origin
+			holder.Connected = proj.Origin == "" || proj.connected()
+			if proj.Origin != "" {
+				// Report the publisher's OWN directory, not the composed key:
+				// the key is a hub implementation detail, and the person reading
+				// the conflict wants a path they recognize.
+				holder.ProjectDir = hubKeyProjectDir(proj.Origin, route.ProjectDir)
+			}
+		}
+		collisions = append(collisions, hubNameCollision{
+			HolderKey: route.ProjectDir,
+			Holder:    holder,
+			Local:     local,
+			Active:    active,
+		})
+	}
+
+	for svcName := range req.Services {
+		hostname := fmt.Sprintf("%s.%s", svcName, req.Domain)
+		if req.HTTPSPort > 0 {
+			consider(hostname, req.HTTPSPort)
+		}
+		if req.HTTPPort > 0 {
+			consider(hostname, req.HTTPPort)
+		}
+	}
+	sort.Slice(collisions, func(i, j int) bool {
+		if collisions[i].Holder.Hostname != collisions[j].Holder.Hostname {
+			return collisions[i].Holder.Hostname < collisions[j].Holder.Hostname
+		}
+		return collisions[i].HolderKey < collisions[j].HolderKey
+	})
+	return collisions
 }
 
 // routeDescriptor builds a canonical key for a single route's full identity
@@ -502,6 +868,14 @@ func (r *Registry) AllRoutes() []RouteInfo {
 
 	routes := make([]RouteInfo, 0, len(r.routes))
 	for _, route := range r.routes {
+		// A local route is always serveable (the daemon dials the target
+		// itself); a hub route needs its publisher's tunnel, whose state the
+		// owning registration mirrors from the session manager (plan 031 D17).
+		connected := true
+		if route.Origin != "" {
+			proj, ok := r.projects[route.ProjectDir]
+			connected = ok && proj.connected()
+		}
 		routes = append(routes, RouteInfo{
 			Hostname:     route.Hostname,
 			Port:         route.Port,
@@ -511,11 +885,7 @@ func (r *Registry) AllRoutes() []RouteInfo {
 			PID:          route.PID,
 			RegisteredAt: route.RegisteredAt,
 			Origin:       route.Origin,
-			// A local route is always serveable (the daemon dials the target
-			// itself); a hub route needs its publisher's tunnel, which the
-			// session manager tracks from C4. Until then a remote route is
-			// honestly reported as not connected (plan 031 D5).
-			Connected: route.Origin == "",
+			Connected:    connected,
 		})
 	}
 	return routes
@@ -534,13 +904,14 @@ func (r *Registry) RemotePublishers() []HubPublisher {
 			continue
 		}
 		publishers = append(publishers, HubPublisher{
-			Origin:     proj.Origin,
-			ProjectDir: hubKeyProjectDir(proj.Origin, key),
-			Key:        key,
-			// Connection state arrives with the tunnel (C4); see HubPublisher.
-			Connected:    false,
-			RegisteredAt: proj.RegisteredAt,
-			Routes:       len(proj.RouteKeys),
+			Origin:         proj.Origin,
+			ProjectDir:     hubKeyProjectDir(proj.Origin, key),
+			Key:            key,
+			Connected:      proj.connected(),
+			ConnectedAt:    proj.ConnectedAt,
+			DisconnectedAt: proj.DisconnectedAt,
+			RegisteredAt:   proj.RegisteredAt,
+			Routes:         len(proj.RouteKeys),
 		})
 	}
 	sort.Slice(publishers, func(i, j int) bool { return publishers[i].Key < publishers[j].Key })

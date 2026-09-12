@@ -58,6 +58,20 @@ type DynamicProxy struct {
 	captureManager *proxy.CaptureManager
 	logger         *slog.Logger
 
+	// tunnels is the hub's reverse-tunnel session manager (plan 031 C4), shared
+	// with the Server. nil on a standalone/test proxy that has no hub, in which
+	// case a remote route simply serves the offline page.
+	//
+	// The data plane resolves a remote route's session THROUGH THIS, by the
+	// route's project key — never off a field on the *Route that Lookup
+	// returned (P5). Registry.Lookup hands back a pointer the handler reads
+	// outside the registry lock, so connection state on it would be a data race
+	// that the race detector would only sometimes catch.
+	//
+	// Its mutex is a LEAF (D17): the handler takes it after Lookup has already
+	// released the registry lock, and never holds it across the proxied request.
+	tunnels *tunnelSessions
+
 	// --- on-502 dead-owner probe (#74) ---
 	// probeMu guards the entire probe state machine: the probes map AND every
 	// field of each *probeState. It is held ONLY for those field reads/writes —
@@ -133,6 +147,13 @@ func NewDynamicProxy(registry *Registry, certMgr certManager, managers *Managers
 			TLSHandshakeTimeout: 10 * time.Second,
 		},
 	}
+}
+
+// SetTunnelSessions wires the hub's session manager into the data plane (plan
+// 031 C4), so routes with an Origin are proxied through their publisher's
+// tunnel. Called once during daemon setup, before any listener serves.
+func (dp *DynamicProxy) SetTunnelSessions(ts *tunnelSessions) {
+	dp.tunnels = ts
 }
 
 // SetDeadRouteRemover installs the callback that reaps a dead generation's
@@ -400,6 +421,25 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			return
 		}
 
+		// A hub route's backend lives on the publisher's machine, reachable
+		// only through that publisher's tunnel (plan 031 D2). The session is
+		// resolved HERE, by project key, through the session manager — never
+		// off the *Route, which the registry hands out and this handler reads
+		// outside its lock (P5).
+		//
+		// tunnelTransport is nil for a local route; for a remote one it is the
+		// owning session's transport, and its absence means the publisher is
+		// offline.
+		var tunnelTransport *http.Transport
+		if route.Origin != "" {
+			session := dp.tunnelSession(route.ProjectDir)
+			if session == nil {
+				dp.serveTunnelOffline(w, hostname, route.ProjectDir)
+				return
+			}
+			tunnelTransport = session.transport
+		}
+
 		// Capture is gated per project: only when the matched route opted in and
 		// a capture manager is available and enabled.
 		captureEnabled := route.CaptureEnabled && dp.captureManager != nil && dp.captureManager.Enabled()
@@ -428,7 +468,14 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		}
 
 		rp := httputil.NewSingleHostReverseProxy(target)
-		rp.Transport = dp.transport
+		// A remote route rides its publisher's per-session transport, so
+		// keep-alive pools over tunnel streams exactly as the shared transport
+		// pools TCP connections for local routes.
+		if tunnelTransport != nil {
+			rp.Transport = tunnelTransport
+		} else {
+			rp.Transport = dp.transport
+		}
 		// Flush immediately for streaming responses (SSE, chunked transfer)
 		rp.FlushInterval = -1
 
@@ -471,8 +518,17 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			dp.logger.Error("proxy error",
 				"hostname", hostname,
 				"target", target.String(),
+				"origin", route.Origin,
 				"error", err,
 			)
+			if route.Origin != "" {
+				// A remote route's transport failure is a failed tunnel dial —
+				// the publisher's CONNECT reply never arrived, or came back ERR.
+				// That is the offline case, not a backend that answered badly,
+				// so it gets the offline 503 rather than a 502 (plan 031 C4).
+				dp.serveTunnelOffline(w, hostname, route.ProjectDir)
+				return
+			}
 			// http.Error writes the 502 through the wrapped writer (latching
 			// the status and firing the first-response hook); an explicit
 			// WriteHeader first would commit the response before http.Error
@@ -604,6 +660,27 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 
 		rp.ServeHTTP(rw, r)
 	})
+}
+
+// tunnelSession resolves a remote route's publisher session by project key
+// (plan 031 P5). nil means offline: either no tunnel has ever attached, or the
+// one that had has closed.
+func (dp *DynamicProxy) tunnelSession(projectKey string) *tunnelSession {
+	if dp.tunnels == nil {
+		return nil
+	}
+	return dp.tunnels.get(projectKey)
+}
+
+// serveTunnelOffline writes the hub's offline 503 for a remote route,
+// timestamped from the owning registration's lease so the page can say WHEN the
+// publisher went away rather than just that it is gone.
+func (dp *DynamicProxy) serveTunnelOffline(w http.ResponseWriter, hostname, projectKey string) {
+	var since time.Time
+	if lease, ok := dp.registry.RemoteLease(projectKey); ok {
+		since = lease.DisconnectedAt
+	}
+	writeTunnelOffline(w, hostname, since)
 }
 
 // statusResponseWriter wraps http.ResponseWriter to capture the status code.
