@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/prox/internal/config"
@@ -106,7 +107,13 @@ func TestHubCmd_Add_RejectsBadURL(t *testing.T) {
 	assert.Contains(t, err.Error(), "must use http:// or https://")
 }
 
-func TestHubCmd_List_ShowsProjectEntriesMarked(t *testing.T) {
+// TestHubCmd_List_MergesByAliasLikeResolveHub uses an alias defined in BOTH
+// files, which is the case the listing has to get right: a project's hubs:
+// entry OVERRIDES a same-named user-file entry (D8), so the alias is one hub
+// with one effective URL. Printing the two definitions as separate rows showed
+// a URL that will never be used and let "(default)" label the shadowed one --
+// the opposite of what `prox up` would do. Disjoint aliases cannot catch that.
+func TestHubCmd_List_MergesByAliasLikeResolveHub(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	resetHubAddFlags()
 	t.Cleanup(resetHubAddFlags)
@@ -114,6 +121,11 @@ func TestHubCmd_List_ShowsProjectEntriesMarked(t *testing.T) {
 	originalConfigPath := configPath
 	t.Cleanup(func() { configPath = originalConfigPath })
 
+	// "llt" is the user file's default AND is overridden by the project;
+	// "home" exists only in the user file.
+	hubAddDefault = true
+	require.NoError(t, runHubAdd(hubAddCmd, []string{"llt", "http://user-file.example:8443"}))
+	resetHubAddFlags()
 	require.NoError(t, runHubAdd(hubAddCmd, []string{"home", "http://home.example:8443"}))
 
 	tmpDir := t.TempDir()
@@ -123,16 +135,76 @@ processes: {web: ./web}
 proxy: {enabled: true, domain: local.test.dev, hub: llt}
 hubs:
   llt:
-    url: http://100.120.127.126:8443
+    url: http://project.example:8443
 `), 0644))
 	configPath = projectConfigPath
 
 	stdout, _ := captureOutput(t, func() {
 		require.NoError(t, runHubList(hubListCmd, nil))
 	})
+
 	assert.Contains(t, stdout, "home")
-	assert.Contains(t, stdout, "llt")
-	assert.Contains(t, stdout, "(project)")
+	assert.Contains(t, stdout, "http://home.example:8443")
+
+	// One row for llt, carrying the URL ResolveHub would pick.
+	var lltRows []string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(line, "llt") {
+			lltRows = append(lltRows, line)
+		}
+	}
+	require.Len(t, lltRows, 1, "an overridden alias must print once, got:\n%s", stdout)
+	assert.Contains(t, lltRows[0], "http://project.example:8443")
+	assert.NotContains(t, stdout, "user-file.example",
+		"the shadowed user-file URL is never used and must not be shown")
+
+	// Both notes on the surviving row, combined.
+	assert.Contains(t, lltRows[0], "(default, project)")
+}
+
+// TestHubCmd_Add_AbsolutizesRelativeTokenFile: a relative --token-file is
+// relative to the shell the command was typed in, but the entry is read later
+// by `prox up` running somewhere else -- so the stored path must be absolute or
+// it works exactly once, from the directory it was added in (plan 031 D8).
+func TestHubCmd_Add_AbsolutizesRelativeTokenFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHubAddFlags()
+	t.Cleanup(resetHubAddFlags)
+
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+
+	hubAddTokenFile = "llt.token"
+	require.NoError(t, runHubAdd(hubAddCmd, []string{"llt", "http://hub.example:8443"}))
+
+	userHubs, err := config.LoadUserHubs()
+	require.NoError(t, err)
+	stored := userHubs.Hubs["llt"].TokenFile
+	assert.True(t, filepath.IsAbs(stored), "a relative --token-file must be stored absolute, got %q", stored)
+	// t.TempDir() can sit behind a symlink (/tmp -> /private/tmp on macOS), so
+	// compare resolved paths rather than raw strings.
+	wantDir, err := filepath.EvalSymlinks(workDir)
+	require.NoError(t, err)
+	gotDir, err := filepath.EvalSymlinks(filepath.Dir(stored))
+	require.NoError(t, err)
+	assert.Equal(t, wantDir, gotDir)
+	assert.Equal(t, "llt.token", filepath.Base(stored))
+}
+
+// TestHubCmd_Add_KeepsTildeTokenFileAsWritten: a "~" path is already
+// machine-absolute and is what the documented examples use, so it is stored
+// verbatim (ResolveHub expands it) rather than being pinned to today's home.
+func TestHubCmd_Add_KeepsTildeTokenFileAsWritten(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetHubAddFlags()
+	t.Cleanup(resetHubAddFlags)
+
+	hubAddTokenFile = "~/.prox/hubs/llt.token"
+	require.NoError(t, runHubAdd(hubAddCmd, []string{"llt", "http://hub.example:8443"}))
+
+	userHubs, err := config.LoadUserHubs()
+	require.NoError(t, err)
+	assert.Equal(t, "~/.prox/hubs/llt.token", userHubs.Hubs["llt"].TokenFile)
 }
 
 func TestHubCmd_List_NoHubsConfigured(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,10 +68,11 @@ var hubAddCmd = &cobra.Command{
 func runHubAdd(cmd *cobra.Command, args []string) error {
 	alias, hubURL := args[0], args[1]
 
-	// "default" is reserved: proxy.hub/--hub use it to mean "the user file's
-	// default: value", never a hub literally aliased "default" (plan 031 D8).
-	if alias == "default" {
-		return fmt.Errorf("hub alias %q is reserved (it selects ~/.prox/hubs.yaml's default: hub); choose another alias", alias)
+	// The reserved-alias ("default") and empty-alias rules live in config so
+	// the same check covers a hand-edited hubs.yaml and a project hubs: block,
+	// not just this command (plan 031 D8).
+	if err := config.ValidateHubAlias(alias); err != nil {
+		return err
 	}
 
 	tokenSources := 0
@@ -87,6 +89,11 @@ func runHubAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("url: %w", err)
 	}
 
+	tokenFile, err := absoluteTokenFilePath(hubAddTokenFile)
+	if err != nil {
+		return err
+	}
+
 	userHubs, err := config.LoadUserHubs()
 	if err != nil {
 		return err
@@ -97,7 +104,7 @@ func runHubAdd(cmd *cobra.Command, args []string) error {
 	userHubs.Hubs[alias] = config.HubConfig{
 		URL:       hubURL,
 		Token:     hubAddToken,
-		TokenFile: hubAddTokenFile,
+		TokenFile: tokenFile,
 		TokenEnv:  hubAddTokenEnv,
 		Origin:    hubAddOrigin,
 	}
@@ -114,6 +121,29 @@ func runHubAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Set %q as the default hub\n", alias)
 	}
 	return nil
+}
+
+// absoluteTokenFilePath turns a --token-file argument into the path to STORE.
+//
+// A relative path typed at a shell is relative to that shell's directory, but
+// the entry it lands in is read later by `prox up` running somewhere else
+// entirely -- so storing "token" verbatim writes an entry that works exactly
+// once, from the directory it was added in (plan 031 D8). Absolutizing here
+// pins what the user meant at the moment they meant it.
+//
+// A "~" path is left as written: it is already machine-absolute, survives a
+// home directory that moves, and is what the documented examples show
+// (ResolveHub expands it). An empty value stays empty -- no token_file was
+// given at all.
+func absoluteTokenFilePath(tokenFile string) (string, error) {
+	if tokenFile == "" || strings.HasPrefix(tokenFile, "~") || filepath.IsAbs(tokenFile) {
+		return tokenFile, nil
+	}
+	abs, err := filepath.Abs(tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("--token-file %s: %w", tokenFile, err)
+	}
+	return abs, nil
 }
 
 // hubRemoveCmd deletes one connection profile from ~/.prox/hubs.yaml.
@@ -158,12 +188,35 @@ var hubListCmd = &cobra.Command{
 	RunE:  runHubList,
 }
 
-// hubListRow is one rendered row of `prox hub list`.
+// hubListRow is one rendered row of `prox hub list`: one row per ALIAS, not
+// one per definition. An alias defined in both ~/.prox/hubs.yaml and a
+// project's prox.yaml is a single hub with a single effective URL, so it prints
+// once, carrying the values ResolveHub would actually pick.
 type hubListRow struct {
 	alias  string
 	url    string
 	origin string
-	note   string
+	// project reports that a project's hubs: block defines this alias, which
+	// means its values are the ones shown (project wins on a clash, D8).
+	project bool
+	// isDefault reports that the user file's default: names this alias.
+	isDefault bool
+}
+
+// note renders the row's trailing annotations, combined: an alias that is both
+// the default AND overridden by the project reads "(default, project)".
+func (r hubListRow) note() string {
+	var notes []string
+	if r.isDefault {
+		notes = append(notes, "default")
+	}
+	if r.project {
+		notes = append(notes, "project")
+	}
+	if len(notes) == 0 {
+		return ""
+	}
+	return "(" + strings.Join(notes, ", ") + ")"
 }
 
 func runHubList(cmd *cobra.Command, args []string) error {
@@ -172,24 +225,32 @@ func runHubList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	var rows []hubListRow
-	for _, alias := range sortedHubAliases(userHubs.Hubs) {
-		hub := userHubs.Hubs[alias]
-		note := ""
-		if alias == userHubs.Default {
-			note = "(default)"
+	// Merged by alias the way ResolveHub merges, so the listing cannot
+	// disagree with what `prox up` will use. Appending the two sets instead
+	// printed an overridden alias TWICE and let "(default)" label the shadowed
+	// user-file URL, which is the one row that never gets used (plan 031 D8).
+	rows := make(map[string]hubListRow, len(userHubs.Hubs))
+	for alias, hub := range userHubs.Hubs {
+		rows[alias] = hubListRow{
+			alias:     alias,
+			url:       hub.URL,
+			origin:    hub.Origin,
+			isDefault: alias == userHubs.Default,
 		}
-		rows = append(rows, hubListRow{alias: alias, url: hub.URL, origin: hub.Origin, note: note})
 	}
 
 	// A project's own hubs: block is shown alongside the user file's, marked
 	// "(project)", when the current directory has one (§4.2). No config file,
 	// or one that fails to load, simply means nothing project-scoped to add
 	// -- `prox hub list` still reports the user file's entries.
-	if cfg, err := config.Load(configPath); err == nil {
-		for _, alias := range sortedHubAliases(cfg.Hubs) {
-			hub := cfg.Hubs[alias]
-			rows = append(rows, hubListRow{alias: alias, url: hub.URL, origin: hub.Origin, note: "(project)"})
+	if cfg, cerr := config.Load(configPath); cerr == nil {
+		for alias, hub := range cfg.Hubs {
+			row := rows[alias] // zero value for an alias the user file lacks
+			row.alias = alias
+			row.url = hub.URL
+			row.origin = hub.Origin
+			row.project = true
+			rows[alias] = row
 		}
 	}
 
@@ -200,16 +261,18 @@ func runHubList(cmd *cobra.Command, args []string) error {
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ALIAS\tURL\tORIGIN\t")
-	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.alias, r.url, r.origin, r.note)
+	for _, alias := range sortedHubAliases(rows) {
+		r := rows[alias]
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.alias, r.url, r.origin, r.note())
 	}
 	w.Flush()
 	return nil
 }
 
-// sortedHubAliases returns a hubs map's keys sorted, for deterministic
-// `prox hub list` output.
-func sortedHubAliases(hubs map[string]config.HubConfig) []string {
+// sortedHubAliases returns an alias-keyed map's keys sorted, for deterministic
+// `prox hub list` output and error text. Generic over the value so it serves
+// both a hubs map and the merged row map.
+func sortedHubAliases[V any](hubs map[string]V) []string {
 	names := make([]string, 0, len(hubs))
 	for name := range hubs {
 		names = append(names, name)

@@ -105,14 +105,14 @@ func NewClient(socketPath string) *Client {
 // missing host is rejected here rather than producing a confusing request
 // later. A trailing slash is normalized away so baseURL+path never doubles it.
 func NewHTTPClient(baseURL, token string) (*Client, error) {
-	return newHubClient(baseURL, token, constants.HubUnaryTimeout)
+	return newHubClient(baseURL, token, constants.HubUnaryTimeout, constants.HubResponseHeaderTimeout)
 }
 
-// newHubClient is NewHTTPClient with an injectable unary timeout. Tests use it
-// to exercise the bounded/unbounded client split in milliseconds instead of
-// waiting out the real 30s HubUnaryTimeout; production always passes the
-// constant.
-func newHubClient(baseURL, token string, unaryTimeout time.Duration) (*Client, error) {
+// newHubClient is NewHTTPClient with injectable timeouts. Tests use it to
+// exercise the bounded/unbounded client split and the black-hole header
+// timeout in milliseconds instead of waiting out the real constants;
+// production always passes them.
+func newHubClient(baseURL, token string, unaryTimeout, responseHeaderTimeout time.Duration) (*Client, error) {
 	normalized, err := normalizeHubBaseURL(baseURL)
 	if err != nil {
 		return nil, err
@@ -124,15 +124,31 @@ func newHubClient(baseURL, token string, unaryTimeout time.Duration) (*Client, e
 	// tunnel is an HTTP/1.1 Connection: Upgrade handshake that h2 cannot
 	// carry.
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// Proxy is deliberately NIL — hub control traffic never goes through an
+		// ambient forward proxy. DO NOT "fix" this back to
+		// http.ProxyFromEnvironment, which is the usual default and is wrong
+		// here: a hub URL is plain HTTP on a private/tailnet address (D6 refuses
+		// a public listen address outright), so an HTTP_PROXY set for ordinary
+		// internet access would receive the ENTIRE request — including the
+		// "Authorization: Bearer <hub token>" header — and the token would leave
+		// the tailnet to a third party. Refusing redirects does not help,
+		// because the proxy sees the request before any response exists. A
+		// forward proxy is never the right path to a hub (plan 031 D6/D16).
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   4,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// ResponseHeaderTimeout bounds ESTABLISHMENT, not the body, which is
+		// what makes it safe to put on the transport the unbounded stream
+		// client shares: it is the only thing that fails a subscription to a
+		// hub that accepts the TCP connection and then never answers. See
+		// constants.HubResponseHeaderTimeout.
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
 	return newClientOverTransport(normalized, token, transport, unaryTimeout), nil
@@ -141,7 +157,12 @@ func newHubClient(baseURL, token string, unaryTimeout time.Duration) (*Client, e
 // newClientOverTransport builds the two-client-over-one-transport pair the
 // Client struct documents: a bounded client for unary JSON calls and an
 // unbounded one for long-lived streams, both refusing redirects.
-func newClientOverTransport(baseURL, token string, transport *http.Transport, unaryTimeout time.Duration) *Client {
+//
+// It takes the http.RoundTripper INTERFACE rather than *http.Transport because
+// that is all either client needs, and because it lets a test drive a Client
+// over a stub round-tripper — asserting what leaves the process (a proxy that
+// must not be consulted, a header that must be present) without a real socket.
+func newClientOverTransport(baseURL, token string, transport http.RoundTripper, unaryTimeout time.Duration) *Client {
 	// A bearer token must never be replayed to whatever origin a 30x names, so
 	// redirects are not followed at all: the caller sees the 30x response
 	// itself (D16/P9).

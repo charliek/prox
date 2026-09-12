@@ -127,3 +127,37 @@ func CheckFilePermissions(path string) error {
 
 	return nil
 }
+
+// CheckCredentialFilePermissions is CheckFilePermissions' stricter sibling, for
+// a file that actually CARRIES a secret: a hub token_file, or ~/.prox/hubs.yaml
+// when one of its entries holds an inline token (plan 031 D18).
+//
+// CheckFilePermissions only rejects world-writable, so it happily accepts 0644
+// -- which for a config file is fine (the threat is someone editing it) and for
+// a credential is not (the threat is every local user READING it). This applies
+// the rule ssh applies to a private key: no group or world access at all. The
+// remedy is always the same, so the message states it.
+//
+// kind names what the file is ("token_file", "hubs file") so the message reads
+// correctly for each caller. Only call this when a secret is genuinely present:
+// a hubs.yaml whose entries all use token_file or token_env carries none and
+// must not be second-guessed about its mode.
+func CheckCredentialFilePermissions(kind, path string) error {
+	// Skip permission check on Windows, like CheckFilePermissions: the mode
+	// bits do not mean there what they mean here.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("checking %s permissions: %w", kind, err)
+	}
+
+	// 0077: any group or other bit at all, read included.
+	if perm := info.Mode().Perm(); perm&0077 != 0 {
+		return fmt.Errorf("%s %s has insecure permissions %#o: it holds a secret and must not be readable by other users. Please run: chmod 600 %s",
+			kind, path, uint32(perm), path)
+	}
+	return nil
+}

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/BurntSushi/toml"
+	"github.com/charliek/prox/internal/domain"
 )
 
 // Settings holds TUI preferences persisted at ~/.prox/tui/config.toml.
@@ -353,57 +354,26 @@ func formatSettingsSaveError(err error) string {
 }
 
 // atomicWriteFile writes data to path via a unique temp file in the same
-// directory (fsync, chmod, rename, fsync file, fsync parent dir). The temp
-// file is removed on any error before rename. Post-rename fsync failures
-// return errSettingsMayNotHavePersisted.
+// directory (chmod, write, fsync, rename, fsync file, fsync parent dir), so a
+// failure before the rename leaves the previous config byte-identical.
+//
+// The sequence itself is domain.AtomicWriter, shared with internal/config
+// (~/.prox/hubs.yaml) and internal/proxyd (~/.prox/hub.yaml, ~/.prox/hub.token)
+// -- it was three near-identical copies before plan 031. What stays local is
+// the TUI's own wording rule: a POST-rename fsync failure means the settings
+// ARE saved but may not survive a power cut, which is a different message from
+// "settings not saved", and AtomicWriteError.Renamed is what tells the two
+// apart. fsyncFileFn stays the injection seam the fsync-wording test drives.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
-	if err != nil {
-		return err
+	w := domain.AtomicWriter{
+		TempPattern: ".config-*.tmp",
+		SyncFn:      func(f *os.File) error { return fsyncFileFn(f) },
 	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
+	err := w.WriteFile(path, data, perm)
 
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
+	var writeErr *domain.AtomicWriteError
+	if errors.As(err, &writeErr) && writeErr.Renamed {
+		return fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, writeErr.Err)
 	}
-	if err := fsyncFileFn(tmp); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, perm); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-
-	if err := fsyncPath(path); err != nil {
-		return fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, err)
-	}
-	if err := fsyncPath(dir); err != nil {
-		return fmt.Errorf("%w: %v", errSettingsMayNotHavePersisted, err)
-	}
-	return nil
-}
-
-// fsyncPath opens path (file or directory) and fsyncs it.
-func fsyncPath(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return fsyncFileFn(f)
+	return err
 }

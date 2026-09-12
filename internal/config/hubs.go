@@ -111,7 +111,31 @@ func LoadUserHubs() (UserHubs, error) {
 	if err := CheckFilePermissions(path); err != nil {
 		return UserHubs{}, err
 	}
-	return parseUserHubs(data, path)
+	hubs, err := parseUserHubs(data, path)
+	if err != nil {
+		return UserHubs{}, err
+	}
+	// The file is only a credential when it actually holds one. A hubs.yaml
+	// whose entries all use token_file or token_env carries no secret and is
+	// left alone at whatever mode the user likes; one with an inline token: is
+	// held to the private-mode rule (plan 031 D18).
+	if hubsHoldInlineToken(hubs.Hubs) {
+		if err := CheckCredentialFilePermissions("hubs file", path); err != nil {
+			return UserHubs{}, err
+		}
+	}
+	return hubs, nil
+}
+
+// hubsHoldInlineToken reports whether any entry carries a token: value, i.e.
+// whether the file the entries came from is itself a secret.
+func hubsHoldInlineToken(hubs map[string]HubConfig) bool {
+	for _, hub := range hubs {
+		if hub.Token != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // parseUserHubs parses the raw bytes of a hubs.yaml file, named by path for
@@ -128,6 +152,16 @@ func parseUserHubs(data []byte, path string) (UserHubs, error) {
 
 	hubs := make(map[string]HubConfig, len(raw.Hubs))
 	errs = append(errs, parseHubs("hubs", raw.Hubs, hubs)...)
+
+	// Alias names are checked HERE as well as in `prox hub add`, because this
+	// file is hand-editable: an alias of "default" would be unreachable
+	// (ResolveHub always reads that word as indirection into default:) and an
+	// empty alias is not addressable at all (plan 031 D8).
+	for _, name := range sortedMapKeys(raw.Hubs) {
+		if err := ValidateHubAlias(name); err != nil {
+			errs = append(errs, fmt.Sprintf("hubs.%s: %s", name, err))
+		}
+	}
 
 	if len(errs) > 0 {
 		sort.Strings(errs)
@@ -156,57 +190,24 @@ func SaveUserHubs(hubs UserHubs) error {
 	if err != nil {
 		return fmt.Errorf("marshaling hubs: %w", err)
 	}
-	if err := atomicWriteFile(path, data, constants.FilePermissionPrivate); err != nil {
+	if err := userHubsWriter.WriteFile(path, data, constants.FilePermissionPrivate); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
 }
 
-// atomicWriteFile writes data to path via a temp file created in path's own
-// directory, fsynced and renamed into place, with the parent directory
-// fsynced afterward so the rename itself is durable (plan 031 D18/P8). Never
-// used for an in-place truncate: on any failure before the rename, path is
-// left completely untouched.
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".prox-hubs-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	// Best-effort cleanup: a no-op once the rename below succeeds, since
-	// nothing named tmpPath exists anymore.
-	defer os.Remove(tmpPath)
-
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return fmt.Errorf("setting permissions: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("writing temp file: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("syncing temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("renaming temp file into place: %w", err)
-	}
-
-	dirHandle, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("opening directory %s for sync: %w", dir, err)
-	}
-	defer dirHandle.Close()
-	if err := dirHandle.Sync(); err != nil {
-		return fmt.Errorf("syncing directory %s: %w", dir, err)
-	}
-	return nil
-}
+// userHubsWriter is the atomic writer ~/.prox/hubs.yaml is saved through
+// (plan 031 D18/P8): temp file in the same directory, fsync, rename, parent-dir
+// fsync -- never an in-place truncate, so a crash mid-write cannot leave a
+// half-written token behind. The sequence itself lives in domain.AtomicWriter
+// because internal/proxyd and internal/tui need exactly the same one and
+// neither package can import this one.
+//
+// It is a var rather than a literal at the call site so hubs_test.go can inject
+// a failure at each step and assert that a pre-rename failure leaves the
+// PREVIOUS file intact -- the property "no temp file survives a successful
+// write" does not actually test.
+var userHubsWriter = domain.AtomicWriter{TempPattern: ".prox-hubs-*.tmp"}
 
 // ResolvedHub is the fully-resolved hub selection for one `prox up --hub`/
 // `proxy.hub` run (plan 031 D8): a usable base URL, a token value already
@@ -220,6 +221,22 @@ type ResolvedHub struct {
 	Origin string
 }
 
+// hubEntry is one merged hubs: entry together with WHERE it came from. The
+// source directory is what a relative token_file resolves against (plan 031
+// D8): a path written in ~/.prox/hubs.yaml means "next to the hubs file", and
+// one written in a project's prox.yaml means "next to that prox.yaml". Neither
+// means "wherever `prox up` happened to be run from", which is what resolving
+// against the process working directory would have meant -- and which breaks
+// the moment the daemon or the CLI is started from another directory.
+type hubEntry struct {
+	hub HubConfig
+	// dir is the directory of the file this entry was read from, or "" when it
+	// is unknown (no project config path was supplied). A relative token_file
+	// under "" falls back to the process working directory, since there is
+	// nothing better to resolve it against.
+	dir string
+}
+
 // ResolveHub resolves alias against cfg's Hubs merged with the user's
 // ~/.prox/hubs.yaml, with cfg's entries winning on an alias clash (plan 031
 // D8: "a committed alias never breaks prox up elsewhere" -- a project can
@@ -227,19 +244,37 @@ type ResolvedHub struct {
 // "default" expands to the user file's default: value, not to a hub entry
 // literally named "default". cfg may be nil (equivalent to an empty Hubs
 // map), so a bare `--hub <alias>` works with no project config loaded.
-func ResolveHub(cfg *Config, alias string) (ResolvedHub, error) {
+//
+// configPath is the path cfg was loaded from, and exists so a relative
+// token_file in a project's hubs: block resolves against that project file's
+// own directory. Pass "" when there is no project config (or it came from
+// somewhere without a path); a relative token_file then falls back to the
+// process working directory.
+func ResolveHub(cfg *Config, configPath, alias string) (ResolvedHub, error) {
 	userHubs, err := LoadUserHubs()
 	if err != nil {
 		return ResolvedHub{}, err
 	}
+	userDir := ""
+	if path, perr := userHubsPath(); perr == nil {
+		userDir = filepath.Dir(path)
+	}
 
-	merged := make(map[string]HubConfig, len(userHubs.Hubs))
+	merged := make(map[string]hubEntry, len(userHubs.Hubs))
 	for name, hub := range userHubs.Hubs {
-		merged[name] = hub
+		merged[name] = hubEntry{hub: hub, dir: userDir}
 	}
 	if cfg != nil {
+		projectDir := ""
+		if configPath != "" {
+			abs, aerr := filepath.Abs(configPath)
+			if aerr != nil {
+				abs = configPath
+			}
+			projectDir = filepath.Dir(abs)
+		}
 		for name, hub := range cfg.Hubs {
-			merged[name] = hub // project wins on an alias clash
+			merged[name] = hubEntry{hub: hub, dir: projectDir} // project wins on an alias clash
 		}
 	}
 
@@ -251,12 +286,13 @@ func ResolveHub(cfg *Config, alias string) (ResolvedHub, error) {
 		resolvedAlias = userHubs.Default
 	}
 
-	hub, ok := merged[resolvedAlias]
+	entry, ok := merged[resolvedAlias]
 	if !ok {
 		return ResolvedHub{}, fmt.Errorf("unknown hub alias %q (defined: %s)", alias, describeHubAliases(merged))
 	}
+	hub := entry.hub
 
-	token, err := resolveHubToken(hub)
+	token, err := resolveHubToken(hub, entry.dir)
 	if err != nil {
 		return ResolvedHub{}, fmt.Errorf("hub %q: %w", resolvedAlias, err)
 	}
@@ -274,7 +310,7 @@ func ResolveHub(cfg *Config, alias string) (ResolvedHub, error) {
 
 // describeHubAliases renders the sorted list of defined aliases for an
 // "unknown alias" error, so the user can see what IS available.
-func describeHubAliases(hubs map[string]HubConfig) string {
+func describeHubAliases(hubs map[string]hubEntry) string {
 	if len(hubs) == 0 {
 		return "none"
 	}
@@ -287,7 +323,10 @@ func describeHubAliases(hubs map[string]HubConfig) string {
 // block, but ResolveHub also merges in ~/.prox/hubs.yaml, which Validate
 // never sees, so the check is repeated here as the actual safety net. A
 // missing token_file or unset token_env is an error naming which.
-func resolveHubToken(hub HubConfig) (string, error) {
+//
+// sourceDir is the directory of the file this entry was read from, which a
+// relative token_file resolves against (see hubEntry).
+func resolveHubToken(hub HubConfig, sourceDir string) (string, error) {
 	set := 0
 	for _, v := range []string{hub.Token, hub.TokenFile, hub.TokenEnv} {
 		if v != "" {
@@ -302,13 +341,20 @@ func resolveHubToken(hub HubConfig) (string, error) {
 	case hub.Token != "":
 		return hub.Token, nil
 	case hub.TokenFile != "":
-		path := expandHomeTilde(hub.TokenFile)
+		path := resolveHubTokenFilePath(hub.TokenFile, sourceDir)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "", fmt.Errorf("token_file %s: not found", hub.TokenFile)
+				return "", fmt.Errorf("token_file %s: not found", path)
 			}
-			return "", fmt.Errorf("token_file %s: %w", hub.TokenFile, err)
+			return "", fmt.Errorf("token_file %s: %w", path, err)
+		}
+		// A token_file IS the credential, so it is held to the private-mode
+		// rule ssh applies to a private key -- checked after the read succeeds
+		// so a missing file still reports "not found" rather than a stat error
+		// (plan 031 D18).
+		if err := CheckCredentialFilePermissions("token_file", path); err != nil {
+			return "", err
 		}
 		return strings.TrimSpace(string(data)), nil
 	case hub.TokenEnv != "":
@@ -320,6 +366,21 @@ func resolveHubToken(hub HubConfig) (string, error) {
 	default:
 		return "", nil
 	}
+}
+
+// resolveHubTokenFilePath turns an entry's token_file value into the path to
+// actually read (plan 031 D8). "~"/"~/" expands to the home directory and an
+// absolute path is taken as written; a RELATIVE path resolves against
+// sourceDir -- the directory of the file the entry itself lives in -- so
+// `token_file: llt.token` in ~/.prox/hubs.yaml means ~/.prox/llt.token no
+// matter where prox is run from. `prox hub add --token-file` absolutizes its
+// argument before writing, so only a hand-written path takes this branch.
+func resolveHubTokenFilePath(tokenFile, sourceDir string) string {
+	expanded := expandHomeTilde(tokenFile)
+	if sourceDir == "" || filepath.IsAbs(expanded) {
+		return expanded
+	}
+	return filepath.Join(sourceDir, expanded)
 }
 
 // expandHomeTilde expands a leading "~" or "~/" in path to the user's home

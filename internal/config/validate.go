@@ -530,6 +530,13 @@ func validateHubs(config *Config) []string {
 		hub := config.Hubs[name]
 		prefix := fmt.Sprintf("hubs.%s", name)
 
+		// The alias itself is validated here, not only in `prox hub add`: a
+		// committed hubs: block can define the same unreachable entries the
+		// command refuses (plan 031 D8).
+		if err := ValidateHubAlias(name); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %s", prefix, err))
+		}
+
 		if err := ValidateHubURL(hub.URL); err != nil {
 			errs = append(errs, fmt.Sprintf("%s.url: %s", prefix, err))
 		}
@@ -563,6 +570,26 @@ func validateHubs(config *Config) []string {
 func ValidateHubURL(raw string) error {
 	_, err := domain.NormalizeHubURL(raw)
 	return err
+}
+
+// ValidateHubAlias checks one hubs: alias name, and is the single home of the
+// reserved-alias rule (plan 031 D8). It is called from THREE places, which is
+// the point: `prox hub add` (internal/cli/hub_cmd.go), Validate's hubs: walk
+// for a project's prox.yaml, and parseUserHubs for ~/.prox/hubs.yaml. Living
+// only in the CLI, it could be walked around by hand-editing either file.
+//
+// Two aliases are refused. "default" is reserved because ResolveHub always
+// reads that word as indirection into the user file's default: value, so an
+// entry named "default" can never be selected -- it would sit in the file
+// looking configured and do nothing. An empty alias is not addressable at all.
+func ValidateHubAlias(alias string) error {
+	if strings.TrimSpace(alias) == "" {
+		return fmt.Errorf("hub alias is empty")
+	}
+	if alias == "default" {
+		return fmt.Errorf("hub alias %q is reserved (it selects ~/.prox/hubs.yaml's default: hub); choose another alias", alias)
+	}
+	return nil
 }
 
 // validationMessage extracts the human message from a ValidateProcessName

@@ -47,7 +47,10 @@ func NormalizeHubURL(raw string) (string, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("must use http:// or https:// (got %q)", u.Scheme)
 	}
-	if u.Host == "" {
+	// Hostname(), not Host: "http://:8443" carries a Host of ":8443" and would
+	// pass a Host != "" check, yet names no host at all — a request built
+	// against it dials an unspecified address rather than the hub (plan 031).
+	if u.Hostname() == "" {
 		return "", fmt.Errorf("has no host")
 	}
 	if u.User != nil {

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/domain"
 	"gopkg.in/yaml.v3"
 )
 
@@ -179,7 +180,7 @@ func SaveHubConfig(cfg HubConfig) error {
 		return fmt.Errorf("marshaling hub config: %w", err)
 	}
 	path := HubConfigPath()
-	if err := atomicWriteFile(path, data, constants.FilePermissionPrivate); err != nil {
+	if err := hubFileWriter.WriteFile(path, data, constants.FilePermissionPrivate); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
@@ -218,7 +219,7 @@ func RotateHubToken() (string, error) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(buf)
 	path := HubTokenPath()
-	if err := atomicWriteFile(path, []byte(token+"\n"), constants.FilePermissionPrivate); err != nil {
+	if err := hubFileWriter.WriteFile(path, []byte(token+"\n"), constants.FilePermissionPrivate); err != nil {
 		return "", fmt.Errorf("writing %s: %w", path, err)
 	}
 	return token, nil
@@ -238,53 +239,14 @@ func ReadHubToken() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// atomicWriteFile writes data to path via a temp file in path's own directory,
-// fsynced and renamed into place, with the parent directory fsynced afterward
-// so the rename itself is durable (plan 031 D18/P8). On any failure before the
-// rename, path is left completely untouched.
-//
-// internal/config has the identical helper for ~/.prox/hubs.yaml; the two
-// packages cannot import each other's unexported code, so this is a deliberate
-// second copy rather than a shared one.
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".prox-hub-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	// Best-effort cleanup: a no-op once the rename below succeeds.
-	defer os.Remove(tmpPath)
-
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return fmt.Errorf("setting permissions: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("writing temp file: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("syncing temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("renaming temp file into place: %w", err)
-	}
-
-	dirHandle, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("opening directory %s for sync: %w", dir, err)
-	}
-	defer dirHandle.Close()
-	if err := dirHandle.Sync(); err != nil {
-		return fmt.Errorf("syncing directory %s: %w", dir, err)
-	}
-	return nil
-}
+// hubFileWriter is the atomic writer ~/.prox/hub.yaml and ~/.prox/hub.token
+// are written through (plan 031 D18/P8): temp file in the target's own
+// directory, fsync, rename, parent-dir fsync -- never the in-place truncate
+// WriteDaemonState uses, so a crash mid-write cannot leave a token truncated to
+// nothing. The sequence lives in domain.AtomicWriter, which internal/config and
+// internal/tui share; it used to be a deliberate second copy here, and a third
+// in the TUI.
+var hubFileWriter = domain.AtomicWriter{TempPattern: ".prox-hub-*.tmp"}
 
 // isPrivateListenAddr reports whether ip is an address the hub control plane
 // may bind (plan 031 D6): loopback (127.0.0.0/8, ::1), RFC 1918 private IPv4

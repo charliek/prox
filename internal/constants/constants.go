@@ -121,6 +121,23 @@ const (
 	// (plan 031 P1/D16).
 	HubUnaryTimeout = 30 * time.Second
 
+	// HubResponseHeaderTimeout bounds how long the hub transport waits for a
+	// response's HEADERS after the request has been written. It sits on the
+	// TRANSPORT, so it applies to both http.Clients — including the unbounded
+	// stream client, which is exactly the point (plan 031 D16).
+	//
+	// Client.Stream deliberately carries no whole-request timeout, and the
+	// forwarder hands it a context that lives as long as the run, so a hub that
+	// completes the TCP handshake and then never answers would otherwise wedge
+	// the subscription forever: reconnect, backoff and self-heal never get to
+	// run because the attempt never fails. A header timeout closes that
+	// black-hole case without bounding an SSE body, since headers arrive
+	// immediately and the body may stream for hours.
+	//
+	// 10s matches the transport's dial and TLS-handshake budgets: it is an
+	// establishment bound, not a request bound.
+	HubResponseHeaderTimeout = 10 * time.Second
+
 	// HubDisconnectGrace is how long a remote (hub-published) registration is
 	// kept after its tunnel closes before the daemon's stale sweep may remove it
 	// (plan 031 D3). During the grace the hub serves the offline page and a

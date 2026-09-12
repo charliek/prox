@@ -233,6 +233,84 @@ func TestNewHTTPClient_DoesNotFollowRedirects(t *testing.T) {
 	assert.Empty(t, secondAuths, "the bearer token must never reach a second origin")
 }
 
+// TestNewHTTPClient_TransportNeverUsesAnEnvironmentProxy pins the other half of
+// "the token never leaves the tailnet". A hub URL is plain HTTP on a private
+// address (D6 refuses a public listen address), so with
+// http.ProxyFromEnvironment an ambient HTTP_PROXY — set for ordinary internet
+// access, as it is on many corporate machines — would receive the whole request
+// including "Authorization: Bearer <hub token>". Refusing redirects does not
+// help: the proxy sees the request before any response exists.
+//
+// The assertion is structural rather than end-to-end ON PURPOSE. Go's
+// ProxyFromEnvironment exempts loopback, and every httptest target is loopback,
+// so no functional test in this package could ever observe the leak — which is
+// exactly why the guard has to be pinned on the transport itself.
+func TestNewHTTPClient_TransportNeverUsesAnEnvironmentProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+	t.Setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+	t.Setenv("ALL_PROXY", "http://proxy.invalid:3128")
+
+	c, err := NewHTTPClient("http://100.120.127.126:8443", "do-not-leak-me")
+	require.NoError(t, err)
+
+	tr, ok := c.unary.Transport.(*http.Transport)
+	require.True(t, ok, "the hub client is built over a concrete *http.Transport")
+	assert.Nil(t, tr.Proxy,
+		"hub control traffic must never be sent through an ambient forward proxy: it carries the bearer token")
+
+	assert.Equal(t, constants.HubResponseHeaderTimeout, tr.ResponseHeaderTimeout,
+		"the transport must bound header establishment; see TestClientStream_FailsWhenHubNeverSendsHeaders")
+}
+
+// TestClientStream_FailsWhenHubNeverSendsHeaders is why
+// ResponseHeaderTimeout exists on the hub transport. Client.Stream carries NO
+// whole-request timeout by design, and the forwarder hands it a context that
+// lives as long as the run, so a hub that completes the TCP handshake and then
+// answers nothing would wedge the subscription forever — reconnect, backoff and
+// self-heal never run, because the attempt never fails. The header timeout is
+// the only thing that turns that black hole into an error.
+//
+// The timeout is injected so this runs in ~150ms instead of waiting out the
+// real 10s constant.
+func TestClientStream_FailsWhenHubNeverSendsHeaders(t *testing.T) {
+	const headerTimeout = 150 * time.Millisecond
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Accept the request and never answer: no WriteHeader, no body, no
+		// flush. The fallback deadline only exists so a regression cannot wedge
+		// httptest.Server.Close() for the whole suite.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	c, err := newHubClient(srv.URL, "s3cr3t", constants.HubUnaryTimeout, headerTimeout)
+	require.NoError(t, err)
+	require.Zero(t, c.stream.Timeout, "the stream client must still be unbounded")
+
+	start := time.Now()
+	resp, err := c.Stream(context.Background(), "/api/v1/requests/stream?project=%2Fp")
+	elapsed := time.Since(start)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Stream must fail against a hub that never sends headers")
+	}
+	assert.Less(t, elapsed, 5*time.Second,
+		"the header timeout must fail the attempt promptly rather than hanging")
+
+	var urlErr *url.Error
+	require.ErrorAs(t, err, &urlErr)
+	assert.True(t, urlErr.Timeout(), "the failure must be a timeout, got %v", err)
+}
+
 // --- base URL validation ---
 
 // TestNormalizeHubBaseURL tables the URLs NewHTTPClient accepts (with their
@@ -264,6 +342,10 @@ func TestNormalizeHubBaseURL(t *testing.T) {
 		{name: "wrong scheme", in: "ftp://hub.example", wantErr: "must use http:// or https://"},
 		{name: "unix scheme", in: "unix:///tmp/proxy.sock", wantErr: "must use http:// or https://"},
 		{name: "no host", in: "http:///api", wantErr: "has no host"},
+		// ":8443" is a Host with no HOSTNAME — a request built against it dials
+		// an unspecified address rather than the hub, so the guard checks
+		// Hostname() rather than Host (plan 031).
+		{name: "port but no hostname", in: "http://:8443", wantErr: "has no host"},
 		{name: "userinfo", in: "http://user:pw@hub.example", wantErr: "must not contain userinfo"},
 		{name: "query", in: "http://hub.example?token=leak", wantErr: "must not contain a query string"},
 		{name: "empty forced query", in: "http://hub.example/?", wantErr: "must not contain a query string"},
@@ -351,7 +433,7 @@ func TestClientStream_OutlivesUnaryTimeoutOnTheSameClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := newHubClient(srv.URL, "", unaryTimeout)
+	c, err := newHubClient(srv.URL, "", unaryTimeout, constants.HubResponseHeaderTimeout)
 	require.NoError(t, err)
 	require.Equal(t, unaryTimeout, c.unary.Timeout)
 	require.Zero(t, c.stream.Timeout)
