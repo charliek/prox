@@ -292,7 +292,7 @@ func TestClientStream_FailsWhenHubNeverSendsHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := newHubClient(srv.URL, "s3cr3t", constants.HubUnaryTimeout, headerTimeout)
+	c, err := newHubClient(srv.URL, "s3cr3t", "", constants.HubUnaryTimeout, headerTimeout)
 	require.NoError(t, err)
 	require.Zero(t, c.stream.Timeout, "the stream client must still be unbounded")
 
@@ -433,7 +433,7 @@ func TestClientStream_OutlivesUnaryTimeoutOnTheSameClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := newHubClient(srv.URL, "", unaryTimeout, constants.HubResponseHeaderTimeout)
+	c, err := newHubClient(srv.URL, "", "", unaryTimeout, constants.HubResponseHeaderTimeout)
 	require.NoError(t, err)
 	require.Equal(t, unaryTimeout, c.unary.Timeout)
 	require.Zero(t, c.stream.Timeout)

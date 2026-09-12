@@ -109,6 +109,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// visible even when the shared proxy is down (which then forces exit 1).
 	renderProxyStatus(status.Proxy)
 
+	// Hub line (plan 031 §4.2, AC9). Deliberately NOT part of proxyDown or any
+	// other input to statusExitError: hub publishing is additive, so a hub in
+	// any degraded state is advisory and `prox status` still exits 0 (AC12).
+	renderHubStatus(status.Proxy)
+
 	// Session warnings (plan 028 A2). They are advisory, so they are PRINTED
 	// here and deliberately absent from statusExitError below: a warning is not
 	// a failure, and turning `prox status` red for one would make every script
@@ -383,6 +388,18 @@ func renderProxyStatus(p *api.ProxyStatusResponse) {
 		}
 	case proxyModeStandalone:
 		fmt.Println("\nProxy: standalone")
+	}
+}
+
+// renderHubStatus prints the `Hub:` line for `prox status` (plan 031 §4.2).
+// Nothing is printed when no hub is configured for the run, which is what keeps
+// hub-less output byte-identical to before (AC1).
+func renderHubStatus(p *api.ProxyStatusResponse) {
+	if p == nil || p.Hub == nil {
+		return
+	}
+	if line := hubStatusLine(p.Hub, time.Now()); line != "" {
+		fmt.Printf("\n%s\n", line)
 	}
 }
 

@@ -33,6 +33,18 @@ type Client struct {
 	// helper every method funnels through — so no method can forget it.
 	token string
 
+	// origin is this client's own machine name when it is talking to a hub's
+	// NETWORK mount, and empty for the Unix socket. It is what lets the
+	// capture calls (Requests, and the forwarder's SSE subscription) send the
+	// origin/project pair the network mount requires instead of the composed
+	// key the socket mount takes: D15 has the hub compose <origin>:<dir>
+	// itself and never accept a pre-qualified key from the wire.
+	//
+	// Holding it on the client rather than threading it through every call
+	// site is what keeps `ForwardRequestsWithClient` one function with one
+	// projectKey argument on both mounts — see scopedRequestQuery.
+	origin string
+
 	// unary and stream are TWO http.Clients deliberately sharing ONE
 	// http.Transport (connection pool, dialer, TLS config).
 	//
@@ -76,6 +88,17 @@ type DaemonAPIError struct {
 	Message string
 	// Status is the HTTP status code the daemon responded with.
 	Status int
+	// Holders carries every conflicting holder on a 409 HUB_NAME_HELD (plan 031
+	// D10/§4.3) and is nil on every other error. It is decoded here rather than
+	// left in the body because by the time `prox up` decides whether to prompt
+	// for a takeover the body is long gone — and the prompt has to name the
+	// holders, not just say that there were some.
+	Holders []HubHolder
+	// HubProtocol is the hub's own protocol version on a 409 PROTOCOL_MISMATCH,
+	// and 0 otherwise. `prox status` renders it as "protocol mismatch: hub 2,
+	// this prox 1"; parsing it back out of the message text would be a second,
+	// silently-drifting copy of the wording.
+	HubProtocol int
 }
 
 func (e *DaemonAPIError) Error() string {
@@ -105,14 +128,23 @@ func NewClient(socketPath string) *Client {
 // missing host is rejected here rather than producing a confusing request
 // later. A trailing slash is normalized away so baseURL+path never doubles it.
 func NewHTTPClient(baseURL, token string) (*Client, error) {
-	return newHubClient(baseURL, token, constants.HubUnaryTimeout, constants.HubResponseHeaderTimeout)
+	return newHubClient(baseURL, token, "", constants.HubUnaryTimeout, constants.HubResponseHeaderTimeout)
+}
+
+// NewHubClient is NewHTTPClient plus the caller's own origin, which scopes the
+// capture calls (Requests and the forwarder's SSE subscription) to this
+// publisher's own registrations (plan 031 D15). A publisher that means to read
+// its own captured traffic through a hub must use this constructor; an empty
+// origin behaves exactly like NewHTTPClient.
+func NewHubClient(baseURL, token, origin string) (*Client, error) {
+	return newHubClient(baseURL, token, origin, constants.HubUnaryTimeout, constants.HubResponseHeaderTimeout)
 }
 
 // newHubClient is NewHTTPClient with injectable timeouts. Tests use it to
 // exercise the bounded/unbounded client split and the black-hole header
 // timeout in milliseconds instead of waiting out the real constants;
 // production always passes them.
-func newHubClient(baseURL, token string, unaryTimeout, responseHeaderTimeout time.Duration) (*Client, error) {
+func newHubClient(baseURL, token, origin string, unaryTimeout, responseHeaderTimeout time.Duration) (*Client, error) {
 	normalized, err := normalizeHubBaseURL(baseURL)
 	if err != nil {
 		return nil, err
@@ -151,7 +183,9 @@ func newHubClient(baseURL, token string, unaryTimeout, responseHeaderTimeout tim
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
-	return newClientOverTransport(normalized, token, transport, unaryTimeout), nil
+	c := newClientOverTransport(normalized, token, transport, unaryTimeout)
+	c.origin = origin
+	return c, nil
 }
 
 // newClientOverTransport builds the two-client-over-one-transport pair the
@@ -233,7 +267,15 @@ func (c *Client) HealthWithContext(ctx context.Context) (string, error) {
 // error Code — e.g. "SHUTTING_DOWN" during the daemon's graceful-shutdown
 // grace (D4 retries this in tryDaemonProxy) or "VERSION_MISMATCH".
 func (c *Client) Register(req RegisterRequest) (*RegisterResponse, error) {
-	resp, err := c.post("/api/v1/register", req)
+	return c.RegisterWithContext(context.Background(), req)
+}
+
+// RegisterWithContext is Register bounded by ctx. `prox up`'s FIRST hub
+// register uses it with a constants.HubConnectTimeout context so a black-holed
+// hub cannot stall startup (plan 031 D16/AC11); every later attempt is owned by
+// the tunnel's own retry loop and is bounded by the run's context instead.
+func (c *Client) RegisterWithContext(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
+	resp, err := c.postWithContext(ctx, "/api/v1/register", req)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +294,13 @@ func (c *Client) Register(req RegisterRequest) (*RegisterResponse, error) {
 
 // Deregister removes a project's routes from the daemon.
 func (c *Client) Deregister(req DeregisterRequest) error {
-	resp, err := c.post("/api/v1/deregister", req)
+	return c.DeregisterWithContext(context.Background(), req)
+}
+
+// DeregisterWithContext is Deregister bounded by ctx, so a teardown stage can
+// cap how long it waits for a hub that may itself be gone (plan 031 C5).
+func (c *Client) DeregisterWithContext(ctx context.Context, req DeregisterRequest) error {
+	resp, err := c.postWithContext(ctx, "/api/v1/deregister", req)
 	if err != nil {
 		return err
 	}
@@ -324,9 +372,8 @@ func (c *Client) Routes() ([]RouteInfo, error) {
 // reconnect cancels an in-flight snapshot instead of waiting out the client's
 // 30s timeout. limit must be supplied explicitly (an omitted limit backfills
 // only the daemon's default of 100).
-func (c *Client) Requests(ctx context.Context, projectDir string, limit int) ([]proxy.RequestRecord, error) {
-	q := url.Values{}
-	q.Set("project", projectDir)
+func (c *Client) Requests(ctx context.Context, projectKey string, limit int) ([]proxy.RequestRecord, error) {
+	q := c.scopedRequestQuery(projectKey)
 	q.Set("limit", strconv.Itoa(limit))
 
 	resp, err := c.getWithContext(ctx, "/api/v1/requests?"+q.Encode())
@@ -363,6 +410,31 @@ func (c *Client) Requests(ctx context.Context, projectDir string, limit int) ([]
 		return nil, fmt.Errorf("snapshot response missing requests key")
 	}
 	return result.Requests, nil
+}
+
+// scopedRequestQuery builds the identity half of the capture query
+// (/api/v1/requests and /api/v1/requests/stream) for projectKey, so the same
+// key works on both mounts (plan 031 D15).
+//
+// On the Unix socket the key IS the project dir and goes out as ?project=. On a
+// hub's network mount the key is the composed "<origin>:<dir>", and the hub
+// refuses to accept a pre-qualified key: it takes ?origin= and ?project= and
+// composes the key itself, which is what makes a publisher structurally unable
+// to name another publisher's — or any local project's — records. So the two
+// halves are split back out here, and only when the key's origin is this
+// client's OWN origin, which by construction it always is (the same two strings
+// built the key and the client).
+func (c *Client) scopedRequestQuery(projectKey string) url.Values {
+	q := url.Values{}
+	if c.origin != "" {
+		if origin, dir, ok := splitHubProjectKey(projectKey); ok && origin == c.origin {
+			q.Set("origin", origin)
+			q.Set("project", dir)
+			return q
+		}
+	}
+	q.Set("project", projectKey)
+	return q
 }
 
 // Shutdown requests the daemon to shut down.
@@ -520,6 +592,13 @@ func (c *Client) getWithContext(ctx context.Context, path string) (*http.Respons
 // post performs an HTTP POST to the daemon with a JSON body, on the bounded
 // (unary) client.
 func (c *Client) post(path string, body any) (*http.Response, error) {
+	return c.postWithContext(context.Background(), path, body)
+}
+
+// postWithContext is post bounded by ctx, so a caller can cap an individual
+// call below the client's own unary timeout (the hub's first register) or
+// abandon one on teardown.
+func (c *Client) postWithContext(ctx context.Context, path string, body any) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -529,7 +608,7 @@ func (c *Client) post(path string, body any) (*http.Response, error) {
 		bodyReader = bytes.NewReader(data)
 	}
 
-	req, err := c.newRequest(context.Background(), http.MethodPost, path, bodyReader)
+	req, err := c.newRequest(ctx, http.MethodPost, path, bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +626,13 @@ func (c *Client) readError(resp *http.Response) error {
 
 	var errResp ErrorResponse
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return &DaemonAPIError{Code: errResp.Code, Message: errResp.Error, Status: resp.StatusCode}
+		return &DaemonAPIError{
+			Code:        errResp.Code,
+			Message:     errResp.Error,
+			Status:      resp.StatusCode,
+			Holders:     errResp.Holders,
+			HubProtocol: errResp.HubProtocol,
+		}
 	}
 	return fmt.Errorf("daemon returned %d: %s", resp.StatusCode, string(body))
 }

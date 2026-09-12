@@ -113,6 +113,35 @@ type proxyRuntime struct {
 	prober   func() (reachable bool, version string)
 	probeTTL time.Duration
 	now      func() time.Time
+
+	// hubMu guards the remote-hub publishing state (plan 031 D19/D20) and the
+	// tunnel's cancel func. It is SEPARATE from mu because the writer is the
+	// publisher's own goroutine (the tunnel loop) while the readers are HTTP
+	// handler goroutines serving GET /status — neither should ever contend with
+	// the client/mode access mu protects, and hubMu is never taken while mu is
+	// held.
+	hubMu     sync.Mutex
+	hub       *hubRuntimeState
+	hubCancel context.CancelFunc
+	// hubPub is this run's hub publisher, nil when the run publishes to no hub
+	// (including a name collision the user declined). performShutdown reads it
+	// to cancel the tunnel and deregister.
+	hubPub *hubPublisher
+}
+
+// hubRuntimeState is this project's remote-hub publishing state as the
+// publisher state machine last left it (plan 031 D19). nil on proxyRuntime
+// means "no hub configured for this run", which is what makes the `hub` key
+// vanish from status.proxy and the `Hub:` line vanish from `prox status`.
+type hubRuntimeState struct {
+	Alias  string
+	State  string
+	Domain string
+	Routes int
+	// Since is when State was entered; the rendered line counts "down 12s"
+	// from it.
+	Since  time.Time
+	Detail string
 }
 
 type proxyProbeResult struct {
@@ -265,6 +294,63 @@ func (r *proxyRuntime) CancelForwarder() {
 	}
 }
 
+// --- remote hub publishing (plan 031 D19/D20) ---
+
+// SetHubState publishes the publisher state machine's current state, or clears
+// it (nil) when this run is not publishing to a hub after all — a declined
+// name collision, per §3.1, leaves NO hub state rather than a degraded one.
+func (r *proxyRuntime) SetHubState(state *hubRuntimeState) {
+	r.hubMu.Lock()
+	defer r.hubMu.Unlock()
+	r.hub = state
+}
+
+// HubState returns a COPY of the current hub state (nil when none), so an HTTP
+// goroutine can render it while the publisher goroutine is still transitioning.
+func (r *proxyRuntime) HubState() *hubRuntimeState {
+	r.hubMu.Lock()
+	defer r.hubMu.Unlock()
+	if r.hub == nil {
+		return nil
+	}
+	out := *r.hub
+	return &out
+}
+
+// SetHubCancel records the hub tunnel's cancel func so performShutdown can stop
+// the tunnel and its request forwarder BEFORE deregistering from the hub — the
+// same D6c ordering the local forwarder gets, for the same reason.
+func (r *proxyRuntime) SetHubCancel(cancel context.CancelFunc) {
+	r.hubMu.Lock()
+	defer r.hubMu.Unlock()
+	r.hubCancel = cancel
+}
+
+// CancelHubTunnel stops the hub tunnel and its forwarder if one was launched
+// (no-op otherwise).
+func (r *proxyRuntime) CancelHubTunnel() {
+	r.hubMu.Lock()
+	cancel := r.hubCancel
+	r.hubMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// SetHubPublisher records this run's hub publisher (nil when there is none).
+func (r *proxyRuntime) SetHubPublisher(p *hubPublisher) {
+	r.hubMu.Lock()
+	defer r.hubMu.Unlock()
+	r.hubPub = p
+}
+
+// HubPublisher returns this run's hub publisher, or nil.
+func (r *proxyRuntime) HubPublisher() *hubPublisher {
+	r.hubMu.Lock()
+	defer r.hubMu.Unlock()
+	return r.hubPub
+}
+
 // setHealState records the heal state machine's current view (D6b).
 func (r *proxyRuntime) setHealState(state string) {
 	r.mu.Lock()
@@ -328,6 +414,24 @@ func (r *proxyRuntime) ProxyStatus() *api.ProxyStatusResponse {
 	}
 	if rm := r.localRequestManager(); rm != nil {
 		resp.DroppedEvents = rm.DroppedEvents()
+	}
+	// The hub block (plan 031 D20) is nested here, under proxy, and stays absent
+	// whenever no hub is configured — that absence is what AC1's negative-space
+	// assertion pins. A degraded hub NEVER affects any other field of this block,
+	// and in particular never DaemonReachable, which is what `prox status`'s
+	// exit code is derived from (AC12).
+	if hub := r.HubState(); hub != nil {
+		resp.Hub = &api.HubStatusResponse{
+			Alias:  hub.Alias,
+			State:  hub.State,
+			Domain: hub.Domain,
+			Routes: hub.Routes,
+			Detail: hub.Detail,
+		}
+		if !hub.Since.IsZero() {
+			since := hub.Since
+			resp.Hub.Since = &since
+		}
 	}
 
 	if mode == proxyModeShared {

@@ -138,6 +138,10 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 				constants.HubProtocolVersion, req.ProtocolVersion,
 			),
 			Code: "PROTOCOL_MISMATCH",
+			// The publisher renders "protocol mismatch: hub 2, this prox 1" in
+			// `prox status` and must not have to parse it back out of the
+			// sentence above (plan 031 C5).
+			HubProtocol: constants.HubProtocolVersion,
 		})
 		return
 	}
@@ -193,6 +197,19 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	req.ProjectDir = HubProjectKey(origin, req.ProjectDir)
 
 	status, body := s.register(req)
+	// D4 again, from the publisher's side: the hub just overwrote the domain and
+	// both data-plane ports, so the publisher has no way to know where its
+	// service names were actually published. Hand those three facts back on the
+	// success body — the ONLY place they are added, so every socket response is
+	// untouched (plan 031 C5).
+	if resp, ok := body.(RegisterResponse); ok {
+		resp.Hub = &RegisterHubInfo{
+			Domain:    cfg.cfg.Domain,
+			HTTPSPort: cfg.cfg.HTTPSPort,
+			HTTPPort:  cfg.cfg.HTTPPort,
+		}
+		body = resp
+	}
 	writeJSON(w, status, body)
 }
 

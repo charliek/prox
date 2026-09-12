@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -209,6 +210,20 @@ func SaveUserHubs(hubs UserHubs) error {
 // write" does not actually test.
 var userHubsWriter = domain.AtomicWriter{TempPattern: ".prox-hubs-*.tmp"}
 
+// ErrUnknownHub is what ResolveHub wraps when the alias names no hub this
+// machine knows about — either no merged entry carries that name, or "default"
+// was asked for and ~/.prox/hubs.yaml sets none.
+//
+// It is a sentinel rather than just an error string because plan 031's §3.1
+// failure table splits exactly on this one condition and nothing else: an
+// unknown alias TYPED on the command line is a fatal mistake the user can fix
+// right now, while the same alias COMMITTED in a project's prox.yaml must never
+// break `prox up` for a teammate who has no such hub — it warns and continues.
+// Every other ResolveHub failure (an unreadable token_file, two token sources,
+// an unset token_env) is a config error and is fatal however the alias was
+// chosen, so callers match on this sentinel, never on message text.
+var ErrUnknownHub = errors.New("unknown hub")
+
 // ResolvedHub is the fully-resolved hub selection for one `prox up --hub`/
 // `proxy.hub` run (plan 031 D8): a usable base URL, a token value already
 // read from whichever of token/token_file/token_env was set (or empty for
@@ -281,14 +296,14 @@ func ResolveHub(cfg *Config, configPath, alias string) (ResolvedHub, error) {
 	resolvedAlias := alias
 	if alias == "default" {
 		if userHubs.Default == "" {
-			return ResolvedHub{}, fmt.Errorf("hub alias \"default\": no default is set in ~/.prox/hubs.yaml (run 'prox hub add <alias> <url> --default')")
+			return ResolvedHub{}, fmt.Errorf("%w: hub alias \"default\": no default is set in ~/.prox/hubs.yaml (run 'prox hub add <alias> <url> --default')", ErrUnknownHub)
 		}
 		resolvedAlias = userHubs.Default
 	}
 
 	entry, ok := merged[resolvedAlias]
 	if !ok {
-		return ResolvedHub{}, fmt.Errorf("unknown hub alias %q (defined: %s)", alias, describeHubAliases(merged))
+		return ResolvedHub{}, fmt.Errorf("%w: unknown hub alias %q (defined: %s)", ErrUnknownHub, alias, describeHubAliases(merged))
 	}
 	hub := entry.hub
 

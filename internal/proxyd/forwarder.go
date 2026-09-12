@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
@@ -86,10 +85,12 @@ func ForwardRequests(ctx context.Context, socketPath string, projectDir string, 
 // backfill, and heal loop can run against either the local Unix-socket daemon
 // or a remote hub's network control plane (plan 031).
 //
-// projectKey is the value sent as the stream's ?project= filter and as
-// Client.Requests' project argument; it must match the key the serving daemon
-// registered this project under. On the socket path that is the project dir
-// (what ForwardRequests passes); a hub qualifies it by origin.
+// projectKey is the key the SERVING daemon registered this project under. On
+// the socket path that is the project dir (what ForwardRequests passes); on a
+// hub it is the composed HubProjectKey(origin, dir) — the same value RunTunnel
+// takes, so a publisher has exactly one project identity to keep straight. The
+// client turns it into the right query for its mount (Client.scopedRequestQuery:
+// the hub takes origin+project and composes the key itself, D15).
 //
 // client is used for the whole forwarder lifetime and must not be shared with a
 // caller that closes it; see ForwardRequests for why it is built once.
@@ -260,7 +261,11 @@ func forwardRequests(ctx context.Context, cfg forwarderConfig) {
 // a failed reconnect (connected=false, count it) from a dropped live stream
 // (connected=true, do not count it).
 func streamRequests(ctx context.Context, client *Client, projectKey string, localRM *proxy.RequestManager, sink ForwarderStatusSink) (connected bool, err error) {
-	streamPath := "/api/v1/requests/stream?project=" + url.QueryEscape(projectKey)
+	// The identity half of the query comes from the client, not from string
+	// concatenation here: a hub's network mount takes origin+project and
+	// composes the key itself (D15), while the socket mount takes the key
+	// directly. See Client.scopedRequestQuery.
+	streamPath := "/api/v1/requests/stream?" + client.scopedRequestQuery(projectKey).Encode()
 
 	resp, err := client.Stream(ctx, streamPath)
 	if err != nil {

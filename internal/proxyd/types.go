@@ -89,6 +89,26 @@ type RegisterResponse struct {
 	// NOT separate two different development builds, and a dev client can very
 	// well talk to a dev daemon built before this field existed.
 	Warnings []domain.Warning `json:"warnings,omitempty"`
+	// Hub describes the hub that accepted this registration, and is present ONLY
+	// on the network mount (plan 031 C5). A socket registration never carries it,
+	// so local register responses are unchanged.
+	//
+	// It exists because D4 makes the HUB own the domain and the data-plane
+	// ports: the publisher sends service names and its own targets and is
+	// otherwise told nothing, yet `prox up` has to print
+	// `Hub (llt): https://*.llt.stridelabs.ai — …`. Deriving the domain from the
+	// registered hostnames would work; deriving the SCHEME and PORT from them
+	// cannot, because neither appears there.
+	Hub *RegisterHubInfo `json:"hub,omitempty"`
+}
+
+// RegisterHubInfo is the hub's own published-address facts, returned to a
+// publisher on a successful network-mount register (plan 031 D4/C5). HTTPSPort
+// or HTTPPort is 0 when the hub publishes no listener of that kind.
+type RegisterHubInfo struct {
+	Domain    string `json:"domain"`
+	HTTPSPort int    `json:"https_port,omitempty"`
+	HTTPPort  int    `json:"http_port,omitempty"`
 }
 
 // DeregisterRequest is sent by prox down to remove a project's routes.
@@ -238,4 +258,9 @@ type ErrorResponse struct {
 	// D10/§4.3) and is absent on every other error, so no existing response
 	// changes shape. C5 renders it in the interactive takeover prompt.
 	Holders []HubHolder `json:"holders,omitempty"`
+	// HubProtocol is the hub's own protocol version on a 409 PROTOCOL_MISMATCH,
+	// absent otherwise (plan 031 §4.3). The message text already names both
+	// versions, but `prox status`'s "protocol mismatch: hub 2, this prox 1"
+	// line needs the number itself rather than a substring of a sentence.
+	HubProtocol int `json:"hub_protocol,omitempty"`
 }

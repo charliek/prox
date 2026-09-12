@@ -153,6 +153,19 @@ const (
 	// completing its handshake.
 	HubAttachGrace = 10 * time.Second
 
+	// HubConnectTimeout bounds the FIRST, synchronous hub register that `prox up`
+	// performs on the startup path (plan 031 D16, AC11). After it the publisher's
+	// tunnel loop owns every further attempt, so this is purely a bound on how
+	// long startup may pause for a hub.
+	//
+	// It exists because "a configured but unreachable hub is never fatal" is not
+	// enough on its own: a black-holed hub (a listener that completes the TCP
+	// handshake and then never answers) would otherwise hold startup for
+	// HubResponseHeaderTimeout, and a 10s stall before any output satisfies the
+	// letter of "exit 0" while being unusable (CodeRabbit M1). 3s is long enough
+	// for a tailnet round trip and short enough that a down hub is invisible.
+	HubConnectTimeout = 3 * time.Second
+
 	// HubDialTimeout bounds ONE tunnel dial end to end on the hub side (plan 031
 	// D16): open a yamux stream, write "CONNECT host:port\n", and read the
 	// publisher's one-line reply. On expiry the hub abandons the stream and
