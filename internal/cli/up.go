@@ -108,9 +108,9 @@ func init() {
 	upCmd.Flags().IntVar(&httpsPort, "https-port", 0, "Override proxy HTTPS port")
 	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Force request/response body capture on (default: on when the proxy is enabled; kept for explicitness/compat)")
 	upCmd.Flags().BoolVar(&noCapture, "no-capture", false, "Disable request/response body capture for this run")
-	upCmd.Flags().StringVar(&hubAlias, "hub", "", "Also publish this project's services through hub <alias> (use 'default' for the ~/.prox/hubs.yaml default); overrides PROX_HUB and proxy.hub")
-	upCmd.Flags().BoolVar(&noHub, "no-hub", false, "Do not publish to any hub for this run, even when proxy.hub or PROX_HUB names one")
-	upCmd.Flags().BoolVar(&hubTakeover, "hub-takeover", false, "Take hub service names already published by another project, without prompting")
+	upCmd.Flags().StringVar(&hubAlias, "hub", "", "(experimental) Also publish this project's services through hub <alias> (use 'default' for the ~/.prox/hubs.yaml default); overrides PROX_HUB and proxy.hub")
+	upCmd.Flags().BoolVar(&noHub, "no-hub", false, "(experimental) Do not publish to any hub for this run, even when proxy.hub or PROX_HUB names one")
+	upCmd.Flags().BoolVar(&hubTakeover, "hub-takeover", false, "(experimental) Take hub service names already published by another project, without prompting")
 }
 
 // completeProcessNames provides shell completion for process names

@@ -503,6 +503,15 @@ See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for mult
 
 ### hub
 
+!!! warning "Experimental"
+
+    Hub mode is **experimental**: new, lightly exercised outside its test
+    suite, and its config keys, flags, status strings and publisher/hub wire
+    protocol may change without a deprecation cycle. See the
+    [Remote Proxy Hub guide](../guides/remote-hub.md) for the security limits
+    that come with it.
+
+
 Manage a [remote proxy hub](../guides/remote-hub.md): a shared proxy daemon on
 another machine that this one can publish through, or that this machine
 itself offers to others.

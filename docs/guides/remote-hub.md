@@ -1,5 +1,22 @@
 # Remote Proxy Hub
 
+!!! warning "Experimental"
+
+    Hub mode is **experimental**. It is new, it has not been run in anger yet,
+    and its surface may change in a future release without a deprecation
+    cycle — config keys, flags, the `Hub:` status strings, and the wire
+    protocol between publisher and hub all count as unstable.
+
+    Two limits are worth knowing before you decide to run one, both covered in
+    [Security](#security): the hub authenticates a **single shared token**, so
+    a publisher that deliberately claims another publisher's `origin` can
+    reach that publisher's registration; and the control plane speaks **plain
+    HTTP**, which is why it refuses to listen anywhere but loopback or an
+    encrypted overlay unless you explicitly opt in.
+
+    Nothing here affects a machine or project that does not configure a hub:
+    with no hub, `prox up` behaves exactly as before.
+
 Hub mode lets `prox up` on one machine publish its services through a shared
 proxy daemon running on **another** machine, so a hostname like
 `https://auth.llt.stridelabs.ai` works from any device that can reach the

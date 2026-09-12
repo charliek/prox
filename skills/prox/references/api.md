@@ -119,7 +119,9 @@ Supervisor status.
 | `backfill_failures` | Post-connect ring snapshot fetch failures |
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
 
-`hub` is present only when this project resolved a [remote proxy
+`hub` is **experimental** (the hub feature is new; this object's shape may
+change without a deprecation cycle). It is present only when this project
+resolved a [remote proxy
 hub](https://charliek.github.io/prox/guides/remote-hub/) to publish through
 (`--hub`/`proxy.hub`/`PROX_HUB`); omitted entirely otherwise. It is this
 project's OWN publishing state — not a hub host's view of every publisher it

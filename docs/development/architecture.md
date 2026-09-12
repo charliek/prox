@@ -199,6 +199,10 @@ When more than one project needs the same proxy port, prox routes through a per-
 
 ### Hub Mode (Remote Proxy Hub, plan 031)
 
+> **Experimental.** Hub mode is new and its surface is not yet stable; the
+> notes below describe the shipped design, not a frozen contract.
+
+
 Hub mode is an optional second interface on the same `proxyd.Server`, not a
 second process: a project on one machine (the **publisher**) can register its
 services with a `proxyd` running on another machine (the **hub**) so a

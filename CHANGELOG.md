@@ -7,7 +7,10 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Remote proxy hub: publish a project's services through a `prox` daemon on
-  another machine** (plan 031). The per-user shared proxy daemon
+  another machine** (plan 031). **Experimental** — new, lightly exercised
+  outside its test suite, and its config keys, flags, status strings and
+  publisher/hub wire protocol may change without a deprecation cycle. Nothing
+  changes for a machine or project that does not configure a hub. The per-user shared proxy daemon
   (`internal/proxyd`) gains an optional **hub mode**: a network control plane
   plus a reverse tunnel, so `prox up --hub <alias>` (or `proxy.hub: <alias>`
   in `prox.yaml`) anywhere with outbound reachability to the hub host

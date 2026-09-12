@@ -40,8 +40,12 @@ var (
 // profiles in ~/.prox/hubs.yaml, in the style of proxyCmd (proxy_cmd.go).
 var hubCmd = &cobra.Command{
 	Use:   "hub",
-	Short: "Manage remote proxy hub connections",
+	Short: "Manage remote proxy hub connections (experimental)",
 	Long: `Manage the remote proxy hubs this machine can publish through.
+
+EXPERIMENTAL: hub mode is new. Its config keys, flags, status strings and the
+wire protocol between publisher and hub may change without a deprecation
+cycle. Nothing changes for a project that does not configure a hub.
 
 A hub is a shared proxy daemon running on another machine (D8, plan 031):
 'prox up --hub <alias>' registers this project's services with it and holds

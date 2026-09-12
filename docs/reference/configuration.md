@@ -525,6 +525,15 @@ See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for exam
 
 ## Hubs
 
+!!! warning "Experimental"
+
+    Hub mode is **experimental**: new, lightly exercised outside its test
+    suite, and its config keys, flags, status strings and publisher/hub wire
+    protocol may change without a deprecation cycle. See the
+    [Remote Proxy Hub guide](../guides/remote-hub.md) for the security limits
+    that come with it.
+
+
 A **hub** is a shared proxy daemon running with hub mode on, on another
 machine, that a project can publish its services through — so a hostname
 like `auth.llt.stridelabs.ai` works from any device that can reach the hub,

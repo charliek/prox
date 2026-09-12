@@ -428,6 +428,9 @@ The behavior is automatic:
 
 ### Remote Proxy Hub
 
+> **Experimental.** Hub mode is new; its keys, flags and wire protocol may change without a deprecation cycle.
+
+
 A **hub** is a shared proxy daemon on another machine (with hub mode on) that
 this project can publish services through, so a hostname like
 `auth.llt.example.com` is reachable from any device that can reach the hub —

@@ -131,7 +131,7 @@ Supervisor status.
 
 `prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
 
-`hub` is this project's [remote proxy hub](../guides/remote-hub.md) publishing state, present only when the run resolved a hub to publish through (`--hub`/`proxy.hub`/`PROX_HUB`); omitted entirely otherwise, so a hub-less status payload is byte-identical to before this feature existed. **This is the publisher's own state for THIS project** — not to be confused with a hub host's view of every publisher it serves, which lives on the shared daemon's own socket API (`prox hub status`), not here:
+`hub` is this project's [remote proxy hub](../guides/remote-hub.md) publishing state. **The hub feature is experimental and this object's shape may change without a deprecation cycle.** It is present only when the run resolved a hub to publish through (`--hub`/`proxy.hub`/`PROX_HUB`); omitted entirely otherwise, so a hub-less status payload is byte-identical to before this feature existed. **This is the publisher's own state for THIS project** — not to be confused with a hub host's view of every publisher it serves, which lives on the shared daemon's own socket API (`prox hub status`), not here:
 
 | Field | Description |
 |-------|-------------|
