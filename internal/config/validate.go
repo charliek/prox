@@ -4,16 +4,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 )
-
-// domainRegex validates domain format (basic DNS name validation)
-var domainRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
 
 // ValidationError represents a configuration validation error
 type ValidationError struct {
@@ -97,8 +93,10 @@ func Validate(config *Config) error {
 		if config.Proxy.Enabled && config.Proxy.Domain == "" {
 			errs = append(errs, "proxy.domain: required when proxy is enabled")
 		}
-		if config.Proxy.Domain != "" && !domainRegex.MatchString(config.Proxy.Domain) {
-			errs = append(errs, fmt.Sprintf("proxy.domain: invalid domain format %q", config.Proxy.Domain))
+		if config.Proxy.Domain != "" {
+			if err := domain.ValidateDomainName(config.Proxy.Domain); err != nil {
+				errs = append(errs, fmt.Sprintf("proxy.domain: %s", err.Error()))
+			}
 		}
 
 		// Validate capture disk budget if set (#69). Empty means "use the default"
@@ -163,27 +161,15 @@ func Validate(config *Config) error {
 	return nil
 }
 
-// validateServiceName checks if a service name is valid as a subdomain
+// validateServiceName checks if a service name is valid as a subdomain.
+//
+// The rule itself lives in domain.ValidateServiceName because the hub's
+// network mount must apply the IDENTICAL one to a registration that never went
+// through this file (plan 031 F9): a remote publisher's services arrive as JSON
+// on another machine's say-so, and two copies of a naming rule are two rules
+// that drift.
 func validateServiceName(name string) error {
-	if name == "" {
-		return fmt.Errorf("service name cannot be empty")
-	}
-	// Service names become subdomains, so they must be valid DNS labels
-	// - Only lowercase alphanumeric and hyphens
-	// - Cannot start or end with hyphen
-	// - Max 63 characters
-	if len(name) > 63 {
-		return fmt.Errorf("service name too long (max 63 characters)")
-	}
-	if name[0] == '-' || name[len(name)-1] == '-' {
-		return fmt.Errorf("service name cannot start or end with hyphen")
-	}
-	for _, c := range name {
-		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-			return fmt.Errorf("service name can only contain lowercase letters, numbers, and hyphens")
-		}
-	}
-	return nil
+	return domain.ValidateServiceName(name)
 }
 
 // ValidateProcessName checks if a process name is valid
@@ -622,21 +608,8 @@ func sortedMapKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// hostnameRegex validates hostname format (excluding IP addresses)
-var hostnameRegex = regexp.MustCompile(`^(localhost|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*)$`)
-
-// validateHost checks if a host is a valid hostname or IP address
+// validateHost checks if a host is a valid hostname or IP address. Shared with
+// the hub's network register path via domain.ValidateHost (plan 031 F9).
 func validateHost(host string) error {
-	if host == "" {
-		return fmt.Errorf("host cannot be empty")
-	}
-	// First check if it's a valid IP address (handles both IPv4 and IPv6)
-	if ip := net.ParseIP(host); ip != nil {
-		return nil
-	}
-	// Otherwise validate as hostname
-	if !hostnameRegex.MatchString(host) {
-		return fmt.Errorf("invalid host format %q", host)
-	}
-	return nil
+	return domain.ValidateHost(host)
 }

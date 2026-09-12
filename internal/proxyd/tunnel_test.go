@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/proxy"
 	"github.com/hashicorp/yamux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,10 @@ func (c *testClock) advance(d time.Duration) {
 // surface 0 already means "no HTTP(S) listener", and overloading it to mean
 // "ephemeral" is the confusion P15 calls out.
 type tunnelHub struct {
+	// certs is the fake cert manager the dynamic proxy runs on, kept so a test
+	// can make the CERT phase of a registration fail — the cheapest way to fail
+	// a newcomer AFTER it has displaced somebody (plan 031 F6).
+	certs     *fakeCertManager
 	server    *Server
 	proxy     *DynamicProxy
 	registry  *Registry
@@ -84,7 +89,8 @@ func newTunnelHub(t *testing.T) *tunnelHub {
 	reg := NewRegistry()
 	reg.now = clock.now
 	ms := NewManagers(100, nil)
-	dp := NewDynamicProxy(reg, newFakeCertManager(), ms, nil, logger)
+	certs := newFakeCertManager()
+	dp := NewDynamicProxy(reg, certs, ms, nil, logger)
 
 	s := NewServer(ServerConfig{SocketPath: "", Logger: logger, Version: "test"})
 	s.SetRegistry(reg)
@@ -93,6 +99,7 @@ func newTunnelHub(t *testing.T) *tunnelHub {
 	dp.SetTunnelSessions(s.tunnels)
 
 	h := &tunnelHub{
+		certs:     certs,
 		server:    s,
 		proxy:     dp,
 		registry:  reg,
@@ -685,9 +692,38 @@ func TestDecideLease(t *testing.T) {
 			want: true,
 		},
 		{
-			name:       "never connected, never disconnected, is not swept here",
+			// Plan 031 F4. This row used to assert `want: false` and so CODIFIED
+			// the leak it should have caught: a registration that never attached
+			// has no DisconnectedAt, and the old rule removed nothing without
+			// one — so a publisher that could register but never tunnel left its
+			// routes, listeners, ring and memory behind forever.
+			name:          "registered but never attached, past its reservation, is reclaimed",
+			now:           base.Add(time.Hour),
+			reservedUntil: base.Add(constants.HubAttachGrace),
+			sessionGen:    0, currentGen: 0,
+			want: true,
+		},
+		{
+			name:          "registered but never attached, still reserved, is kept",
+			now:           base.Add(time.Second),
+			reservedUntil: base.Add(constants.HubAttachGrace),
+			sessionGen:    0, currentGen: 0,
+		},
+		{
+			// A registration with no reservation at all is not an expired attach
+			// lease — there was never a lease to expire. Only a reservation that
+			// EXISTED and ran out counts.
+			name:       "no reservation and no disconnect is never swept",
 			now:        base.Add(time.Hour),
 			sessionGen: 0, currentGen: 0,
+		},
+		{
+			// The attach-lease arm must not fire for a registration that HAS
+			// attached: a non-zero generation means the disconnect lease governs.
+			name:          "attached and connected, with a lapsed reservation, is kept",
+			now:           base.Add(time.Hour),
+			reservedUntil: base.Add(constants.HubAttachGrace),
+			sessionGen:    2, currentGen: 2,
 		},
 	}
 	for _, tt := range tests {
@@ -890,10 +926,16 @@ func TestTunnel_UpgradeRequiresRegistration(t *testing.T) {
 	assert.Equal(t, "NOT_REGISTERED", errorCode(t, resp))
 }
 
-// TestTunnel_SessionManagerDial exercises the session manager's Dial directly:
-// it is the data plane's only entry into the session layer (P5), and the
-// absent-session arm is what the offline 503 is built on.
-func TestTunnel_SessionManagerDial(t *testing.T) {
+// TestTunnel_SessionTransport exercises the session manager's ONE entry point
+// into the session layer (P5): TransportFor resolves a publisher's transport by
+// key, and its absent arm is what the offline 503 is built on.
+//
+// It replaces a test of tunnelSessions.Dial, which nothing but that test called
+// while the data plane reached into the session struct's transport field — two
+// ways into the same layer, one of them exercised only by a test. The transport
+// IS the abstraction now: it is what pools keep-alive streams, and its
+// DialContext is where the CONNECT handshake lives.
+func TestTunnel_SessionTransport(t *testing.T) {
 	backendHost, backendPort := newTestBackend(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "dialed")
 	})
@@ -901,23 +943,24 @@ func TestTunnel_SessionManagerDial(t *testing.T) {
 	h := newTunnelHub(t)
 	services := map[string]ServiceTarget{"web": {Host: backendHost, Port: backendPort}}
 
-	_, err := h.server.tunnels.Dial(context.Background(), HubProjectKey("shed", "/home/dev/app"), backendHost, backendPort)
-	require.ErrorIs(t, err, errNoTunnelSession, "dialing a key with no session must fail, not block")
+	_, ok := h.server.tunnels.TransportFor(HubProjectKey("shed", "/home/dev/app"))
+	assert.False(t, ok, "a key with no session has no transport — that is the offline case")
 
 	key, _ := h.startPublisher(t, "shed", "/home/dev/app", services, services)
 
-	conn, err := h.server.tunnels.Dial(context.Background(), key, backendHost, backendPort)
-	require.NoError(t, err)
-	defer conn.Close()
-	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+	transport, ok := h.server.tunnels.TransportFor(key)
+	require.True(t, ok)
 
-	_, err = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-		net.JoinHostPort(backendHost, strconv.Itoa(backendPort)))
+	// The transport's DialContext is the CONNECT handshake, so an ordinary
+	// request through it proves the whole path.
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s/", net.JoinHostPort(backendHost, strconv.Itoa(backendPort))))
 	require.NoError(t, err)
-	raw, err := io.ReadAll(conn)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), "200 OK")
-	assert.Contains(t, string(raw), "dialed")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "dialed", string(body))
 }
 
 // TestTunnel_ReregistersAfterNotRegistered pins the callback RunTunnel's
@@ -1072,4 +1115,316 @@ func decodeHolders(t *testing.T, h *tunnelHub, body RegisterRequest) []HubHolder
 	var er ErrorResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&er))
 	return er.Holders
+}
+
+// TestTunnel_NeverAttachedRegistrationIsReclaimed is plan 031 F4 end to end: a
+// publisher that registers and never opens a tunnel must not leak its routes,
+// its listener refcounts, its ring and its memory until `prox hub stop`.
+//
+// The old rule swept only on a DISCONNECT, and such a registration has none —
+// it sets ReservedUntil and nothing else — so nothing ever removed it and a
+// caller registering in a loop accumulated registrations without bound.
+func TestTunnel_NeverAttachedRegistrationIsReclaimed(t *testing.T) {
+	h := newTunnelHub(t)
+	key := HubProjectKey("shed", "/home/dev/app")
+	h.mustRegister(t, "shed", "/home/dev/app", map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}})
+
+	// Inside the attach reservation the publisher is still completing its
+	// handshake and must be left alone (P3).
+	h.clock.advance(constants.HubAttachGrace - time.Second)
+	assert.Empty(t, h.registry.ExpiredLeases(), "a publisher inside its attach grace is not a candidate")
+	assert.True(t, h.registry.HasProject(key))
+
+	// Past it, with no tunnel ever attached, the attach lease itself expires.
+	h.clock.advance(2 * time.Second)
+	expired := h.registry.ExpiredLeases()
+	require.Len(t, expired, 1, "a registration that never attached must be reclaimed")
+	assert.Equal(t, key, expired[0].Key)
+	assert.Equal(t, uint64(0), expired[0].SessionGen)
+
+	removed, hostnames, _ := h.server.removeDisconnectedRemote(expired[0].Key, expired[0].SessionGen)
+	require.True(t, removed)
+	assert.Equal(t, []string{"web." + h.domain}, hostnames)
+	assert.False(t, h.registry.HasProject(key))
+	assert.Empty(t, h.registry.AllRoutes())
+
+	// A publisher that DOES attach inside the grace is not reclaimed, which is
+	// what keeps the new arm from reaping healthy publishers.
+	h.mustRegister(t, "shed", "/home/dev/app", map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}})
+	attachStubTunnel(t, h, key)
+	h.clock.advance(constants.HubAttachGrace + time.Hour)
+	assert.Empty(t, h.registry.ExpiredLeases(), "a connected publisher is never a candidate")
+	assert.True(t, h.registry.HasProject(key))
+}
+
+// TestHubRegister_RenewsTheAttachReservation is plan 031 F5: every accepted
+// remote register renews the reservation of a registration that has not
+// attached yet, so a publisher retrying its handshake is not reclaimed by the
+// sweep (F4) or displaced by a newcomer (D10) between the 200 it just got and
+// the tunnel it is about to open.
+func TestHubRegister_RenewsTheAttachReservation(t *testing.T) {
+	services := map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}}
+
+	t.Run("the idempotent no-op refresh renews", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", services)
+
+		// Almost out of the reservation, still no tunnel.
+		h.clock.advance(constants.HubAttachGrace - time.Second)
+		h.mustRegister(t, "shed", "/home/dev/app", services) // unchanged config: the no-op arm
+
+		// Past where the ORIGINAL reservation would have expired.
+		h.clock.advance(2 * time.Second)
+		assert.Empty(t, h.registry.ExpiredLeases(), "a re-registered publisher must keep its reservation")
+		assert.True(t, h.registry.HasProject(key))
+
+		// And it still expires eventually, once the publisher really stops.
+		h.clock.advance(constants.HubAttachGrace + time.Second)
+		assert.Len(t, h.registry.ExpiredLeases(), 1)
+	})
+
+	t.Run("a config-changed replace renews", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", services)
+		h.clock.advance(constants.HubAttachGrace - time.Second)
+
+		// A changed config takes the replace arm, which CARRIES the old lease —
+		// including its nearly-expired reservation. Without the renewal the
+		// successor would inherit an expiry that has already passed.
+		_, err := h.client(t).Register(registerBody("shed", "/home/dev/app",
+			map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 2}}, false))
+		require.NoError(t, err)
+
+		h.clock.advance(2 * time.Second)
+		assert.Empty(t, h.registry.ExpiredLeases())
+		assert.True(t, h.registry.HasProject(key))
+	})
+
+	t.Run("a connected registration is left alone", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", services)
+		attachStubTunnel(t, h, key)
+
+		// MarkConnected clears the reservation: the tunnel is the lease (D3).
+		h.mustRegister(t, "shed", "/home/dev/app", services)
+		lease, ok := h.registry.RemoteLease(key)
+		require.True(t, ok)
+		assert.True(t, lease.ReservedUntil.IsZero(), "a connected publisher needs no reservation")
+		assert.True(t, lease.DisconnectedAt.IsZero())
+	})
+}
+
+// TestHubDeregister_ClosesTheTunnel is plan 031 F10: an explicit deregister
+// ends the lease, so the session it belonged to must go with it. Leaving it
+// open leaked a yamux session, its keepalive goroutines, a watcher, a transport
+// and their descriptors until the publisher happened to disconnect — every
+// `prox down` against a long-lived hub.
+func TestHubDeregister_ClosesTheTunnel(t *testing.T) {
+	h := newTunnelHub(t)
+	key := HubProjectKey("shed", "/home/dev/app")
+	h.mustRegister(t, "shed", "/home/dev/app", map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}})
+	session, _ := attachStubTunnel(t, h, key)
+
+	require.NoError(t, h.client(t).Deregister(DeregisterRequest{
+		Origin:     "shed",
+		ProjectDir: "/home/dev/app",
+		PID:        os.Getpid(),
+	}))
+
+	assert.False(t, h.registry.HasProject(key))
+	assert.Nil(t, h.server.tunnels.get(key), "the session must be out of the manager")
+	require.Eventually(t, session.sess.IsClosed, 5*time.Second, 2*time.Millisecond,
+		"an explicit deregister must close the publisher's tunnel")
+}
+
+// TestHubCollision_TakeoverRollsBackWhenTheNewcomerFails is plan 031 F6: a
+// takeover is failure-atomic.
+//
+// The displaced holders used to be destroyed the moment the collision was
+// resolved — routes removed, rings destroyed, tunnels closed — while the
+// newcomer still had to get through the registry, the cert phase and the
+// listener phase, any of which can fail. A failure there left BOTH sides
+// unpublished: the newcomer rolled back, and the holders it displaced on its
+// way in stayed gone. Now nothing about a loser is final until the newcomer
+// commits.
+func TestHubCollision_TakeoverRollsBackWhenTheNewcomerFails(t *testing.T) {
+	h := newTunnelHub(t)
+	services := map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 3000}}
+
+	holderKey := HubProjectKey("alpha", "/home/dev/app")
+	h.mustRegister(t, "alpha", "/home/dev/app", services)
+	holder, _ := attachStubTunnel(t, h, holderKey)
+	recordInto(h.server, proxy.RequestRecord{
+		ID: "alpha-1", Method: "GET", URL: "/", Hostname: "web." + h.domain, ProjectDir: holderKey,
+	})
+	require.Equal(t, 1, projectCount(h.server, holderKey))
+
+	// The newcomer will displace alpha and then fail in the CERT phase, which is
+	// after the registry commit and before anything is bound.
+	h.certs.failDomain(h.domain)
+
+	_, err := h.client(t).Register(registerBody("beta", "/other/app", services, true))
+	require.Error(t, err, "the newcomer must fail")
+	apiErr := requireAPIError(t, err)
+	assert.Equal(t, "CERT_GENERATION_FAILED", apiErr.Code)
+
+	// The displaced holder is back, in full.
+	assert.True(t, h.registry.HasProject(holderKey), "a displaced holder must be restored when the newcomer fails")
+	route, ok := h.registry.Lookup("web."+h.domain, h.httpsPort)
+	require.True(t, ok, "the holder's route must be serving again")
+	assert.Equal(t, holderKey, route.ProjectDir)
+	assert.False(t, h.registry.HasProject(HubProjectKey("beta", "/other/app")), "the newcomer must not be registered")
+
+	// Its ring survived: rings are destroyed only once the newcomer commits.
+	assert.Equal(t, 1, projectCount(h.server, holderKey), "a restored holder keeps its captured records")
+
+	// And its TUNNEL was never closed, so it is still serving rather than
+	// showing the offline page.
+	assert.False(t, holder.sess.IsClosed(), "a displaced holder's tunnel must survive a failed takeover")
+	assert.Same(t, holder, h.server.tunnels.get(holderKey))
+	lease, ok := h.registry.RemoteLease(holderKey)
+	require.True(t, ok)
+	assert.Equal(t, holder.gen, lease.SessionGen)
+	assert.True(t, lease.DisconnectedAt.IsZero())
+
+	// A successful takeover afterwards still works, and NOW the loser is gone
+	// for good.
+	h.certs.clearFailures()
+	_, err = h.client(t).Register(registerBody("beta", "/other/app", services, true))
+	require.NoError(t, err)
+	assert.False(t, h.registry.HasProject(holderKey))
+	require.Eventually(t, holder.sess.IsClosed, 5*time.Second, 2*time.Millisecond,
+		"a committed takeover closes the loser's tunnel")
+	assert.Equal(t, 0, projectCount(h.server, holderKey), "a committed takeover destroys the loser's ring")
+}
+
+// TestHubCollision_RestoredHolderIsMarkedDisconnectedIfItsTunnelWentAway is the
+// corner of F6 the rollback alone does not cover: the holder's session closed
+// while its registration was briefly out of the registry, so MarkDisconnected
+// found nothing to mark. Restoring the snapshot would otherwise bring back a
+// registration that claims a tunnel nobody holds — connected forever,
+// unserveable and unsweepable. reconcileTunnelLease, run after the lock is
+// released, is what closes it.
+func TestHubCollision_RestoredHolderIsMarkedDisconnectedIfItsTunnelWentAway(t *testing.T) {
+	h := newTunnelHub(t)
+	services := map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 3000}}
+
+	holderKey := HubProjectKey("alpha", "/home/dev/app")
+	h.mustRegister(t, "alpha", "/home/dev/app", services)
+	holder, _ := attachStubTunnel(t, h, holderKey)
+
+	// The session goes away silently, exactly as a close landing inside the
+	// takeover window would: out of the manager, with the registration not
+	// there to be marked.
+	require.True(t, h.server.tunnels.detach(holderKey, holder.gen))
+
+	h.certs.failDomain(h.domain)
+	_, err := h.client(t).Register(registerBody("beta", "/other/app", services, true))
+	require.Error(t, err)
+
+	require.True(t, h.registry.HasProject(holderKey))
+	lease, ok := h.registry.RemoteLease(holderKey)
+	require.True(t, ok)
+	assert.False(t, lease.DisconnectedAt.IsZero(),
+		"a restored holder whose session is gone must read as disconnected, not as permanently connected")
+
+	// Which means it is sweepable again, rather than pinned forever.
+	h.clock.advance(constants.HubDisconnectGrace + time.Second)
+	assert.Len(t, h.registry.ExpiredLeases(), 1)
+}
+
+// newDeafBackend is a TCP backend that accepts a connection, reads whatever
+// arrives, and then does NOTHING: it never writes a response and never closes.
+// It is not a straw man — it is every server that treats a half-close as
+// "the peer is still there" — and it is the exact shape plan 031 F11 is about.
+func newDeafBackend(t *testing.T) (host string, port int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			go func() {
+				// Drain and then hold the connection open forever, answering
+				// nothing — not even to an EOF on the request side.
+				_, _ = io.Copy(io.Discard, conn)
+				select {}
+			}()
+		}
+	}()
+
+	hostStr, portStr, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	p, err := strconv.Atoi(portStr)
+	require.NoError(t, err)
+	return hostStr, p
+}
+
+// TestTunnel_ShutdownForceClosesADeafBackend is plan 031 F11: cancelling a
+// publisher's context must tear its tunnel down even when a backend ignores
+// EOF.
+//
+// runSession waits for every stream goroutine before it returns, and a stream
+// goroutine's response-side copy blocks on a read from the BACKEND — a separate
+// TCP connection that neither cancelling the context nor closing the yamux
+// session interrupts. One such backend was therefore enough to hang `prox down`
+// (and the daemon shutdown behind it) forever. The fix force-closes both
+// endpoints on either stop signal, which is what actually unblocks the copy.
+func TestTunnel_ShutdownForceClosesADeafBackend(t *testing.T) {
+	backendHost, backendPort := newDeafBackend(t)
+
+	h := newTunnelHub(t)
+	services := map[string]ServiceTarget{"web": {Host: backendHost, Port: backendPort}}
+	key, stop := h.startPublisher(t, "shed", "/home/dev/app", services, services)
+
+	// Establish one proxied connection and get the publisher into its copy loop
+	// with the deaf backend on the far end.
+	session := h.server.tunnels.get(key)
+	require.NotNil(t, session)
+	conn, err := session.dial(context.Background(), backendHost, backendPort)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	require.NoError(t, err)
+
+	// Give the publisher a moment to be inside pipeConns rather than still
+	// finishing its handshake; the assertion below does not depend on it, but
+	// without it the test could pass without exercising anything.
+	require.Eventually(t, func() bool {
+		lease, ok := h.registry.RemoteLease(key)
+		return ok && lease.SessionGen == session.gen
+	}, 5*time.Second, 2*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		stop() // cancels the publisher's context and WAITS for RunTunnel to return
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the publisher did not shut down: a backend that ignores EOF blocked its stream copy forever")
+	}
 }

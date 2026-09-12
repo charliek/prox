@@ -192,6 +192,15 @@ const (
 	HubTunnelWriteTimeout      = 10 * time.Second
 	HubTunnelStreamOpenTimeout = 30 * time.Second
 
+	// HubShutdownGrace bounds the GRACEFUL half of stopping a hub control-plane
+	// server — a rebind's replaced server, or `prox hub stop`. When it expires
+	// the server is Closed outright rather than left running (plan 031 F15):
+	// the hub's longest-lived handler is an SSE request subscription a publisher
+	// holds open indefinitely, so Shutdown reliably reaches this bound and
+	// "wait a bit, then give up and leak it" is not a shutdown. Hijacked tunnel
+	// connections are unaffected by either call and survive a rebind.
+	HubShutdownGrace = 5 * time.Second
+
 	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
 	// liveness probes for a single project (#74). When a route's backend
 	// transport fails, the daemon probes the owning `prox up` process's liveness

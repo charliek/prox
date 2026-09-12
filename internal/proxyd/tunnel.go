@@ -48,10 +48,6 @@ const (
 	tunnelReplyErr      = "ERR"
 )
 
-// errNoTunnelSession is the dial failure for a remote route whose publisher has
-// no attached session — the offline case the data plane turns into a 503.
-var errNoTunnelSession = errors.New("no tunnel session for this publisher")
-
 // tunnelYamuxConfig is the yamux configuration BOTH ends run (plan 031 D16).
 //
 // The three tuned values matter for different reasons. KeepAliveInterval and
@@ -216,18 +212,21 @@ type tunnelSession struct {
 // StreamOpenTimeout. Closing it releases the slot as soon as the peer
 // acknowledges, and bounds the damage to StreamOpenTimeout when it never does.
 func (t *tunnelSession) dial(ctx context.Context, host string, port int) (net.Conn, error) {
-	stream, err := t.sess.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("opening a tunnel stream to %s: %w", t.key, err)
-	}
-
-	// The dial deadline is the whole handshake's bound (D16). A caller context
-	// with an earlier deadline wins, so a cancelled request does not wait out
-	// the full budget.
+	// The dial deadline is the whole handshake's bound (D16), and it starts
+	// HERE — before the stream exists — because acquiring the stream is itself
+	// something that can block (see openStream). A caller context with an
+	// earlier deadline wins, so a cancelled request does not wait out the full
+	// budget.
 	deadline := time.Now().Add(t.dialTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
+
+	stream, err := t.openStream(ctx, deadline)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := stream.SetDeadline(deadline); err != nil {
 		_ = stream.Close()
 		return nil, err
@@ -255,6 +254,73 @@ func (t *tunnelSession) dial(ctx context.Context, host string, port int) (net.Co
 		return nil, err
 	}
 	return stream, nil
+}
+
+// openedStream is one result of an OpenStream attempt, carried on a channel so
+// the attempt can be abandoned at a deadline.
+type openedStream struct {
+	stream net.Conn
+	err    error
+}
+
+// openStream acquires a yamux stream under the dial deadline (plan 031 F7).
+//
+// yamux caps INFLIGHT (unACKed) SYNs at AcceptBacklog — 256 — and OpenStream
+// BLOCKS on that budget with no context, no deadline, and no way to give up:
+// `select { case s.synCh <- struct{}{}: case <-s.shutdownCh: }`. Against a
+// frozen publisher (one whose kernel still ACKs but whose process answers
+// nothing) the budget fills, and every caller past the 256th waited inside
+// OpenStream until yamux's StreamOpenTimeout (30s) tore the SESSION down —
+// tenfold HubDialTimeout, and exactly the "requests hang instead of getting a
+// 503" outcome the offline page exists to prevent. Applying the deadline only
+// AFTER OpenStream returned could not see any of that.
+//
+// A plain semaphore in front of OpenStream cannot fix it, which is why this
+// costs a goroutine instead: our slot would have to be held for exactly as long
+// as yamux holds ITS slot, and yamux releases on ACK or full close — neither of
+// which is observable here, and neither of which happens at all for a stream
+// abandoned against a frozen peer. Racing the call against the deadline needs
+// no such accounting.
+//
+// The abandoned attempt is not leaked: the goroutine always finishes (yamux
+// returns ErrSessionShutdown once the session closes, which the session's own
+// StreamOpenTimeout guarantees) and whatever it produces is closed.
+func (t *tunnelSession) openStream(ctx context.Context, deadline time.Time) (net.Conn, error) {
+	ch := make(chan openedStream, 1)
+	go func() {
+		stream, err := t.sess.OpenStream()
+		if err != nil {
+			ch <- openedStream{err: err}
+			return
+		}
+		ch <- openedStream{stream: stream}
+	}()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	select {
+	case got := <-ch:
+		if got.err != nil {
+			return nil, fmt.Errorf("opening a tunnel stream to %s: %w", t.key, got.err)
+		}
+		return got.stream, nil
+	case <-ctx.Done():
+		go discardStream(ch)
+		return nil, fmt.Errorf("opening a tunnel stream to %s: %w", t.key, ctx.Err())
+	case <-timer.C:
+		go discardStream(ch)
+		return nil, fmt.Errorf("timed out acquiring a tunnel stream to %s: the publisher is not acknowledging new streams", t.key)
+	}
+}
+
+// discardStream drains an abandoned openStream attempt and closes whatever it
+// eventually produced, so giving up on the deadline leaks neither the stream
+// nor the goroutine holding it.
+func discardStream(ch <-chan openedStream) {
+	if got := <-ch; got.err == nil {
+		_ = got.stream.Close()
+	}
 }
 
 // close tears the session down and drops any streams the transport pooled.
@@ -394,16 +460,25 @@ func (ts *tunnelSessions) removeAll() []*tunnelSession {
 	return all
 }
 
-// Dial opens a proxied connection to host:port through key's tunnel. It is the
-// data plane's only entry point into the session layer (P5): the session is
-// resolved HERE, by key, never read off the *Route that Registry.Lookup hands
-// the data plane outside the registry lock.
-func (ts *tunnelSessions) Dial(ctx context.Context, key, host string, port int) (net.Conn, error) {
+// TransportFor returns the http.Transport that proxies to key's publisher, and
+// ok=false when no tunnel is attached — which is precisely "the publisher is
+// offline" and is what the data plane turns into the 503 page.
+//
+// It is the data plane's ONLY entry point into the session layer, and it hands
+// back a transport rather than a dialer on purpose (plan 031, the C3+C4 review's
+// reuse gap): there used to be two ways in — a tunnelSessions.Dial that nothing
+// but a test called, and the handler reaching through tunnelSessions.get into
+// the session's transport field. One abstraction is now the rule: the session is
+// resolved HERE, by key (P5 — never read off the *Route the registry hands the
+// data plane outside its lock), and the per-session transport is what callers
+// get, because a transport is what pools keep-alive streams and a bare dial is
+// not.
+func (ts *tunnelSessions) TransportFor(key string) (*http.Transport, bool) {
 	t := ts.get(key)
 	if t == nil {
-		return nil, fmt.Errorf("%w: %s", errNoTunnelSession, key)
+		return nil, false
 	}
-	return t.dial(ctx, host, port)
+	return t.transport, true
 }
 
 // --- the hub's upgrade handler ---
@@ -411,9 +486,13 @@ func (ts *tunnelSessions) Dial(ctx context.Context, key, host string, port int) 
 // handleHubTunnel is POST /api/v1/tunnel on the NETWORK mount (plan 031 §4.3).
 //
 // The key is COMPOSED from the caller's own X-Prox-Origin and
-// X-Prox-Project-Dir, never read from a pre-qualified header (D15). That is the
-// same structural rule the register and deregister handlers follow, and it is
-// why a publisher cannot attach a tunnel to anyone else's registration.
+// X-Prox-Project-Dir, never read from a pre-qualified header (D15) — the same
+// rule the register and deregister handlers follow, with the same two
+// strengths: a publisher cannot attach a tunnel to a LOCAL project's key at all
+// (no composition produces one), and cannot attach to another publisher's BY
+// ACCIDENT. A publisher that deliberately sends another's origin can attach in
+// its place, which is D12's accepted trust model (§8) and wants per-origin
+// credentials rather than a stricter header rule.
 func (s *Server) handleHubTunnel(w http.ResponseWriter, r *http.Request) {
 	if !headerHasToken(r.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), tunnelUpgradeProtocol) {

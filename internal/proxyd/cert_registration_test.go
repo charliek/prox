@@ -54,6 +54,14 @@ func (f *fakeCertManager) failDomain(domain string) {
 	f.failFor[domain] = fmt.Errorf("forced cert failure for %s", domain)
 }
 
+// clearFailures removes every configured EnsureDomain failure, so a test can
+// let a retry succeed after exercising a failure path.
+func (f *fakeCertManager) clearFailures() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failFor = make(map[string]error)
+}
+
 // ensureCount reports how many times EnsureDomain was called for a domain.
 func (f *fakeCertManager) ensureCount(domain string) int {
 	f.mu.Lock()

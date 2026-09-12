@@ -31,6 +31,7 @@ var (
 	hubStartHTTPSPort int
 	hubStartHTTPPort  int
 	hubStartAuth      string
+	hubStartAllowLAN  bool
 	hubStatusJSON     bool
 	hubTokenRotate    bool
 )
@@ -300,18 +301,26 @@ var hubStartCmd = &cobra.Command{
 	Short: "Turn on hub mode in the shared proxy daemon",
 	Long: `Turn on hub mode so other machines can publish through this daemon.
 
-Flags given here are persisted to ~/.prox/hub.yaml and become the defaults for
-later runs; the file is the source of truth. --domain is required the first
-time (no default is guessable) and optional afterwards.
+Flags given here are persisted to ~/.prox/hub.yaml once the daemon has actually
+bound them, and become the defaults for later runs; the file is the source of
+truth. --domain is required the first time (no default is guessable) and
+optional afterwards.
 
-The listen address must be a loopback, private (RFC 1918), tailnet (100.64/10),
-or IPv6 unique-local address -- never 0.0.0.0 or a public address. Use
-'--listen <host>:0' to bind an ephemeral port; the port actually bound is
-printed.
+By default the listen address must be one whose traffic is encrypted end to
+end: loopback, or a tailnet (100.64/10) address. The control plane speaks plain
+HTTP with a shared bearer token, so a plain LAN address (10/8, 172.16/12,
+192.168/16, fc00::/7) needs the explicit --allow-unencrypted-lan. 0.0.0.0, ::,
+and public addresses are refused outright. Use '--listen <host>:0' to bind an
+ephemeral port; the port actually bound is printed.
+
+The hub domain and data-plane ports cannot be changed while publishers are
+registered -- their hostnames and ports were fixed when they registered. Run
+'prox hub stop' first and let the publishers re-register.
 
 Examples:
   prox hub start --domain llt.example.com
   prox hub start --listen 100.82.128.123:8443
+  prox hub start --listen 192.168.1.10:8443 --allow-unencrypted-lan
   prox hub start --auth none`,
 	Args: cobra.NoArgs,
 	RunE: runHubStart,
@@ -327,12 +336,17 @@ type hubStartFlagSet struct {
 	auth      string
 	httpsPort int
 	httpPort  int
+	// allowLAN is --allow-unencrypted-lan (plan 031 F8): the explicit opt-in
+	// that lets the control plane bind a plain RFC 1918 / ULA address instead of
+	// only loopback and tailnet ones.
+	allowLAN bool
 
 	domainSet    bool
 	listenSet    bool
 	authSet      bool
 	httpsPortSet bool
 	httpPortSet  bool
+	allowLANSet  bool
 }
 
 // applyHubStartFlags folds the given flags onto the stored config and returns
@@ -369,6 +383,7 @@ func applyHubStartFlags(cfg proxyd.HubConfig, exists bool, f hubStartFlagSet) (p
 	set(f.authSet, func() { cfg.Auth = f.auth })
 	set(f.httpsPortSet, func() { cfg.HTTPSPort = f.httpsPort })
 	set(f.httpPortSet, func() { cfg.HTTPPort = f.httpPort })
+	set(f.allowLANSet, func() { cfg.AllowUnencryptedLAN = f.allowLAN })
 
 	normalized, err := proxyd.NormalizeHubConfig(cfg)
 	if err != nil {
@@ -399,6 +414,7 @@ func runHubStart(cmd *cobra.Command, args []string) error {
 		auth:      hubStartAuth,
 		httpsPort: hubStartHTTPSPort,
 		httpPort:  hubStartHTTPPort,
+		allowLAN:  hubStartAllowLAN,
 	}
 	if cmd != nil && cmd.Flags() != nil {
 		flags.domainSet = cmd.Flags().Changed("domain")
@@ -406,16 +422,12 @@ func runHubStart(cmd *cobra.Command, args []string) error {
 		flags.authSet = cmd.Flags().Changed("auth")
 		flags.httpsPortSet = cmd.Flags().Changed("https-port")
 		flags.httpPortSet = cmd.Flags().Changed("http-port")
+		flags.allowLANSet = cmd.Flags().Changed("allow-unencrypted-lan")
 	}
 
 	next, changed, err := applyHubStartFlags(cfg, exists, flags)
 	if err != nil {
 		return err
-	}
-	if changed {
-		if err := proxyd.SaveHubConfig(next); err != nil {
-			return fmt.Errorf("saving %s: %w", proxyd.HubConfigPath(), err)
-		}
 	}
 
 	// Generate the token BEFORE asking the daemon to start, so this command can
@@ -433,7 +445,18 @@ func runHubStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("starting the shared proxy daemon: %w", err)
 	}
-	status, err := client.HubStart()
+	// The DAEMON writes hub.yaml, and only after it has bound the config (plan
+	// 031 F13). This command used to save the file first and ask for the bind
+	// afterwards, so a rebind that failed left the previous listener serving
+	// while hub.yaml described an address nothing was listening on — and the
+	// next daemon start would autostart into the broken one. Sending the
+	// proposed config instead makes validate → bind → commit a single operation
+	// on the one side that can actually perform all three.
+	var proposed *proxyd.HubConfig
+	if changed {
+		proposed = &next
+	}
+	status, err := client.HubStart(proposed)
 	if err != nil {
 		return fmt.Errorf("starting hub mode: %w", err)
 	}
@@ -651,6 +674,8 @@ func init() {
 	hubStartCmd.Flags().IntVar(&hubStartHTTPSPort, "https-port", 0, "Data-plane HTTPS port remote routes are published on")
 	hubStartCmd.Flags().IntVar(&hubStartHTTPPort, "http-port", 0, "Data-plane HTTP port remote routes are published on (0 = off)")
 	hubStartCmd.Flags().StringVar(&hubStartAuth, "auth", "", "Control-plane auth: token (default) or none")
+	hubStartCmd.Flags().BoolVar(&hubStartAllowLAN, "allow-unencrypted-lan", false,
+		"Allow a plain private-LAN listen address (10/8, 172.16/12, 192.168/16, fc00::/7); by default only loopback and tailnet (100.64/10) addresses are allowed, because the control plane's bearer token crosses the wire in cleartext")
 	hubHostStatusCmd.Flags().BoolVar(&hubStatusJSON, "json", false, "Output as JSON")
 	hubTokenCmd.Flags().BoolVar(&hubTokenRotate, "rotate", false, "Write a new token and make the running hub accept only it")
 

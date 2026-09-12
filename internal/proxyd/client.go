@@ -417,13 +417,16 @@ func (c *Client) Requests(ctx context.Context, projectKey string, limit int) ([]
 // key works on both mounts (plan 031 D15).
 //
 // On the Unix socket the key IS the project dir and goes out as ?project=. On a
-// hub's network mount the key is the composed "<origin>:<dir>", and the hub
-// refuses to accept a pre-qualified key: it takes ?origin= and ?project= and
-// composes the key itself, which is what makes a publisher structurally unable
-// to name another publisher's — or any local project's — records. So the two
-// halves are split back out here, and only when the key's origin is this
-// client's OWN origin, which by construction it always is (the same two strings
-// built the key and the client).
+// hub's network mount the key is the composed HubProjectKey(origin, dir), and
+// the hub refuses to accept a pre-qualified key: it takes ?origin= and
+// ?project= and composes the key itself. So the two halves are split back out
+// here, and only when the key's origin is this client's OWN origin, which by
+// construction it always is (the same two strings built the key and the
+// client).
+//
+// What that composition buys on the server side is accident-proofing — an
+// honest caller reaches its own records and no caller can name a LOCAL
+// project — not authentication of the origin; see validateHubOrigin.
 func (c *Client) scopedRequestQuery(projectKey string) url.Values {
 	q := url.Values{}
 	if c.origin != "" {
@@ -455,24 +458,28 @@ func (c *Client) Shutdown(force bool) error {
 	return nil
 }
 
-// HubStart asks the daemon to turn hub mode on (or reconfigure it) from
-// ~/.prox/hub.yaml and returns the resulting status, whose Listen is the
-// address actually bound (plan 031 D13/D14). Socket-only: the network mount
-// carries no hub/* routes at all.
-func (c *Client) HubStart() (*HubStatus, error) {
-	return c.hubCall(http.MethodPost, "/api/v1/hub/start")
+// HubStart asks the daemon to turn hub mode on (or reconfigure it) and returns
+// the resulting status, whose Listen is the address actually bound (plan 031
+// D13/D14). Socket-only: the network mount carries no hub/* routes at all.
+//
+// A nil cfg means "start from ~/.prox/hub.yaml as it stands". A non-nil cfg
+// PROPOSES a configuration, and the daemon persists it only after it has bound
+// it (plan 031 F13) — which is why the CLI hands the config over instead of
+// writing the file itself and hoping the bind that follows succeeds.
+func (c *Client) HubStart(cfg *HubConfig) (*HubStatus, error) {
+	return c.hubCall(http.MethodPost, "/api/v1/hub/start", HubStartRequest{Config: cfg})
 }
 
 // HubStop asks the daemon to close the network control plane, drop every remote
 // registration, and re-arm the ordinary empty-daemon shutdown check.
 func (c *Client) HubStop() (*HubStatus, error) {
-	return c.hubCall(http.MethodPost, "/api/v1/hub/stop")
+	return c.hubCall(http.MethodPost, "/api/v1/hub/stop", nil)
 }
 
 // HubStatus returns the hub HOST's view (D20). Enabled is false when hub mode
 // is off; that is a normal answer, not an error.
 func (c *Client) HubStatus() (*HubStatus, error) {
-	return c.hubCall(http.MethodGet, "/api/v1/hub/status")
+	return c.hubCall(http.MethodGet, "/api/v1/hub/status", nil)
 }
 
 // HubRotateToken makes the daemon write a fresh token and accept ONLY it, with
@@ -495,13 +502,13 @@ func (c *Client) HubRotateToken() (*HubTokenResponse, error) {
 
 // hubCall is the shared request/decode body of the three hub/* endpoints that
 // answer with a HubStatus.
-func (c *Client) hubCall(method, path string) (*HubStatus, error) {
+func (c *Client) hubCall(method, path string, body any) (*HubStatus, error) {
 	var resp *http.Response
 	var err error
 	if method == http.MethodGet {
 		resp, err = c.get(path)
 	} else {
-		resp, err = c.post(path, nil)
+		resp, err = c.post(path, body)
 	}
 	if err != nil {
 		return nil, err

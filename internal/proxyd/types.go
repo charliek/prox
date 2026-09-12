@@ -116,10 +116,14 @@ type DeregisterRequest struct {
 	ProjectDir string `json:"project_dir"`
 	PID        int    `json:"pid"`
 	// Origin is the caller's own machine name on the NETWORK mount (plan 031
-	// D15). The hub composes HubProjectKey(origin, project_dir) itself, so a
-	// publisher can only ever deregister its own registration — never another
-	// publisher's, and never a LOCAL project (whose key is a bare dir that no
-	// origin composition can produce). Ignored on the socket mount.
+	// D15). The hub composes HubProjectKey(origin, project_dir) itself, so an
+	// HONEST publisher naming someone else's directory reaches its own key
+	// rather than theirs, and NO caller can name a LOCAL project (whose key
+	// cannot carry the "hub:" prefix every composed key does). What it does not
+	// do is authenticate the origin: it is the caller's claim, checked against
+	// one hub-wide token, so a publisher that deliberately sends another's
+	// origin does reach that registration — the accepted residual of D12/§8.
+	// Ignored on the socket mount.
 	Origin string `json:"origin,omitempty"`
 }
 
@@ -136,7 +140,7 @@ type RouteInfo struct {
 	// LOCAL one (plan 031 D5). It is what `prox proxy routes` renders as the
 	// SOURCE column, and what tells the data plane a route's target lives
 	// through a tunnel rather than on this host. ProjectDir for such a route is
-	// the composed key "<origin>:<dir>".
+	// the composed key HubProjectKey(origin, dir).
 	Origin string `json:"origin,omitempty"`
 	// Connected reports whether the route can currently be served. It is always
 	// true for a local route (the daemon dials the target directly). For a hub
@@ -209,8 +213,8 @@ type HubStatus struct {
 // HubPublisher is one remote registration as the hub operator sees it.
 type HubPublisher struct {
 	// Origin is the publishing machine, ProjectDir the publisher's OWN
-	// directory, and Key the composed registry key "<origin>:<dir>" the hub
-	// actually stores it under (plan 031 D5).
+	// directory, and Key the composed registry key HubProjectKey(origin, dir)
+	// the hub actually stores it under (plan 031 D5).
 	Origin     string `json:"origin"`
 	ProjectDir string `json:"project_dir"`
 	Key        string `json:"key"`
@@ -241,6 +245,17 @@ type HubHolder struct {
 	// the message names a path the user recognizes.
 	ProjectDir string `json:"project_dir"`
 	Connected  bool   `json:"connected"`
+}
+
+// HubStartRequest is the socket POST /api/v1/hub/start body (plan 031 F13).
+//
+// A nil Config means "start from ~/.prox/hub.yaml as it stands" — the no-flags
+// `prox hub start`. A non-nil Config PROPOSES a configuration: the daemon
+// normalizes it, binds it, and only then writes it to hub.yaml, so validate,
+// bind, and commit are one operation and a failed rebind never leaves the file
+// describing an address nothing is listening on.
+type HubStartRequest struct {
+	Config *HubConfig `json:"config,omitempty"`
 }
 
 // HubTokenResponse is the socket POST /api/v1/hub/token (rotate) reply: the

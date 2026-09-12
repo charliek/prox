@@ -2,13 +2,18 @@ package proxyd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -262,40 +267,80 @@ func TestHubRegister_HubOwnsDomainAndPorts(t *testing.T) {
 // DERIVED from the caller's own origin. A publisher that sends an
 // already-qualified dir does not get someone else's key — it gets that string
 // composed under its OWN origin, which is harmless.
+// TestHubRegister_ComposesKeyServerSide pins D15's derivation rule: the key is
+// built from the caller's own origin and directory, and a pre-qualified key on
+// the wire is not merely rejected — it cannot be expressed.
 func TestHubRegister_ComposesKeyServerSide(t *testing.T) {
 	s, base := newHubServer(t, HubConfig{Token: "tok"})
 
 	registerViaHub(t, base, "tok", "popos", "/home/dev/app",
 		map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}})
-	assert.NotNil(t, s.registry.ProjectHostnames("popos:/home/dev/app"))
+	assert.NotNil(t, s.registry.ProjectHostnames(HubProjectKey("popos", "/home/dev/app")))
 	assert.Nil(t, s.registry.ProjectHostnames("/home/dev/app"), "the bare dir must never become a key")
 
 	// A pre-qualified dir cannot smuggle another publisher's key past the
 	// composition: it is simply the second half of this caller's own key.
-	registerViaHub(t, base, "tok", "popos", "mac:/home/other",
+	registerViaHub(t, base, "tok", "popos", "/hub:mac|/home/other",
 		map[string]ServiceTarget{"other": {Host: "localhost", Port: 3100}})
-	assert.NotNil(t, s.registry.ProjectHostnames("popos:mac:/home/other"))
-	assert.Nil(t, s.registry.ProjectHostnames("mac:/home/other"), "a wire-supplied qualified key must never be honored")
+	assert.NotNil(t, s.registry.ProjectHostnames(HubProjectKey("popos", "/hub:mac|/home/other")))
+	assert.Nil(t, s.registry.ProjectHostnames(HubProjectKey("mac", "/home/other")),
+		"a wire-supplied qualified key must never be honored")
 
 	// The routes report the hub-side view: composed PROJECT, publisher ORIGIN.
 	routes := s.registry.AllRoutes()
 	require.NotEmpty(t, routes)
 	for _, r := range routes {
 		assert.Equal(t, "popos", r.Origin)
-		assert.Contains(t, r.ProjectDir, "popos:")
+		assert.True(t, isHubProjectKey(r.ProjectDir))
 	}
 }
 
-// TestHubDeregister_CannotReachAnotherPublisher is D15/P7's first hole: with
-// one shared hub token, publisher A must not be able to deregister publisher B
-// by naming B's directory.
-func TestHubDeregister_CannotReachAnotherPublisher(t *testing.T) {
+// TestSocketRegister_RefusesAHubKeyPrefix is the other half of the F2
+// invariant. Hub keys all begin with "hub:", so a LOCAL registration may not:
+// with both halves in place, "no composition can name a local project" holds
+// for any origin, any directory, and any platform's idea of a path — rather
+// than resting on "a local key is an absolute path", which a Windows-shaped
+// `C:\work\app` would have disproved.
+func TestSocketRegister_RefusesAHubKeyPrefix(t *testing.T) {
+	s := newLifecycleServer()
+
+	req := newTestRequest("hub:popos|/home/dev/app", "local.test",
+		map[string]ServiceTarget{"web": {Host: "localhost", Port: 4000}}, 0, 16443)
+	req.Version = s.version
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/register", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	var er ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &er))
+	assert.Equal(t, "BAD_REQUEST", er.Code)
+	assert.Contains(t, er.Error, "hub:")
+	assert.Nil(t, s.registry.ProjectHostnames("hub:popos|/home/dev/app"))
+}
+
+// TestHubDeregister_KeyCompositionPreventsNamingAnotherPublishersDir is the
+// FIRST of the three composition tests, and its name says exactly what it
+// proves: an HONEST publisher that names someone else's directory reaches its
+// own key, not theirs.
+//
+// It does NOT prove that Alice cannot reach Bob. It cannot: the hub's only
+// credential is one shared bearer token (D6/D12), so nothing on this mount
+// establishes that a caller is the machine it claims to be. What composition
+// buys is that cross-tenant access cannot happen BY ACCIDENT — a stale
+// project_dir, a copied config, a publisher confused about its own identity.
+// The deliberate case is
+// TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation, which
+// demonstrates the forgery succeeding.
+func TestHubDeregister_KeyCompositionPreventsNamingAnotherPublishersDir(t *testing.T) {
 	s, base := newHubServer(t, HubConfig{Token: "tok"})
 
 	registerViaHub(t, base, "tok", "alice", "/home/a/app", map[string]ServiceTarget{"a": {Host: "localhost", Port: 3000}})
 	registerViaHub(t, base, "tok", "bob", "/home/b/app", map[string]ServiceTarget{"b": {Host: "localhost", Port: 3001}})
 
-	// Alice, holding a perfectly valid token, names Bob's directory.
+	// Alice, holding a perfectly valid token and honestly sending her own
+	// origin, names Bob's directory.
 	resp := hubDo(t, http.MethodPost, base+"/api/v1/deregister", "tok", DeregisterRequest{
 		Origin:     "alice",
 		ProjectDir: "/home/b/app",
@@ -303,8 +348,8 @@ func TestHubDeregister_CannotReachAnotherPublisher(t *testing.T) {
 	})
 	require.Equal(t, http.StatusOK, resp.StatusCode, "the call succeeds — it just cannot name Bob")
 
-	assert.NotNil(t, s.registry.ProjectHostnames("bob:/home/b/app"), "Bob's registration must survive")
-	assert.NotNil(t, s.registry.ProjectHostnames("alice:/home/a/app"), "Alice's own registration is untouched too")
+	assert.NotNil(t, s.registry.ProjectHostnames(HubProjectKey("bob", "/home/b/app")), "Bob's registration must survive")
+	assert.NotNil(t, s.registry.ProjectHostnames(HubProjectKey("alice", "/home/a/app")), "Alice's own registration is untouched too")
 
 	// And Alice deregistering her OWN project works, so the endpoint is not
 	// simply broken.
@@ -314,15 +359,78 @@ func TestHubDeregister_CannotReachAnotherPublisher(t *testing.T) {
 		PID:        os.Getpid(),
 	})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Nil(t, s.registry.ProjectHostnames("alice:/home/a/app"))
-	assert.NotNil(t, s.registry.ProjectHostnames("bob:/home/b/app"))
+	assert.Nil(t, s.registry.ProjectHostnames(HubProjectKey("alice", "/home/a/app")))
+	assert.NotNil(t, s.registry.ProjectHostnames(HubProjectKey("bob", "/home/b/app")))
 }
 
-// TestHubDeregister_CannotReachALocalProject is D15/P7's second hole, and the
-// structural one: a local project's key is a BARE directory, and no
-// "<origin>:<dir>" composition can produce that shape — with any origin, and
-// with any dir the publisher can send.
-func TestHubDeregister_CannotReachALocalProject(t *testing.T) {
+// TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation
+// demonstrates the hole the three composition tests do NOT close, so that no
+// future reader mistakes what the guarantee is.
+//
+// The hub authenticates ONE shared bearer token and takes the origin from the
+// caller. A publisher holding that token can therefore send another
+// publisher's origin and address their registration: deregister it, read its
+// captured traffic, or attach a tunnel in its place. Below, Alice does exactly
+// that to Bob, and it WORKS — which is what this test asserts.
+//
+// This is the accepted posture of plan 031 D12/§8, not an oversight: publishers
+// on one hub are declared mutually trusted, and the hub token is the trust
+// boundary. The panel proposed an opaque per-registration lease ID returned by
+// register and required on tunnel and deregister; it was declined for v1 as a
+// scope increase against a threat the trust model does not include. Closing it
+// properly needs PER-ORIGIN CREDENTIALS — each publisher holding its own
+// secret, so the origin is proven rather than claimed — at which point this
+// test should start failing and be replaced by one asserting a 401/403.
+//
+// Until then, "cross-tenant access is impossible" is false and must not be
+// written anywhere: what is true is "impossible by accident, impossible by
+// composition". The F8 default (bind only loopback and tailnet addresses)
+// shrinks the exposure by keeping the token off wires strangers share; it does
+// not remove it for anyone already holding the token.
+func TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok"})
+
+	registerViaHub(t, base, "tok", "bob", "/home/b/app", map[string]ServiceTarget{"b": {Host: "localhost", Port: 3001}})
+	bobKey := HubProjectKey("bob", "/home/b/app")
+	recordInto(s, proxy.RequestRecord{
+		ID: "bob-secret-1", Method: "POST", URL: "/login",
+		Hostname: "b.llt.test", ProjectDir: bobKey,
+	})
+	require.Equal(t, 1, projectCount(s, bobKey))
+
+	// Alice holds the shared token and simply CLAIMS to be Bob.
+	t.Run("reads Bob's captured traffic", func(t *testing.T) {
+		resp := hubDo(t, http.MethodGet,
+			base+"/api/v1/requests?origin=bob&project=%2Fhome%2Fb%2Fapp&limit=100", "tok", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var result struct {
+			Requests []proxy.RequestRecord `json:"requests"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Len(t, result.Requests, 1,
+			"KNOWN LIMITATION (D12/§8): a forged origin reads another publisher's records")
+		assert.Equal(t, "bob-secret-1", result.Requests[0].ID)
+	})
+
+	t.Run("deregisters Bob", func(t *testing.T) {
+		resp := hubDo(t, http.MethodPost, base+"/api/v1/deregister", "tok", DeregisterRequest{
+			Origin:     "bob",
+			ProjectDir: "/home/b/app",
+			PID:        os.Getpid(),
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Nil(t, s.registry.ProjectHostnames(bobKey),
+			"KNOWN LIMITATION (D12/§8): a forged origin deregisters another publisher")
+	})
+}
+
+// TestHubDeregister_KeyCompositionCannotProduceALocalKey is the STRUCTURAL one
+// of the three, and the only one that holds against a hostile caller as well as
+// an honest one: a local project's key can never be produced by any
+// "<origin>|<dir>" composition, because every composed key carries the "hub:"
+// prefix and the socket mount refuses a project_dir that does. Forging an
+// origin does not help — there is no origin that composes to a local key.
+func TestHubDeregister_KeyCompositionCannotProduceALocalKey(t *testing.T) {
 	s, base := newHubServer(t, HubConfig{Token: "tok"})
 
 	// A local registration, exactly as `prox up` on the hub host makes it.
@@ -331,12 +439,14 @@ func TestHubDeregister_CannotReachALocalProject(t *testing.T) {
 	require.NoError(t, err)
 
 	// Every shape a publisher could try, including one that "looks like" the
-	// local key and one that tries to escape the composition.
+	// local key, one that tries to escape the composition, and one that forges
+	// an origin — the attack the other two tests do not stop.
 	attempts := []struct{ origin, dir string }{
 		{"popos", "/home/dev/local-project"},
-		{"popos", "local-project"},
-		{"popos", ":/home/dev/local-project"},
-		{"popos", "popos:/home/dev/local-project"},
+		{"popos", "/local-project"},
+		{"popos", "/hub:popos|/home/dev/local-project"},
+		{"hub", "/home/dev/local-project"},
+		{"", "/home/dev/local-project"},
 	}
 	for _, a := range attempts {
 		resp := hubDo(t, http.MethodPost, base+"/api/v1/deregister", "tok", DeregisterRequest{
@@ -344,20 +454,25 @@ func TestHubDeregister_CannotReachALocalProject(t *testing.T) {
 			ProjectDir: a.dir,
 			PID:        os.Getpid(),
 		})
-		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		// Either a 400 (a malformed origin) or a 200 that named the caller's own
+		// non-existent key. Never a removal.
 		assert.NotNil(t, s.registry.ProjectHostnames("/home/dev/local-project"),
-			"local project must survive deregister attempt %q/%q", a.origin, a.dir)
+			"local project must survive deregister attempt %q/%q (status %d)", a.origin, a.dir, resp.StatusCode)
 	}
 
 	_, ok := s.registry.Lookup("web.local.test", 16443)
 	assert.True(t, ok, "the local route must still be serving")
 }
 
-// TestHubRequests_ScopedToCallerOrigin is D15/P7's third hole: captured request
-// bodies are the most sensitive thing the daemon holds, and one shared token
-// must not turn them into a shared inbox. Asking for another publisher's dir
-// yields the caller's OWN (empty) ring.
-func TestHubRequests_ScopedToCallerOrigin(t *testing.T) {
+// TestHubRequests_KeyCompositionScopesToTheCallersOwnOrigin is the third
+// composition test. Captured request bodies are the most sensitive thing the
+// daemon holds, and an HONEST publisher asking for another publisher's dir gets
+// its OWN (empty) ring rather than theirs.
+//
+// As with the deregister case, this is about accidents, not about a hostile
+// caller: see TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation
+// for what a publisher that lies about its origin can still read.
+func TestHubRequests_KeyCompositionScopesToTheCallersOwnOrigin(t *testing.T) {
 	s, base := newHubServer(t, HubConfig{Token: "tok"})
 
 	registerViaHub(t, base, "tok", "alice", "/home/a/app", map[string]ServiceTarget{"a": {Host: "localhost", Port: 3000}})
@@ -365,14 +480,15 @@ func TestHubRequests_ScopedToCallerOrigin(t *testing.T) {
 
 	// Bob's traffic, in Bob's ring (keyed by the composed key, as the hub
 	// registers it).
+	bobKey := HubProjectKey("bob", "/home/b/app")
 	recordInto(s, proxy.RequestRecord{
 		ID: "bob-secret-1", Method: "POST", URL: "/login",
-		Hostname: "b.llt.test", ProjectDir: "bob:/home/b/app",
+		Hostname: "b.llt.test", ProjectDir: bobKey,
 	})
-	require.Equal(t, 1, projectCount(s, "bob:/home/b/app"))
+	require.Equal(t, 1, projectCount(s, bobKey))
 
 	t.Run("snapshot", func(t *testing.T) {
-		// Alice asks for Bob's dir.
+		// Alice asks for Bob's dir under her own origin.
 		resp := hubDo(t, http.MethodGet,
 			base+"/api/v1/requests?origin=alice&project=%2Fhome%2Fb%2Fapp&limit=100", "tok", nil)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -397,8 +513,8 @@ func TestHubRequests_ScopedToCallerOrigin(t *testing.T) {
 		defer resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		// The composed key "alice:/home/b/app" has no ring, so the stream ends
-		// cleanly right after the preamble instead of delivering Bob's events.
+		// The composed key has no ring, so the stream ends cleanly right after
+		// the preamble instead of delivering Bob's events.
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		assert.NotContains(t, string(body), "bob-secret-1")
@@ -728,7 +844,7 @@ func TestHubStatus_ReportsPublishersAndIsAbsentWhenOff(t *testing.T) {
 	require.Len(t, status.Publishers, 1)
 	assert.Equal(t, "popos", status.Publishers[0].Origin)
 	assert.Equal(t, "/home/dev/app", status.Publishers[0].ProjectDir)
-	assert.Equal(t, "popos:/home/dev/app", status.Publishers[0].Key)
+	assert.Equal(t, HubProjectKey("popos", "/home/dev/app"), status.Publishers[0].Key)
 	assert.Equal(t, 1, status.Publishers[0].Routes)
 
 	// Daemon status carries the same object while hub mode is on...
@@ -816,4 +932,493 @@ func freeLoopbackAddr(t *testing.T) string {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 	return addr
+}
+
+// TestHubRegister_BoundsAndValidatesTheBody is plan 031 F9: the network mount
+// takes JSON from another machine, so it applies the same naming and target
+// rules internal/config applies to a project's own prox.yaml — plus the bounds
+// a local config file never needed.
+func TestHubRegister_BoundsAndValidatesTheBody(t *testing.T) {
+	_, base := newHubServer(t, HubConfig{Token: "tok"})
+
+	badRequests := []struct {
+		name string
+		req  RegisterRequest
+	}{
+		{
+			name: "service name is not a DNS label",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"not a label": {Host: "localhost", Port: 3000}}),
+		},
+		{
+			name: "service name is a wildcard",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"*": {Host: "localhost", Port: 3000}}),
+		},
+		{
+			name: "service name traverses",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"../evil": {Host: "localhost", Port: 3000}}),
+		},
+		{
+			name: "target host is not a host",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"app": {Host: "not a host!", Port: 3000}}),
+		},
+		{
+			name: "target port is out of range",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"app": {Host: "localhost", Port: 70000}}),
+		},
+		{
+			name: "target port is zero",
+			req: hubRegisterRequest("popos", "/home/dev/app",
+				map[string]ServiceTarget{"app": {Host: "localhost", Port: 0}}),
+		},
+		{
+			name: "no services at all",
+			req:  hubRegisterRequest("popos", "/home/dev/app", map[string]ServiceTarget{}),
+		},
+		{
+			name: "relative project dir",
+			req: hubRegisterRequest("popos", "app",
+				map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}}),
+		},
+		{
+			name: "windows-shaped project dir",
+			req: hubRegisterRequest("popos", `C:\work\app`,
+				map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}}),
+		},
+	}
+	for _, tt := range badRequests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := hubDo(t, http.MethodPost, base+"/api/v1/register", "tok", tt.req)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "BAD_REQUEST", errorCode(t, resp))
+		})
+	}
+
+	t.Run("too many services", func(t *testing.T) {
+		services := make(map[string]ServiceTarget, hubMaxServices+1)
+		for i := 0; i <= hubMaxServices; i++ {
+			services[fmt.Sprintf("svc-%d", i)] = ServiceTarget{Host: "localhost", Port: 3000}
+		}
+		resp := hubDo(t, http.MethodPost, base+"/api/v1/register", "tok",
+			hubRegisterRequest("popos", "/home/dev/app", services))
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "BAD_REQUEST", errorCode(t, resp))
+	})
+
+	t.Run("an oversized body is refused rather than buffered", func(t *testing.T) {
+		// A body far past maxControlRequestBytes. MaxBytesReader fails the
+		// decode partway rather than reading it all into memory.
+		var buf bytes.Buffer
+		buf.WriteString(`{"project_dir":"/home/dev/`)
+		buf.WriteString(strings.Repeat("a", maxControlRequestBytes+1024))
+		buf.WriteString(`"}`)
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/register", bytes.NewReader(buf.Bytes()))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := hubClient().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("trailing JSON is refused", func(t *testing.T) {
+		// Two objects in one body: the first must not be quietly registered
+		// while the second is silently discarded.
+		first, err := json.Marshal(hubRegisterRequest("popos", "/home/dev/app",
+			map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}}))
+		require.NoError(t, err)
+		body := append(append([]byte{}, first...), first...)
+
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/register", bytes.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := hubClient().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "BAD_REQUEST", errorCode(t, resp))
+	})
+
+	t.Run("a well-formed registration still succeeds", func(t *testing.T) {
+		registerViaHub(t, base, "tok", "popos", "/home/dev/app",
+			map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}})
+	})
+}
+
+// TestHubRegister_CannotLowerTheCaptureDiskBudget is the cross-tenant half of
+// F9, and the reason that finding is not merely hygiene.
+//
+// The capture disk budget is not per-project: EffectiveCaptureDiskBudget folds
+// every capture-enabled project's value into ONE daemon-wide minimum for the
+// hub host's single capture dir. A remote registration asking for a tiny budget
+// would therefore start evicting every OTHER project's captured bodies on a
+// machine the publisher does not own — reachable by a publisher that is
+// supposed to be able to touch nothing but its own registration.
+func TestHubRegister_CannotLowerTheCaptureDiskBudget(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok"})
+
+	// A local project on the hub host that opted every capture-enabled project
+	// up to 4 GiB.
+	local := newTestRequest("/home/dev/local", "local.test",
+		map[string]ServiceTarget{"web": {Host: "localhost", Port: 4000}}, 0, 16443)
+	local.CaptureEnabled = true
+	local.DiskBudget = 4 << 30
+	_, _, err := s.registry.Register(local)
+	require.NoError(t, err)
+	require.Equal(t, int64(4<<30), s.registry.EffectiveCaptureDiskBudget())
+
+	// A publisher tries to pull the daemon-wide bound down to 1 MiB.
+	hostile := hubRegisterRequest("popos", "/home/dev/app",
+		map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}})
+	hostile.CaptureEnabled = true
+	hostile.DiskBudget = 1 << 20
+	resp := hubDo(t, http.MethodPost, base+"/api/v1/register", "tok", hostile)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the registration itself is fine — only its budget claim is ignored")
+
+	assert.Equal(t, int64(4<<30), s.registry.EffectiveCaptureDiskBudget(),
+		"a remote registration must not move the hub host's capture disk budget")
+
+	// Belt and braces: the stored registration carries no budget at all, so even
+	// a future accountant that forgot to skip remote registrations reads zero
+	// (i.e. "the default") rather than the publisher's number.
+	publishers := s.registry.RemotePublishers()
+	require.Len(t, publishers, 1)
+	snap, ok := s.registry.snapshotProject(publishers[0].Key)
+	require.True(t, ok)
+	assert.Equal(t, int64(0), snap.proj.DiskBudget)
+}
+
+// TestHubCaptureForwarding_EndToEndOverTheHubMount is plan 031 F12's regression
+// test: a legitimate hub publisher must be able to read and stream its OWN
+// captured requests through the hub's network mount.
+//
+// The bug it guards against was a functional one, not a hardening nit. The
+// network capture endpoints require origin AND project and compose the key
+// themselves (D15), but the forwarder sent the already-composed key as
+// `project` alone — so every hub publisher got a 400 and its TUI stayed empty
+// forever. C5's Client.scopedRequestQuery splits the key back into its two
+// halves for a hub client; this exercises BOTH callers of it (the snapshot and
+// the SSE subscription) against a real hub mount, since the split lives in one
+// place precisely so both can rely on it.
+func TestHubCaptureForwarding_EndToEndOverTheHubMount(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok"})
+
+	const (
+		origin = "popos"
+		dir    = "/home/dev/app"
+	)
+	key := HubProjectKey(origin, dir)
+
+	client, err := NewHubClient(base, "tok", origin)
+	require.NoError(t, err)
+	_, err = client.Register(hubRegisterRequest(origin, dir,
+		map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}}))
+	require.NoError(t, err)
+
+	// A record captured on the HUB, keyed as the hub registered the project.
+	recordInto(s, proxy.RequestRecord{
+		ID: "hub-1", Method: "GET", URL: "/one", Hostname: "app.llt.test", ProjectDir: key,
+	})
+
+	t.Run("snapshot", func(t *testing.T) {
+		// The publisher asks with the COMPOSED key, exactly as the forwarder
+		// does; the client splits it into origin+project for this mount.
+		records, err := client.Requests(context.Background(), key, 100)
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+		assert.Equal(t, "hub-1", records[0].ID)
+	})
+
+	t.Run("stream and backfill through the forwarder", func(t *testing.T) {
+		localRM := proxy.NewRequestManager(100)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ForwardRequestsWithClient(ctx, client, key, localRM, nil, nil)
+		}()
+
+		// The backfill snapshot brings the existing record across...
+		require.Eventually(t, func() bool {
+			return len(localRM.Recent(proxy.RequestFilter{})) == 1
+		}, 10*time.Second, 5*time.Millisecond, "the hub backfill must reach the publisher's local ring")
+
+		// ...and a record captured afterwards arrives over the SSE stream.
+		recordInto(s, proxy.RequestRecord{
+			ID: "hub-2", Method: "POST", URL: "/two", Hostname: "app.llt.test", ProjectDir: key,
+		})
+		require.Eventually(t, func() bool {
+			for _, r := range localRM.Recent(proxy.RequestFilter{}) {
+				if r.ID == "hub-2" {
+					return true
+				}
+			}
+			return false
+		}, 10*time.Second, 5*time.Millisecond, "the hub request stream must reach the publisher's local ring")
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the forwarder did not stop")
+		}
+	})
+
+	t.Run("a socket client's bare key still works on the socket mount", func(t *testing.T) {
+		// The other half of the contract: the SAME method with no origin on the
+		// client sends ?project=<key> as it always did, so the socket mount is
+		// untouched.
+		socket := NewClient("")
+		q := socket.scopedRequestQuery("/home/dev/local")
+		assert.Equal(t, "/home/dev/local", q.Get("project"))
+		assert.Empty(t, q.Get("origin"))
+
+		// And a hub client asked for a key that is not its own falls back to the
+		// unsplit form rather than silently addressing someone else.
+		q = client.scopedRequestQuery(HubProjectKey("someone-else", dir))
+		assert.Empty(t, q.Get("origin"))
+	})
+}
+
+// hubStartWithConfig posts a hub/start carrying a proposed config, the way
+// `prox hub start` with flags does.
+func hubStartWithConfig(t *testing.T, s *Server, cfg HubConfig) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(HubStartRequest{Config: &cfg})
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/hub/start", bytes.NewReader(body)))
+	return rec
+}
+
+// TestHubStart_CommitsTheConfigOnlyAfterBinding is plan 031 F13: validate,
+// bind, and commit are ONE operation, performed by the daemon.
+//
+// `prox hub start` used to write ~/.prox/hub.yaml and then ask the daemon to
+// bind it. A rebind that failed therefore left the old listener serving while
+// the file described an address nothing was listening on — and the next daemon
+// start would autostart into that broken config. The file must only ever
+// describe something the daemon has actually bound.
+func TestHubStart_CommitsTheConfigOnlyAfterBinding(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newLifecycleServer()
+	t.Cleanup(s.StopHub)
+
+	good := HubConfig{Domain: "llt.test", Listen: "127.0.0.1:0", HTTPSPort: 16443, Auth: HubAuthToken}
+	rec := hubStartWithConfig(t, s, good)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	bound := s.HubListenAddr()
+
+	stored, err := LoadHubConfig()
+	require.NoError(t, err, "a successful start writes the file")
+	assert.Equal(t, "llt.test", stored.Domain)
+	assert.Equal(t, 16443, stored.HTTPSPort)
+	assert.Empty(t, stored.Token, "the token is never written into hub.yaml")
+
+	t.Run("a refused config is not written", func(t *testing.T) {
+		bad := good
+		bad.Listen = "0.0.0.0:8443"
+		rec := hubStartWithConfig(t, s, bad)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, "HUB_CONFIG_INVALID", errorCodeFromRecorder(t, rec))
+
+		after, err := LoadHubConfig()
+		require.NoError(t, err)
+		assert.Equal(t, "127.0.0.1:0", after.Listen, "a refused config must not reach hub.yaml")
+		assert.Equal(t, bound, s.HubListenAddr(), "and the running hub must be untouched")
+	})
+
+	t.Run("a config that cannot bind is not written", func(t *testing.T) {
+		blocker, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer blocker.Close()
+
+		occupied := good
+		occupied.Listen = blocker.Addr().String()
+		rec := hubStartWithConfig(t, s, occupied)
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.Equal(t, "HUB_BIND_FAILED", errorCodeFromRecorder(t, rec))
+
+		after, err := LoadHubConfig()
+		require.NoError(t, err)
+		assert.Equal(t, "127.0.0.1:0", after.Listen,
+			"a config the daemon could not bind must not be left in hub.yaml for the next autostart to pick up")
+		assert.Equal(t, bound, s.HubListenAddr(), "the previous listener keeps serving")
+	})
+}
+
+// TestStartHub_RefusesDomainOrPortChangeWithPublishers is the other half of F13.
+//
+// Domain and the data-plane ports are baked into every remote route when it
+// registers (D4): the hostname is "<service>.<domain>" and the route is keyed by
+// "<hostname>:<port>". Swapping them under a live publisher would leave the
+// routes on the old values while `prox hub status` reported the new ones —
+// status describing a configuration the routes do not use. The chosen arm is
+// REJECT, with a message that says what to do instead.
+func TestStartHub_RefusesDomainOrPortChangeWithPublishers(t *testing.T) {
+	s, base := newHubServer(t, HubConfig{Token: "tok", Domain: "llt.test", HTTPSPort: 16443})
+	registerViaHub(t, base, "tok", "popos", "/home/dev/app",
+		map[string]ServiceTarget{"app": {Host: "localhost", Port: 3000}})
+
+	current := s.hubConfigSnapshot().cfg
+
+	t.Run("domain change is refused", func(t *testing.T) {
+		next := current
+		next.Domain = "other.test"
+		err := s.StartHub(next)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "publisher(s) are registered")
+		assert.Contains(t, err.Error(), "prox hub stop")
+		assert.Equal(t, "llt.test", s.hubStatus().Domain, "status must keep reporting what the routes use")
+	})
+
+	t.Run("port change is refused", func(t *testing.T) {
+		next := current
+		next.HTTPSPort = 17443
+		err := s.StartHub(next)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "publisher(s) are registered")
+	})
+
+	t.Run("a listen-address change is still allowed", func(t *testing.T) {
+		// The listen address appears in no route, so moving the control plane
+		// does not invalidate anything a publisher registered.
+		next := current
+		next.Listen = "127.0.0.1:0"
+		require.NoError(t, s.StartHub(next))
+		assert.True(t, s.registry.HasProject(HubProjectKey("popos", "/home/dev/app")))
+	})
+
+	t.Run("and the change is allowed once the publishers are gone", func(t *testing.T) {
+		s.removeProject(HubProjectKey("popos", "/home/dev/app"))
+		next := s.hubConfigSnapshot().cfg
+		next.Domain = "other.test"
+		require.NoError(t, s.StartHub(next))
+		assert.Equal(t, "other.test", s.hubStatus().Domain)
+	})
+}
+
+// TestHubLifecycle_StartDoesNotOverwriteAConcurrentRotation is plan 031 F14.
+//
+// `hub start` reads the token, binds a listener, and writes the token into the
+// running hub's state — a read-modify-write with I/O in the middle. Without one
+// lifecycle mutex over start/stop/rotate, a rotation landing inside that window
+// was silently overwritten with the pre-rotation value, so a credential the
+// operator had just revoked kept working. The invariant asserted here is the
+// one that matters: whatever the interleaving, the token the hub ACCEPTS is the
+// token on disk.
+func TestHubLifecycle_StartDoesNotOverwriteAConcurrentRotation(t *testing.T) {
+	s, _ := newHubServer(t, HubConfig{Token: ""}) // real token, from the token file
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			cfg := s.hubConfigSnapshot().cfg
+			cfg.Token = "" // as `prox hub start` sends it: the daemon resolves the token
+			_ = s.StartHub(cfg)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			rec := httptest.NewRecorder()
+			s.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/hub/token", nil))
+		}
+	}()
+	wg.Wait()
+
+	onDisk, err := ReadHubToken()
+	require.NoError(t, err)
+
+	base := "http://" + s.HubListenAddr()
+	resp := hubDo(t, http.MethodGet, base+"/api/v1/routes", onDisk, nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"the hub must accept the token that is on disk, whatever order start and rotate ran in")
+}
+
+// TestHubRebind_ClosesTheReplacedServerAndKeepsTunnels is plan 031 F15.
+//
+// A rebind shuts the replaced server down gracefully, and graceful means
+// "waits for in-flight handlers" — which for this mount includes an SSE
+// subscription a publisher holds open indefinitely. The Shutdown therefore
+// reliably times out, and discarding that error left the replaced server's
+// handlers and connections alive for as long as the subscriber cared to hold
+// them. Close ends them.
+//
+// The second half is what must NOT break: net/http neither tracks nor closes
+// HIJACKED connections in Shutdown or Close, so the yamux tunnels attached
+// through the replaced server survive the rebind — a publisher does not have to
+// reconnect because the operator moved the control plane.
+func TestHubRebind_ClosesTheReplacedServerAndKeepsTunnels(t *testing.T) {
+	h := newTunnelHub(t)
+	backendHost, backendPort := newTestBackend(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "still here")
+	})
+	services := map[string]ServiceTarget{"web": {Host: backendHost, Port: backendPort}}
+	key, _ := h.startPublisher(t, "shed", "/home/dev/app", services, services)
+	session := h.server.tunnels.get(key)
+	require.NotNil(t, session)
+
+	// A long-lived SSE subscription against the CURRENT control plane, which is
+	// exactly what makes the replaced server's graceful shutdown time out.
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet,
+		h.baseURL+"/api/v1/requests/stream?origin=shed&project=%2Fhome%2Fdev%2Fapp", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	streamClient := &http.Client{}
+	streamResp, err := streamClient.Do(req)
+	require.NoError(t, err)
+	defer streamResp.Body.Close()
+	require.Equal(t, http.StatusOK, streamResp.StatusCode)
+
+	// Rebind the control plane onto a new ephemeral port.
+	oldAddr := h.server.HubListenAddr()
+	cfg := h.server.hubConfigSnapshot().cfg
+	// A concrete port, not ":0": the running hub's CONFIGURED address is
+	// "127.0.0.1:0", and StartHub treats an unchanged configured address as a
+	// reconfigure-in-place rather than a rebind.
+	cfg.Listen = net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t)))
+	start := time.Now()
+	require.NoError(t, h.server.StartHub(cfg))
+	newAddr := h.server.HubListenAddr()
+	require.NotEqual(t, oldAddr, newAddr)
+
+	// The replaced server's shutdown is bounded and then forced, so the SSE
+	// handler's connection ends rather than living on.
+	buf := make([]byte, 256)
+	require.Eventually(t, func() bool {
+		_, rerr := streamResp.Body.Read(buf)
+		return rerr != nil
+	}, constants.HubShutdownGrace+10*time.Second, 100*time.Millisecond,
+		"the replaced server must eventually Close its handlers rather than leaking them")
+	assert.Less(t, time.Since(start), constants.HubShutdownGrace+15*time.Second)
+
+	// And the tunnel attached through the replaced server is untouched: same
+	// session, still serving.
+	assert.Same(t, session, h.server.tunnels.get(key), "a rebind must not drop an attached tunnel")
+	assert.False(t, session.sess.IsClosed())
+	status, body, _ := h.get(t, h.httpsClient(), "web", "/")
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "still here", body)
+}
+
+// errorCodeFromRecorder decodes an ErrorResponse recorded by an httptest
+// recorder and returns its Code.
+func errorCodeFromRecorder(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var er ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &er))
+	return er.Code
 }

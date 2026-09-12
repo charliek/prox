@@ -40,19 +40,27 @@ const (
 // reaches the registry (D4), so hostnames are always <service>.<hub domain> and
 // the hub host alone decides which ports it exposes.
 type HubConfig struct {
-	Domain    string `yaml:"domain"`
-	Listen    string `yaml:"listen"`
-	HTTPSPort int    `yaml:"https_port"`
-	HTTPPort  int    `yaml:"http_port"`
-	Auth      string `yaml:"auth"`
-	Autostart bool   `yaml:"autostart"`
+	Domain    string `yaml:"domain" json:"domain"`
+	Listen    string `yaml:"listen" json:"listen"`
+	HTTPSPort int    `yaml:"https_port" json:"https_port"`
+	HTTPPort  int    `yaml:"http_port" json:"http_port"`
+	Auth      string `yaml:"auth" json:"auth"`
+	Autostart bool   `yaml:"autostart" json:"autostart"`
+	// AllowUnencryptedLAN opts the listen address out of the encrypted-transport
+	// default (plan 031 D6 as amended by F8). Without it the hub binds only
+	// loopback and tailnet (100.64/10) addresses, whose traffic is encrypted end
+	// to end; with it the plain private ranges (10/8, 172.16/12, 192.168/16,
+	// fc00::/7) are accepted too, and the operator has taken responsibility for a
+	// bearer token crossing a wire other people can read. Public and unspecified
+	// addresses are refused either way.
+	AllowUnencryptedLAN bool `yaml:"allow_unencrypted_lan" json:"allow_unencrypted_lan"`
 
 	// Token is the bearer credential the network mount checks. It is NEVER
 	// serialized into hub.yaml — it lives in its own 0600 file
 	// (~/.prox/hub.token) so the config can be read, diffed, and edited without
 	// handling a secret. StartHub fills it from EnsureHubToken when auth is
 	// "token" and the caller left it empty; tests pass it explicitly.
-	Token string `yaml:"-"`
+	Token string `yaml:"-" json:"-"`
 }
 
 // HubConfigPath returns ~/.prox/hub.yaml.
@@ -65,6 +73,21 @@ func HubTokenPath() string {
 	return filepath.Join(DaemonDir(), HubTokenFileName)
 }
 
+// Hub registry-key composition (plan 031 D5/D15, hardened per F2).
+const (
+	// hubKeyPrefix begins EVERY composed hub key and can begin no local one.
+	// That is the whole invariant: the socket register handler refuses a
+	// project_dir starting with this prefix (see handleRegister), so the local
+	// key space and the hub key space are disjoint by construction rather than
+	// by an argument about what a path can look like.
+	hubKeyPrefix = "hub:"
+	// hubKeySeparator separates the origin from the publisher's directory. An
+	// origin may not contain it (validateHubOrigin), so the FIRST occurrence is
+	// always the separator and the split is exact even for a directory that
+	// contains one.
+	hubKeySeparator = "|"
+)
+
 // HubProjectKey composes the registry key for a remote registration from the
 // caller's OWN origin and project dir (plan 031 D5/D15).
 //
@@ -74,15 +97,27 @@ func HubTokenPath() string {
 //
 //   - It is DERIVED, never accepted from the wire. A network handler builds the
 //     key from the authenticated caller's own identity, so a publisher can only
-//     ever address its own registrations.
-//   - A composed key can never collide with a LOCAL one. validateHubOrigin
-//     rejects an origin containing "/" or ":", so "<origin>:<dir>" always
-//     begins with a non-"/" label followed by ":" — a shape no absolute project
-//     directory (the local key form) can take. That is why "a publisher cannot
-//     deregister a local project" is structural rather than a check someone can
-//     forget to write.
+//     ever address its own registrations BY ACCIDENT-PROOF COMPOSITION. (It is
+//     not an authentication boundary: see the note on validateHubOrigin.)
+//   - A composed key can never collide with a LOCAL one. Every composed key
+//     starts with hubKeyPrefix, and the socket mount refuses any project_dir
+//     that starts with it, so no local registration can ever be named by a
+//     composition — with any origin and any directory a publisher can send.
+//
+// The earlier form joined with ":" and leaned on "a local key is an absolute
+// path", which a Windows-shaped local key (`C:\work\app` = origin "C" + dir
+// `\work\app`) would have defeated. Windows is not a build target here, but the
+// prefix plus validateHubProjectDir's slash-absolute rule makes the claim an
+// invariant rather than a platform coincidence (plan 031 F2).
 func HubProjectKey(origin, dir string) string {
-	return origin + ":" + dir
+	return hubKeyPrefix + origin + hubKeySeparator + dir
+}
+
+// isHubProjectKey reports whether key was produced by HubProjectKey. It is the
+// socket mount's guard: a local project_dir carrying this prefix is refused, so
+// the two key spaces stay disjoint.
+func isHubProjectKey(key string) bool {
+	return strings.HasPrefix(key, hubKeyPrefix)
 }
 
 // splitHubProjectKey is HubProjectKey's inverse, used by the publisher's tunnel
@@ -93,11 +128,13 @@ func HubProjectKey(origin, dir string) string {
 // the §8 "the publisher must use the key consistently" risk structural: the
 // tunnel headers and the registered key are the same two strings by
 // construction, so the hub's own composition of the key is guaranteed to
-// reproduce the one the register call created. The split is exact because
-// validateHubOrigin forbids ":" in an origin, so the FIRST ":" is always the
-// separator.
+// reproduce the one the register call created.
 func splitHubProjectKey(key string) (origin, dir string, ok bool) {
-	origin, dir, found := strings.Cut(key, ":")
+	rest, found := strings.CutPrefix(key, hubKeyPrefix)
+	if !found {
+		return "", "", false
+	}
+	origin, dir, found = strings.Cut(rest, hubKeySeparator)
 	if !found || origin == "" || dir == "" {
 		return "", "", false
 	}
@@ -106,16 +143,27 @@ func splitHubProjectKey(key string) (origin, dir string, ok bool) {
 
 // hubKeyProjectDir recovers the publisher's OWN directory from a composed key,
 // for display (`prox hub status`). It is exact by construction: HubProjectKey
-// joins with the single ":" that an origin may not itself contain.
+// joins with the single separator that an origin may not itself contain.
 func hubKeyProjectDir(origin, key string) string {
-	return strings.TrimPrefix(key, origin+":")
+	return strings.TrimPrefix(key, hubKeyPrefix+origin+hubKeySeparator)
 }
 
 // validateHubOrigin checks a publisher-supplied origin before it is composed
 // into a registry key (plan 031 D15). An origin is a machine name: non-empty,
 // bounded like a hostname, and free of the separators that would let one
-// publisher's composed key impersonate another key shape — "/" (absolute dirs,
-// i.e. local keys) and ":" (the composition separator itself).
+// publisher's composed key take another key's shape — "/" (directories), ":"
+// (the key prefix) and the key separator itself.
+//
+// WHAT THIS IS NOT. The origin is the caller's own CLAIM, and the hub's only
+// credential is one shared bearer token (D6/D12), so nothing here proves a
+// publisher is the machine it says it is. Composition makes cross-tenant access
+// impossible BY ACCIDENT — a publisher naming someone else's directory reaches
+// its own key, not theirs — and that is all it makes impossible. A publisher
+// that deliberately sends another publisher's origin reaches that publisher's
+// registration, which is the accepted residual risk in the plan's §8 (and is
+// demonstrated, deliberately, by
+// TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation). Closing it
+// needs per-origin credentials, not a stricter string rule.
 func validateHubOrigin(origin string) error {
 	if origin == "" {
 		return errors.New("origin is required on the hub control plane")
@@ -123,12 +171,42 @@ func validateHubOrigin(origin string) error {
 	if len(origin) > 253 {
 		return errors.New("origin is too long (max 253 characters)")
 	}
-	if strings.ContainsAny(origin, ":/") {
-		return errors.New(`origin must not contain ":" or "/"`)
+	if strings.ContainsAny(origin, ":/"+hubKeySeparator) {
+		return fmt.Errorf(`origin must not contain ":", "/" or %q`, hubKeySeparator)
 	}
 	for _, r := range origin {
 		if r <= ' ' || r == 0x7f {
 			return errors.New("origin must not contain whitespace or control characters")
+		}
+	}
+	return nil
+}
+
+// hubProjectDirMaxBytes bounds a publisher-supplied project directory. Linux
+// caps a path at PATH_MAX (4096) and every other platform is smaller, so this
+// rejects nothing real while refusing a megabyte of "directory" as a registry
+// key, a ring key, and a log line (plan 031 F9).
+const hubProjectDirMaxBytes = 4096
+
+// validateHubProjectDir checks the directory half of a composed key (plan 031
+// F2/F9). It must be SLASH-ABSOLUTE: that is what makes "<origin>|<dir>" a
+// shape no local key can take on any platform, rather than one that happens to
+// differ on the platforms prox is built for today. A Windows-shaped path
+// (`C:\work\app`) is refused here, which is the point — not because Windows is
+// a target, but because the invariant must not depend on it never becoming one.
+func validateHubProjectDir(dir string) error {
+	if dir == "" {
+		return errors.New("project_dir is required")
+	}
+	if len(dir) > hubProjectDirMaxBytes {
+		return fmt.Errorf("project_dir is too long (max %d bytes)", hubProjectDirMaxBytes)
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return fmt.Errorf("project_dir must be an absolute path beginning with %q, got %q", "/", dir)
+	}
+	for _, r := range dir {
+		if r < ' ' || r == 0x7f {
+			return errors.New("project_dir must not contain control characters")
 		}
 	}
 	return nil
@@ -267,47 +345,72 @@ func ReadHubToken() (string, error) {
 // in the TUI.
 var hubFileWriter = domain.AtomicWriter{TempPattern: ".prox-hub-*.tmp"}
 
-// isPrivateListenAddr reports whether ip is an address the hub control plane
-// may bind (plan 031 D6): loopback (127.0.0.0/8, ::1), RFC 1918 private IPv4
-// (10/8, 172.16/12, 192.168/16), CGNAT 100.64/10 (the range Tailscale assigns),
-// or IPv6 unique-local fc00::/7.
+// hubListenClass classifies an address the hub control plane might bind (plan
+// 031 D6, amended by F8).
 //
-// Everything else is refused, and the two refusals that matter most are the
-// UNSPECIFIED addresses 0.0.0.0 and :: — the dangerous typo, since they bind
-// every interface including a public one. A public address is refused outright:
-// the control plane speaks plain HTTP in v1 and is protected by a shared bearer
-// token, so exposing it beyond a private network would be a real vulnerability
-// rather than an inconvenience.
-func isPrivateListenAddr(ip net.IP) bool {
+// The amendment is the important part. D6 originally allowed any RFC 1918
+// address, but the control plane speaks PLAIN HTTP with a shared bearer token:
+// on an arbitrary LAN — a café, a hotel, a co-working 192.168/16 — a passive
+// peer can lift that token off the wire and then exercise every hole the trust
+// model already accepts (a forged origin reaches another publisher's
+// registration; see validateHubOrigin). So the classes are:
+//
+//   - ENCRYPTED: loopback (127.0.0.0/8, ::1) and CGNAT 100.64/10, the range
+//     Tailscale assigns. Loopback never leaves the machine, and a tailnet
+//     address is reachable only over WireGuard, so the token is never in
+//     cleartext on a wire a stranger shares. These are the DEFAULT.
+//   - UNENCRYPTED LAN: 10/8, 172.16/12, 192.168/16, fc00::/7. Still supported,
+//     but only with an explicit opt-in (hub.yaml `allow_unencrypted_lan: true`
+//     or `prox hub start --allow-unencrypted-lan`), because "private" is not
+//     "confidential".
+//   - REFUSED: everything else, including the UNSPECIFIED addresses 0.0.0.0 and
+//     :: — the dangerous typo, since they bind every interface including a
+//     public one — and any public address. No flag opts into those.
+type hubListenClass int
+
+const (
+	hubListenRefused hubListenClass = iota
+	hubListenEncrypted
+	hubListenUnencryptedLAN
+)
+
+func classifyHubListenAddr(ip net.IP) hubListenClass {
 	if ip == nil {
-		return false
+		return hubListenRefused
 	}
 	// 0.0.0.0 and :: first: both would otherwise fall through to the
 	// per-family checks, and neither is a place to put this endpoint.
 	if ip.IsUnspecified() {
-		return false
+		return hubListenRefused
 	}
 	if ip.IsLoopback() {
-		return true
+		return hubListenEncrypted
 	}
 	if v4 := ip.To4(); v4 != nil {
 		switch {
-		case v4[0] == 10:
-			return true // 10.0.0.0/8
-		case v4[0] == 172 && v4[1]&0xf0 == 16:
-			return true // 172.16.0.0/12
-		case v4[0] == 192 && v4[1] == 168:
-			return true // 192.168.0.0/16
 		case v4[0] == 100 && v4[1]&0xc0 == 64:
-			return true // 100.64.0.0/10 (CGNAT / tailnet)
+			return hubListenEncrypted // 100.64.0.0/10 (CGNAT / tailnet)
+		case v4[0] == 10:
+			return hubListenUnencryptedLAN // 10.0.0.0/8
+		case v4[0] == 172 && v4[1]&0xf0 == 16:
+			return hubListenUnencryptedLAN // 172.16.0.0/12
+		case v4[0] == 192 && v4[1] == 168:
+			return hubListenUnencryptedLAN // 192.168.0.0/16
 		default:
-			return false
+			return hubListenRefused
 		}
 	}
 	if v6 := ip.To16(); v6 != nil && v6[0]&0xfe == 0xfc {
-		return true // fc00::/7 (IPv6 unique-local)
+		return hubListenUnencryptedLAN // fc00::/7 (IPv6 unique-local)
 	}
-	return false
+	return hubListenRefused
+}
+
+// isPrivateListenAddr reports whether ip is bindable at all — under the default
+// rules or with the LAN opt-in. Used where only "could this ever be a listen
+// address" matters (address discovery and the advice text).
+func isPrivateListenAddr(ip net.IP) bool {
+	return classifyHubListenAddr(ip) != hubListenRefused
 }
 
 // DefaultHubListenAddr returns the address a first `prox hub start` should use
@@ -355,12 +458,16 @@ func localPrivateAddrs() []net.IP {
 	return append(cgnat, other...)
 }
 
-// validateHubListenAddr checks a configured listen address against D6's rule
-// and returns the normalized "host:port" form. A host with no port gets
-// HubDefaultPort. The refusal names this machine's OWN private/tailnet
-// addresses, because "that address is not allowed" without saying which one to
-// use instead is an error a user cannot act on.
-func validateHubListenAddr(addr string) (string, error) {
+// validateHubListenAddr checks a configured listen address against D6's rule as
+// amended by F8 and returns the normalized "host:port" form. A host with no
+// port gets HubDefaultPort. allowUnencryptedLAN is the explicit opt-in that
+// admits the plain RFC 1918 / ULA ranges.
+//
+// Both refusals name what to do instead, because "that address is not allowed"
+// without an alternative is an error a user cannot act on — and the LAN refusal
+// additionally says WHY, since an operator who just typed their own 192.168
+// address deserves better than a rule quoted back at them.
+func validateHubListenAddr(addr string, allowUnencryptedLAN bool) (string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		// No port: accept the bare host and supply the default port.
@@ -376,18 +483,48 @@ func validateHubListenAddr(addr string) (string, error) {
 	if ip == nil {
 		return "", hubConfigErrorf("listen address %q must be a literal IP address, not a hostname: %s", addr, hubListenAdvice())
 	}
-	if !isPrivateListenAddr(ip) {
+	switch classifyHubListenAddr(ip) {
+	case hubListenEncrypted:
+	case hubListenUnencryptedLAN:
+		if !allowUnencryptedLAN {
+			return "", hubConfigErrorf("listen address %q is a plain LAN address: %s", addr, hubLANAdvice())
+		}
+	default:
 		return "", hubConfigErrorf("listen address %q is not allowed: %s", addr, hubListenAdvice())
 	}
 	return net.JoinHostPort(ip.String(), port), nil
+}
+
+// hubLANAdvice explains the F8 refusal: why a private LAN address is not
+// enough, and the two ways forward.
+func hubLANAdvice() string {
+	var b strings.Builder
+	b.WriteString("the hub control plane speaks plain HTTP and authenticates with one shared bearer token,")
+	b.WriteString(" so anyone else on that LAN can read the token off the wire and then publish, deregister,")
+	b.WriteString(" or read another publisher's captured traffic as that publisher.")
+	b.WriteString(" By default the hub binds only addresses whose transport is encrypted end to end:")
+	b.WriteString(" loopback, or a tailnet (100.64/10) address.")
+	if addrs := localEncryptedAddrs(); len(addrs) > 0 {
+		b.WriteString(" This machine's tailnet address: ")
+		b.WriteString(addrs[0].String())
+		b.WriteString(" — try --listen ")
+		b.WriteString(net.JoinHostPort(addrs[0].String(), strconv.Itoa(constants.HubDefaultPort)))
+		b.WriteString(".")
+	}
+	b.WriteString(" If this LAN really is trusted, opt in explicitly with")
+	b.WriteString(" 'prox hub start --allow-unencrypted-lan' (or allow_unencrypted_lan: true in ")
+	b.WriteString(HubConfigFileName)
+	b.WriteString(").")
+	return b.String()
 }
 
 // hubListenAdvice is the actionable half of a refused-listen-address error: the
 // rule, and the addresses on THIS machine that satisfy it.
 func hubListenAdvice() string {
 	var b strings.Builder
-	b.WriteString("the hub control plane must bind a loopback, private (10/8, 172.16/12, 192.168/16), tailnet (100.64/10), or IPv6 unique-local (fc00::/7) address")
-	b.WriteString(" — never 0.0.0.0, ::, or a public address")
+	b.WriteString("the hub control plane must bind a loopback or tailnet (100.64/10) address")
+	b.WriteString(", or — with --allow-unencrypted-lan — a private one (10/8, 172.16/12, 192.168/16, fc00::/7)")
+	b.WriteString("; never 0.0.0.0, ::, or a public address")
 	addrs := localPrivateAddrs()
 	if len(addrs) == 0 {
 		b.WriteString(". This machine has no private address besides loopback; try --listen 127.0.0.1:")
@@ -403,6 +540,18 @@ func hubListenAdvice() string {
 	b.WriteString(" — try --listen ")
 	b.WriteString(net.JoinHostPort(addrs[0].String(), strconv.Itoa(constants.HubDefaultPort)))
 	return b.String()
+}
+
+// localEncryptedAddrs returns this machine's tailnet (CGNAT) addresses — the
+// non-loopback ones the hub may bind with no opt-in.
+func localEncryptedAddrs() []net.IP {
+	var out []net.IP
+	for _, ip := range localPrivateAddrs() {
+		if classifyHubListenAddr(ip) == hubListenEncrypted {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // hubConfigError marks a hub CONFIGURATION defect — a missing domain, a bad
@@ -428,6 +577,12 @@ func NormalizeHubConfig(cfg HubConfig) (HubConfig, error) {
 	if cfg.Domain == "" {
 		return HubConfig{}, hubConfigErrorf("hub domain is required (prox hub start --domain <domain>)")
 	}
+	// The same domain rule internal/config applies to proxy.domain (plan 031
+	// F9): every remote hostname is "<service>.<this>", so a domain that is not
+	// a DNS name produces routes and certificate names nobody can reach.
+	if err := domain.ValidateDomainName(cfg.Domain); err != nil {
+		return HubConfig{}, hubConfigErrorf("hub domain: %s", err.Error())
+	}
 
 	switch cfg.Auth {
 	case "":
@@ -441,7 +596,7 @@ func NormalizeHubConfig(cfg HubConfig) (HubConfig, error) {
 		addr, _ := DefaultHubListenAddr()
 		cfg.Listen = addr
 	}
-	listen, err := validateHubListenAddr(strings.TrimSpace(cfg.Listen))
+	listen, err := validateHubListenAddr(strings.TrimSpace(cfg.Listen), cfg.AllowUnencryptedLAN)
 	if err != nil {
 		return HubConfig{}, err
 	}

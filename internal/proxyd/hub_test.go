@@ -11,46 +11,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIsPrivateListenAddr pins plan 031 D6's listen-address rule with literal
-// addresses, because CI never sees a tailnet and the rule is the only thing
-// standing between a typo and a plain-HTTP control plane on the public
-// internet. The two unspecified addresses are the cases that matter most:
-// binding 0.0.0.0 or :: would expose the hub on EVERY interface, which is
-// exactly the mistake the rule exists to catch.
-func TestIsPrivateListenAddr(t *testing.T) {
+// TestClassifyHubListenAddr pins plan 031 D6's listen-address rule as amended
+// by F8, with literal addresses, because CI never sees a tailnet and the rule is
+// the only thing standing between a typo and a plain-HTTP control plane on the
+// public internet.
+//
+// Three classes, not two. ENCRYPTED (loopback and CGNAT) is the default because
+// neither carries the bearer token across a wire a stranger can read. The plain
+// private ranges are UNENCRYPTED LAN: still usable, but only with an explicit
+// opt-in, since "RFC 1918" describes an address space and not a confidentiality
+// boundary — a café LAN is 192.168/16. The two unspecified addresses are the
+// cases that matter most: binding 0.0.0.0 or :: would expose the hub on EVERY
+// interface, and no flag opts into that.
+func TestClassifyHubListenAddr(t *testing.T) {
 	tests := []struct {
-		name  string
-		addr  string
-		allow bool
+		name string
+		addr string
+		want hubListenClass
 	}{
-		{"loopback v4", "127.0.0.1", true},
-		{"loopback v4 elsewhere in /8", "127.9.9.9", true},
-		{"loopback v6", "::1", true},
-		{"rfc1918 10/8", "10.1.2.3", true},
-		{"rfc1918 172.16/12 low", "172.16.0.1", true},
-		{"rfc1918 172.16/12 high", "172.31.255.254", true},
-		{"rfc1918 192.168/16", "192.168.1.5", true},
-		{"cgnat 100.64/10 low", "100.64.0.1", true},
-		{"cgnat 100.64/10 tailnet", "100.82.128.123", true},
-		{"cgnat 100.64/10 high", "100.127.255.254", true},
-		{"ipv6 unique-local fc00::/7", "fd12:3456:789a::1", true},
-		{"ipv6 unique-local fc range", "fc00::1", true},
+		{"loopback v4", "127.0.0.1", hubListenEncrypted},
+		{"loopback v4 elsewhere in /8", "127.9.9.9", hubListenEncrypted},
+		{"loopback v6", "::1", hubListenEncrypted},
+		{"cgnat 100.64/10 low", "100.64.0.1", hubListenEncrypted},
+		{"cgnat 100.64/10 tailnet", "100.82.128.123", hubListenEncrypted},
+		{"cgnat 100.64/10 high", "100.127.255.254", hubListenEncrypted},
 
-		{"unspecified v4", "0.0.0.0", false},
-		{"unspecified v6", "::", false},
-		{"public v4", "93.184.216.34", false},
-		{"public v6", "2606:2800:220:1:248:1893:25c8:1946", false},
-		{"just outside 172.16/12", "172.32.0.1", false},
-		{"just outside cgnat", "100.128.0.1", false},
-		{"ipv4 link-local", "169.254.1.1", false},
-		{"ipv6 link-local", "fe80::1", false},
+		{"rfc1918 10/8", "10.1.2.3", hubListenUnencryptedLAN},
+		{"rfc1918 172.16/12 low", "172.16.0.1", hubListenUnencryptedLAN},
+		{"rfc1918 172.16/12 high", "172.31.255.254", hubListenUnencryptedLAN},
+		{"rfc1918 192.168/16", "192.168.1.5", hubListenUnencryptedLAN},
+		{"ipv6 unique-local fc00::/7", "fd12:3456:789a::1", hubListenUnencryptedLAN},
+		{"ipv6 unique-local fc range", "fc00::1", hubListenUnencryptedLAN},
+
+		{"unspecified v4", "0.0.0.0", hubListenRefused},
+		{"unspecified v6", "::", hubListenRefused},
+		{"public v4", "93.184.216.34", hubListenRefused},
+		{"public v6", "2606:2800:220:1:248:1893:25c8:1946", hubListenRefused},
+		{"just outside 172.16/12", "172.32.0.1", hubListenRefused},
+		{"just outside cgnat", "100.128.0.1", hubListenRefused},
+		{"ipv4 link-local", "169.254.1.1", hubListenRefused},
+		{"ipv6 link-local", "fe80::1", hubListenRefused},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ip := net.ParseIP(tt.addr)
 			require.NotNil(t, ip, "test address must parse")
-			assert.Equal(t, tt.allow, isPrivateListenAddr(ip))
+			assert.Equal(t, tt.want, classifyHubListenAddr(ip))
+			assert.Equal(t, tt.want != hubListenRefused, isPrivateListenAddr(ip))
 		})
 	}
 }
@@ -61,19 +69,19 @@ func TestIsPrivateListenAddr(t *testing.T) {
 // is rejected because the rule can only be evaluated on a literal IP.
 func TestValidateHubListenAddr(t *testing.T) {
 	t.Run("adds the default port to a bare host", func(t *testing.T) {
-		got, err := validateHubListenAddr("127.0.0.1")
+		got, err := validateHubListenAddr("127.0.0.1", false)
 		require.NoError(t, err)
 		assert.Equal(t, "127.0.0.1:8443", got)
 	})
 
 	t.Run("keeps an explicit port, including 0", func(t *testing.T) {
-		got, err := validateHubListenAddr("10.0.0.5:0")
+		got, err := validateHubListenAddr("100.64.1.2:0", false)
 		require.NoError(t, err)
-		assert.Equal(t, "10.0.0.5:0", got)
+		assert.Equal(t, "100.64.1.2:0", got)
 	})
 
 	t.Run("refuses 0.0.0.0 with advice", func(t *testing.T) {
-		_, err := validateHubListenAddr("0.0.0.0:8443")
+		_, err := validateHubListenAddr("0.0.0.0:8443", false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not allowed")
 		assert.Contains(t, err.Error(), "never 0.0.0.0")
@@ -81,36 +89,124 @@ func TestValidateHubListenAddr(t *testing.T) {
 		assert.Contains(t, err.Error(), "--listen ")
 	})
 
+	t.Run("refuses 0.0.0.0 even with the LAN opt-in", func(t *testing.T) {
+		// The opt-in is about ENCRYPTION, not about relaxing the rule: an
+		// unspecified or public address is refused with or without it.
+		for _, addr := range []string{"0.0.0.0:8443", "[::]:8443", "93.184.216.34:8443"} {
+			_, err := validateHubListenAddr(addr, true)
+			require.Error(t, err, addr)
+			assert.Contains(t, err.Error(), "not allowed", addr)
+		}
+	})
+
 	t.Run("refuses a public address", func(t *testing.T) {
-		_, err := validateHubListenAddr("93.184.216.34:8443")
+		_, err := validateHubListenAddr("93.184.216.34:8443", false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not allowed")
 	})
 
 	t.Run("refuses a hostname", func(t *testing.T) {
-		_, err := validateHubListenAddr("hub.example.com:8443")
+		_, err := validateHubListenAddr("hub.example.com:8443", false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "literal IP")
 	})
+
+	// Plan 031 F8: the plain private ranges need the opt-in, and the refusal has
+	// to explain WHY (a cleartext bearer token on a shared wire) and HOW to
+	// proceed, not just quote the rule back at the operator.
+	t.Run("refuses a plain LAN address by default, explaining why", func(t *testing.T) {
+		for _, addr := range []string{"10.0.0.5:8443", "172.16.4.4:8443", "192.168.1.10:8443", "[fd00::1]:8443"} {
+			_, err := validateHubListenAddr(addr, false)
+			require.Error(t, err, addr)
+			assert.Contains(t, err.Error(), "plain LAN address", addr)
+			assert.Contains(t, err.Error(), "bearer token", addr)
+			assert.Contains(t, err.Error(), "--allow-unencrypted-lan", addr)
+		}
+	})
+
+	t.Run("accepts a plain LAN address with the opt-in", func(t *testing.T) {
+		got, err := validateHubListenAddr("192.168.1.10:8443", true)
+		require.NoError(t, err)
+		assert.Equal(t, "192.168.1.10:8443", got)
+	})
 }
 
-// TestHubProjectKey_CannotNameALocalProject is the structural half of D15: a
-// composed key and a local key are different SHAPES, so no origin/dir pair a
-// publisher can send composes to a local project's bare directory. This is what
-// makes "a publisher cannot deregister a local project" a property rather than
-// a check.
+// TestHubProjectKey_CannotNameALocalProject is the structural half of D15, as
+// hardened by F2: a composed key and a local key are different SHAPES, so no
+// origin/dir pair a publisher can send composes to a local project's key. This
+// is what makes "a publisher cannot deregister a local project" a property
+// rather than a check.
+//
+// The invariant is now the hub: prefix on one side and the socket mount's
+// refusal of that prefix on the other (see
+// TestSocketRegister_RefusesAHubKeyPrefix), which is why the WINDOWS-shaped
+// cases below matter even though Windows is not a build target. The previous
+// composition joined with ":" and leaned on "a local key is an absolute path";
+// a local key of `C:\work\app` is reproducible as origin "C" + dir `\work\app`
+// under that rule, and would have been a real cross-tenant hole on the day
+// anyone built for Windows.
 func TestHubProjectKey_CannotNameALocalProject(t *testing.T) {
-	localKeys := []string{"/home/dev/project", "/", "/srv/app-1"}
+	localKeys := []string{
+		"/home/dev/project", "/", "/srv/app-1",
+		// Windows-shaped local keys (plan 031 F2). Not reachable on a build
+		// target today; the point is that the invariant does not depend on that.
+		`C:\work\app`, `C:\`, `D:\src\api`,
+	}
 
-	for _, origin := range []string{"mac", "popos", "shed-1"} {
-		for _, dir := range []string{"/home/dev/project", "/", "/srv/app-1", "relative"} {
+	origins := []string{"mac", "popos", "shed-1", "C", "D", "hub"}
+	dirs := []string{"/home/dev/project", "/", "/srv/app-1", `\work\app`, `\`, "relative", "hub:/x"}
+
+	for _, origin := range origins {
+		for _, dir := range dirs {
 			key := HubProjectKey(origin, dir)
 			for _, local := range localKeys {
 				assert.NotEqual(t, local, key, "composed key must never equal a local project key")
 			}
-			assert.True(t, strings.HasPrefix(key, origin+":"))
+			assert.True(t, isHubProjectKey(key), "every composed key is recognizable as one")
 			assert.Equal(t, dir, hubKeyProjectDir(origin, key))
+
+			gotOrigin, gotDir, ok := splitHubProjectKey(key)
+			require.True(t, ok, "a composed key must split back")
+			assert.Equal(t, origin, gotOrigin)
+			assert.Equal(t, dir, gotDir)
 		}
+	}
+
+	// A local key never splits as a hub key, whatever shape it has.
+	for _, local := range localKeys {
+		_, _, ok := splitHubProjectKey(local)
+		assert.False(t, ok, "a local key %q must not parse as a hub key", local)
+	}
+}
+
+// TestValidateHubProjectDir pins the slash-absolute rule the key invariant
+// rests on (plan 031 F2) and the bounds F9 adds.
+func TestValidateHubProjectDir(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  string
+		ok   bool
+	}{
+		{"absolute posix path", "/home/dev/app", true},
+		{"root", "/", true},
+		{"path containing the key separator", "/home/dev/a|b", true},
+		{"empty", "", false},
+		{"relative", "app", false},
+		{"windows drive path", `C:\work\app`, false},
+		{"windows unc path", `\\server\share`, false},
+		{"contains NUL", "/home/dev/\x00app", false},
+		{"contains newline", "/home/dev/a\nb", false},
+		{"too long", "/" + strings.Repeat("a", hubProjectDirMaxBytes), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHubProjectDir(tt.dir)
+			if tt.ok {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
 	}
 }
 
@@ -128,6 +224,7 @@ func TestValidateHubOrigin(t *testing.T) {
 		{"empty", "", false},
 		{"contains colon", "mac:/home/dev", false},
 		{"contains slash", "/home/dev", false},
+		{"contains the key separator", "mac|other", false},
 		{"contains space", "my machine", false},
 		{"contains newline", "mac\nother", false},
 		{"too long", strings.Repeat("a", 254), false},

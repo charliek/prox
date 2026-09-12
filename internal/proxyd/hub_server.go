@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -68,6 +71,90 @@ func (s *Server) newHubRouter() *chi.Mux {
 	return r
 }
 
+// Bounds on what one control-plane request may assert (plan 031 F9). The
+// network mount takes JSON from another machine, so "decode whatever arrives"
+// is a memory-exhaustion hole and a registry full of megabyte-long strings is
+// a log, status, and route table nobody can read.
+const (
+	// maxControlRequestBytes caps a control-plane JSON body. A register request
+	// with the service cap below is a few kilobytes; 1 MiB is generous.
+	maxControlRequestBytes = 1 << 20
+	// hubMaxServices caps the service names one registration may claim. Each
+	// one becomes a hostname, a route, and (for HTTPS) an SNI name on this
+	// machine's listeners.
+	hubMaxServices = 64
+)
+
+// decodeControlJSON reads exactly one JSON value from a bounded request body.
+//
+// Two rules beyond a plain Decode (plan 031 F9): the body is capped with
+// http.MaxBytesReader so an unbounded upload cannot be buffered into memory,
+// and TRAILING data is rejected — a body of "{...}{...}" must not quietly
+// register the first object and discard whatever the second one was trying to
+// say. The same shape Client.Requests already applies to responses.
+func decodeControlJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlRequestBytes))
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing data after the JSON body")
+	}
+	return nil
+}
+
+// validateHubRegistration applies to a NETWORK registration the same naming and
+// target rules internal/config applies to a project's own prox.yaml (plan 031
+// F9), through the one shared implementation in internal/domain.
+//
+// The socket mount can lean on the CLI having validated the config it is about
+// to send; the network mount cannot lean on anything. Without this, a remote
+// publisher could register a service named "*" or "../x" (a hostname the route
+// table and the cert manager were never meant to see), a target host that is
+// not a host at all, or ten thousand services.
+func validateHubRegistration(req RegisterRequest) error {
+	if err := validateHubProjectDir(req.ProjectDir); err != nil {
+		return err
+	}
+	if req.PID <= 0 {
+		return errors.New("pid must be a positive process id")
+	}
+	if len(req.Services) == 0 {
+		return errors.New("at least one service is required")
+	}
+	if len(req.Services) > hubMaxServices {
+		return fmt.Errorf("too many services: %d (max %d)", len(req.Services), hubMaxServices)
+	}
+	for _, name := range sortedKeys(req.Services) {
+		target := req.Services[name]
+		if err := domain.ValidateServiceName(name); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
+		}
+		if err := domain.ValidateHost(target.Host); err != nil {
+			return fmt.Errorf("service %q host: %w", name, err)
+		}
+		if err := domain.ValidatePort(target.Port); err != nil {
+			return fmt.Errorf("service %q port: %w", name, err)
+		}
+	}
+	if req.MaxBodySize < 0 {
+		return fmt.Errorf("max_body_size must not be negative, got %d", req.MaxBodySize)
+	}
+	return nil
+}
+
+// sortedKeys returns a map's keys in sorted order, so a validation failure over
+// a map reports the same offender every time rather than whichever one Go's
+// randomized iteration reached first.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // hubAuthMiddleware enforces the bearer token on every network-mount route it
 // wraps (/health is registered outside it). Token comparison is
 // constant-time: a byte-by-byte early exit would leak the token one character
@@ -118,12 +205,18 @@ func bearerCredential(header string) string {
 //  2. origin is validated and the registry key is COMPOSED here from the
 //     caller's own origin and dir (D5/D15). A pre-qualified key on the wire is
 //     not merely rejected: it cannot be expressed, because project_dir is only
-//     ever used as the second half of the composition.
+//     ever used as the second half of the composition. This scopes an HONEST
+//     caller to its own registrations and puts every local project out of
+//     reach entirely; it does not authenticate the origin (validateHubOrigin).
+//     The body is also bounded and validated (F9) with the same service-name,
+//     target and port rules internal/config applies to a local prox.yaml, plus
+//     a size cap and a service-count cap, because nothing upstream of this
+//     mount has checked anything.
 //  3. domain and both data-plane ports are overwritten from hub.yaml (D4) — the
 //     hub owns the hostnames it publishes and the ports it exposes.
 func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeControlJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: fmt.Sprintf("invalid request body: %v", err),
 			Code:  "BAD_REQUEST",
@@ -151,18 +244,8 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error(), Code: "BAD_REQUEST"})
 		return
 	}
-	if req.ProjectDir == "" {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "project_dir is required",
-			Code:  "BAD_REQUEST",
-		})
-		return
-	}
-	if req.PID <= 0 {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "pid must be a positive process id",
-			Code:  "BAD_REQUEST",
-		})
+	if err := validateHubRegistration(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error(), Code: "BAD_REQUEST"})
 		return
 	}
 	if s.registry == nil {
@@ -190,6 +273,17 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	req.HTTPSPort = cfg.cfg.HTTPSPort
 	req.HTTPPort = cfg.cfg.HTTPPort
 
+	// The capture DISK BUDGET is the hub host's own disk and none of a
+	// publisher's business (plan 031 F9). It is not a per-project setting at
+	// all: EffectiveCaptureDiskBudget folds every capture-enabled project's
+	// value into ONE daemon-wide minimum, so an accepted remote registration
+	// asking for 1 MiB would start evicting every other project's captured
+	// bodies on this machine — a genuine cross-tenant effect from a publisher
+	// that is only supposed to be able to touch its own registration. Cleared
+	// here, and remote registrations are skipped by the accountant as well
+	// (Registry.EffectiveCaptureDiskBudget), so neither half can be forgotten.
+	req.DiskBudget = 0
+
 	// D5/D15: the key is derived, never accepted. From here down, ProjectDir IS
 	// the composed key — the registry, the per-project ring, the request
 	// filters, and the publisher's own later deregister all use the same value.
@@ -214,13 +308,22 @@ func (s *Server) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHubDeregister is the network mount's deregister (plan 031 §4.3, D15).
-// It composes the key from the CALLER's origin, which is what makes the
-// authorization structural: a publisher cannot name another publisher's
-// registration (a different origin composes a different key), and cannot name a
-// LOCAL project at all (a local key is a bare dir; no composition produces one).
+// It composes the key from the CALLER's origin, which gives two different
+// strengths of guarantee, and the difference matters:
+//
+//   - Against a LOCAL project, the guarantee is structural and holds against a
+//     hostile caller: every composed key carries the "hub:" prefix, the socket
+//     mount refuses a project_dir that does, so no origin/dir pair composes to
+//     a local key.
+//   - Against ANOTHER PUBLISHER, the guarantee is only that it cannot happen by
+//     accident: a different origin composes a different key, but the origin is
+//     the caller's own claim and the hub holds one shared token, so a publisher
+//     that deliberately sends another's origin reaches their registration.
+//     That is D12's accepted trust model (§8), demonstrated by
+//     TestHubOrigin_ForgedOriginReachesAnotherPublisher_KnownLimitation.
 func (s *Server) handleHubDeregister(w http.ResponseWriter, r *http.Request) {
 	var req DeregisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeControlJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: fmt.Sprintf("invalid request body: %v", err),
 			Code:  "BAD_REQUEST",
@@ -232,11 +335,8 @@ func (s *Server) handleHubDeregister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error(), Code: "BAD_REQUEST"})
 		return
 	}
-	if req.ProjectDir == "" {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "project_dir is required",
-			Code:  "BAD_REQUEST",
-		})
+	if err := validateHubProjectDir(req.ProjectDir); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error(), Code: "BAD_REQUEST"})
 		return
 	}
 	if s.registry == nil {
@@ -252,8 +352,10 @@ func (s *Server) handleHubDeregister(w http.ResponseWriter, r *http.Request) {
 
 // handleHubGetRequests and handleHubStreamRequests are the network mount's
 // capture endpoints. Both take origin AND project and compose the key (D15), so
-// a publisher asking for someone else's dir subscribes to a ring that does not
-// exist — it gets its own empty result, never another publisher's traffic.
+// a publisher asking for someone else's DIR under its own origin subscribes to
+// a ring that does not exist and gets its own empty result. A publisher that
+// forges the origin TOO does read the other's traffic: see handleHubDeregister
+// for why that is the accepted posture rather than a bug.
 func (s *Server) handleHubGetRequests(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.hubRequestKey(w, r)
 	if !ok {
@@ -280,9 +382,9 @@ func (s *Server) hubRequestKey(w http.ResponseWriter, r *http.Request) (string, 
 		return "", false
 	}
 	project := r.URL.Query().Get("project")
-	if project == "" {
+	if err := validateHubProjectDir(project); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: "project query parameter is required",
+			Error: fmt.Sprintf("project query parameter: %v", err),
 			Code:  "BAD_REQUEST",
 		})
 		return "", false
@@ -293,7 +395,14 @@ func (s *Server) hubRequestKey(w http.ResponseWriter, r *http.Request) (string, 
 // --- hub lifecycle (socket-only control) ---
 
 // StartHub binds the network control plane and starts serving it (plan 031
-// D13). It is safe to call on a running hub:
+// D13) without persisting anything. Used by the autostart path (the file it
+// would write is the file it just read) and by tests.
+func (s *Server) StartHub(cfg HubConfig) error {
+	return s.startHub(cfg, false)
+}
+
+// startHub is StartHub plus the F13 commit rule. It is safe to call on a
+// running hub:
 //
 //   - Same configured listen address → the live config and token are updated in
 //     place and the listener is kept. This is what makes a repeated
@@ -303,7 +412,22 @@ func (s *Server) hubRequestKey(w http.ResponseWriter, r *http.Request) (string, 
 //     previous listener is still serving and the error is returned, which is
 //     the rollback D14 asks for; only on success is the old server swapped out
 //     and shut down.
-func (s *Server) StartHub(cfg HubConfig) error {
+//
+// persist is the F13 fix: `prox hub start` used to write ~/.prox/hub.yaml and
+// THEN ask the daemon to bind it, so a failed rebind left the old listener
+// serving while the file described an address nothing was listening on. Now
+// validate → bind → commit is one operation and the file is written only after
+// the daemon is actually serving the config it describes. The daemon is also
+// the single writer, which is what lets the whole sequence sit under one
+// lifecycle mutex (F14).
+func (s *Server) startHub(cfg HubConfig, persist bool) error {
+	// F14: start, stop, and token rotation are serialized against each other.
+	// Without this, a `hub start` that read the token before taking hubMu could
+	// write a stale value back over a rotation that landed in between, silently
+	// re-admitting a credential the operator had just revoked.
+	s.hubLifecycleMu.Lock()
+	defer s.hubLifecycleMu.Unlock()
+
 	cfg, err := NormalizeHubConfig(cfg)
 	if err != nil {
 		return err
@@ -315,6 +439,9 @@ func (s *Server) StartHub(cfg HubConfig) error {
 		}
 		cfg.Token = token
 	}
+	if err := s.checkHubReconfigureAllowed(cfg); err != nil {
+		return err
+	}
 
 	// Fast path: already serving this exact address. Update config/token under
 	// the lock and return — no rebind, no listener churn.
@@ -323,16 +450,23 @@ func (s *Server) StartHub(cfg HubConfig) error {
 		s.hubCfg = cfg
 		s.hubToken = cfg.Token
 		s.hubMu.Unlock()
+		if err := s.commitHubConfig(cfg, persist); err != nil {
+			return err
+		}
 		s.logger.Info("hub mode reconfigured in place", "listen", cfg.Listen, "domain", cfg.Domain)
 		return nil
 	}
 	s.hubMu.Unlock()
 
 	// Bind before touching the running hub, so a bind failure leaves the
-	// previous listener untouched (D14 rollback).
+	// previous listener untouched (D14 rollback) and hub.yaml unwritten (F13).
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("binding hub control plane on %s: %w", cfg.Listen, err)
+	}
+	if err := s.commitHubConfig(cfg, persist); err != nil {
+		_ = ln.Close()
+		return err
 	}
 
 	srv := &http.Server{
@@ -376,6 +510,60 @@ func (s *Server) StartHub(cfg HubConfig) error {
 	return nil
 }
 
+// commitHubConfig writes the configuration the daemon has just proven it can
+// serve (plan 031 F13). The Token is never part of the file (HubConfig.Token is
+// yaml:"-"); it lives in ~/.prox/hub.token.
+func (s *Server) commitHubConfig(cfg HubConfig, persist bool) error {
+	if !persist {
+		return nil
+	}
+	if err := SaveHubConfig(cfg); err != nil {
+		return fmt.Errorf("saving the hub config after binding %s: %w", cfg.Listen, err)
+	}
+	return nil
+}
+
+// checkHubReconfigureAllowed refuses a reconfiguration that would change facts
+// the EXISTING remote registrations were built from (plan 031 F13).
+//
+// Domain and the two data-plane ports are baked into every remote route at
+// register time (D4): the hostname is "<service>.<domain>" and the route is
+// keyed by "<hostname>:<port>". Swapping them on a running hub would leave the
+// routes serving the old domain and ports while `prox hub status` reported the
+// new ones — status describing a config the routes do not use, which is exactly
+// what the finding says not to leave behind.
+//
+// The chosen arm is REJECT rather than "drop and re-register": dropping every
+// publisher's registration to make a flag take effect is a destructive surprise
+// for an operator who typed `prox hub start --https-port 8443` meaning to adjust
+// one thing. `prox hub stop` first is one extra command and says what it does.
+// Changing only the LISTEN address (or the auth mode) is unaffected — those do
+// not appear in any route.
+func (s *Server) checkHubReconfigureAllowed(cfg HubConfig) error {
+	s.hubMu.RLock()
+	running := s.hubServer != nil
+	current := s.hubCfg
+	s.hubMu.RUnlock()
+	if !running {
+		return nil
+	}
+	if current.Domain == cfg.Domain && current.HTTPSPort == cfg.HTTPSPort && current.HTTPPort == cfg.HTTPPort {
+		return nil
+	}
+	if s.registry == nil {
+		return nil
+	}
+	publishers := len(s.registry.RemoteProjectKeys())
+	if publishers == 0 {
+		return nil
+	}
+	return hubConfigErrorf(
+		"cannot change the hub domain or data-plane ports while %d publisher(s) are registered "+
+			"(their hostnames and ports were fixed at register time): run 'prox hub stop' first, "+
+			"then 'prox hub start' with the new settings and let the publishers re-register",
+		publishers)
+}
+
 // StopHub closes the network control plane and removes every remote
 // registration it was serving (plan 031 §4.2), then schedules the ordinary
 // empty-daemon shutdown check — which now CAN fire, since hub mode is off. A
@@ -387,6 +575,11 @@ func (s *Server) StartHub(cfg HubConfig) error {
 // take hubMu) and before removeProject (which takes lifecycleMu, above hubMu in
 // the lock order).
 func (s *Server) StopHub() {
+	// F14: serialized against start and token rotation, so a stop can never
+	// interleave with a start that is mid-bind.
+	s.hubLifecycleMu.Lock()
+	defer s.hubLifecycleMu.Unlock()
+
 	s.hubMu.Lock()
 	srv := s.hubServer
 	ln := s.hubListener
@@ -428,10 +621,25 @@ func (s *Server) StopHub() {
 
 // shutdownHubServer gracefully stops a hub control-plane server, bounded so a
 // wedged handler cannot hold up a rebind or a daemon exit forever.
+//
+// The Close on timeout is plan 031 F15. Shutdown WAITS for in-flight handlers,
+// and the hub's longest-lived handler is an SSE request subscription that a
+// publisher holds open indefinitely — so a rebind's Shutdown reliably times
+// out, and discarding that error left the replaced server's handlers (and the
+// connections under them) alive for as long as the subscriber cared to hold
+// them. Close ends them.
+//
+// It does NOT end the tunnels, which is the point: net/http neither tracks nor
+// closes HIJACKED connections in Shutdown or Close, so the yamux sessions
+// attached through the replaced server keep running across a rebind exactly as
+// D14 intends — a publisher does not have to reconnect because the operator
+// moved the control plane to another address.
 func shutdownHubServer(srv *http.Server) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), constants.HubShutdownGrace)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		_ = srv.Close()
+	}
 }
 
 // HubListenAddr returns the address the control plane is ACTUALLY bound to, or
@@ -530,24 +738,49 @@ func (s *Server) setHubToken(token string) {
 
 // --- socket-only hub/* handlers ---
 
-// handleHubStart turns hub mode on (or reconfigures it) from ~/.prox/hub.yaml.
-// The FILE is the source of truth (D13/D14): `prox hub start` persists whatever
-// flags it was given and then asks the daemon to read them, so the daemon and
-// the CLI can never disagree about what is configured.
+// handleHubStart turns hub mode on (or reconfigures it).
+//
+// The daemon owns validate → bind → commit as ONE operation (plan 031 F13). A
+// request carrying a config proposes it: the daemon normalizes it, binds it,
+// and only then writes ~/.prox/hub.yaml, so a failed rebind can never leave the
+// file describing an address nothing is listening on. A request with no config
+// (an empty body) means "start from the file as it stands", which is the
+// no-flags `prox hub start` and the shape autostart uses.
 func (s *Server) handleHubStart(w http.ResponseWriter, r *http.Request) {
-	cfg, err := LoadHubConfig()
-	if err != nil {
-		code := "HUB_CONFIG_INVALID"
-		if errors.Is(err, os.ErrNotExist) {
-			code = "HUB_NOT_CONFIGURED"
+	var req HubStartRequest
+	if r.Body != nil {
+		// A body is optional; an empty one decodes to the zero request.
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlRequestBytes))
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error: fmt.Sprintf("invalid request body: %v", err),
+				Code:  "BAD_REQUEST",
+			})
+			return
 		}
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: fmt.Sprintf("reading hub config: %v", err),
-			Code:  code,
-		})
-		return
 	}
-	if err := s.StartHub(cfg); err != nil {
+
+	var cfg HubConfig
+	persist := req.Config != nil
+	if req.Config != nil {
+		cfg = *req.Config
+	} else {
+		loaded, err := LoadHubConfig()
+		if err != nil {
+			code := "HUB_CONFIG_INVALID"
+			if errors.Is(err, os.ErrNotExist) {
+				code = "HUB_NOT_CONFIGURED"
+			}
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error: fmt.Sprintf("reading hub config: %v", err),
+				Code:  code,
+			})
+			return
+		}
+		cfg = loaded
+	}
+
+	if err := s.startHub(cfg, persist); err != nil {
 		status, code := http.StatusInternalServerError, "HUB_BIND_FAILED"
 		var cfgErr *hubConfigError
 		if errors.As(err, &cfgErr) {
@@ -574,6 +807,12 @@ func (s *Server) handleHubStatus(w http.ResponseWriter, r *http.Request) {
 // only it (D18). The daemon is the single writer, so the CLI never has to race
 // it for the file.
 func (s *Server) handleHubRotateToken(w http.ResponseWriter, r *http.Request) {
+	// F14: the write and the in-memory swap happen under the same lifecycle
+	// mutex a concurrent `hub start` takes, so a start can no longer read the
+	// pre-rotation token and write it back over the new one.
+	s.hubLifecycleMu.Lock()
+	defer s.hubLifecycleMu.Unlock()
+
 	token, err := RotateHubToken()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{

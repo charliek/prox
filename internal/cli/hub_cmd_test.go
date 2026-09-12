@@ -291,11 +291,11 @@ func TestApplyHubStartFlags_LaterStarts(t *testing.T) {
 
 	t.Run("a flag overwrites its own key only", func(t *testing.T) {
 		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{
-			listen: "10.0.0.5:9443", listenSet: true,
+			listen: "100.64.0.5:9443", listenSet: true,
 		})
 		require.NoError(t, err)
 		assert.True(t, changed)
-		assert.Equal(t, "10.0.0.5:9443", cfg.Listen)
+		assert.Equal(t, "100.64.0.5:9443", cfg.Listen)
 		assert.Equal(t, stored.Domain, cfg.Domain)
 		assert.Equal(t, stored.HTTPSPort, cfg.HTTPSPort)
 		assert.True(t, cfg.Autostart, "autostart is not a `hub start` flag and must survive")
@@ -324,6 +324,31 @@ func TestApplyHubStartFlags_LaterStarts(t *testing.T) {
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not allowed")
+	})
+
+	// Plan 031 F8: a plain LAN address needs --allow-unencrypted-lan, and the
+	// opt-in is a persisted key like any other, so a later start keeps it.
+	t.Run("a plain LAN listen address needs the opt-in", func(t *testing.T) {
+		_, _, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			listen: "10.0.0.5:9443", listenSet: true,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--allow-unencrypted-lan")
+
+		cfg, changed, err := applyHubStartFlags(stored, true, hubStartFlagSet{
+			listen: "10.0.0.5:9443", listenSet: true,
+			allowLAN: true, allowLANSet: true,
+		})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, "10.0.0.5:9443", cfg.Listen)
+		assert.True(t, cfg.AllowUnencryptedLAN, "the opt-in is persisted, not per-invocation")
+
+		// And a stored opt-in keeps working with no flag at all.
+		lanStored := cfg
+		again, _, err := applyHubStartFlags(lanStored, true, hubStartFlagSet{})
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.5:9443", again.Listen)
 	})
 }
 

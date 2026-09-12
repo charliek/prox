@@ -200,7 +200,11 @@ func (cfg tunnelClientConfig) runSession(ctx context.Context, allowed map[string
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cfg.serveStream(ctx, stream, allowed)
+			// sess.CloseChan() is the second stop signal alongside ctx (plan 031
+			// F11): a session that ends on its own — the hub restarting, the
+			// connection dropping — must unblock every copy it spawned, or the
+			// wg.Wait above never returns.
+			cfg.serveStream(ctx, sess.CloseChan(), stream, allowed)
 		}()
 	}
 }
@@ -246,7 +250,7 @@ func (cfg tunnelClientConfig) dialHub(ctx context.Context) (io.ReadWriteCloser, 
 
 // serveStream handles one proxied connection: read and validate the preamble,
 // enforce the D11 allow-list, dial, answer, and pipe.
-func (cfg tunnelClientConfig) serveStream(ctx context.Context, stream net.Conn, allowed map[string]struct{}) {
+func (cfg tunnelClientConfig) serveStream(ctx context.Context, sessDone <-chan struct{}, stream net.Conn, allowed map[string]struct{}) {
 	closeStream := true
 	defer func() {
 		if closeStream {
@@ -297,7 +301,7 @@ func (cfg tunnelClientConfig) serveStream(ctx context.Context, stream net.Conn, 
 	}
 
 	closeStream = false // pipe owns both ends from here
-	pipeConns(stream, backend)
+	pipeConns(ctx, sessDone, stream, backend)
 }
 
 // replyErr sends the one-line refusal. The reason is always a fixed, framing-safe
@@ -319,7 +323,30 @@ func (cfg tunnelClientConfig) replyErr(stream net.Conn, reason string) {
 // stream is closed outright, because a yamux stream cannot be half-closed for
 // writing only: its Close returns EOF to local reads once the buffer drains. By
 // then the response is fully copied, so there is nothing left to truncate.
-func pipeConns(stream, backend net.Conn) {
+//
+// The FORCE-CLOSE on shutdown is plan 031 F11. Half-closing the backend tells a
+// well-behaved server the request is over, but nothing compels a backend to
+// answer an EOF — a server that simply keeps the connection open leaves the
+// response-side io.Copy blocked on a read that will never return, and neither
+// cancelling the context nor closing the yamux session interrupts a read on a
+// separate TCP connection. runSession waits for every stream goroutine before
+// it returns, so one such backend was enough to hang `prox down` (and daemon
+// shutdown behind it) forever. On either stop signal both endpoints are closed
+// outright, which is what actually unblocks the copies.
+func pipeConns(ctx context.Context, sessDone <-chan struct{}, stream, backend net.Conn) {
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-sessDone:
+		case <-stopped:
+			return
+		}
+		_ = stream.Close()
+		_ = backend.Close()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {

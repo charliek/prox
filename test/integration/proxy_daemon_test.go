@@ -510,8 +510,8 @@ func TestProxyDaemon_HubRegistration(t *testing.T) {
 	if r.Origin != "popos" {
 		t.Errorf("Origin = %q, want popos", r.Origin)
 	}
-	if r.ProjectDir != "popos:/home/dev/remote-app" {
-		t.Errorf("ProjectDir = %q, want the composed key popos:/home/dev/remote-app", r.ProjectDir)
+	if want := proxyd.HubProjectKey("popos", "/home/dev/remote-app"); r.ProjectDir != want {
+		t.Errorf("ProjectDir = %q, want the composed key %q", r.ProjectDir, want)
 	}
 	if r.Target != (proxyd.ServiceTarget{Host: "localhost", Port: 3000}) {
 		t.Errorf("Target = %+v, want localhost:3000", r.Target)

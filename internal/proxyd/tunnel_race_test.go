@@ -75,10 +75,17 @@ func TestTunnelRace_FrozenPublisherServes503(t *testing.T) {
 		"a frozen publisher must fail on the dial deadline, not on session death")
 }
 
-// TestTunnelRace_FrozenPublisherConcurrentRequests is §8's accepted-risk pin:
-// many simultaneous requests to a frozen publisher must ALL get a 503 rather
-// than blocking on yamux's inflight-SYN budget. The dial timeout is shortened so
-// the test is fast; the code path is identical.
+// TestTunnelRace_FrozenPublisherConcurrentRequests is §8's accepted-risk pin and
+// plan 031 F7's regression test: many simultaneous requests to a frozen
+// publisher must ALL get a 503 rather than blocking on yamux's inflight-SYN
+// budget. The dial timeout is shortened so the test is fast; the code path is
+// identical.
+//
+// The request count is deliberately ABOVE yamux's AcceptBacklog (256). The
+// earlier 64 could not reach the limit and so could not see the bug at all:
+// OpenStream blocks inside yamux once 256 SYNs are unACKed, with no context and
+// no deadline, so the 257th caller waited StreamOpenTimeout (30s) instead of
+// HubDialTimeout. Anything at or under the backlog passes either way.
 func TestTunnelRace_FrozenPublisherConcurrentRequests(t *testing.T) {
 	h := newTunnelHub(t)
 	// Shorten before anything attaches: a session copies the bound at attach.
@@ -87,7 +94,9 @@ func TestTunnelRace_FrozenPublisherConcurrentRequests(t *testing.T) {
 	services := map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}}
 	registerAndFreeze(t, h, "shed", "/home/dev/app", services)
 
-	const requests = 64 // comfortably inside yamux's AcceptBacklog of 256
+	// yamux's AcceptBacklog is 256; this must exceed it, or the acquisition
+	// path the fix is about is never entered (plan 031 F7).
+	const requests = 300
 	client := h.httpsClient()
 	statuses := make([]int, requests)
 
@@ -304,9 +313,19 @@ func TestTunnelRace_HubStopRacesSessionCloseAndSweep(t *testing.T) {
 		keys = append(keys, key)
 		sessions = append(sessions, hubSess)
 	}
-	// Every registration is disconnected and past its grace, so the sweep has
-	// real work to do while hub stop is tearing the same state down.
+	// Every registration must actually BE disconnected before the clock moves,
+	// or the sweep has no candidates and this test proves nothing about racing
+	// it — attachTunnel marks a registration CONNECTED, and a connected
+	// registration is never a lease candidate however far the clock advances.
+	for i, key := range keys {
+		gen := h.server.tunnels.get(key).gen
+		require.True(t, h.registry.MarkDisconnected(key, gen, h.clock.now()),
+			"registration %s must be marked disconnected for the sweep to have work", key)
+		_ = i
+	}
 	h.clock.advance(constants.HubDisconnectGrace + constants.HubAttachGrace + time.Second)
+	require.Len(t, h.registry.ExpiredLeases(), len(keys),
+		"every registration must be a sweep candidate before the race starts")
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -344,4 +363,139 @@ func TestTunnelRace_HubStopRacesSessionCloseAndSweep(t *testing.T) {
 		assert.Nil(t, h.server.tunnels.get(key), "tunnel %s must be closed", key)
 	}
 	assert.Empty(t, h.registry.AllRoutes())
+}
+
+// TestTunnelRace_AttachDuringReplaceIsNotLost is plan 031 F3, driven with a
+// barrier rather than raced.
+//
+// The bug: a remote re-register with a CHANGED config snapshotted the lease,
+// removed the registration, re-added it, and then wrote the snapshot back. A
+// tunnel attaching inside that sequence marked the NEW registration connected
+// under a fresh generation, and the stale write then clobbered it — leaving a
+// registration that claimed a tunnel the session manager had never associated
+// with it. Nothing could ever fix it up: MarkDisconnected no-ops on a
+// generation mismatch, so the registration stayed "connected" with no session,
+// unserveable and unsweepable, until `prox hub stop`.
+//
+// The barrier sits exactly where that window was — inside the registry lock,
+// immediately before the lease carry. The attach must land on one side of the
+// replacement or the other, never inside it, and afterwards the registration's
+// generation must be the one the session manager actually holds.
+func TestTunnelRace_AttachDuringReplaceIsNotLost(t *testing.T) {
+	h := newTunnelHub(t)
+	key := HubProjectKey("shed", "/home/dev/app")
+	h.mustRegister(t, "shed", "/home/dev/app", map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 1}})
+
+	// The session the "concurrent" attach will install, built up front because
+	// require.* must run on the test's own goroutine.
+	hubSess, _ := newStubSessionPair(t)
+
+	attaching := make(chan struct{})
+	attached := make(chan *tunnelSession, 1)
+	h.registry.beforeReplaceCommit = func() {
+		// Runs with the registry lock held, immediately before the lease carry.
+		// The attach below therefore BLOCKS here, which is the point: under the
+		// old code it would have completed and then been overwritten.
+		close(attaching)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	go func() {
+		<-attaching
+		attached <- h.server.attachTunnel(key, hubSess)
+	}()
+
+	// A re-register with a CHANGED service target: the replace arm.
+	_, err := h.client(t).Register(registerBody("shed", "/home/dev/app",
+		map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: 2}}, false))
+	require.NoError(t, err)
+
+	var session *tunnelSession
+	select {
+	case session = <-attached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the concurrent attach never completed")
+	}
+
+	// The invariant: whatever the interleaving, the registration's generation is
+	// the one the session manager holds, and a live session is not reported as
+	// disconnected.
+	require.Eventually(t, func() bool {
+		lease, ok := h.registry.RemoteLease(key)
+		return ok && lease.SessionGen == session.gen
+	}, 5*time.Second, 2*time.Millisecond,
+		"the registration must end up on the generation the session manager installed")
+
+	lease, ok := h.registry.RemoteLease(key)
+	require.True(t, ok)
+	assert.True(t, lease.DisconnectedAt.IsZero(), "a live tunnel must not read as disconnected")
+	assert.Same(t, session, h.server.tunnels.get(key))
+
+	// And the registration still reflects the CHANGED config.
+	route, ok := h.registry.Lookup("web."+h.domain, h.httpsPort)
+	require.True(t, ok)
+	assert.Equal(t, 2, route.Target.Port)
+
+	// The close callback still works, which is the proof that the generation on
+	// the registration and the one in the session manager really do match: a
+	// mismatch would make this a silent no-op.
+	require.True(t, h.server.tunnels.detach(key, session.gen))
+	require.True(t, h.registry.MarkDisconnected(key, session.gen, h.clock.now()))
+}
+
+// TestTunnelRace_ReplaceCarriesTheLeaseInEitherOrder is the deterministic half
+// of F3: with the replacement atomic, an attach either precedes it (its state
+// is carried) or follows it (it applies to the successor), and a disconnect
+// mid-flight is carried too rather than being reset to "connected".
+func TestTunnelRace_ReplaceCarriesTheLeaseInEitherOrder(t *testing.T) {
+	changed := func(port int) map[string]ServiceTarget {
+		return map[string]ServiceTarget{"web": {Host: "127.0.0.1", Port: port}}
+	}
+
+	t.Run("attach before the replace is carried forward", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", changed(1))
+		session, _ := attachStubTunnel(t, h, key)
+
+		_, err := h.client(t).Register(registerBody("shed", "/home/dev/app", changed(2), false))
+		require.NoError(t, err)
+
+		lease, ok := h.registry.RemoteLease(key)
+		require.True(t, ok)
+		assert.Equal(t, session.gen, lease.SessionGen, "the live generation survives a config change")
+		assert.True(t, lease.DisconnectedAt.IsZero())
+	})
+
+	t.Run("attach after the replace applies to the successor", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", changed(1))
+
+		_, err := h.client(t).Register(registerBody("shed", "/home/dev/app", changed(2), false))
+		require.NoError(t, err)
+
+		session, _ := attachStubTunnel(t, h, key)
+		lease, ok := h.registry.RemoteLease(key)
+		require.True(t, ok)
+		assert.Equal(t, session.gen, lease.SessionGen)
+	})
+
+	t.Run("a disconnect before the replace is carried forward", func(t *testing.T) {
+		h := newTunnelHub(t)
+		key := HubProjectKey("shed", "/home/dev/app")
+		h.mustRegister(t, "shed", "/home/dev/app", changed(1))
+		session, _ := attachStubTunnel(t, h, key)
+		require.True(t, h.server.tunnels.detach(key, session.gen))
+		require.True(t, h.registry.MarkDisconnected(key, session.gen, h.clock.now()))
+
+		_, err := h.client(t).Register(registerBody("shed", "/home/dev/app", changed(2), false))
+		require.NoError(t, err)
+
+		lease, ok := h.registry.RemoteLease(key)
+		require.True(t, ok)
+		assert.Equal(t, session.gen, lease.SessionGen)
+		assert.False(t, lease.DisconnectedAt.IsZero(),
+			"a re-register must not make a publisher with no tunnel look connected")
+	})
 }

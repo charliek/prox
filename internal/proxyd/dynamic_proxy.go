@@ -432,12 +432,12 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// offline.
 		var tunnelTransport *http.Transport
 		if route.Origin != "" {
-			session := dp.tunnelSession(route.ProjectDir)
-			if session == nil {
+			transport, ok := dp.tunnelTransport(route.ProjectDir)
+			if !ok {
 				dp.serveTunnelOffline(w, hostname, route.ProjectDir)
 				return
 			}
-			tunnelTransport = session.transport
+			tunnelTransport = transport
 		}
 
 		// Capture is gated per project: only when the matched route opted in and
@@ -662,14 +662,16 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 	})
 }
 
-// tunnelSession resolves a remote route's publisher session by project key
-// (plan 031 P5). nil means offline: either no tunnel has ever attached, or the
-// one that had has closed.
-func (dp *DynamicProxy) tunnelSession(projectKey string) *tunnelSession {
+// tunnelTransport resolves a remote route's publisher transport by project key
+// (plan 031 P5). ok=false means offline: either no tunnel has ever attached, or
+// the one that had has closed. It goes through tunnelSessions.TransportFor
+// rather than reaching into the session struct, so the session layer has one
+// entry point rather than two.
+func (dp *DynamicProxy) tunnelTransport(projectKey string) (*http.Transport, bool) {
 	if dp.tunnels == nil {
-		return nil
+		return nil, false
 	}
-	return dp.tunnels.get(projectKey)
+	return dp.tunnels.TransportFor(projectKey)
 }
 
 // serveTunnelOffline writes the hub's offline 503 for a remote route,
