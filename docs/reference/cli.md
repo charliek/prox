@@ -50,6 +50,9 @@ prox up [processes...]
 | `--no-proxy` | Disable proxy even if configured |
 | `--capture` | Force request/response body capture on for this run. Capture is already on by default whenever the proxy is enabled, so this flag is kept for explicitness/compatibility; mutually exclusive with `--no-capture` |
 | `--no-capture` | Disable request/response body capture for this run (config-level opt-out: `proxy.capture.enabled: false`) |
+| `--hub <alias>` | Also publish this project's services through the [remote proxy hub](../guides/remote-hub.md) aliased `<alias>` (`default` means `~/.prox/hubs.yaml`'s own default). **Requires a value** — `--hub` takes arbitrary process names as positional arguments too, so an optional-value flag would be ambiguous. Overrides `PROX_HUB` and `proxy.hub` |
+| `--no-hub` | Do not publish to any hub for this run, even when `proxy.hub` or `PROX_HUB` names one. Mutually exclusive with `--hub` |
+| `--hub-takeover` | When a hub service name is already held by another connected publisher, take it over instead of prompting (foreground) or warning and continuing without that route (non-interactive) |
 
 **Examples:**
 
@@ -184,6 +187,18 @@ prox status --json
 **Proxy line:** when a proxy is configured, output includes a `Proxy:` line reporting the shared-proxy health tracked by [the `proxy` block of `GET /status`](api.md#get-status) — `Proxy: shared (running, vX.Y.Z)` when healthy, `Proxy: standalone` for an in-process proxy, or the `Proxy: DOWN` line above when the shared daemon is unreachable.
 
 **Warnings:** any session warnings (see [`Warnings` under `up`](#up)) print after the process table, in the same `Warning: <message>` form. They are advisory and **never affect `prox status`'s exit code** — a script that checks the exit code should not start failing because of an untrusted mkcert CA it never asked about.
+
+**Hub line:** when this project is publishing through a [remote proxy hub](../guides/remote-hub.md) (`--hub`/`proxy.hub`/`PROX_HUB`), output gains a `Hub:` line reporting the publisher state machine's current state:
+
+| State | Line |
+|-------|------|
+| Connected | `Hub: llt (connected, 2 routes)` |
+| Reconnecting (hub unreachable, or the tunnel dropped) | `Hub: llt (reconnecting, down 12s)` |
+| Displaced (another publisher took over a name via `--hub-takeover`) | `Hub: llt (displaced: auth held by mac:/home/c/slauth)` |
+| Protocol mismatch | `Hub: llt (protocol mismatch: hub 2, this prox 1)` |
+| Auth rejected | `Hub: llt (auth failed)` |
+
+The line is absent entirely when no hub is configured for the run, so hub-less `prox status` output is unchanged. **A degraded hub never changes `prox status`'s exit code** — hub publishing is additive, and the exit-1 contract above stays reserved for the local proxy and the processes themselves. See [`status.proxy.hub`](api.md#get-status) for the underlying JSON shape and [Remote Proxy Hub](../guides/remote-hub.md) for the full walkthrough and security posture.
 
 **STATUS column decoration.** A `waiting` process shows its still-resolving `depends_on` targets inline — `waiting(postgres, redis)` — and a `blocked` process shows the targets that failed it — `blocked(postgres)` — in declaration order. The JSON `status` field stays the bare state name in both cases (`waiting`/`blocked`); only the human table decorates it. The PID column shows `-` whenever there is no live PID, including a `waiting` process and a `completed` task (whose uptime is frozen at completion rather than reading `0`).
 
@@ -457,6 +472,17 @@ prox proxy <command>
 
 **Capture line:** human output prints a `Capture:` line reporting the daemon-wide capture disk budget (see [Request Capture](configuration.md#request-capture)) — `Capture:    <used> used / <budget> budget on disk`, or `Capture:    unavailable (<reason>)` when the daemon's own capture manager failed to initialize at startup (distinct from any project simply choosing capture off, which never shows up here). `--json` carries the same information as `capture_disk_used`/`capture_disk_budget` (bytes, both `0` when the daemon has no capture manager) and `capture_available`/`capture_error`.
 
+**SOURCE column (`prox proxy routes`).** With no [hub](../guides/remote-hub.md)-origin route registered, the table is byte-identical to a hub-less daemon's: `HOSTNAME PORT PROTOCOL TARGET PROJECT PID`. The moment at least one hub route exists, a `SOURCE` column (`local` or `hub`) appears, and a hub route's `TARGET` renders as `tunnel -> host:port` (its backend lives on the publisher's machine, reached through the tunnel, not on this host) and its `PROJECT` renders as the hub's composed registry key `hub:<origin>|<project dir>` rather than a bare directory:
+
+```text
+SOURCE  HOSTNAME                     PORT  PROTOCOL  TARGET                 PROJECT                        PID
+------  --------                     ----  --------  ------                 -------                        ---
+local   app.local.example.dev       443   https     localhost:5173         /projects/app                  12391
+hub     auth.llt.stridelabs.ai      443   https     tunnel -> localhost:3000  hub:mac|/home/charlie/auth  12345
+```
+
+`--json` always carries the underlying `origin`/`connected` fields, regardless of whether any hub route exists.
+
 **Examples:**
 
 ```bash
@@ -474,6 +500,61 @@ prox proxy stop --force
 ```
 
 See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for multi-project behavior and constraints.
+
+### hub
+
+Manage a [remote proxy hub](../guides/remote-hub.md): a shared proxy daemon on
+another machine that this one can publish through, or that this machine
+itself offers to others.
+
+```bash
+prox hub <command>
+```
+
+**Publisher commands** — manage this machine's connection profiles in `~/.prox/hubs.yaml`:
+
+| Command | Description |
+|---------|-------------|
+| `prox hub add <alias> <url> [--token T \| --token-file P \| --token-env E] [--origin O] [--default]` | Add or replace a hub connection profile |
+| `prox hub remove <alias>` | Remove a connection profile |
+| `prox hub list` | List configured hubs — the merged user-file view, plus the current directory's `prox.yaml` `hubs:` entries marked `(project)` |
+
+**Hub host commands** — run on the machine that offers the hub, and control this machine's own shared daemon:
+
+| Command | Description |
+|---------|-------------|
+| `prox hub start [--domain D] [--listen A] [--https-port N] [--http-port N] [--auth token\|none] [--allow-unencrypted-lan]` | Ensure the shared daemon is running and turn hub mode on. `--domain` is required the first time; flags given are persisted to `~/.prox/hub.yaml` and become the default for later runs. Prints the bound listen address (so `--listen host:0`'s ephemeral port is visible) and a paste-ready `prox hub add` line for publisher machines |
+| `prox hub stop` | Turn hub mode off: close every publisher's tunnel, drop their routes, close the network control plane. The daemon keeps running if local (non-hub) projects are still registered |
+| `prox hub status [--json]` | On/off, domain, listen address, ports, auth mode, and every connected/disconnected publisher (origin, project dir, route count, registered/connected-since time) |
+| `prox hub token [--rotate]` | Print the token and the file it lives in. `--rotate` writes a new token and tells the running hub to accept only it — established tunnels survive, but the next call with the old token gets `401` |
+
+**Examples:**
+
+```bash
+# Hub host: turn on hub mode
+prox hub start --domain llt.stridelabs.ai
+
+# Publisher: add the connection, then publish
+prox hub add llt http://100.82.128.123:8443 --token-file ~/.prox/hubs/llt.token --default
+prox up -d --hub llt
+
+# Hub host: see who's publishing
+prox hub status
+
+# Rotate the hub's token
+prox hub token --rotate
+```
+
+`--domain` and the data-plane ports cannot be changed on a running hub while
+publishers are registered — their hostnames and ports were fixed when they
+registered. Run `prox hub stop` first and let publishers re-register once the
+hub is back.
+
+By default the hub's listen address must be loopback or a tailnet
+(`100.64.0.0/10`) address, whose traffic is encrypted end to end; a plain
+private-LAN address needs `--allow-unencrypted-lan`. See
+[Security](../guides/remote-hub.md#security) in the Remote Proxy Hub guide
+before turning that on, and before running a hub at all.
 
 ### version
 

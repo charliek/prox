@@ -411,6 +411,7 @@ certs:
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
 | `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
+| `proxy.hub` | string | — | Alias of a remote proxy hub to also publish through, e.g. `hub: llt` (`default` = `~/.prox/hubs.yaml`'s default). Overridden per run by `--hub`/`--no-hub`/`PROX_HUB` |
 | `proxy.capture.enabled` | bool | `true` | Capture request/response headers and bodies for proxied requests (see Request Capture below for the full field list) |
 | `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
 
@@ -424,6 +425,53 @@ The behavior is automatic:
 - `prox down` deregisters only this project.
 - The daemon stops after the last project deregisters.
 - `prox proxy status` and `prox proxy routes` show daemon state.
+
+### Remote Proxy Hub
+
+A **hub** is a shared proxy daemon on another machine (with hub mode on) that
+this project can publish services through, so a hostname like
+`auth.llt.example.com` is reachable from any device that can reach the hub —
+not just `127.0.0.1` on this machine. `prox up --hub <alias>` (or
+`proxy.hub: <alias>` in `prox.yaml`) registers with it and holds an outbound
+tunnel; `prox status` then shows a `Hub:` line. See `references/api.md` for
+the `status.proxy.hub` publisher state object.
+
+`hubs:` (a map of alias to connection profile) is accepted in the project's
+`prox.yaml` and in the per-user `~/.prox/hubs.yaml` (managed by `prox hub
+add|remove|list`), merged by alias with the project file winning:
+
+```yaml
+# prox.yaml
+proxy:
+  hub: llt
+
+hubs:
+  llt:
+    url: http://100.82.128.123:8443
+    token_env: PROX_HUB_TOKEN   # or token_file; token: (inline) warns in a git work tree
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `hubs.<alias>.url` | string | required | The hub's control-plane address |
+| `hubs.<alias>.token` | string | — | Inline bearer token (discouraged in a committed file) |
+| `hubs.<alias>.token_file` | string | — | Path to a file holding the token |
+| `hubs.<alias>.token_env` | string | — | Environment variable holding the token |
+| `hubs.<alias>.origin` | string | this machine's hostname | Overrides this machine's publisher identity |
+
+`~/.prox/hubs.yaml` additionally carries `default: <alias>`, which `--hub
+default` / `hub: default` resolve to.
+
+**On the hub HOST**, `~/.prox/hub.yaml` (written by `prox hub start`, or by
+hand) configures the hub itself: `domain` (required, first start), `listen`
+(control-plane address; default: this machine's tailnet `100.64.0.0/10`
+address, else loopback), `https_port`/`http_port` (data-plane ports for
+published routes), `auth` (`token` | `none`), `autostart`, and
+`allow_unencrypted_lan` (opt-in for a plain private-LAN listen address — the
+control plane is plain HTTP, so this matters; see the
+[Remote Proxy Hub guide](https://charliek.github.io/prox/guides/remote-hub/)'s
+security section). The bearer token itself lives separately in
+`~/.prox/hub.token` (`0600`), never in `hub.yaml`.
 
 ### Service Fields
 
