@@ -298,8 +298,15 @@ func TestHubTunnel_ValidatesTheProjectDirHeader(t *testing.T) {
 
 			resp, err := hubClient().Do(req)
 			if err != nil {
-				// A header the CLIENT refuses to send is refused just as
-				// firmly; the point is that it never reaches a registry key.
+				// ONLY the control-character case may fail client-side:
+				// http.Header refuses to frame it, and a header the client
+				// will not send never reaches a registry key either. Every
+				// other value here is one the client CAN send, so letting
+				// them take this branch would let the case pass without ever
+				// reaching the handler assertion below — the test would stop
+				// testing the server (plan 031, CodeRabbit).
+				require.Equal(t, "control character", tc.name,
+					"%s is a value the client can send, so it must reach the handler", tc.name)
 				return
 			}
 			defer resp.Body.Close()

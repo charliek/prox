@@ -802,15 +802,35 @@ func (p *hubPublisher) start(ctx context.Context, localRM *proxy.RequestManager)
 func (p *hubPublisher) Shutdown(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	p.stop()
-	p.joinWorkers(time.Until(deadline))
+
+	// RESERVE the gate's share of the budget before joining (plan 031,
+	// CodeRabbit). joinWorkers given the whole deadline can consume all of it
+	// while a worker is still inside register() holding regGate, leaving
+	// acquireRegisterGate about a millisecond — so the barrier silently fails
+	// open and the deregister below races the very registration it exists to
+	// order against. Two thirds to the join, one third (at least a second) held
+	// back for the barrier.
+	gateBudget := max(timeout/3, time.Second)
+	p.joinWorkers(time.Until(deadline) - gateBudget)
 
 	// The in-flight registration barrier. Holding the permit across the
 	// deregister below also means a register that somehow starts afterwards
 	// waits for the deregister rather than racing it — and it will fail
 	// immediately anyway, since its context is derived from the cancelled one.
-	if p.acquireRegisterGate(time.Until(deadline)) {
-		defer func() { <-p.regGate }()
+	if !p.acquireRegisterGate(time.Until(deadline)) {
+		// A registration is STILL in flight and we are out of budget.
+		// Deregistering now is the one thing we must not do: the in-flight
+		// register would land afterwards and put the routes back with nothing
+		// left to remove them, which is strictly worse than leaving a
+		// registration the hub's own lease sweep reclaims in under two
+		// minutes. Say so where a detached run can still see it.
+		logHubAdvisory(p.alias, domain.Warning{
+			Message: "a registration was still in flight at shutdown; leaving it " +
+				"for the hub's lease sweep to reclaim rather than racing it",
+		})
+		return
 	}
+	defer func() { <-p.regGate }()
 
 	// A publisher that never registered has nothing on the hub to remove, and
 	// the hub is usually the reason it never registered — so calling anyway
