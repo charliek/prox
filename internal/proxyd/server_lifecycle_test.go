@@ -199,12 +199,12 @@ func TestRequestEndpoints_RequireProjectParam(t *testing.T) {
 	server, client, _ := startTestServer(t)
 	_ = server // ring set already wired by startTestServer
 
-	resp, err := client.httpClient.Get("http://proxyd/api/v1/requests")
+	resp, err := client.get("/api/v1/requests")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, 400, resp.StatusCode)
 
-	respStream, err := client.httpClient.Get("http://proxyd/api/v1/requests/stream")
+	respStream, err := client.get("/api/v1/requests/stream")
 	require.NoError(t, err)
 	defer respStream.Body.Close()
 	assert.Equal(t, 400, respStream.StatusCode)
@@ -230,7 +230,7 @@ func TestHandleGetRequests_LimitClamp(t *testing.T) {
 
 	getCount := func(t *testing.T, query string) int {
 		t.Helper()
-		resp, err := client.httpClient.Get("http://proxyd/api/v1/requests?project=/projects/a" + query)
+		resp, err := client.get("/api/v1/requests?project=/projects/a" + query)
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, 200, resp.StatusCode)

@@ -37,6 +37,15 @@ type fakeCertManager struct {
 	// drive the register flow through this fake exercise the production holder
 	// (record + snapshot + dedupe), not a test-only reimplementation of it.
 	warnings certWarningHolder
+	// onEnsure, when set, runs at the top of EnsureDomain. See EnsureDomain.
+	onEnsure func(domain string)
+}
+
+// setEnsureHook installs the EnsureDomain hook.
+func (f *fakeCertManager) setEnsureHook(hook func(domain string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onEnsure = hook
 }
 
 func newFakeCertManager() *fakeCertManager {
@@ -54,6 +63,14 @@ func (f *fakeCertManager) failDomain(domain string) {
 	f.failFor[domain] = fmt.Errorf("forced cert failure for %s", domain)
 }
 
+// clearFailures removes every configured EnsureDomain failure, so a test can
+// let a retry succeed after exercising a failure path.
+func (f *fakeCertManager) clearFailures() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failFor = make(map[string]error)
+}
+
 // ensureCount reports how many times EnsureDomain was called for a domain.
 func (f *fakeCertManager) ensureCount(domain string) int {
 	f.mu.Lock()
@@ -64,6 +81,17 @@ func (f *fakeCertManager) ensureCount(domain string) int {
 // EnsureDomain generates and caches a self-signed wildcard cert for domain,
 // recording the call. It is idempotent (one cert per domain) like the real one.
 func (f *fakeCertManager) EnsureDomain(domain string) error {
+	// The hook runs OUTSIDE the fake's own lock and inside the register
+	// transaction's (plan 031, reviews B2 and B7): cert generation is the one
+	// phase of a registration that is slow in reality and observable in a test,
+	// which makes it the place to hold lifecycleMu or advance a clock.
+	f.mu.Lock()
+	hook := f.onEnsure
+	f.mu.Unlock()
+	if hook != nil {
+		hook(domain)
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

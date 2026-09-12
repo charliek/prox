@@ -197,6 +197,71 @@ When more than one project needs the same proxy port, prox routes through a per-
 - **Stale-PID sweep + on-502 dead-owner probe.** Registrations left behind by a crashed or `kill -9`'d project are reaped two ways. A periodic sweep (every 30s) checks each registered project's owning PID and start-token for liveness — the always-on backstop. On top of it, when a route's backend transport fails and the proxy returns a 502, the daemon probes just that project's owning `prox up` process off the data plane and, if it is dead, reaps the registration immediately — so a crashed project's routes converge in about one request instead of waiting up to 30s. The trigger is structurally flap-safe: the registry stores the *owner's* identity, not the backend's, so a flapping or restarting backend under a live owner always probes as alive and is never removed. A single-in-flight state machine (one probe chain per project, rate-limited to one probe per `DeadRouteProbeMinInterval`) keeps a 502 storm cheap, and a 502 suppressed inside that window still fires exactly one trailing probe, so a post-death request is never lost. Reaping goes through the same identity-guarded removal path as the sweep (so a PID reused by a live restart is protected) and reaps of the last project schedule the idle-daemon shutdown check just like the sweep. Backend-authored 502s, mid-stream aborts, and dead-but-trafficless projects have no transport-failure trigger and rely on the 30s sweep.
 - **Self-heal re-registration.** If a project's connection to the daemon breaks (daemon restart, transient crash), its forwarder re-establishes the daemon connection and re-registers automatically once the failure persists past a threshold — see the Forwarder Bridge below.
 
+### Hub Mode (Remote Proxy Hub, plan 031)
+
+> **Experimental.** Hub mode is new and its surface is not yet stable; the
+> notes below describe the shipped design, not a frozen contract.
+
+
+Hub mode is an optional second interface on the same `proxyd.Server`, not a
+second process: a project on one machine (the **publisher**) can register its
+services with a `proxyd` running on another machine (the **hub**) so a
+hostname like `auth.llt.stridelabs.ai` is reachable from anywhere that can
+reach the hub, not just `127.0.0.1` on the machine the project runs on. See
+the [Remote Proxy Hub guide](../guides/remote-hub.md) for the user-facing
+walkthrough and its security posture.
+
+- **Network control plane.** `Server.StartHub` mounts a second chi router on a
+  TCP listener (`hub_server.go`) — the Unix-socket mount stays as it is —
+  behind bearer-token middleware, with an explicit allow-list
+  (`register`/`deregister`/`status`/`routes`/`requests[/stream]`/`tunnel`;
+  never `shutdown` or `hub/*`, which stay socket-only so a remote publisher
+  can never stop the daemon).
+- **Reverse tunnel, not a direct dial.** A publisher opens one outbound
+  connection to the hub and multiplexes it with `hashicorp/yamux` — one
+  stream per proxied TCP connection, with a `CONNECT host:port` preamble. This
+  is what makes a VM or container with only outbound reachability work: the
+  hub never dials the publisher, it only ever accepts a stream the publisher
+  already opened. `DynamicProxy`'s per-route transport dials through the
+  tunnel's session exactly as it dials `host:port` locally, so capture,
+  request records, and the reverse-proxy path downstream of that point are
+  unchanged.
+- **Origin-qualified keys, composed server-side.** A remote registration is
+  keyed by `HubProjectKey(origin, dir) = "hub:" + origin + "|" + dir`
+  (`internal/proxyd/hub.go`), derived from the caller's own claimed identity —
+  never accepted as a pre-built key from the wire. This makes cross-tenant
+  access structurally impossible **by accident** (no composition a publisher
+  can construct can ever name a local project's bare-dir key), though not
+  impossible by a publisher that deliberately forges another's origin while
+  holding the one shared bearer token — an accepted v1 trust posture, spelled
+  out in the guide's security section.
+- **The tunnel is the liveness lease**, not a PID: `ProjectRegistration`
+  carries `Origin`, `SessionGen`, `ConnectedAt`/`DisconnectedAt`, and
+  `ReservedUntil`. A disconnected registration serves a `503` offline page for
+  a grace window, then the same periodic sweep that reaps stale local PIDs
+  removes it via `Registry.DeregisterIfDisconnected(key, sessionGen)` — guarded
+  by session generation so a publisher that reconnects between the sweep's
+  scan and its removal is never deleted out from under itself.
+- **Stay-alive while hub mode is on.** The empty-daemon shutdown check treats
+  "hub enabled" as its own reason to keep the daemon running, independent of
+  whether any local project is registered.
+
+```
+┌────────────────────────┐              ┌───────────────────────────────────────────┐
+│ Publisher (prox up      │  register /  │        Shared Proxy Daemon (proxyd)        │
+│ --hub llt), own machine │  tunnel      │       hub mode on, same process           │
+│ ┌──────────┐ ┌────────┐│─────────────▶│  ┌──────────┐   ┌───────────────────────┐  │
+│ │ tunnel   │ │ local  ││  (outbound   │  │ Registry │──▶│ Hostname Router       │  │
+│ │ client   │ │ target ││   only)      │  │ (origin- │   │ (Host header / SNI)   │  │
+│ └────┬─────┘ └────────┘│              │  │ qualified│   └──────────┬────────────┘  │
+└──────┼──────────────────┘              │  │  keys)   │              │              │
+       │ one yamux session, one stream   │  └──────────┘   ┌──────────▼────────────┐  │
+       │ per proxied connection          │                 │ httputil.ReverseProxy │  │
+       └─────────────────────────────────┼────────────────▶│  DialContext = open   │  │
+                                          │                 │  a tunnel stream      │  │
+                                          └───────────────────────────────────────────┘
+```
+
 ### Capture Pipeline
 
 Request/response body capture (`internal/proxy/capture.go`, `body.go`) is **on by default whenever the proxy is enabled** (plan 012): `config.materializeCapture` builds a `CaptureConfig` with `Enabled: true` for every proxy block unless the config explicitly says `enabled: false`, and `ProxyConfig.CaptureEffectivelyEnabled()` (proxy AND capture both on) is the single gate consulted at every use site — the register wire, the CLI hint, `prox up --no-capture`. It works identically whether the proxy is standalone or routed through the shared daemon.

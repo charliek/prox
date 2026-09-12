@@ -34,10 +34,12 @@ nav = [
   { "Guides" = [
     { "Local DNS & Certificates" = "guides/local-dns.md" },
     { "Shared Proxy Across Projects" = "guides/shared-proxy.md" },
+    { "Remote Proxy Hub" = "guides/remote-hub.md" },
     { "Dependencies, Tasks, and Process Gating" = "guides/dependencies.md" },
   ] },
   { "Design Notes" = [
     { "Shared Proxy Across Projects" = "discovery/shared-proxy-across-projects.md" },
+    { "Remote Proxy Hub" = "discovery/remote-proxy-hub.md" },
   ] },
   { "Reference" = [
     { "CLI" = "reference/cli.md" },

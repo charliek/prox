@@ -18,9 +18,15 @@ var (
 	topLevelAllowedKeys = map[string]struct{}{
 		"api": {}, "env_file": {}, "processes": {}, "proxy": {}, "services": {},
 		"certs": {}, "dependencies": {}, "tasks": {}, "shutdown_timeout": {},
+		// hubs (plan 031 C2) is a fixed key at this level, but its own
+		// entries are user-chosen alias names -- see hubsEntryAllowedKeys in
+		// hubs.go, enforced by parseHubs, not by this schema walk.
+		"hubs": {},
 	}
 	proxyAllowedKeys = map[string]struct{}{
 		"enabled": {}, "http_port": {}, "https_port": {}, "domain": {}, "capture": {},
+		// hub (plan 031 D8): the alias this project publishes through.
+		"hub": {},
 	}
 	captureAllowedKeys = map[string]struct{}{
 		"enabled": {}, "max_body_size": {}, "disk_budget": {},
@@ -72,12 +78,23 @@ const maxAliasHops = 100
 // structural errors. A yaml.Node decode failure returns no errors rather than a
 // second opinion on YAML syntax: the raw decode owns that error (W0).
 func checkDocumentStructure(data []byte) []string {
+	return checkDocumentStructureWithSchema(data, schemaAllowedKeys)
+}
+
+// checkDocumentStructureWithSchema is checkDocumentStructure generalized over
+// the fixed-schema allow-list (plan 031 C2): ~/.prox/hubs.yaml (hubs.go)
+// reuses this exact walk -- aliased duplicate keys, `<<` merge expansion, and
+// the single-document rule -- against its own, much smaller schema instead of
+// prox.yaml's schemaAllowedKeys. checkDocumentStructure is the prox.yaml
+// caller and is what every existing test and doc comment refers to.
+func checkDocumentStructureWithSchema(data []byte, schema map[string]map[string]struct{}) []string {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var doc yaml.Node
 	if err := dec.Decode(&doc); err != nil {
 		return nil
 	}
 	w := &structuralWalker{
+		schema:     schema,
 		active:     make(map[*yaml.Node]bool),
 		merging:    make(map[*yaml.Node]bool),
 		dupChecked: make(map[*yaml.Node]bool),
@@ -118,6 +135,11 @@ func checkDocumentStructure(data []byte) []string {
 // reporting only -- schema checks are per-path and must run at every
 // destination.
 type structuralWalker struct {
+	// schema is the fixed-schema allow-list this walk checks unknown keys
+	// against (plan 031 C2): schemaAllowedKeys for prox.yaml,
+	// userHubsSchemaAllowedKeys for ~/.prox/hubs.yaml. See
+	// checkDocumentStructureWithSchema.
+	schema     map[string]map[string]struct{}
 	errs       []string
 	active     map[*yaml.Node]bool
 	merging    map[*yaml.Node]bool
@@ -205,7 +227,7 @@ func (w *structuralWalker) walkValue(node *yaml.Node, path string) {
 // destination's child path. That is what stops a typo from hiding behind a
 // merge, at any depth -- a merged-in `proxy:` block is validated as `proxy`.
 func (w *structuralWalker) walkMapping(node *yaml.Node, path string) {
-	allowed, schema := schemaAllowedKeys[path]
+	allowed, hasSchema := w.schema[path]
 	claimed := make(map[keyIdent]struct{}, len(node.Content)/2)
 	reportDupes := !w.dupChecked[node]
 	w.dupChecked[node] = true
@@ -243,12 +265,12 @@ func (w *structuralWalker) walkMapping(node *yaml.Node, path string) {
 			continue
 		}
 		claimed[ident] = struct{}{}
-		w.checkKey(ident, path, allowed, schema)
+		w.checkKey(ident, path, allowed, hasSchema)
 		w.walkValue(valueNode, childPath(path, ident.value))
 	}
 
 	for _, mergeValue := range merges {
-		w.expandMerge(mergeValue, path, claimed, allowed, schema)
+		w.expandMerge(mergeValue, path, claimed, allowed, hasSchema)
 	}
 }
 

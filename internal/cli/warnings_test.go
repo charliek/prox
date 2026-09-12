@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,6 +101,72 @@ func TestWarningSink_SealLatchesWithoutFreezing(t *testing.T) {
 	require.Len(t, s.Add(testWarning("late", "raised by a heal", "")), 1)
 	assert.Len(t, s.Warnings(), 1, "a post-seal warning is still recorded and still served")
 	assert.True(t, s.WarningsSealed())
+}
+
+// TestWarningSink_SealAndSnapshotIsAtomic is plan 031 review A4.
+//
+// A warning raised late in startup has to know whether the session's ONE render
+// has already happened: if it has, its producer must log it or nobody sees it;
+// if it has not, logging it would print it twice. Snapshot-then-seal answered
+// that question in a different critical section from the one that recorded the
+// warning, so a warning landing between the two was in NEITHER — lost from the
+// render and from the log — or, on the other side of the window, in both.
+//
+// The invariant, asserted here over many concurrent producers: every warning is
+// either in the returned snapshot AND was told sealed=false, or is not in the
+// snapshot AND was told sealed=true. Never both, never neither.
+func TestWarningSink_SealAndSnapshotIsAtomic(t *testing.T) {
+	const producers = 64
+
+	s := newWarningSink()
+
+	type outcome struct {
+		code   string
+		added  bool
+		sealed bool
+	}
+	results := make(chan outcome, producers)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(producers)
+	for i := 0; i < producers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			code := fmt.Sprintf("w%02d", i)
+			added, sealed := s.AddSealed(testWarning(code, "message "+code, ""))
+			results <- outcome{code: code, added: len(added) > 0, sealed: sealed}
+		}(i)
+	}
+
+	snapshot := make(chan []domain.Warning, 1)
+	go func() {
+		<-start
+		snapshot <- s.SealAndSnapshot()
+	}()
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	rendered := make(map[string]bool)
+	for _, w := range <-snapshot {
+		rendered[w.Code] = true
+	}
+
+	for got := range results {
+		require.True(t, got.added, "every producer raised a distinct warning")
+		if got.sealed {
+			assert.False(t, rendered[got.code],
+				"%s was told the session had already rendered, so it must NOT be in the snapshot (it logs itself)", got.code)
+		} else {
+			assert.True(t, rendered[got.code],
+				"%s was told the session had not rendered yet, so the snapshot must carry it", got.code)
+		}
+	}
+
+	assert.True(t, s.WarningsSealed(), "the snapshot seals")
 }
 
 // TestWarningSink_ConcurrentReadWhileWriting is the reason the sink has a mutex

@@ -3,6 +3,7 @@ package proxyd
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,16 @@ type Route struct {
 	// (D13, #49), stamped from the registration like CaptureEnabled. The dynamic
 	// proxy passes it as the per-call capture limit; 0 means the daemon default.
 	MaxBodySize int64
+	// Origin is the publishing machine for a hub-registered route and empty for
+	// a local one (plan 031 D5). It is the data plane's "this target lives
+	// through a tunnel, not on this host" flag and the reason the on-502
+	// dead-owner probe skips the route: a remote PID means nothing here (P4).
+	//
+	// Origin is the ONLY hub field on Route, deliberately (P5): Registry.Lookup
+	// hands the data plane a *Route it reads OUTSIDE the registry lock, so
+	// mutable connection state must never live here. It belongs to
+	// ProjectRegistration and (from C4) the session manager.
+	Origin string
 }
 
 // ProjectRegistration tracks all routes belonging to a project.
@@ -63,6 +74,79 @@ type ProjectRegistration struct {
 	// consults it) — the daemon folds every capture-enabled project's budget into
 	// one effective daemon-wide bound via EffectiveCaptureDiskBudget.
 	DiskBudget int64
+	// Origin is the publishing machine for a hub registration, empty for a local
+	// one (plan 031 D5). Its presence is what makes this registration REMOTE,
+	// which has two consequences on the hub host: the stale-PID sweep skips it
+	// (a publisher's PID is meaningless here — P4) and Dir is the composed key
+	// HubProjectKey(origin, publisher dir) rather than a bare directory.
+	Origin string
+
+	// --- hub lease state (plan 031 D17), meaningful only when Origin != "" ---
+	//
+	// This is where a remote registration's connection state LIVES, together
+	// with the session manager. It is deliberately NOT on Route: the data plane
+	// reads Registry.Lookup's *Route outside the registry lock, so a mutable
+	// field there would be a data race (P5).
+
+	// SessionGen is the generation of the tunnel session this registration is
+	// currently associated with, 0 before the first attach. It is the identity
+	// half of every lease decision: a removal or a disconnect that names an
+	// older generation is stale by definition and must be ignored, which is what
+	// keeps a sweep from deleting a publisher that reattached between detection
+	// and removal (P2).
+	SessionGen uint64
+	// ConnectedAt is when the current tunnel attached; zero when none ever has.
+	ConnectedAt time.Time
+	// DisconnectedAt is when the current tunnel closed; zero while connected.
+	// A registration is CONNECTED exactly when ConnectedAt is set and this is
+	// not — see ProjectRegistration.connected.
+	DisconnectedAt time.Time
+	// ReservedUntil is register time + HubAttachGrace for a freshly accepted
+	// remote registration (D17/P3). Until it expires the registration counts as
+	// connected for collision purposes even though no tunnel has attached yet,
+	// closing the register→attach window in which a second publisher could
+	// otherwise take the name out from under one still completing its handshake.
+	ReservedUntil time.Time
+}
+
+// connected reports whether this registration currently holds a tunnel.
+func (p *ProjectRegistration) connected() bool {
+	return !p.ConnectedAt.IsZero() && p.DisconnectedAt.IsZero()
+}
+
+// active reports whether this registration holds a name against a newcomer
+// (plan 031 D10): a LOCAL registration always does, and a remote one does while
+// it is connected or still inside its attach reservation.
+func (p *ProjectRegistration) active(now time.Time) bool {
+	if p.Origin == "" {
+		return true
+	}
+	return p.connected() || now.Before(p.ReservedUntil)
+}
+
+// hubLease is a remote registration's lease state, copied out under the registry
+// lock so a caller can reason about it without holding one.
+type hubLease struct {
+	SessionGen     uint64
+	ConnectedAt    time.Time
+	DisconnectedAt time.Time
+	ReservedUntil  time.Time
+}
+
+func leaseOf(p *ProjectRegistration) hubLease {
+	return hubLease{
+		SessionGen:     p.SessionGen,
+		ConnectedAt:    p.ConnectedAt,
+		DisconnectedAt: p.DisconnectedAt,
+		ReservedUntil:  p.ReservedUntil,
+	}
+}
+
+func applyLease(p *ProjectRegistration, l hubLease) {
+	p.SessionGen = l.SessionGen
+	p.ConnectedAt = l.ConnectedAt
+	p.DisconnectedAt = l.DisconnectedAt
+	p.ReservedUntil = l.ReservedUntil
 }
 
 // ListenerInfo tracks the protocol and route count for a port.
@@ -78,6 +162,32 @@ type Registry struct {
 	routes    map[string]*Route               // key: "hostname:port"
 	projects  map[string]*ProjectRegistration // key: project dir
 	listeners map[int]*ListenerInfo           // key: port
+	// now is the clock every hub LEASE decision reads (plan 031 D17): the
+	// attach reservation, the disconnect grace, and the collision "is this
+	// holder active" test. Injectable so the grace-expiry tests drive it
+	// deterministically instead of sleeping, exactly as DynamicProxy's
+	// probeClock does for the on-502 probe.
+	now func() time.Time
+
+	// beforeMarkConnected, when non-nil, runs at the TOP of MarkConnected,
+	// before the registry lock is taken. It is the other half of the attach
+	// barrier the replacement test needs (plan 031, review B8): the old test
+	// signalled "go" and then SLEPT 20ms, which proved nothing about where the
+	// concurrent attach had actually got to. This seam lets the replacement wait
+	// until the attach has demonstrably reached the registry call it is racing,
+	// so the barrier is a synchronization point rather than a guess about
+	// scheduling. Nil in production.
+	beforeMarkConnected func(key string, gen uint64)
+
+	// beforeReplaceCommit, when non-nil, runs inside ReplaceRegistration while
+	// the registry lock is HELD, immediately before the replaced lease is
+	// carried onto the successor. It is a test seam and nothing else: the
+	// atomicity of that sequence is the whole of plan 031 F3, and "atomic"
+	// cannot be demonstrated by racing goroutines and hoping — the test puts a
+	// barrier exactly where the old code's window was and shows that a
+	// concurrent attach is still not lost. Nil in production, where it costs one
+	// nil check per replacement.
+	beforeReplaceCommit func()
 }
 
 // NewRegistry creates a new empty route registry.
@@ -86,6 +196,7 @@ func NewRegistry() *Registry {
 		routes:    make(map[string]*Route),
 		projects:  make(map[string]*ProjectRegistration),
 		listeners: make(map[int]*ListenerInfo),
+		now:       time.Now,
 	}
 }
 
@@ -118,39 +229,59 @@ func (e *ProjectConflictError) Error() string {
 	)
 }
 
-// Register adds a project's routes to the registry.
-// Returns the registered hostnames, any new ports that need listeners, or an error on conflict.
-func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts []PortSpec, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// HubNameHeldError is returned when a remote registration collides with service
+// names an ACTIVE holder owns (plan 031 D10), analogous to
+// ProjectConflictError for the same-dir case. It carries EVERY conflicting
+// holder, because registration is all-or-nothing: a publisher whose two
+// services are held by two different publishers takes both names or neither,
+// and the user deciding whether to force it needs to see both.
+//
+// It is matched with errors.As; the register handler turns it into a
+// 409 HUB_NAME_HELD whose body carries the holder list.
+type HubNameHeldError struct {
+	Holders []HubHolder
+}
 
-	// Check if this project is already registered
-	if existing, exists := r.projects[req.ProjectDir]; exists {
-		return nil, nil, &ProjectConflictError{
-			Dir:       req.ProjectDir,
-			PID:       existing.PID,
-			StartTime: existing.StartTime,
+func (e *HubNameHeldError) Error() string {
+	parts := make([]string, 0, len(e.Holders))
+	for _, h := range e.Holders {
+		who := h.Origin
+		if who == "" {
+			who = "this machine"
 		}
+		state := "disconnected"
+		if h.Connected {
+			state = "connected"
+		}
+		parts = append(parts, fmt.Sprintf("%s held by %s:%s (%s)", h.Hostname, who, h.ProjectDir, state))
 	}
+	return fmt.Sprintf(
+		"service name(s) already published on this hub: %s. Retry with --hub-takeover to take them",
+		strings.Join(parts, ", "),
+	)
+}
 
-	// Reject same port for both HTTP and HTTPS
-	if req.HTTPPort > 0 && req.HTTPSPort > 0 && req.HTTPPort == req.HTTPSPort {
-		return nil, nil, fmt.Errorf("http_port and https_port cannot be the same (%d)", req.HTTPPort)
-	}
+// pendingRoute is one route a registration wants: the hostname it composes, the
+// port and protocol it lands on, and the backend it points at.
+type pendingRoute struct {
+	hostname string
+	port     int
+	protocol string
+	target   ServiceTarget
+}
 
-	// Build the set of routes this project wants to register.
-	type pendingRoute struct {
-		hostname string
-		port     int
-		protocol string
-		target   ServiceTarget
-	}
-
+// pendingRoutes builds the exact route set req is asking for.
+//
+// It is THE expression of "which names does this registration want", shared by
+// Register (which commits them) and HubNameCollisions (which checks who already
+// holds them). Those two used to construct hostnames and ports separately, a
+// few dozen lines apart, and a drift between them would mean the collision
+// check guarded a different set of names than the registration then claimed —
+// the kind of divergence that quietly turns a security check into a decoration.
+func pendingRoutes(req RegisterRequest) []pendingRoute {
 	var pending []pendingRoute
-
 	for svcName, target := range req.Services {
 		hostname := fmt.Sprintf("%s.%s", svcName, req.Domain)
-
 		if req.HTTPSPort > 0 {
 			pending = append(pending, pendingRoute{
 				hostname: hostname,
@@ -168,6 +299,37 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			})
 		}
 	}
+	return pending
+}
+
+// Register adds a project's routes to the registry.
+// Returns the registered hostnames, any new ports that need listeners, or an error on conflict.
+func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts []PortSpec, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registerLocked(req)
+}
+
+// registerLocked is Register's body; r.mu must be held for writing. It is split
+// out so a replacement (deregister + register + lease carry) can run as ONE
+// atomic registry operation — see ReplaceRegistration.
+func (r *Registry) registerLocked(req RegisterRequest) (hostnames []string, newPorts []PortSpec, err error) {
+	// Check if this project is already registered
+	if existing, exists := r.projects[req.ProjectDir]; exists {
+		return nil, nil, &ProjectConflictError{
+			Dir:       req.ProjectDir,
+			PID:       existing.PID,
+			StartTime: existing.StartTime,
+		}
+	}
+
+	// Reject same port for both HTTP and HTTPS
+	if req.HTTPPort > 0 && req.HTTPSPort > 0 && req.HTTPPort == req.HTTPSPort {
+		return nil, nil, fmt.Errorf("http_port and https_port cannot be the same (%d)", req.HTTPPort)
+	}
+
+	// Build the set of routes this project wants to register.
+	pending := pendingRoutes(req)
 
 	if len(pending) == 0 {
 		return nil, nil, fmt.Errorf("no routes to register (no services or no ports configured)")
@@ -194,7 +356,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	}
 
 	// All checks passed — commit the registration.
-	now := time.Now()
+	now := r.now()
 	var routeKeys []string
 	portsNeeded := make(map[int]string) // port -> protocol
 
@@ -211,6 +373,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 			RegisteredAt:   now,
 			CaptureEnabled: req.CaptureEnabled,
 			MaxBodySize:    req.MaxBodySize,
+			Origin:         req.Origin,
 		}
 		routeKeys = append(routeKeys, key)
 		hostnames = append(hostnames, p.hostname)
@@ -228,7 +391,7 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		}
 	}
 
-	r.projects[req.ProjectDir] = &ProjectRegistration{
+	proj := &ProjectRegistration{
 		Dir:            req.ProjectDir,
 		PID:            req.PID,
 		Domain:         req.Domain,
@@ -238,7 +401,18 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 		CaptureEnabled: req.CaptureEnabled,
 		MaxBodySize:    req.MaxBodySize,
 		DiskBudget:     req.DiskBudget,
+		Origin:         req.Origin,
 	}
+	if req.Origin != "" {
+		// A freshly accepted remote registration is RESERVED: it counts as
+		// connected for collision purposes until its tunnel has had
+		// HubAttachGrace to attach (plan 031 D17/P3). Without this, the window
+		// between register and attach is one in which nothing is connected, so
+		// D10's "inactive is replaceable" rule would let a second publisher take
+		// the name from one that is mid-handshake.
+		proj.ReservedUntil = now.Add(constants.HubAttachGrace)
+	}
+	r.projects[req.ProjectDir] = proj
 
 	for port, proto := range portsNeeded {
 		newPorts = append(newPorts, PortSpec{Port: port, Protocol: proto})
@@ -247,12 +421,179 @@ func (r *Registry) Register(req RegisterRequest) (hostnames []string, newPorts [
 	return hostnames, newPorts, nil
 }
 
+// ReplaceResult is what one atomic registry REPLACEMENT produced: the removal's
+// effects (so the caller can close listeners and purge records) and the new
+// registration's (so it can bind listeners).
+type ReplaceResult struct {
+	Hostnames        []string
+	NewPorts         []PortSpec
+	RemovedHostnames []string
+	EmptyPorts       []int
+	// Snapshot is the registration that was replaced, for the caller to restore
+	// if a LATER phase (cert generation, listener bind) fails.
+	Snapshot projectSnapshot
+}
+
+// ReplaceRegistration atomically swaps key's registration for req, carrying a
+// remote registration's tunnel LEASE onto its successor — all under one
+// acquisition of the registry lock (plan 031 F3).
+//
+// The atomicity is the whole point. The previous shape was: snapshot the lease,
+// remove the project, register the new one, then write the lease back. A tunnel
+// attaching anywhere inside that sequence called MarkConnected on the new
+// registration, and the stale lease write then clobbered it — leaving a
+// registration permanently "connected" to a generation the session manager had
+// never heard of. It could not be served (no session under that generation was
+// ever installed for it to disconnect) and could not be swept
+// (DeregisterIfDisconnected needs DisconnectedAt, which only MarkDisconnected
+// sets, and MarkDisconnected no-ops on a generation mismatch). One lock
+// acquisition removes the window entirely: an attach either lands before the
+// swap, and its state is what gets carried, or after it, and it applies to the
+// successor.
+//
+// On failure nothing has changed: the previous registration is restored under
+// the same lock, and since the caller has not yet acted on the removal, no
+// physical listener was ever closed.
+func (r *Registry) ReplaceRegistration(key string, req RegisterRequest) (ReplaceResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	snap, ok := r.snapshotProjectLocked(key)
+	if !ok {
+		return ReplaceResult{}, fmt.Errorf("cannot replace %s: not registered", key)
+	}
+	lease := leaseOf(snap.proj)
+
+	var res ReplaceResult
+	res.Snapshot = snap
+	res.RemovedHostnames, res.EmptyPorts = r.deregisterLocked(key)
+
+	var err error
+	res.Hostnames, res.NewPorts, err = r.registerLocked(req)
+	if err != nil {
+		r.restoreProjectLocked(snap)
+		return ReplaceResult{}, err
+	}
+	if r.beforeReplaceCommit != nil {
+		r.beforeReplaceCommit()
+	}
+	if proj, ok := r.projects[req.ProjectDir]; ok && proj.Origin != "" {
+		applyLease(proj, lease)
+	}
+	return res, nil
+}
+
+// RestoreReplaced puts a snapshot back after a replacement failed in a LATER
+// phase (cert generation, listener bind), carrying forward whatever lease the
+// short-lived successor accumulated (plan 031 F3).
+//
+// Carrying the lease FORWARD rather than restoring the snapshot's own is
+// deliberate and is the same invariant ReplaceRegistration protects: a tunnel
+// that attached while the doomed registration was live told the session manager
+// a generation, and that generation must end up on whatever registration
+// survives. Restoring the older one would strand the live session exactly as
+// the bug above did. Returns the ports whose physical listener the caller must
+// re-open.
+func (r *Registry) RestoreReplaced(key string, snap projectSnapshot) (reopenPorts []PortSpec) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	carry, hasCarry := hubLease{}, false
+	if proj, ok := r.projects[key]; ok && proj.Origin != "" && proj.SessionGen > snap.proj.SessionGen {
+		carry, hasCarry = leaseOf(proj), true
+	}
+	r.deregisterLocked(key)
+	reopenPorts = r.restoreProjectLocked(snap)
+	if hasCarry {
+		if proj, ok := r.projects[snap.proj.Dir]; ok && proj.Origin != "" {
+			applyLease(proj, carry)
+		}
+	}
+	return reopenPorts
+}
+
 // Deregister removes all routes for a project.
 // Returns the removed hostnames and ports that now have zero routes.
 func (r *Registry) Deregister(projectDir string) (removedHostnames []string, emptyPorts []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.deregisterLocked(projectDir)
+}
+
+// DeregisterResult is what a guarded deregistration did, including the LEASE
+// GENERATION the removed registration was holding (plan 031, review B1).
+//
+// The generation is the load-bearing field. A deregister used to remove by key
+// and then close the key's tunnel blind, so an old `prox up` shutting down after
+// its successor had already re-registered and attached would close the
+// SUCCESSOR's session. Reporting which generation was actually removed lets the
+// caller close that exact session and nothing else.
+type DeregisterResult struct {
+	// Removed is false when nothing was removed — either the project is not
+	// registered at all, or it is registered to a different owner (Mismatch).
+	Removed bool
+	// Mismatch distinguishes "somebody else owns this key now" from "nothing
+	// there", so the caller can log the difference rather than guess.
+	Mismatch   bool
+	Hostnames  []string
+	EmptyPorts []int
+	// SessionGen is the removed registration's lease generation; 0 for a local
+	// registration and for a remote one that never attached a tunnel.
+	SessionGen uint64
+}
+
+// DeregisterOwned removes a project's routes only when pid still names the
+// registration's OWNER, and reports the lease generation it removed (plan 031,
+// review B1).
+//
+// The guard is the deregister half of the identity discipline the sweep
+// (DeregisterIfIdentity) and the lease sweep (DeregisterIfDisconnected) already
+// have. Without it, `prox down` in a process whose registration has since been
+// replaced — a crashed-and-restarted `prox up` in the same directory, a
+// publisher that re-registered under a new PID — deleted its successor's
+// registration, which the caller then compounded by closing the successor's
+// tunnel.
+//
+// A pid of 0 on EITHER side means "no identity claim" and the removal proceeds
+// unguarded: the register handler requires a positive PID, so a zero on the
+// registration can only come from a test or a future caller, and a zero from the
+// wire is a client that never learned to send one. Narrowing further would turn
+// a missing field into an un-deregisterable project.
+func (r *Registry) DeregisterOwned(key string, pid int) DeregisterResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok {
+		return DeregisterResult{}
+	}
+	if pid > 0 && proj.PID > 0 && proj.PID != pid {
+		return DeregisterResult{Mismatch: true}
+	}
+	gen := proj.SessionGen
+	hostnames, emptyPorts := r.deregisterLocked(key)
+	return DeregisterResult{Removed: true, Hostnames: hostnames, EmptyPorts: emptyPorts, SessionGen: gen}
+}
+
+// SnapshotAndDeregister takes a project's snapshot and removes it under ONE lock
+// acquisition (plan 031, review B3).
+//
+// Doing it as snapshotProject followed by Deregister left a window between the
+// two in which a tunnel could attach: the snapshot then carried a lease older
+// than the session the manager had just installed, and restoring it after a
+// failed takeover left the registration claiming a generation nobody held —
+// permanently "connected", unserveable, and unsweepable. One lock acquisition
+// removes the window rather than narrowing it.
+func (r *Registry) SnapshotAndDeregister(key string) (snap projectSnapshot, removedHostnames []string, emptyPorts []int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	snap, ok = r.snapshotProjectLocked(key)
+	if !ok {
+		return projectSnapshot{}, nil, nil, false
+	}
+	removedHostnames, emptyPorts = r.deregisterLocked(key)
+	return snap, removedHostnames, emptyPorts, true
 }
 
 // DeregisterIfIdentity removes a project's routes only if its CURRENT
@@ -278,6 +619,311 @@ func (r *Registry) DeregisterIfIdentity(projectDir string, pid int, startTime in
 	}
 	removedHostnames, emptyPorts = r.deregisterLocked(projectDir)
 	return true, removedHostnames, emptyPorts
+}
+
+// --- hub lease (plan 031 D3/D17) ---
+
+// decideLease is the PURE lease-expiry decision, with every input passed in so
+// it can be table-tested against an injected clock — the same shape decideProbe
+// takes for the on-502 dead-owner gate.
+//
+// There are TWO expiries here, because a remote registration has two ways to
+// stop being worth keeping.
+//
+// The DISCONNECT lease. A registration whose tunnel attached and later closed
+// may be removed when all of these hold:
+//
+//   - it is disconnected (disconnectedAt is set). A connected publisher is
+//     serving traffic; nothing about a sweep should touch it.
+//   - its attach reservation has expired. A registration inside HubAttachGrace
+//     has not had a fair chance to attach yet (P3).
+//   - the grace has elapsed since the disconnect. Below it the hub serves the
+//     offline page and a reattach costs no route churn (D3).
+//   - the generation the caller OBSERVED is still the current one. This is the
+//     P2 guard: a sweep that saw "disconnected past grace", then had the
+//     publisher reattach before it got the lock, would otherwise delete a live
+//     registration. A reattach bumps currentGen, so the stale decision falls
+//     through here instead.
+//
+// The ATTACH lease (plan 031 F4). A registration that NEVER attached has no
+// disconnectedAt to expire — only reservedUntil — and the original rule's "no
+// disconnect, no removal" first line therefore leaked it forever: its routes,
+// its listeners, its ring and its memory stayed until `prox hub stop`, and a
+// publisher that could register but never tunnel (or simply a caller that
+// registers in a loop) accumulated them without bound. So a lapsed reservation
+// with sessionGen == 0 — registered, reserved, never attached — is itself an
+// expiry. The generation test is what keeps this narrow: any registration that
+// has ever attached has a non-zero generation and is judged by the disconnect
+// lease instead.
+//
+// F5 is the other half of making that safe: every accepted re-register renews
+// reservedUntil, so a publisher retrying its handshake keeps its registration
+// alive rather than racing this sweep.
+func decideLease(now, disconnectedAt, reservedUntil time.Time, sessionGen, currentGen uint64, grace time.Duration) bool {
+	if sessionGen != currentGen {
+		return false
+	}
+	if now.Before(reservedUntil) {
+		return false
+	}
+	if disconnectedAt.IsZero() {
+		// Never attached: removable once the attach reservation itself lapses.
+		// A zero reservedUntil means no reservation was ever taken (a registration
+		// that predates the field, or a local one this function never sees), which
+		// is not an expiry — only a reservation that EXISTED and ran out is.
+		return sessionGen == 0 && !reservedUntil.IsZero()
+	}
+	return !now.Before(disconnectedAt.Add(grace))
+}
+
+// MarkConnected records that a tunnel of generation gen attached for key. It
+// reports whether a remote registration was found and updated.
+//
+// An OLDER generation is refused. Generations are allocated monotonically by
+// the one session manager, so a lower number can only come from a session that
+// has already been replaced — applying it would roll the registration back onto
+// a dead tunnel.
+func (r *Registry) MarkConnected(key string, gen uint64) bool {
+	if r.beforeMarkConnected != nil {
+		r.beforeMarkConnected(key, gen)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || gen < proj.SessionGen {
+		return false
+	}
+	proj.SessionGen = gen
+	proj.ConnectedAt = r.now()
+	proj.DisconnectedAt = time.Time{}
+	// The attach reservation has done its job; the tunnel itself now holds the
+	// name.
+	proj.ReservedUntil = time.Time{}
+	return true
+}
+
+// MarkDisconnected records that the tunnel of generation gen closed, starting
+// the disconnect grace. It is a NO-OP unless gen is still the registration's
+// current generation — the second half of the P2 gate, mirroring the session
+// manager's own generation check, so a replaced session's late close callback
+// can never disconnect its successor.
+func (r *Registry) MarkDisconnected(key string, gen uint64, at time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || proj.SessionGen != gen || !proj.DisconnectedAt.IsZero() {
+		return false
+	}
+	proj.DisconnectedAt = at
+	return true
+}
+
+// RefreshRemoteOwner records the PID and start token of the process that most
+// recently registered a REMOTE key (plan 031, review B1).
+//
+// A remote registration's identity is its composed key, not its PID — the
+// publisher's PID means nothing on this host — so a same-key re-register with an
+// unchanged config takes the idempotent no-op arm and changes nothing. But the
+// PID it carries is still the answer to "which process is publishing this
+// now?", and the deregister guard needs that answer to be current: without this,
+// a registration would keep the PID of the FIRST process that ever published it,
+// so the process actually publishing today could not deregister its own
+// registration, while the long-dead original still could.
+func (r *Registry) RefreshRemoteOwner(key string, pid int, startTime int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || pid <= 0 {
+		return false
+	}
+	proj.PID = pid
+	proj.StartTime = startTime
+	return true
+}
+
+// RemoteLease returns key's lease state, or ok=false when key is not a remote
+// registration. The data plane uses it to render "offline since <t>".
+func (r *Registry) RemoteLease(key string) (hubLease, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" {
+		return hubLease{}, false
+	}
+	return leaseOf(proj), true
+}
+
+// RenewAttachReservation extends key's attach reservation to `until` when the
+// registration still NEEDS to attach — that is, when it holds no live tunnel
+// (plan 031 F5).
+//
+// Every accepted remote register goes through here, not just the first. A
+// re-register that took the idempotent no-op arm previously returned 200
+// without touching the reservation, so a publisher whose first tunnel attempt
+// failed and which re-registered before retrying got a fresh 200 against a
+// registration the sweep (or a newcomer's collision check) could remove a
+// moment later — the register said "I am still here" and nothing recorded it.
+//
+// Two guards keep it narrow. A CONNECTED registration is left alone: its tunnel
+// is the lease (D3) and a reservation would only confuse the collision rules.
+// And the reservation is never SHORTENED, so a renewal cannot accidentally
+// bring an expiry forward. The generation is preserved untouched, so the P2
+// guard on every other lease decision still applies.
+func (r *Registry) RenewAttachReservation(key string, grace time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" || proj.connected() {
+		return false
+	}
+	until := r.now().Add(grace)
+	if proj.ReservedUntil.After(until) {
+		return false
+	}
+	proj.ReservedUntil = until
+	return true
+}
+
+// LeaseCandidate is one remote registration whose disconnect grace has expired,
+// paired with the generation that was current when the sweep observed it.
+type LeaseCandidate struct {
+	Key        string
+	SessionGen uint64
+}
+
+// ExpiredLeases returns the remote registrations the sweep should remove. The
+// answer is advisory by design: it is computed under a read lock and acted on
+// later, so DeregisterIfDisconnected re-runs the same decision under the write
+// lock before removing anything (P2).
+func (r *Registry) ExpiredLeases() []LeaseCandidate {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := r.now()
+	var expired []LeaseCandidate
+	for key, proj := range r.projects {
+		if proj.Origin == "" {
+			continue
+		}
+		if decideLease(now, proj.DisconnectedAt, proj.ReservedUntil, proj.SessionGen, proj.SessionGen, constants.HubDisconnectGrace) {
+			expired = append(expired, LeaseCandidate{Key: key, SessionGen: proj.SessionGen})
+		}
+	}
+	sort.Slice(expired, func(i, j int) bool { return expired[i].Key < expired[j].Key })
+	return expired
+}
+
+// DeregisterIfDisconnected removes a remote registration only if it is STILL
+// disconnected past its grace AND its SessionGen is unchanged since the caller
+// observed it (plan 031 D17/P2).
+//
+// This is deliberately NOT removeStaleProject: that path's identity guard is
+// (dir, PID, start token), every element of which SURVIVES a tunnel reattach, so
+// a sweep that observed an expired lease would happily delete a publisher that
+// reconnected in between. The session generation is the only identity that
+// changes on reattach, which is why it — and not the PID — is the guard here.
+func (r *Registry) DeregisterIfDisconnected(key string, sessionGen uint64) (removed bool, removedHostnames []string, emptyPorts []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proj, ok := r.projects[key]
+	if !ok || proj.Origin == "" {
+		return false, nil, nil
+	}
+	if !decideLease(r.now(), proj.DisconnectedAt, proj.ReservedUntil, sessionGen, proj.SessionGen, constants.HubDisconnectGrace) {
+		return false, nil, nil
+	}
+	removedHostnames, emptyPorts = r.deregisterLocked(key)
+	return true, removedHostnames, emptyPorts
+}
+
+// HasProject reports whether key names a registered project. The tunnel upgrade
+// handler uses it to answer 404 NOT_REGISTERED before hijacking a connection it
+// would only have to drop.
+func (r *Registry) HasProject(key string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.projects[key]
+	return ok
+}
+
+// --- hub name collisions (plan 031 D10) ---
+
+// hubNameCollision is one existing route that stands between a remote
+// registration and a service name it wants.
+type hubNameCollision struct {
+	// HolderKey is the registry key of the project that holds the name, used to
+	// remove the whole losing registration when it loses.
+	HolderKey string
+	// Holder is the wire-facing identity the 409 body reports.
+	Holder HubHolder
+	// Local marks a socket-registered holder, which is NEVER displaced by a
+	// remote registration (D10).
+	Local bool
+	// Active marks a holder that is connected or still inside its attach
+	// reservation — the holders that need consent (takeover) to displace.
+	Active bool
+}
+
+// HubNameCollisions reports every existing route that blocks req, classified so
+// the caller can apply D10 without re-deriving anything under its own lock.
+//
+// The desired route set comes from pendingRoutes — the SAME function Register
+// commits — so the collision check and the registration cannot disagree about
+// which names are wanted.
+func (r *Registry) HubNameCollisions(req RegisterRequest) []hubNameCollision {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := r.now()
+	seen := make(map[string]struct{})
+	var collisions []hubNameCollision
+
+	consider := func(hostname string, port int) {
+		route, ok := r.routes[routeKey(hostname, port)]
+		if !ok || route.ProjectDir == req.ProjectDir {
+			return
+		}
+		if _, dup := seen[route.ProjectDir+"|"+hostname]; dup {
+			return
+		}
+		seen[route.ProjectDir+"|"+hostname] = struct{}{}
+
+		holder := HubHolder{Hostname: hostname, ProjectDir: route.ProjectDir}
+		local := true
+		active := true
+		if proj, ok := r.projects[route.ProjectDir]; ok {
+			local = proj.Origin == ""
+			active = proj.active(now)
+			holder.Origin = proj.Origin
+			holder.Connected = proj.Origin == "" || proj.connected()
+			if proj.Origin != "" {
+				// Report the publisher's OWN directory, not the composed key:
+				// the key is a hub implementation detail, and the person reading
+				// the conflict wants a path they recognize.
+				holder.ProjectDir = hubKeyProjectDir(proj.Origin, route.ProjectDir)
+			}
+		}
+		collisions = append(collisions, hubNameCollision{
+			HolderKey: route.ProjectDir,
+			Holder:    holder,
+			Local:     local,
+			Active:    active,
+		})
+	}
+
+	for _, p := range pendingRoutes(req) {
+		consider(p.hostname, p.port)
+	}
+	sort.Slice(collisions, func(i, j int) bool {
+		if collisions[i].Holder.Hostname != collisions[j].Holder.Hostname {
+			return collisions[i].Holder.Hostname < collisions[j].Holder.Hostname
+		}
+		return collisions[i].HolderKey < collisions[j].HolderKey
+	})
+	return collisions
 }
 
 // routeDescriptor builds a canonical key for a single route's full identity
@@ -382,6 +1028,13 @@ type projectSnapshot struct {
 func (r *Registry) snapshotProject(projectDir string) (projectSnapshot, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.snapshotProjectLocked(projectDir)
+}
+
+// snapshotProjectLocked is snapshotProject's body; r.mu must be held (for read
+// or write). Split out so an atomic replacement can snapshot, remove, and
+// re-register under ONE lock acquisition (ReplaceRegistration).
+func (r *Registry) snapshotProjectLocked(projectDir string) (projectSnapshot, bool) {
 	proj, ok := r.projects[projectDir]
 	if !ok {
 		return projectSnapshot{}, false
@@ -408,7 +1061,11 @@ func (r *Registry) snapshotProject(projectDir string) (projectSnapshot, bool) {
 func (r *Registry) restoreProject(snap projectSnapshot) (reopenPorts []PortSpec) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.restoreProjectLocked(snap)
+}
 
+// restoreProjectLocked is restoreProject's body; r.mu must be held for writing.
+func (r *Registry) restoreProjectLocked(snap projectSnapshot) (reopenPorts []PortSpec) {
 	for _, route := range snap.routes {
 		rc := *route
 		r.routes[routeKey(rc.Hostname, rc.Port)] = &rc
@@ -484,6 +1141,14 @@ func (r *Registry) AllRoutes() []RouteInfo {
 
 	routes := make([]RouteInfo, 0, len(r.routes))
 	for _, route := range r.routes {
+		// A local route is always serveable (the daemon dials the target
+		// itself); a hub route needs its publisher's tunnel, whose state the
+		// owning registration mirrors from the session manager (plan 031 D17).
+		connected := true
+		if route.Origin != "" {
+			proj, ok := r.projects[route.ProjectDir]
+			connected = ok && proj.connected()
+		}
 		routes = append(routes, RouteInfo{
 			Hostname:     route.Hostname,
 			Port:         route.Port,
@@ -492,9 +1157,55 @@ func (r *Registry) AllRoutes() []RouteInfo {
 			ProjectDir:   route.ProjectDir,
 			PID:          route.PID,
 			RegisteredAt: route.RegisteredAt,
+			Origin:       route.Origin,
+			Connected:    connected,
 		})
 	}
 	return routes
+}
+
+// RemotePublishers returns one entry per HUB (origin-qualified) registration,
+// for the hub operator's `prox hub status` (plan 031 §4.2). Local registrations
+// are never listed: this is the publisher roster, not the route table.
+func (r *Registry) RemotePublishers() []HubPublisher {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	publishers := make([]HubPublisher, 0)
+	for key, proj := range r.projects {
+		if proj.Origin == "" {
+			continue
+		}
+		publishers = append(publishers, HubPublisher{
+			Origin:         proj.Origin,
+			ProjectDir:     hubKeyProjectDir(proj.Origin, key),
+			Key:            key,
+			Connected:      proj.connected(),
+			ConnectedAt:    proj.ConnectedAt,
+			DisconnectedAt: proj.DisconnectedAt,
+			RegisteredAt:   proj.RegisteredAt,
+			Routes:         len(proj.RouteKeys),
+		})
+	}
+	sort.Slice(publishers, func(i, j int) bool { return publishers[i].Key < publishers[j].Key })
+	return publishers
+}
+
+// RemoteProjectKeys returns the registry keys of every hub registration, so
+// `prox hub stop` can remove them all when the network control plane closes
+// (plan 031 §4.2). Sorted for deterministic teardown order.
+func (r *Registry) RemoteProjectKeys() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	keys := make([]string, 0)
+	for key, proj := range r.projects {
+		if proj.Origin != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // ListenerPorts returns all ports with active listeners.
@@ -530,6 +1241,18 @@ func (r *Registry) EffectiveCaptureDiskBudget() int64 {
 	seen := false
 	for _, proj := range r.projects {
 		if !proj.CaptureEnabled {
+			continue
+		}
+		if proj.Origin != "" {
+			// REMOTE registrations get no vote (plan 031 F9). This bound governs
+			// the HUB HOST's own disk, and it is a MINIMUM over every
+			// participant: a publisher's value — or even its silence, which
+			// contributes the daemon default — could pull the effective bound
+			// below what the machine's own projects agreed on and start evicting
+			// their captured bodies — one publisher reaching every other
+			// project's data through the accountant, sideways. The network register handler also clears
+			// DiskBudget on arrival, so this is the second of two independent
+			// guards.
 			continue
 		}
 		budget := proj.DiskBudget
@@ -573,7 +1296,15 @@ type StaleProject struct {
 }
 
 // StalePIDs returns the registered projects whose owning process generation is
-// no longer running. Liveness is keyed on (PID, start token) so a reused PID
+// no longer running. REMOTE (hub) registrations are skipped entirely: a
+// publisher's PID identifies a process on ANOTHER machine, so probing it here
+// is meaningless in both directions — it may be dead on the hub host while the
+// publisher is perfectly healthy, or (worse) coincidentally alive as some
+// unrelated local process, making a genuinely gone publisher look live (plan
+// 031 P4/D3). A remote registration's liveness is its tunnel, swept on the
+// disconnect grace in C4.
+//
+// Liveness is keyed on (PID, start token) so a reused PID
 // naming a different process reads as dead (see daemon.IsProcessAlive). It only
 // detects — removal goes through the consolidated removeStaleProject path
 // (identity-guarded via DeregisterIfIdentity) so the crash path purges captured
@@ -592,6 +1323,10 @@ func (r *Registry) StalePIDs() []StaleProject {
 	r.mu.RLock()
 	candidates := make([]candidate, 0, len(r.projects))
 	for dir, proj := range r.projects {
+		if proj.Origin != "" {
+			// Remote registration: its PID lives on another machine (P4).
+			continue
+		}
 		candidates = append(candidates, candidate{dir: dir, pid: proj.PID, token: proj.StartTime})
 	}
 	r.mu.RUnlock()

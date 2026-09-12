@@ -98,6 +98,17 @@ No operator action is required to recover: each project's forwarder detects the 
 | Fallback | If `~/.prox/` is unavailable, prox runs a standalone per-project proxy. Port sharing is not available in fallback mode. |
 | Capture disk budget | Every capture-enabled project shares one `~/.prox/capture` directory and one daemon-wide budget (the minimum across each project's `disk_budget`, 1GiB default). One noisy project's large bodies can trigger eviction of another project's older captures — only the spilled body files, never metadata. See [Request Capture](../reference/configuration.md#request-capture). |
 
+## Publishing Beyond This Machine
+
+The shared daemon described above only ever answers on this machine — its
+hostnames resolve to `127.0.0.1`. To make a project reachable from another
+device (a teammate's laptop, a phone, or a VM/container with no inbound
+reachability of its own), that same daemon can also run in **hub mode**,
+publishing over a network control plane and a reverse tunnel instead of only
+the local Unix socket. See the [Remote Proxy Hub](remote-hub.md) guide —
+including its security section, which is required reading before turning hub
+mode on.
+
 ## Files
 
 Shared proxy state is stored under `~/.prox/`:

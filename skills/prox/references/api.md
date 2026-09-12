@@ -86,7 +86,14 @@ Supervisor status.
     "last_connected_at": "2025-01-19T10:32:01.123Z",
     "dropped_events": 0,
     "backfill_failures": 0,
-    "heal_state": "healthy"
+    "heal_state": "healthy",
+    "hub": {
+      "alias": "llt",
+      "state": "connected",
+      "domain": "llt.stridelabs.ai",
+      "routes": 2,
+      "since": "2025-01-19T10:30:01.000Z"
+    }
   },
   "dependencies": [
     {
@@ -111,6 +118,26 @@ Supervisor status.
 | `dropped_events` | Request-stream events lost to a full subscriber channel |
 | `backfill_failures` | Post-connect ring snapshot fetch failures |
 | `heal_state` | `healthy`, `healing`, or `version_mismatch`; empty when not in shared mode |
+
+`hub` is **experimental** (the hub feature is new; this object's shape may
+change without a deprecation cycle). It is present only when this project
+resolved a [remote proxy
+hub](https://charliek.github.io/prox/guides/remote-hub/) to publish through
+(`--hub`/`proxy.hub`/`PROX_HUB`); omitted entirely otherwise. It is this
+project's OWN publishing state — not a hub host's view of every publisher it
+serves, which is a separate object reached only via `prox hub status`.
+
+| Field | Description |
+|-------|-------------|
+| `alias` | The resolved hub alias (never the literal `"default"`) |
+| `state` | `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or a terminal `displaced` / `protocol_mismatch` / `auth_failed` / `name_held` |
+| `domain` | The hub's own domain; empty until a register has succeeded once |
+| `routes` | Hostnames the hub published for this project |
+| `since` | When the current state was entered; omitted for a state with no interesting age |
+| `detail` | State-specific tail: the holder for `displaced` and `name_held`, both versions for `protocol_mismatch`, the reason for `reconnecting`; omitted when there is none |
+
+A degraded hub only ever renders `prox status`'s `Hub:` line — it never
+changes any exit code, because hub publishing is additive to the local proxy.
 
 **When `mode` is `shared` and `daemon_reachable` is `false`, proxied routes are dead** — requests through the proxy will fail even though the project's own processes may be healthy. This is not necessarily an error to act on immediately: the project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s. An agent polling status should treat a brief `daemon_reachable: false` as transient, retry rather than fail the task outright, and only surface it as a real problem if it persists past that window. `prox proxy status` gives daemon-side detail (routes, version) that this per-project block does not.
 

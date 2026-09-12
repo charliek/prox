@@ -169,16 +169,53 @@ func formatBytes(n int64) string {
 }
 
 // printRoutesTable prints routes in a tabwriter table.
+//
+// The hub columns are CONDITIONAL (plan 031 §4.2, P13): with no hub route
+// registered the table is byte-for-byte the one this command has always
+// printed, so a user who never touches hub mode sees no change at all. The
+// moment a hub-origin route exists, a SOURCE column appears and a hub route's
+// TARGET is rendered as the tunnel it really is. `--json` is unconditional --
+// it always carries origin/connected -- because a machine-readable shape that
+// changes with the data is worse than one extra field.
 func printRoutesTable(routes []proxyd.RouteInfo) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "HOSTNAME\tPORT\tPROTOCOL\tTARGET\tPROJECT\tPID")
-	fmt.Fprintln(w, "--------\t----\t--------\t------\t-------\t---")
-
+	hasHubRoute := false
 	for _, r := range routes {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s:%d\t%s\t%d\n",
-			r.Hostname, r.Port, r.Protocol,
-			r.Target.Host, r.Target.Port,
-			r.ProjectDir, r.PID)
+		if r.Origin != "" {
+			hasHubRoute = true
+			break
+		}
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if !hasHubRoute {
+		fmt.Fprintln(w, "HOSTNAME\tPORT\tPROTOCOL\tTARGET\tPROJECT\tPID")
+		fmt.Fprintln(w, "--------\t----\t--------\t------\t-------\t---")
+
+		for _, r := range routes {
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s:%d\t%s\t%d\n",
+				r.Hostname, r.Port, r.Protocol,
+				r.Target.Host, r.Target.Port,
+				r.ProjectDir, r.PID)
+		}
+		w.Flush()
+		return
+	}
+
+	fmt.Fprintln(w, "SOURCE\tHOSTNAME\tPORT\tPROTOCOL\tTARGET\tPROJECT\tPID")
+	fmt.Fprintln(w, "------\t--------\t----\t--------\t------\t-------\t---")
+	for _, r := range routes {
+		source := "local"
+		target := fmt.Sprintf("%s:%d", r.Target.Host, r.Target.Port)
+		if r.Origin != "" {
+			// A hub route's backend lives on the publisher's machine and is
+			// reached through its tunnel; printing a bare host:port here would
+			// name something that does not exist on THIS host. PROJECT is
+			// already the composed "<origin>:<dir>" key (plan 031 D5).
+			source = "hub"
+			target = "tunnel -> " + target
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t%d\n",
+			source, r.Hostname, r.Port, r.Protocol, target, r.ProjectDir, r.PID)
 	}
 	w.Flush()
 }

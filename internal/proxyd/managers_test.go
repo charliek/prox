@@ -233,7 +233,7 @@ func TestInFlightCompletionAfterDeregister_DropsSafely(t *testing.T) {
 func TestMissingProjectSnapshot_ReturnsEmpty200(t *testing.T) {
 	_, client, _ := startTestServer(t)
 
-	resp, err := client.httpClient.Get("http://proxyd/api/v1/requests?project=/projects/missing")
+	resp, err := client.get("/api/v1/requests?project=/projects/missing")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -252,7 +252,7 @@ func TestMissingProjectSnapshot_ReturnsEmpty200(t *testing.T) {
 func TestMissingProjectStream_EndsCleanly(t *testing.T) {
 	_, client, _ := startTestServer(t)
 
-	resp, err := client.httpClient.Get("http://proxyd/api/v1/requests/stream?project=/projects/missing")
+	resp, err := client.get("/api/v1/requests/stream?project=/projects/missing")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

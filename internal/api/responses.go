@@ -120,6 +120,46 @@ type ProxyStatusResponse struct {
 	// opinion. nil means UNKNOWN and callers must fall back to their
 	// capture-agnostic wording rather than treating it as disabled.
 	CaptureEnabled *bool `json:"capture_enabled,omitempty"`
+	// Hub is this project's REMOTE-HUB publishing state (plan 031 D20), nil
+	// whenever no hub is configured for the run — so a hub-less status payload
+	// carries no `hub` key at all and is byte-identical to before (AC1).
+	//
+	// It lives HERE, nested in the proxy block, rather than at the top level of
+	// StatusResponse: it describes this project's proxy path exactly as the rest
+	// of this block does. Do not confuse it with the hub HOST's view, which is
+	// the shared daemon's own proxyd.DaemonStatusResponse.Hub and lists every
+	// publisher; this one is one project's own publishing state.
+	Hub *HubStatusResponse `json:"hub,omitempty"`
+}
+
+// HubStatusResponse is one project's remote-hub publishing state, surfaced as
+// status.proxy.hub and rendered by `prox status` as the `Hub:` line (plan 031
+// D19/D20, §4.2).
+//
+// A degraded hub is ADVISORY in every state here: `prox status` renders the
+// line and still exits 0, because hub publishing is additive and the non-zero
+// exits stay reserved for the local proxy and the processes themselves (AC12).
+type HubStatusResponse struct {
+	// Alias is the hub alias this project resolved (never "default", which is
+	// expanded before it gets here).
+	Alias string `json:"alias"`
+	// State is the publisher state machine's current state: "resolving",
+	// "registering", "connecting", "connected", "reconnecting", or one of the
+	// terminal "displaced" / "protocol_mismatch" / "auth_failed".
+	State string `json:"state"`
+	// Domain is the hub's own domain (the hub owns it, D4), empty until a
+	// register has succeeded at least once.
+	Domain string `json:"domain,omitempty"`
+	// Routes is how many hostnames the hub published for this project.
+	Routes int `json:"routes"`
+	// Since is when the current state was entered, which is what the
+	// "reconnecting, down 12s" line counts from. Nil for a state with no
+	// interesting age.
+	Since *time.Time `json:"since,omitempty"`
+	// Detail carries the state-specific tail of the rendered line: the holder
+	// for "displaced", the two versions for "protocol_mismatch", the reason for
+	// "reconnecting".
+	Detail string `json:"detail,omitempty"`
 }
 
 // ProxyStatusProvider supplies the proxy block for GET /status. The daemon

@@ -74,8 +74,8 @@ func TestForwardRequests_InvokesHealAfterThreshold(t *testing.T) {
 
 	healed := make(chan struct{}, 1)
 	cfg := forwarderConfig{
-		socketPath: deadSocket,
-		projectDir: "/p",
+		client:     NewClient(deadSocket),
+		projectKey: "/p",
 		localRM:    proxy.NewRequestManager(100),
 		heal: func() bool {
 			select {
@@ -148,7 +148,7 @@ func TestForwardRequests_HealDampingAcrossOutages(t *testing.T) {
 	// Scripted connect outcomes: fail, fail(heal), connect, fail, fail, fail.
 	streamResults := []bool{false, false, true, false, false, false}
 	var streamIdx int
-	stream := func(context.Context, string, *Client, string, *proxy.RequestManager, ForwarderStatusSink) (bool, error) {
+	stream := func(context.Context, *Client, string, *proxy.RequestManager, ForwarderStatusSink) (bool, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		// Clamp: after heal #2 cancels ctx, an extra iteration may fire before the
@@ -179,8 +179,8 @@ func TestForwardRequests_HealDampingAcrossOutages(t *testing.T) {
 	}
 
 	cfg := forwarderConfig{
-		socketPath:      filepath.Join(t.TempDir(), "unused.sock"),
-		projectDir:      "/p",
+		client:          NewClient(filepath.Join(t.TempDir(), "unused.sock")),
+		projectKey:      "/p",
 		localRM:         proxy.NewRequestManager(100),
 		heal:            heal,
 		stream:          stream,
@@ -229,8 +229,8 @@ func TestForwardRequests_ImmediateEOFIsNotRecovery(t *testing.T) {
 	// outage would start at 16s and no heal could fire until 31s.
 	step := 0
 	cfg := forwarderConfig{
-		socketPath: "/nonexistent",
-		projectDir: "/p",
+		client:     NewClient("/nonexistent"),
+		projectKey: "/p",
 		localRM:    proxy.NewRequestManager(10),
 		now:        func() time.Time { return clock },
 		// Each backoff advances the scripted clock 8s; the streams themselves
@@ -249,7 +249,7 @@ func TestForwardRequests_ImmediateEOFIsNotRecovery(t *testing.T) {
 			healCalls++
 			return false
 		},
-		stream: func(ctx context.Context, _ string, _ *Client, _ string, _ *proxy.RequestManager, _ ForwarderStatusSink) (bool, error) {
+		stream: func(ctx context.Context, _ *Client, _ string, _ *proxy.RequestManager, _ ForwarderStatusSink) (bool, error) {
 			switch step {
 			case 0:
 				step++ // fail at t=0 → downSince=t0

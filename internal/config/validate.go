@@ -4,16 +4,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
 )
-
-// domainRegex validates domain format (basic DNS name validation)
-var domainRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
 
 // ValidationError represents a configuration validation error
 type ValidationError struct {
@@ -97,8 +93,10 @@ func Validate(config *Config) error {
 		if config.Proxy.Enabled && config.Proxy.Domain == "" {
 			errs = append(errs, "proxy.domain: required when proxy is enabled")
 		}
-		if config.Proxy.Domain != "" && !domainRegex.MatchString(config.Proxy.Domain) {
-			errs = append(errs, fmt.Sprintf("proxy.domain: invalid domain format %q", config.Proxy.Domain))
+		if config.Proxy.Domain != "" {
+			if err := domain.ValidateDomainName(config.Proxy.Domain); err != nil {
+				errs = append(errs, fmt.Sprintf("proxy.domain: %s", err.Error()))
+			}
 		}
 
 		// Validate capture disk budget if set (#69). Empty means "use the default"
@@ -153,6 +151,9 @@ func Validate(config *Config) error {
 	// perturbs the report.
 	errs = append(errs, validateDependenciesAndTasks(config)...)
 
+	// Validate hubs: entries and proxy.hub (plan 031 C2, D8).
+	errs = append(errs, validateHubs(config)...)
+
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: %s", domain.ErrInvalidConfig, strings.Join(errs, "; "))
 	}
@@ -160,27 +161,15 @@ func Validate(config *Config) error {
 	return nil
 }
 
-// validateServiceName checks if a service name is valid as a subdomain
+// validateServiceName checks if a service name is valid as a subdomain.
+//
+// The rule itself lives in domain.ValidateServiceName because the hub's
+// network mount must apply the IDENTICAL one to a registration that never went
+// through this file (plan 031 F9): a remote publisher's services arrive as JSON
+// on another machine's say-so, and two copies of a naming rule are two rules
+// that drift.
 func validateServiceName(name string) error {
-	if name == "" {
-		return fmt.Errorf("service name cannot be empty")
-	}
-	// Service names become subdomains, so they must be valid DNS labels
-	// - Only lowercase alphanumeric and hyphens
-	// - Cannot start or end with hyphen
-	// - Max 63 characters
-	if len(name) > 63 {
-		return fmt.Errorf("service name too long (max 63 characters)")
-	}
-	if name[0] == '-' || name[len(name)-1] == '-' {
-		return fmt.Errorf("service name cannot start or end with hyphen")
-	}
-	for _, c := range name {
-		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-			return fmt.Errorf("service name can only contain lowercase letters, numbers, and hyphens")
-		}
-	}
-	return nil
+	return domain.ValidateServiceName(name)
 }
 
 // ValidateProcessName checks if a process name is valid
@@ -517,6 +506,78 @@ func detectTaskCycles(tasks map[string]TaskConfig, taskNames map[string]struct{}
 	return cycleMsg
 }
 
+// validateHubs checks every hubs: entry and proxy.hub (plan 031 C2, D8).
+// Visited in sorted order so the report is deterministic regardless of map
+// iteration.
+func validateHubs(config *Config) []string {
+	var errs []string
+
+	for _, name := range sortedMapKeys(config.Hubs) {
+		hub := config.Hubs[name]
+		prefix := fmt.Sprintf("hubs.%s", name)
+
+		// The alias itself is validated here, not only in `prox hub add`: a
+		// committed hubs: block can define the same unreachable entries the
+		// command refuses (plan 031 D8).
+		if err := ValidateHubAlias(name); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %s", prefix, err))
+		}
+
+		if err := ValidateHubURL(hub.URL); err != nil {
+			errs = append(errs, fmt.Sprintf("%s.url: %s", prefix, err))
+		}
+
+		tokenSources := 0
+		for _, v := range []string{hub.Token, hub.TokenFile, hub.TokenEnv} {
+			if v != "" {
+				tokenSources++
+			}
+		}
+		if tokenSources > 1 {
+			errs = append(errs, fmt.Sprintf("%s: at most one of token, token_file, token_env may be set", prefix))
+		}
+	}
+
+	if config.Proxy != nil && config.Proxy.Hub != "" && !config.Proxy.Enabled {
+		errs = append(errs, "proxy.hub: requires proxy.enabled to be true")
+	}
+
+	return errs
+}
+
+// ValidateHubURL checks a hubs: entry's url, and is what `prox hub add`
+// (internal/cli/hub_cmd.go) calls before writing ~/.prox/hubs.yaml so the
+// command applies the same rule Validate applies to a project's hubs: block.
+//
+// The rule itself lives in domain.NormalizeHubURL because internal/proxyd
+// enforces the identical one on the client side and the two packages cannot
+// import each other (plan 031 D8/C2). This wrapper exists only to discard the
+// canonical form, which a validator does not need.
+func ValidateHubURL(raw string) error {
+	_, err := domain.NormalizeHubURL(raw)
+	return err
+}
+
+// ValidateHubAlias checks one hubs: alias name, and is the single home of the
+// reserved-alias rule (plan 031 D8). It is called from THREE places, which is
+// the point: `prox hub add` (internal/cli/hub_cmd.go), Validate's hubs: walk
+// for a project's prox.yaml, and parseUserHubs for ~/.prox/hubs.yaml. Living
+// only in the CLI, it could be walked around by hand-editing either file.
+//
+// Two aliases are refused. "default" is reserved because ResolveHub always
+// reads that word as indirection into the user file's default: value, so an
+// entry named "default" can never be selected -- it would sit in the file
+// looking configured and do nothing. An empty alias is not addressable at all.
+func ValidateHubAlias(alias string) error {
+	if strings.TrimSpace(alias) == "" {
+		return fmt.Errorf("hub alias is empty")
+	}
+	if alias == "default" {
+		return fmt.Errorf("hub alias %q is reserved (it selects ~/.prox/hubs.yaml's default: hub); choose another alias", alias)
+	}
+	return nil
+}
+
 // validationMessage extracts the human message from a ValidateProcessName
 // error, stripping its "name: " field prefix so the dependency/task caller can
 // re-prefix with the right namespace path.
@@ -547,21 +608,8 @@ func sortedMapKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// hostnameRegex validates hostname format (excluding IP addresses)
-var hostnameRegex = regexp.MustCompile(`^(localhost|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*)$`)
-
-// validateHost checks if a host is a valid hostname or IP address
+// validateHost checks if a host is a valid hostname or IP address. Shared with
+// the hub's network register path via domain.ValidateHost (plan 031 F9).
 func validateHost(host string) error {
-	if host == "" {
-		return fmt.Errorf("host cannot be empty")
-	}
-	// First check if it's a valid IP address (handles both IPv4 and IPv6)
-	if ip := net.ParseIP(host); ip != nil {
-		return nil
-	}
-	// Otherwise validate as hostname
-	if !hostnameRegex.MatchString(host) {
-		return fmt.Errorf("invalid host format %q", host)
-	}
-	return nil
+	return domain.ValidateHost(host)
 }

@@ -87,7 +87,14 @@ Supervisor status.
     "dropped_events": 0,
     "backfill_failures": 0,
     "heal_state": "healthy",
-    "capture_enabled": true
+    "capture_enabled": true,
+    "hub": {
+      "alias": "llt",
+      "state": "connected",
+      "domain": "llt.stridelabs.ai",
+      "routes": 2,
+      "since": "2025-01-19T10:30:01.000Z"
+    }
   },
   "dependencies": [
     {
@@ -123,6 +130,19 @@ Supervisor status.
 | `capture_enabled` | Whether request/response capture is effectively on (a proxy is running for this session **and** `proxy.capture.enabled` is true). Daemons predating this field omit it entirely; an absent `capture_enabled` means "unknown", **not** `false` |
 
 `prox status` (the CLI command) renders this block as a `Proxy:` line and, when `mode` is `shared` and `daemon_reachable` is `false`, prints `Proxy: DOWN — shared proxy daemon unreachable (proxied routes are dead). Check 'prox proxy status'.` and **exits with status 1** even though the project's own processes may be healthy. The project self-heals automatically (re-registers with a fresh or recovered daemon), worst case within ~45s — treat a brief `daemon_reachable: false` as transient rather than a hard failure. See [`prox status`](cli.md#status).
+
+`hub` is this project's [remote proxy hub](../guides/remote-hub.md) publishing state. **The hub feature is experimental and this object's shape may change without a deprecation cycle.** It is present only when the run resolved a hub to publish through (`--hub`/`proxy.hub`/`PROX_HUB`); omitted entirely otherwise, so a hub-less status payload is byte-identical to before this feature existed. **This is the publisher's own state for THIS project** — not to be confused with a hub host's view of every publisher it serves, which lives on the shared daemon's own socket API (`prox hub status`), not here:
+
+| Field | Description |
+|-------|-------------|
+| `alias` | The hub alias this project resolved (never the literal `"default"`, which is expanded before this is populated) |
+| `state` | The publisher state machine's current state: `resolving`, `registering`, `connecting`, `connected`, `reconnecting`, or one of the terminal states `displaced`, `protocol_mismatch`, `auth_failed`, `name_held` |
+| `domain` | The hub's own domain (the hub owns it, not the publisher); empty until a register has succeeded at least once |
+| `routes` | How many hostnames the hub published for this project |
+| `since` | When the current state was entered — what a `reconnecting, down 12s` rendering counts from. Omitted for a state with no interesting age |
+| `detail` | The state-specific tail of the rendered line: the holder's identity for `displaced` and `name_held`, the two protocol versions for `protocol_mismatch`, the failure reason for `reconnecting`. Omitted when there is none |
+
+A degraded hub is **advisory only**: it renders in `prox status`'s `Hub:` line but never changes its exit code, because hub publishing is additive — see [`prox status`](cli.md#status).
 
 `dependencies` reports the resolution state of every configured `dependencies:` entry; the field is omitted entirely when no dependencies are configured (it is never an empty array):
 

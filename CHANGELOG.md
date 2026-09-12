@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- **Remote proxy hub: publish a project's services through a `prox` daemon on
+  another machine** (plan 031). **Experimental** — new, lightly exercised
+  outside its test suite, and its config keys, flags, status strings and
+  publisher/hub wire protocol may change without a deprecation cycle. Nothing
+  changes for a machine or project that does not configure a hub. The per-user shared proxy daemon
+  (`internal/proxyd`) gains an optional **hub mode**: a network control plane
+  plus a reverse tunnel, so `prox up --hub <alias>` (or `proxy.hub: <alias>`
+  in `prox.yaml`) anywhere with outbound reachability to the hub host
+  publishes `auth.llt.stridelabs.ai` on the hub's existing `:443` listener and
+  proxies each connection back through an outbound-only tunnel to
+  `localhost:3000` on the publisher — reaching a loopback-bound dev server, a
+  VZ shed, or a container with no inbound reachability at all. Publishing is
+  purely additive: local behavior on every machine is unchanged unless it
+  configures a hub, and a configured-but-unreachable hub never fails
+  `prox up` or changes `prox status`'s exit code.
+
+  New commands: `prox hub start|stop|status|token` (the hub host) and
+  `prox hub add|remove|list` (a publisher's `~/.prox/hubs.yaml` connection
+  profiles); new `prox up` flags `--hub <alias>`, `--no-hub`,
+  `--hub-takeover`; a new `Hub:` line in `prox status`; a `SOURCE` column and
+  tunnel targets in `prox proxy routes`, appearing only once a hub route
+  exists so hub-less output is unchanged.
+
+  Certificates need no new setup — the hub generates mkcert certificates on
+  demand exactly as the local proxy does; a phone or other non-mkcert device
+  installs the root CA once. The control plane authenticates with one shared
+  bearer token and defaults to binding only loopback or a Tailscale-style
+  CGNAT (`100.64.0.0/10`) address, because it speaks plain HTTP and a token
+  is sniffable on an unencrypted LAN; a plain private-LAN address needs an
+  explicit `allow_unencrypted_lan` opt-in. See the
+  [Remote Proxy Hub guide](docs/guides/remote-hub.md) — including its
+  security section, which every user of this feature should read — for the
+  full walkthrough, configuration, and the accepted v1 trust model: mutually
+  trusted machines sharing one token, where a publisher that deliberately
+  sends another publisher's `origin` reaches **that other publisher's**
+  registration — it can deregister it, read its captured requests, or take
+  over its tunnel.
+
 ## v0.4.0
 
 The first-impression release. Foreground `prox up` now opens the TUI by

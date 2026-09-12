@@ -107,6 +107,100 @@ const (
 	// attempts, damping churn against a flapping daemon (D6b). Injectable in tests.
 	ForwarderHealMinInterval = 30 * time.Second
 
+	// HubUnaryTimeout is the whole-request bound the proxyd Client applies to
+	// its UNARY calls — register, deregister, status, routes, requests,
+	// shutdown, health — over both the Unix socket and a hub's network control
+	// plane. It is the value that client carried inline before plan 031 C1, so
+	// the socket path's timing is unchanged.
+	//
+	// It deliberately does NOT apply to Client.Stream: an http.Client.Timeout
+	// covers reading the response body, so bounding the SSE request
+	// subscription (or the hub tunnel upgrade) by it would cut every
+	// long-lived stream at 30 seconds. Those go through the Client's second,
+	// unbounded http.Client and are bounded by their request context instead
+	// (plan 031 P1/D16).
+	HubUnaryTimeout = 30 * time.Second
+
+	// HubResponseHeaderTimeout bounds how long the hub transport waits for a
+	// response's HEADERS after the request has been written. It sits on the
+	// TRANSPORT, so it applies to both http.Clients — including the unbounded
+	// stream client, which is exactly the point (plan 031 D16).
+	//
+	// Client.Stream deliberately carries no whole-request timeout, and the
+	// forwarder hands it a context that lives as long as the run, so a hub that
+	// completes the TCP handshake and then never answers would otherwise wedge
+	// the subscription forever: reconnect, backoff and self-heal never get to
+	// run because the attempt never fails. A header timeout closes that
+	// black-hole case without bounding an SSE body, since headers arrive
+	// immediately and the body may stream for hours.
+	//
+	// 10s matches the transport's dial and TLS-handshake budgets: it is an
+	// establishment bound, not a request bound.
+	HubResponseHeaderTimeout = 10 * time.Second
+
+	// HubDisconnectGrace is how long a remote (hub-published) registration is
+	// kept after its tunnel closes before the daemon's stale sweep may remove it
+	// (plan 031 D3). During the grace the hub serves the offline page and a
+	// reattach by the same publisher reconnects with no route churn. Because the
+	// sweep runs every 30s, removal is observable at up to grace + one sweep
+	// interval (90s) — which is what the plan promises, not 60s (P11).
+	HubDisconnectGrace = 60 * time.Second
+
+	// HubAttachGrace is how long a freshly-accepted remote registration counts
+	// as connected for collision purposes before its tunnel attaches (plan 031
+	// D17/P3). It closes the register→attach window in which a second publisher
+	// could otherwise take the name out from under a publisher that is still
+	// completing its handshake.
+	HubAttachGrace = 10 * time.Second
+
+	// HubConnectTimeout bounds the FIRST, synchronous hub register that `prox up`
+	// performs on the startup path (plan 031 D16, AC11). After it the publisher's
+	// tunnel loop owns every further attempt, so this is purely a bound on how
+	// long startup may pause for a hub.
+	//
+	// It exists because "a configured but unreachable hub is never fatal" is not
+	// enough on its own: a black-holed hub (a listener that completes the TCP
+	// handshake and then never answers) would otherwise hold startup for
+	// HubResponseHeaderTimeout, and a 10s stall before any output satisfies the
+	// letter of "exit 0" while being unusable (CodeRabbit M1). 3s is long enough
+	// for a tailnet round trip and short enough that a down hub is invisible.
+	HubConnectTimeout = 3 * time.Second
+
+	// HubDialTimeout bounds ONE tunnel dial end to end on the hub side (plan 031
+	// D16): open a yamux stream, write "CONNECT host:port\n", and read the
+	// publisher's one-line reply. On expiry the hub abandons the stream and
+	// serves the offline 503.
+	//
+	// This deadline — not TCP, and not yamux's own session-death detection — is
+	// what makes a frozen publisher produce a prompt 503 (P10). A SIGSTOPped
+	// publisher's kernel keeps ACKing, so the connection stays ESTABLISHED, and
+	// yamux's keepalive needs KeepAliveInterval + ConnectionWriteTimeout to
+	// notice. Only the application-level reply deadline is fast and deterministic.
+	HubDialTimeout = 3 * time.Second
+
+	// HubTunnelKeepAliveInterval, HubTunnelWriteTimeout, and
+	// HubTunnelStreamOpenTimeout are the yamux session settings BOTH ends of a
+	// hub tunnel run with (plan 031 D16). They are tuned well below yamux's own
+	// defaults (30s/10s/75s) so a dead peer is eventually torn down in ~15s
+	// rather than ~40s; the prompt failure path is still HubDialTimeout.
+	//
+	// HubTunnelStreamOpenTimeout additionally bounds how long a stream whose SYN
+	// the peer never ACKs may occupy yamux's inflight-SYN budget (AcceptBacklog,
+	// 256): once it expires yamux closes the whole session, which is the right
+	// outcome for a peer that has stopped answering entirely.
+	HubTunnelKeepAliveInterval = 5 * time.Second
+	HubTunnelWriteTimeout      = 10 * time.Second
+	HubTunnelStreamOpenTimeout = 30 * time.Second
+
+	// HubShutdownGrace bounds the GRACEFUL half of stopping a hub control-plane
+	// server — a rebind's replaced server, or `prox hub stop`. When it expires
+	// the server is Closed outright rather than left running (plan 031 F15):
+	// the hub's longest-lived handler is an SSE request subscription a publisher
+	// holds open indefinitely, so Shutdown reliably reaches this bound and
+	// "wait a bit, then give up and leak it" is not a shutdown. Hijacked tunnel
+	// connections are unaffected by either call and survive a rebind.
+	HubShutdownGrace = 5 * time.Second
+
 	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
 	// liveness probes for a single project (#74). When a route's backend
 	// transport fails, the daemon probes the owning `prox up` process's liveness
@@ -382,6 +476,24 @@ const (
 
 	// DefaultProxyMaxIdleConns is the maximum number of idle connections
 	DefaultProxyMaxIdleConns = 100
+)
+
+// Remote proxy hub (plan 031)
+const (
+	// HubProtocolVersion is the version of the hub's network JSON API and
+	// tunnel framing. A remote publisher sends it as `protocol_version` on the
+	// NETWORK mount and a mismatch is a 409 PROTOCOL_MISMATCH (plan 031 D7).
+	//
+	// It is deliberately NOT the binary version: machines upgrade at different
+	// times and only the wire contract has to agree across them. The Unix
+	// socket mount keeps its exact-binary-version rule unchanged, because a
+	// local project and its daemon are the same install.
+	HubProtocolVersion = 1
+
+	// HubDefaultPort is the default TCP port for a hub's network control plane
+	// (plan 031 D6). It is a high port on a private/tailnet address, so binding
+	// it needs no privilege.
+	HubDefaultPort = 8443
 )
 
 // File permissions

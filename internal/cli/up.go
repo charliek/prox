@@ -61,6 +61,12 @@ var (
 	httpsPort     int
 	enableCapture bool
 	noCapture     bool
+	// Remote hub publishing (plan 031 D8). --hub takes a REQUIRED value: `prox
+	// up` takes positional process names, so an optional-value flag would read
+	// `prox up --hub llt` as "the default hub, and start process llt".
+	hubAlias    string
+	noHub       bool
+	hubTakeover bool
 )
 
 // upCmd represents the up command
@@ -102,6 +108,9 @@ func init() {
 	upCmd.Flags().IntVar(&httpsPort, "https-port", 0, "Override proxy HTTPS port")
 	upCmd.Flags().BoolVar(&enableCapture, "capture", false, "Force request/response body capture on (default: on when the proxy is enabled; kept for explicitness/compat)")
 	upCmd.Flags().BoolVar(&noCapture, "no-capture", false, "Disable request/response body capture for this run")
+	upCmd.Flags().StringVar(&hubAlias, "hub", "", "(experimental) Also publish this project's services through hub <alias> (use 'default' for the ~/.prox/hubs.yaml default); overrides PROX_HUB and proxy.hub")
+	upCmd.Flags().BoolVar(&noHub, "no-hub", false, "(experimental) Do not publish to any hub for this run, even when proxy.hub or PROX_HUB names one")
+	upCmd.Flags().BoolVar(&hubTakeover, "hub-takeover", false, "(experimental) Take hub service names already published by another project, without prompting")
 }
 
 // completeProcessNames provides shell completion for process names
@@ -342,6 +351,28 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 
+	// Resolve the remote hub (plan 031 D8/§3.1) HERE, before the PID file, the
+	// supervisor, the proxy or any process exists. Exactly one class of hub
+	// problem fails `prox up` — a fatal CLI/config error: an explicitly named
+	// alias this machine does not define, a malformed hub url, two token
+	// sources — and the whole point of resolving this early is that such a
+	// failure costs the user nothing but the error message.
+	//
+	// Everything else the resolution can produce is advisory and is carried in
+	// hubRes.Warning until the warning sink exists a few dozen lines below.
+	envHub, envHubPresent := os.LookupEnv(proxHubEnvVar)
+	hubRes, err := resolveHubPublishing(cfg, configPath, hubSelectionInputs{
+		FlagSet:    cmd.Flags().Changed("hub"),
+		FlagValue:  hubAlias,
+		NoHub:      noHub,
+		Env:        envHub,
+		EnvPresent: envHubPresent,
+		ConfigHub:  proxyHubAlias(cfg),
+	})
+	if err != nil {
+		return err
+	}
+
 	// For foreground mode, also check if already running and handle state
 	if !detach {
 		if err := ensureNotAlreadyRunning(cwd); err != nil {
@@ -556,6 +587,20 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	// so it never leaks.
 	go forwardShutdownSignal(ctx, sigCh, coordinator, sup.SystemLog)
 
+	// The advisory half of the hub resolution above (an alias a committed
+	// prox.yaml names and this machine does not define). Reported now that the
+	// sink exists, so it renders with every other advisory in one block.
+	if hubRes.Warning != nil {
+		warnings.Add(*hubRes.Warning)
+	}
+	// A resolved hub with no proxy to publish through (--no-proxy, or a
+	// proxy: block that is off) publishes nothing. Say so rather than ignoring
+	// the request silently: hub publishing is layered ON the local proxy path,
+	// so there is nothing to layer it on.
+	if hubRes.Enabled && !proxyFacts.Configured {
+		warnings.Add(hubNoProxyWarning(hubRes.Hub.Alias))
+	}
+
 	// Start proxy — either via shared daemon or standalone fallback.
 	var proxyService *proxy.Service
 	var daemonClient *proxyd.Client
@@ -565,6 +610,35 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 		if proxyErr != nil {
 			return proxyErr
 		}
+
+		// Hub publishing is layered on top of the local path, never in place of
+		// it (plan 031 D9): by this point the project is registered locally (or
+		// running a standalone proxy) and that is untouched by anything below.
+		// This call cannot fail the command — §3.1's only fatal class was
+		// settled before anything started.
+		//
+		// It runs on runUp's own goroutine because it prints the preamble line
+		// and may ask about a name collision. `--no-proxy` skips it with
+		// everything else proxy-shaped: a run with no proxy at all publishes
+		// nothing.
+		runtime.SetHubPublisher(startHubPublishing(ctx, hubPublishOptions{
+			Res:      hubRes,
+			Cfg:      cfg,
+			Cwd:      cwd,
+			Runtime:  runtime,
+			Preamble: preamble,
+			LocalRM:  handlers.GetRequestManager(),
+			// The same start token the local registration read, so both
+			// registrations name one generation of this process.
+			StartToken: hubStartToken(),
+			Takeover:   hubTakeover,
+			// D10: a detached session has a terminal it is about to let go of,
+			// so it warns rather than asking a question nobody will answer.
+			Interactive: isInteractiveStdio() && !detach,
+			Stdin:       os.Stdin,
+			Stdout:      os.Stdout,
+			InGitTree:   insideGitWorkTree,
+		}))
 	}
 	// Ensure standalone proxy is cleaned up on any subsequent error. This defer
 	// only tears down the proxy listeners (never processes), so it gets the
@@ -694,8 +768,11 @@ func runUp(cmd *cobra.Command, args []string) (err error) {
 	if !warnings.Wait(warningProducerJoinTimeout) {
 		log.Printf("prox: startup warning checks did not finish within %s; continuing", warningProducerJoinTimeout)
 	}
-	reportStartupWarnings(warnings.Warnings(), preamble, os.Stderr)
-	warnings.Seal()
+	// Seal and snapshot are ONE operation (plan 031, review A4): a warning that
+	// lands between them would otherwise be in neither the render nor its
+	// producer's own log line, because the producer decides which of the two it
+	// is by asking whether the sink is sealed.
+	reportStartupWarnings(warnings.SealAndSnapshot(), preamble, os.Stderr)
 
 	// Handle TUI vs terminal output. tuiErr survives the block: a failed TUI
 	// session must reach the exit contract below.
@@ -1098,9 +1175,16 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 	// the client, so we deregister through the HEALED client, never the one captured
 	// at startup (FIX 3). daemonClient is the fallback for helper tests with no runtime.
 	daemonClient := deps.daemonClient
+	var hubPub *hubPublisher
 	if deps.runtime != nil {
 		deps.runtime.MarkShuttingDown()
 		deps.runtime.CancelForwarder()
+		// The hub tunnel and its request forwarder stop here too, for exactly
+		// the D6c reason the local forwarder does: the tunnel loop's
+		// re-register callback would otherwise put the registration back a
+		// moment after stage 1a2 removed it (plan 031 C5).
+		deps.runtime.CancelHubTunnel()
+		hubPub = deps.runtime.HubPublisher()
 		daemonClient = deps.runtime.clientAfterHealBarrier()
 	}
 
@@ -1126,6 +1210,15 @@ func performShutdown(deps shutdownDeps) *domain.ProcessStopError {
 		case <-timer.C:
 			fmt.Fprintf(os.Stderr, "Warning: proxy daemon deregister exceeded %s; abandoning in background\n", deps.stageTimeout)
 		}
+	}
+
+	// Stage 1a2: deregister from the remote hub (plan 031 C5), so the hub drops
+	// this project's routes immediately rather than waiting out the disconnect
+	// grace plus a sweep. The tunnel was already cancelled above; the call is
+	// bounded by the same stage timeout, and a failure is advisory — the lease
+	// removes the registration on its own if the hub never hears from us.
+	if hubPub != nil {
+		hubPub.Shutdown(deps.stageTimeout)
 	}
 
 	// Stage 1b: stop the standalone proxy (listeners only, never processes).

@@ -506,6 +506,7 @@ certs:
 | `proxy.http_port` | int | — | Port for the HTTP proxy server |
 | `proxy.https_port` | int | `6789` | Port for the HTTPS proxy server (default when enabled with no ports set) |
 | `proxy.domain` | string | required | Base domain used to derive hostnames for shared proxy routing |
+| `proxy.hub` | string | — | Alias of a [remote proxy hub](#hubs) to also publish this project's services through, e.g. `hub: llt`. `default` means the alias `~/.prox/hubs.yaml`'s own `default:` key names. Overridden per run by `--hub`/`--no-hub`/`PROX_HUB` |
 | `proxy.capture.enabled` | bool | `true` | Capture request/response headers and bodies for proxied requests (see [Request Capture](#request-capture) for the full field list) |
 | `proxy.capture.max_body_size` | string | `1MB` | Maximum request or response body size to capture |
 
@@ -521,6 +522,109 @@ The behavior is automatic:
 - `prox proxy status` and `prox proxy routes` show daemon state.
 
 See the [Shared Proxy Across Projects](../guides/shared-proxy.md) guide for examples and constraints.
+
+## Hubs
+
+!!! warning "Experimental"
+
+    Hub mode is **experimental**: new, lightly exercised outside its test
+    suite, and its config keys, flags, status strings and publisher/hub wire
+    protocol may change without a deprecation cycle. See the
+    [Remote Proxy Hub guide](../guides/remote-hub.md) for the security limits
+    that come with it.
+
+
+A **hub** is a shared proxy daemon running with hub mode on, on another
+machine, that a project can publish its services through — so a hostname
+like `auth.llt.stridelabs.ai` works from any device that can reach the hub,
+not just the machine the project runs on. See the
+[Remote Proxy Hub](../guides/remote-hub.md) guide for the full walkthrough,
+setup, and — importantly — its security posture, which every user of this
+feature should read before relying on it.
+
+### `hubs:` — publisher connection profiles
+
+`hubs:` is a map of alias to connection profile, accepted in **two** places
+with the same schema: a project's `prox.yaml` (self-contained, committed) and
+the per-user `~/.prox/hubs.yaml` (shared by every project on the machine,
+managed by `prox hub add|remove|list`). Entries are merged by alias, with the
+project file winning on a clash.
+
+```yaml
+# prox.yaml
+proxy:
+  hub: llt   # publish this project through the hub aliased "llt"
+
+hubs:
+  llt:
+    url: http://100.82.128.123:8443
+    token_env: PROX_HUB_TOKEN   # or token_file; token: (inline) warns in a git work tree
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | The hub's control-plane address, e.g. `http://100.82.128.123:8443`. No query, fragment, or userinfo |
+| `token` | string | — | Inline bearer token. Discouraged in a committed `prox.yaml` — a one-line warning is raised when the file is inside a git work tree |
+| `token_file` | string | — | Path to a file holding the token. Relative to the directory of the file the `hubs:` entry itself came from (the project's `prox.yaml`, or `~/.prox/hubs.yaml`), not the current working directory |
+| `token_env` | string | — | Name of an environment variable holding the token, read at resolve time |
+| `origin` | string | this machine's hostname | Overrides the name this machine reports to the hub as its publisher identity |
+
+At most one of `token`/`token_file`/`token_env` may be set; `auth: none` on
+the hub side needs none of them.
+
+### `~/.prox/hubs.yaml` — the per-user file
+
+```yaml
+default: llt
+hubs:
+  llt:
+    url: http://100.82.128.123:8443
+    token_file: ~/.prox/hubs/llt.token
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default` | string | — | The alias `--hub default` or `hub: default` resolves to |
+| `hubs` | map | — | Same schema as a project's `hubs:` block |
+
+Written by `prox hub add <alias> <url> [--token T \| --token-file P \| --token-env E] [--origin O] [--default]` and managed with `prox hub remove <alias>` / `prox hub list` — see [CLI Reference](cli.md#hub). The file is `0600` (it can hold an inline token) and written atomically, so a crash mid-write can never leave a truncated token behind.
+
+### `~/.prox/hub.yaml` — the hub HOST's own configuration
+
+This file describes the hub a machine **offers**, and is written by
+`prox hub start` (flags persist to it) or by hand:
+
+```yaml
+domain: llt.stridelabs.ai       # remote hostnames are <service>.<domain>
+listen: 100.82.128.123:8443     # control + tunnel endpoint
+https_port: 443                 # data-plane HTTPS port for remote routes
+http_port: 0                    # 0 = no HTTP listener for remote routes
+auth: token                     # token | none
+autostart: false                # true: hub mode turns on whenever the daemon starts
+allow_unencrypted_lan: false    # true: also accept a plain private-LAN listen address
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `domain` | string | required (first start) | Base domain remote hostnames are published under |
+| `listen` | string | this machine's first tailnet address — a CGNAT (`100.64.0.0/10`) address on a tunnel interface — port `8443`; loopback if none found | Control-plane + tunnel bind address. `host:0` binds an ephemeral port. A CGNAT address that is NOT on a tunnel interface (carrier-grade NAT, a hotspot) counts as a plain LAN address and needs `allow_unencrypted_lan` |
+| `https_port` | int | `443` | Data-plane HTTPS port hub routes are published on. `0` disables it |
+| `http_port` | int | `0` (off) | Data-plane HTTP port hub routes are published on |
+| `auth` | string | `token` | `token` requires the bearer token in `~/.prox/hub.token`; `none` is an explicit "this network is trusted" opt-out |
+| `autostart` | bool | `false` | Turn hub mode on automatically whenever the shared daemon starts, not just via `prox hub start` |
+| `allow_unencrypted_lan` | bool | `false` | Accept a plain private-LAN listen address (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 ULA `fc00::/7`) in addition to loopback/tailnet. See [Security](../guides/remote-hub.md#security) before setting this — the control plane is plain HTTP, so a shared LAN's bearer token is sniffable |
+
+`https_port` and `http_port` cannot both be `0`, and cannot be equal to each
+other. The listen address is refused outright — with no opt-in — when it is
+`0.0.0.0`, `::`, or any public address; see
+[Security](../guides/remote-hub.md#security) for the full reasoning.
+
+The token itself lives in `~/.prox/hub.token` (`0600`, generated on first
+`prox hub start` when `auth: token`), never inside `hub.yaml`, so the config
+file can be read, diffed, and edited without handling a secret. `prox hub
+token [--rotate]` prints it, or rotates it and tells the running hub to
+accept only the new value (established tunnels survive; the next call with
+the old token gets `401`).
 
 ### Service Fields
 

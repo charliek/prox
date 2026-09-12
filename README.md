@@ -8,6 +8,7 @@ A modern process manager for development with an API-first design.
 - **API-first** - Full process control and log access via HTTP
 - **Interactive TUI, by default** - `prox up` in a terminal opens it: real-time log viewing with menu bar, themes, query filter bar, and mouse support
 - **HTTP/HTTPS proxy** - Friendly local hostnames with shared multi-project port support
+- **Remote proxy hub** *(experimental)* - Publish a project's services through a `prox` daemon on another machine, so a hostname like `auth.llt.example.com` works from a phone, a teammate's laptop, or a VM with only outbound network access ([guide](docs/guides/remote-hub.md))
 - **Health checks** - Optional health monitoring for processes
 
 ## Installation
