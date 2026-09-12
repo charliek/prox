@@ -115,7 +115,7 @@ func TestStreamRequests_LargeInlineBodies(t *testing.T) {
 
 	localRM := proxy.NewRequestManager(100)
 	// streamRequests returns nil once the server closes the stream (io.EOF).
-	_, err = streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM, nil)
+	_, err = streamRequests(context.Background(), NewClient(socketPath), "/p", localRM, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, localRM.Count())
@@ -153,7 +153,7 @@ func TestStreamRequests_OversizeEventSkippedStreamContinues(t *testing.T) {
 	})
 
 	localRM := proxy.NewRequestManager(100)
-	_, err = streamRequests(context.Background(), socketPath, NewClient(socketPath), "/p", localRM, nil)
+	_, err = streamRequests(context.Background(), NewClient(socketPath), "/p", localRM, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, localRM.Count(), "oversize event skipped, following event delivered")

@@ -107,6 +107,20 @@ const (
 	// attempts, damping churn against a flapping daemon (D6b). Injectable in tests.
 	ForwarderHealMinInterval = 30 * time.Second
 
+	// HubUnaryTimeout is the whole-request bound the proxyd Client applies to
+	// its UNARY calls — register, deregister, status, routes, requests,
+	// shutdown, health — over both the Unix socket and a hub's network control
+	// plane. It is the value that client carried inline before plan 031 C1, so
+	// the socket path's timing is unchanged.
+	//
+	// It deliberately does NOT apply to Client.Stream: an http.Client.Timeout
+	// covers reading the response body, so bounding the SSE request
+	// subscription (or the hub tunnel upgrade) by it would cut every
+	// long-lived stream at 30 seconds. Those go through the Client's second,
+	// unbounded http.Client and are bounded by their request context instead
+	// (plan 031 P1/D16).
+	HubUnaryTimeout = 30 * time.Second
+
 	// DeadRouteProbeMinInterval is the minimum spacing between on-502 dead-owner
 	// liveness probes for a single project (#74). When a route's backend
 	// transport fails, the daemon probes the owning `prox up` process's liveness

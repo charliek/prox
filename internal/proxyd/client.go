@@ -10,15 +10,55 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/proxy"
 )
 
-// Client communicates with the proxy daemon over its Unix socket.
+// Client communicates with a proxy daemon: over its Unix socket (NewClient) or
+// over TCP against a hub daemon's network control plane (NewHTTPClient). The
+// transport and the base URL are the only difference between the two — every
+// method below is written against c.baseURL and works over either.
 type Client struct {
-	socketPath string
-	httpClient *http.Client
+	// baseURL is the scheme://host[/path] prefix every request is built
+	// against. For the Unix-socket client it is the dummy "http://proxyd"
+	// (the socket transport ignores the host); for a hub client it is the
+	// hub's URL, validated and trailing-slash-normalized at construction.
+	baseURL string
+
+	// token, when non-empty, is sent as "Authorization: Bearer <token>" on
+	// every request. It is applied in newRequest — the single request-building
+	// helper every method funnels through — so no method can forget it.
+	token string
+
+	// unary and stream are TWO http.Clients deliberately sharing ONE
+	// http.Transport (connection pool, dialer, TLS config).
+	//
+	// DO NOT COLLAPSE THEM INTO ONE CLIENT. http.Client.Timeout is a
+	// WHOLE-REQUEST bound that covers reading the response body, not just the
+	// handshake and headers:
+	//
+	//   - unary carries constants.HubUnaryTimeout (30s, historically the
+	//     NewClient timeout) and is correct for the small JSON calls —
+	//     register, deregister, status, routes, requests, shutdown, health.
+	//   - stream carries Timeout: 0 (unbounded) and is the ONLY client that
+	//     may carry a long-lived response body: the SSE request subscription
+	//     and, later, the hub tunnel upgrade. Routing those through unary
+	//     would silently cut every subscription at 30 seconds and look like a
+	//     flapping daemon; the forwarder used to build its own timeout-free
+	//     client for exactly this reason (plan 031 P1/D16).
+	//
+	// Callers bound a stream with the request context instead, which is what
+	// the forwarder's per-attempt context already does.
+	//
+	// Both refuse redirects (CheckRedirect returns http.ErrUseLastResponse) so
+	// a bearer token can never be replayed to another origin by a 30x from a
+	// compromised or misconfigured hub (D16/P9). The daemon never redirects,
+	// so this changes nothing on the socket path.
+	unary  *http.Client
+	stream *http.Client
 }
 
 // DaemonAPIError is returned by Client methods when the daemon responds with a
@@ -42,20 +82,129 @@ func (e *DaemonAPIError) Error() string {
 	return e.Message
 }
 
-// NewClient creates a new daemon client that connects via Unix socket.
+// NewClient creates a new daemon client that connects via Unix socket. The
+// socket path lives in the transport's dialer closure; the base URL is the
+// dummy "http://proxyd" the Unix transport ignores.
 func NewClient(socketPath string) *Client {
 	dialer := &net.Dialer{}
-	return &Client{
-		socketPath: socketPath,
-		httpClient: &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return dialer.DialContext(ctx, "unix", socketPath)
-				},
-			},
-			Timeout: 30 * time.Second,
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", socketPath)
 		},
 	}
+	return newClientOverTransport("http://proxyd", "", transport, constants.HubUnaryTimeout)
+}
+
+// NewHTTPClient creates a client for a hub daemon's network control plane over
+// TCP. token (may be empty, for a hub configured `auth: none`) is sent as a
+// bearer credential on every request.
+//
+// Unlike NewClient it returns an error, because a hub URL comes from user
+// configuration and must be validated before a credential is ever attached to
+// it: a query, fragment, or userinfo component, a non-http(s) scheme, or a
+// missing host is rejected here rather than producing a confusing request
+// later. A trailing slash is normalized away so baseURL+path never doubles it.
+func NewHTTPClient(baseURL, token string) (*Client, error) {
+	return newHubClient(baseURL, token, constants.HubUnaryTimeout)
+}
+
+// newHubClient is NewHTTPClient with an injectable unary timeout. Tests use it
+// to exercise the bounded/unbounded client split in milliseconds instead of
+// waiting out the real 30s HubUnaryTimeout; production always passes the
+// constant.
+func newHubClient(baseURL, token string, unaryTimeout time.Duration) (*Client, error) {
+	normalized, err := normalizeHubBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// An explicit transport rather than a clone of http.DefaultTransport:
+	// supplying DialContext also keeps Go from auto-negotiating HTTP/2 over
+	// TLS (ForceAttemptHTTP2 stays false), which matters because the hub
+	// tunnel is an HTTP/1.1 Connection: Upgrade handshake that h2 cannot
+	// carry.
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return newClientOverTransport(normalized, token, transport, unaryTimeout), nil
+}
+
+// newClientOverTransport builds the two-client-over-one-transport pair the
+// Client struct documents: a bounded client for unary JSON calls and an
+// unbounded one for long-lived streams, both refusing redirects.
+func newClientOverTransport(baseURL, token string, transport *http.Transport, unaryTimeout time.Duration) *Client {
+	// A bearer token must never be replayed to whatever origin a 30x names, so
+	// redirects are not followed at all: the caller sees the 30x response
+	// itself (D16/P9).
+	noRedirect := func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Client{
+		baseURL: baseURL,
+		token:   token,
+		unary: &http.Client{
+			Transport:     transport,
+			Timeout:       unaryTimeout,
+			CheckRedirect: noRedirect,
+		},
+		stream: &http.Client{
+			Transport: transport,
+			// Timeout: 0 — unbounded ON PURPOSE. See the struct comment.
+			CheckRedirect: noRedirect,
+		},
+	}
+}
+
+// normalizeHubBaseURL validates a configured hub URL and returns its canonical
+// scheme://host[/path] form with any trailing slash removed.
+//
+// The rejections are deliberate rather than tolerant: a query or fragment
+// would be silently dropped once a method appends its own path and query, and
+// userinfo would put a second credential on a request that already carries a
+// bearer token. Failing at construction turns each into a config error the
+// user can see instead of a request that quietly goes somewhere else.
+func normalizeHubBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("hub url is empty")
+	}
+
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("parsing hub url %q: %w", raw, err)
+	}
+	if u.Opaque != "" {
+		return "", fmt.Errorf("hub url %q must be an absolute http:// or https:// url", raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("hub url %q must use http:// or https:// (got %q)", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("hub url %q has no host", raw)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("hub url %q must not contain userinfo (use a token instead)", raw)
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return "", fmt.Errorf("hub url %q must not contain a query string", raw)
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return "", fmt.Errorf("hub url %q must not contain a fragment", raw)
+	}
+
+	// Normalize the trailing slash (and any run of them) so callers can append
+	// "/api/v1/..." without producing a doubled separator.
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	return u.Scheme + "://" + u.Host + path, nil
 }
 
 // Health checks if the daemon is alive and returns its version.
@@ -239,24 +388,55 @@ func (c *Client) Shutdown(force bool) error {
 	return nil
 }
 
-// get performs an HTTP GET to the daemon.
+// Stream issues a GET on the UNBOUNDED client and returns the live response
+// without reading it, so the caller owns the body (and MUST close it). This is
+// the only way to open a response that outlives constants.HubUnaryTimeout: the
+// SSE request subscription and, later, the hub tunnel upgrade.
+//
+// ctx is the stream's real bound — cancelling it tears the response down —
+// because the client itself imposes none. See the Client struct comment for
+// why routing these through the unary client would be a silent 30s cap.
+func (c *Client) Stream(ctx context.Context, path string) (*http.Response, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.stream.Do(req)
+}
+
+// newRequest builds a request against c.baseURL and attaches the bearer token
+// when one is configured. EVERY request this client issues is built here (get,
+// getWithContext, post, and Stream all funnel through it), so a method cannot
+// forget the Authorization header on the network mount.
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
+}
+
+// get performs an HTTP GET to the daemon on the bounded (unary) client.
 func (c *Client) get(path string) (*http.Response, error) {
-	// "http://proxyd" is a dummy host — the Unix socket transport ignores it.
-	return c.httpClient.Get("http://proxyd" + path)
+	return c.getWithContext(context.Background(), path)
 }
 
 // getWithContext performs an HTTP GET to the daemon bound to ctx, so a caller
 // can cancel the request (e.g. on shutdown) without waiting out the client's
 // timeout. The existing get helper is left ctx-less for its callers.
 func (c *Client) getWithContext(ctx context.Context, path string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://proxyd"+path, nil)
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
-	return c.httpClient.Do(req)
+	return c.unary.Do(req)
 }
 
-// post performs an HTTP POST to the daemon with a JSON body.
+// post performs an HTTP POST to the daemon with a JSON body, on the bounded
+// (unary) client.
 func (c *Client) post(path string, body any) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
@@ -267,7 +447,12 @@ func (c *Client) post(path string, body any) (*http.Response, error) {
 		bodyReader = bytes.NewReader(data)
 	}
 
-	return c.httpClient.Post("http://proxyd"+path, "application/json", bodyReader)
+	req, err := c.newRequest(context.Background(), http.MethodPost, path, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.unary.Do(req)
 }
 
 // readError reads an error response from the daemon. When the body decodes to
