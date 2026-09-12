@@ -153,6 +153,9 @@ func Validate(config *Config) error {
 	// perturbs the report.
 	errs = append(errs, validateDependenciesAndTasks(config)...)
 
+	// Validate hubs: entries and proxy.hub (plan 031 C2, D8).
+	errs = append(errs, validateHubs(config)...)
+
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: %s", domain.ErrInvalidConfig, strings.Join(errs, "; "))
 	}
@@ -515,6 +518,51 @@ func detectTaskCycles(tasks map[string]TaskConfig, taskNames map[string]struct{}
 
 	sort.Strings(cycleMsg)
 	return cycleMsg
+}
+
+// validateHubs checks every hubs: entry and proxy.hub (plan 031 C2, D8).
+// Visited in sorted order so the report is deterministic regardless of map
+// iteration.
+func validateHubs(config *Config) []string {
+	var errs []string
+
+	for _, name := range sortedMapKeys(config.Hubs) {
+		hub := config.Hubs[name]
+		prefix := fmt.Sprintf("hubs.%s", name)
+
+		if err := ValidateHubURL(hub.URL); err != nil {
+			errs = append(errs, fmt.Sprintf("%s.url: %s", prefix, err))
+		}
+
+		tokenSources := 0
+		for _, v := range []string{hub.Token, hub.TokenFile, hub.TokenEnv} {
+			if v != "" {
+				tokenSources++
+			}
+		}
+		if tokenSources > 1 {
+			errs = append(errs, fmt.Sprintf("%s: at most one of token, token_file, token_env may be set", prefix))
+		}
+	}
+
+	if config.Proxy != nil && config.Proxy.Hub != "" && !config.Proxy.Enabled {
+		errs = append(errs, "proxy.hub: requires proxy.enabled to be true")
+	}
+
+	return errs
+}
+
+// ValidateHubURL checks a hubs: entry's url, and is what `prox hub add`
+// (internal/cli/hub_cmd.go) calls before writing ~/.prox/hubs.yaml so the
+// command applies the same rule Validate applies to a project's hubs: block.
+//
+// The rule itself lives in domain.NormalizeHubURL because internal/proxyd
+// enforces the identical one on the client side and the two packages cannot
+// import each other (plan 031 D8/C2). This wrapper exists only to discard the
+// canonical form, which a validator does not need.
+func ValidateHubURL(raw string) error {
+	_, err := domain.NormalizeHubURL(raw)
+	return err
 }
 
 // validationMessage extracts the human message from a ValidateProcessName

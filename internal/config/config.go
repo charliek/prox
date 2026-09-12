@@ -32,6 +32,12 @@ type Config struct {
 	// every process that does not set its own stop_timeout. Empty means
 	// "use constants.DefaultShutdownTimeout". See stopBudgetOptions.
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
+	// Hubs are named remote-proxy-hub connection profiles (plan 031 D8),
+	// keyed by user-chosen alias exactly like Processes/Services. Merged with
+	// ~/.prox/hubs.yaml by ResolveHub, with THIS map winning on an alias
+	// clash. Entries are key-checked by parseHubs, not by strictyaml.go's
+	// fixed-schema walk -- see the comment at strictyaml.go:11-16.
+	Hubs map[string]HubConfig `yaml:"hubs,omitempty"`
 }
 
 // ProxyConfig defines the HTTP/HTTPS reverse proxy configuration
@@ -41,6 +47,25 @@ type ProxyConfig struct {
 	HTTPSPort int            `yaml:"https_port"`
 	Domain    string         `yaml:"domain"`
 	Capture   *CaptureConfig `yaml:"capture,omitempty"`
+	// Hub opts this project into publishing through a remote proxy hub (plan
+	// 031 D8): an alias into Hubs or ~/.prox/hubs.yaml, or the literal
+	// "default" to select the user file's default: value. Empty means no hub.
+	// Requires Enabled (checked in Validate).
+	Hub string `yaml:"hub"`
+}
+
+// HubConfig is one hubs: entry (plan 031 D8): a named connection profile for
+// a remote proxy hub, accepted both in a project's prox.yaml (hubs:) and in
+// the per-user ~/.prox/hubs.yaml (see UserHubs in hubs.go). At most one of
+// Token/TokenFile/TokenEnv may be set (checked in Validate and, for the
+// merged/resolved value, in ResolveHub); Origin defaults to os.Hostname()
+// when unset (ResolveHub).
+type HubConfig struct {
+	URL       string `yaml:"url"`
+	Token     string `yaml:"token,omitempty"`
+	TokenFile string `yaml:"token_file,omitempty"`
+	TokenEnv  string `yaml:"token_env,omitempty"`
+	Origin    string `yaml:"origin,omitempty"`
 }
 
 // CaptureEffectivelyEnabled reports whether capture is actually on for this
@@ -152,6 +177,7 @@ type rawProxyConfig struct {
 	HTTPSPort int               `yaml:"https_port"`
 	Domain    string            `yaml:"domain"`
 	Capture   *rawCaptureConfig `yaml:"capture,omitempty"`
+	Hub       string            `yaml:"hub"`
 }
 
 // rawCaptureConfig is the raw YAML parse shape for a proxy's capture: block
@@ -206,6 +232,10 @@ type rawConfig struct {
 	Dependencies    map[string]interface{} `yaml:"dependencies,omitempty"`
 	Tasks           map[string]interface{} `yaml:"tasks,omitempty"`
 	ShutdownTimeout string                 `yaml:"shutdown_timeout"`
+	// Hubs is held as a raw map, like Dependencies/Tasks, so parseHubs can
+	// reject unknown per-entry keys precisely (plan 031 C2) -- the re-marshal
+	// path used elsewhere would silently drop a typo'd field.
+	Hubs map[string]interface{} `yaml:"hubs,omitempty"`
 }
 
 // Load reads and parses a configuration file
@@ -247,6 +277,7 @@ func Parse(data []byte) (*Config, error) {
 		Tasks:           make(map[string]TaskConfig),
 		Certs:           raw.Certs,
 		ShutdownTimeout: raw.ShutdownTimeout,
+		Hubs:            make(map[string]HubConfig),
 	}
 	if raw.Proxy != nil {
 		config.Proxy = &ProxyConfig{
@@ -257,6 +288,7 @@ func Parse(data []byte) (*Config, error) {
 			// so capture is on by default the moment a proxy: block exists (plan 012
 			// D1, C4). See materializeCapture.
 			Capture: materializeCapture(raw.Proxy.Capture),
+			Hub:     raw.Proxy.Hub,
 		}
 		if raw.Proxy.Enabled != nil {
 			config.Proxy.Enabled = *raw.Proxy.Enabled
@@ -314,6 +346,7 @@ func Parse(data []byte) (*Config, error) {
 
 	structuralErrs = append(structuralErrs, parseDependencies(raw.Dependencies, config.Dependencies)...)
 	structuralErrs = append(structuralErrs, parseTasks(raw.Tasks, config.Tasks)...)
+	structuralErrs = append(structuralErrs, parseHubs("hubs", raw.Hubs, config.Hubs)...)
 	if len(structuralErrs) > 0 {
 		sort.Strings(structuralErrs)
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidConfig, strings.Join(structuralErrs, "; "))

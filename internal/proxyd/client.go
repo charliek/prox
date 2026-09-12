@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/charliek/prox/internal/constants"
+	"github.com/charliek/prox/internal/domain"
 	"github.com/charliek/prox/internal/proxy"
 )
 
@@ -165,46 +165,20 @@ func newClientOverTransport(baseURL, token string, transport *http.Transport, un
 }
 
 // normalizeHubBaseURL validates a configured hub URL and returns its canonical
-// scheme://host[/path] form with any trailing slash removed.
+// scheme://host[/path] form.
 //
-// The rejections are deliberate rather than tolerant: a query or fragment
-// would be silently dropped once a method appends its own path and query, and
-// userinfo would put a second credential on a request that already carries a
-// bearer token. Failing at construction turns each into a config error the
-// user can see instead of a request that quietly goes somewhere else.
+// The rule lives in domain.NormalizeHubURL so that internal/config enforces the
+// identical one when it validates a project's hubs: block and when `prox hub
+// add` writes ~/.prox/hubs.yaml — the two packages cannot import each other, so
+// a copy in each would be two rules that drift (plan 031 D8/D16). This wrapper
+// only names the offender, since the domain messages are written to follow a
+// caller-supplied subject.
 func normalizeHubBaseURL(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", fmt.Errorf("hub url is empty")
-	}
-
-	u, err := url.Parse(trimmed)
+	normalized, err := domain.NormalizeHubURL(raw)
 	if err != nil {
-		return "", fmt.Errorf("parsing hub url %q: %w", raw, err)
+		return "", fmt.Errorf("hub url %q %w", raw, err)
 	}
-	if u.Opaque != "" {
-		return "", fmt.Errorf("hub url %q must be an absolute http:// or https:// url", raw)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("hub url %q must use http:// or https:// (got %q)", raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("hub url %q has no host", raw)
-	}
-	if u.User != nil {
-		return "", fmt.Errorf("hub url %q must not contain userinfo (use a token instead)", raw)
-	}
-	if u.RawQuery != "" || u.ForceQuery {
-		return "", fmt.Errorf("hub url %q must not contain a query string", raw)
-	}
-	if u.Fragment != "" || u.RawFragment != "" {
-		return "", fmt.Errorf("hub url %q must not contain a fragment", raw)
-	}
-
-	// Normalize the trailing slash (and any run of them) so callers can append
-	// "/api/v1/..." without producing a doubled separator.
-	path := strings.TrimRight(u.EscapedPath(), "/")
-	return u.Scheme + "://" + u.Host + path, nil
+	return normalized, nil
 }
 
 // Health checks if the daemon is alive and returns its version.

@@ -255,8 +255,8 @@ func TestNormalizeHubBaseURL(t *testing.T) {
 		{name: "surrounding whitespace trimmed", in: "  http://hub.example:8443 ", want: "http://hub.example:8443"},
 		{name: "bracketed IPv6 literal", in: "http://[fd00::1]:8443", want: "http://[fd00::1]:8443"},
 
-		{name: "empty", in: "", wantErr: "hub url is empty"},
-		{name: "whitespace only", in: "   ", wantErr: "hub url is empty"},
+		{name: "empty", in: "", wantErr: "is empty"},
+		{name: "whitespace only", in: "   ", wantErr: "is empty"},
 		// "hub.example:8443" parses as an OPAQUE url (scheme "hub.example"),
 		// which is the shape a user produces by pasting a host:port with no
 		// scheme — caught by the opaque guard rather than the scheme guard.
@@ -268,7 +268,7 @@ func TestNormalizeHubBaseURL(t *testing.T) {
 		{name: "query", in: "http://hub.example?token=leak", wantErr: "must not contain a query string"},
 		{name: "empty forced query", in: "http://hub.example/?", wantErr: "must not contain a query string"},
 		{name: "fragment", in: "http://hub.example#frag", wantErr: "must not contain a fragment"},
-		{name: "unparseable", in: "http://hub.example:not-a-port", wantErr: "parsing hub url"},
+		{name: "unparseable", in: "http://hub.example:not-a-port", wantErr: "is not a valid url"},
 	}
 
 	for _, tc := range tests {
