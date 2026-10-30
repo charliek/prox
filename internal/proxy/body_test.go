@@ -263,25 +263,23 @@ func TestDecodeCapturedBody_D10Codecs(t *testing.T) {
 	jsonPayload := []byte(`{"hello":"world","n":42}`)
 
 	type codecCase struct {
-		name   string
-		token  string
-		encode func(t *testing.T, data []byte) []byte
-		// corruptIndex picks which byte of the encoded stream to flip to
-		// produce a genuinely corrupt (decode-failing) stream. Defaults to
-		// len(raw)-3 (same recipe as the pre-existing gzip test) when nil;
-		// brotli has no trailing checksum, so flipping near the end can land
-		// on padding bits the decoder tolerates — corrupting byte 0 (the
-		// stream header) reliably fails instead.
-		corruptIndex func(raw []byte) int
+		name    string
+		token   string
+		encode  func(t *testing.T, data []byte) []byte
+		corrupt func(raw []byte)
 	}
 
-	nearEnd := func(raw []byte) int { return len(raw) - 3 }
+	nearEnd := func(raw []byte) { raw[len(raw)-3] ^= 0xff }
 
 	cases := []codecCase{
 		{"deflate (zlib-wrapped, RFC 9110)", "deflate", zlibBytes, nearEnd},
-		{"deflate (raw, no zlib header)", "deflate", rawDeflateBytes, nearEnd},
+		{"deflate (raw, no zlib header)", "deflate", rawDeflateBytes, func(raw []byte) {
+			// Raw DEFLATE has no checksum; force the reserved BTYPE=3 rather
+			// than relying on corruption of version-dependent compressed bytes.
+			raw[0] |= 0x06
+		}},
 		{"zstd", "zstd", zstdBytes, nearEnd},
-		{"br", "br", brotliBytes, func(raw []byte) int { return 0 }},
+		{"br", "br", brotliBytes, func(raw []byte) { raw[0] ^= 0xff }},
 	}
 
 	for _, tc := range cases {
@@ -297,7 +295,7 @@ func TestDecodeCapturedBody_D10Codecs(t *testing.T) {
 
 		t.Run(tc.name+"/corrupt stream falls back to raw binary", func(t *testing.T) {
 			raw := tc.encode(t, jsonPayload)
-			raw[tc.corruptIndex(raw)] ^= 0xff
+			tc.corrupt(raw)
 			body := &CapturedBody{ContentEncoding: tc.token, ContentType: "application/json"}
 			got := DecodeCapturedBody(body, raw)
 			assert.True(t, got.Available)

@@ -284,7 +284,7 @@ Every project registered with the shared daemon runs a forwarder (`internal/prox
 
 | Component | Technology | Notes |
 |-----------|------------|-------|
-| Language | Go 1.24+ | Concurrency, single binary |
+| Language | Go 1.27.1+ | Concurrency, single binary |
 | TUI | [bubbletea](https://github.com/charmbracelet/bubbletea) | Elm-architecture TUI framework |
 | TUI styling | [lipgloss](https://github.com/charmbracelet/lipgloss) | Styling for bubbletea |
 | HTTP router | [chi](https://github.com/go-chi/chi) or stdlib | Lightweight, idiomatic |

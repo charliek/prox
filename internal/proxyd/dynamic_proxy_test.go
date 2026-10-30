@@ -92,6 +92,86 @@ func serve(dp *DynamicProxy, method, target, body string, headers map[string]str
 	return rec
 }
 
+func TestDynamicProxy_RewriteForwarding(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		xff        []string
+		remoteAddr string
+		port       int
+		connection string
+		wantXFF    string
+		wantRealIP string
+	}{
+		{name: "peer", remoteAddr: "192.0.2.10:1234", port: 80, wantXFF: "192.0.2.10", wantRealIP: "192.0.2.10"},
+		{name: "chain over HTTPS listener", xff: []string{"198.51.100.1", "198.51.100.2"}, remoteAddr: "[2001:db8::1]:1234", port: 443, wantXFF: "198.51.100.1, 198.51.100.2, 2001:db8::1", wantRealIP: "198.51.100.1"},
+		{name: "hop by hop chain", xff: []string{"198.51.100.1"}, remoteAddr: "192.0.2.10:1234", port: 80, connection: "x-forwarded-for, x-hop, forwarded", wantXFF: "192.0.2.10", wantRealIP: "198.51.100.1"},
+		{name: "nil opt out", xff: nil, remoteAddr: "192.0.2.10:1234", port: 80, wantRealIP: "192.0.2.10"},
+		{name: "non TCP peer", xff: []string{"198.51.100.1"}, remoteAddr: "unix-peer", port: 80, wantXFF: "198.51.100.1", wantRealIP: "198.51.100.1"},
+		{name: "connection cannot remove generated headers", remoteAddr: "192.0.2.10:1234", port: 80, connection: "X-Forwarded-Host, X-Forwarded-Proto, X-Real-IP, X-Hop, Forwarded", wantXFF: "192.0.2.10", wantRealIP: "192.0.2.10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan *http.Request, 1)
+			host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Clone(r.Context())
+				w.WriteHeader(http.StatusNoContent)
+			})
+			dp, rm, _ := newCaptureProxy(t, true, host, port, 10)
+			defer dp.transport.CloseIdleConnections()
+			dp.registry = NewRegistry()
+			_, _, err := dp.registry.Register(RegisterRequest{
+				ProjectDir: "/projects/a", PID: 1, Version: "dev", Domain: "local.dev",
+				Services: map[string]ServiceTarget{"api": {Host: host, Port: port}},
+				HTTPPort: 80, HTTPSPort: 443, CaptureEnabled: true,
+			})
+			require.NoError(t, err)
+
+			const target = "/a%2Fb?keep=1&bad=%zz&semi=a;b&dup=1&dup=2&space=a+%20"
+			req := httptest.NewRequest("GET", target, nil)
+			req.Host = "api.local.dev:" + strconv.Itoa(tc.port)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.name != "peer" && tc.name != "connection cannot remove generated headers" {
+				req.Header["X-Forwarded-For"] = tc.xff
+			}
+			req.Header.Set("X-Forwarded-Host", "untrusted.example")
+			req.Header.Set("X-Forwarded-Proto", "untrusted")
+			req.Header.Set("X-Real-IP", "198.51.100.9")
+			req.Header.Set("Forwarded", "for=198.51.100.1")
+			req.Header.Set("Authorization", "Bearer test")
+			req.Header.Set("Connection", tc.connection)
+			req.Header.Set("X-Hop", "remove-me")
+			originalHeaders := req.Header.Clone()
+			w := httptest.NewRecorder()
+			dp.handler(tc.port).ServeHTTP(w, req)
+			require.Equal(t, http.StatusNoContent, w.Code)
+			got := <-received
+			assert.Equal(t, req.Host, got.Host)
+			assert.Equal(t, target, got.RequestURI)
+			assert.Equal(t, tc.wantXFF, got.Header.Get("X-Forwarded-For"))
+			assert.Equal(t, req.Host, got.Header.Get("X-Forwarded-Host"))
+			proto := "http"
+			if tc.port == 443 {
+				proto = "https"
+			}
+			assert.Equal(t, proto, got.Header.Get("X-Forwarded-Proto"), "listener protocol must win even without TLS on the input request")
+			assert.Equal(t, tc.wantRealIP, got.Header.Get("X-Real-IP"))
+			assert.Equal(t, "Bearer test", got.Header.Get("Authorization"))
+			if tc.connection != "" {
+				assert.Empty(t, got.Header.Get("X-Hop"))
+				assert.Empty(t, got.Header.Get("Forwarded"))
+			} else {
+				assert.Equal(t, "for=198.51.100.1", got.Header.Get("Forwarded"))
+			}
+			assert.Equal(t, target, req.URL.String())
+			assert.Equal(t, originalHeaders, req.Header)
+			records := rm.Recent(proxy.RequestFilter{})
+			require.Len(t, records, 1)
+			assert.Equal(t, target, records[0].URL)
+			require.NotNil(t, records[0].Details)
+			assert.Equal(t, map[string][]string(originalHeaders), records[0].Details.RequestHeaders)
+		})
+	}
+}
+
 func TestDynamicProxy_CaptureEnabled_RecordsDetailsInline(t *testing.T) {
 	const respBody = `{"ok":true}`
 	host, port := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {

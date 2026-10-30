@@ -37,7 +37,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version: '1.27.1'
       # -timeout must match the Makefile's, or a local pass and a CI pass do not
       # mean the same thing: with no flag, `go test` uses its 10m default, so a
       # run that passes under `make test` (20m) could die on a CI panic-dump.
@@ -54,10 +54,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version: '1.27.1'
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.10.1
+          version: v2.13.2
 
   # Validate the GoReleaser pipeline (including the nfpms: deb block) without
   # publishing anything. Catches broken nfpm config before it hits a real tag.

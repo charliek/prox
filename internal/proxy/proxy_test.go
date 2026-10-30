@@ -298,6 +298,83 @@ func TestCreateRouter_XForwardedProto(t *testing.T) {
 	})
 }
 
+func TestCreateRouter_RewriteForwarding(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		xff        []string
+		remoteAddr string
+		tls        bool
+		connection string
+		wantXFF    string
+		wantRealIP string
+	}{
+		{name: "peer", remoteAddr: "192.0.2.10:1234", wantXFF: "192.0.2.10", wantRealIP: "198.51.100.9"},
+		{name: "chain over TLS", xff: []string{"198.51.100.1", "198.51.100.2"}, remoteAddr: "[2001:db8::1]:1234", tls: true, wantXFF: "198.51.100.1, 198.51.100.2, 2001:db8::1", wantRealIP: "198.51.100.1"},
+		{name: "hop by hop chain", xff: []string{"198.51.100.1"}, remoteAddr: "192.0.2.10:1234", connection: "x-forwarded-for, x-hop, forwarded", wantXFF: "192.0.2.10", wantRealIP: "198.51.100.1"},
+		{name: "nil opt out", xff: nil, remoteAddr: "192.0.2.10:1234", wantRealIP: "198.51.100.9"},
+		{name: "non TCP peer", xff: []string{"198.51.100.1"}, remoteAddr: "unix-peer", wantXFF: "198.51.100.1", wantRealIP: "198.51.100.1"},
+		{name: "connection cannot remove generated headers", remoteAddr: "192.0.2.10:1234", connection: "X-Forwarded-Host, X-Forwarded-Proto, X-Real-IP, X-Hop, Forwarded", wantXFF: "192.0.2.10", wantRealIP: "198.51.100.9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan *http.Request, 1)
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Clone(r.Context())
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer backend.Close()
+			svc := newTwoPhaseService(t, true, backend.Listener.Addr().(*net.TCPAddr).Port)
+			defer svc.transport.CloseIdleConnections()
+
+			const target = "/a%2Fb?keep=1&bad=%zz&semi=a;b&dup=1&dup=2&space=a+%20"
+			req := httptest.NewRequest("GET", target, nil)
+			req.Host = "app.local.myapp.dev:6788"
+			req.RemoteAddr = tc.remoteAddr
+			if tc.tls {
+				req.TLS = &tls.ConnectionState{}
+			}
+			if tc.name != "peer" && tc.name != "connection cannot remove generated headers" {
+				req.Header["X-Forwarded-For"] = tc.xff
+			}
+			req.Header.Set("X-Forwarded-Host", "untrusted.example")
+			req.Header.Set("X-Forwarded-Proto", "untrusted")
+			req.Header.Set("X-Real-IP", "198.51.100.9")
+			req.Header.Set("Forwarded", "for=198.51.100.1")
+			req.Header.Set("Authorization", "Bearer test")
+			req.Header.Set("Connection", tc.connection)
+			req.Header.Set("X-Hop", "remove-me")
+			originalHeaders := req.Header.Clone()
+			w := httptest.NewRecorder()
+			svc.createRouter().ServeHTTP(w, req)
+			require.Equal(t, http.StatusNoContent, w.Code)
+			got := <-received
+			assert.Equal(t, req.Host, got.Host)
+			assert.Equal(t, target, got.RequestURI)
+			assert.Equal(t, tc.wantXFF, got.Header.Get("X-Forwarded-For"))
+			assert.Equal(t, req.Host, got.Header.Get("X-Forwarded-Host"))
+			proto := "http"
+			if tc.tls {
+				proto = "https"
+			}
+			assert.Equal(t, proto, got.Header.Get("X-Forwarded-Proto"))
+			assert.Equal(t, tc.wantRealIP, got.Header.Get("X-Real-IP"))
+			assert.Equal(t, "Bearer test", got.Header.Get("Authorization"))
+			if tc.connection != "" {
+				assert.Empty(t, got.Header.Get("X-Hop"))
+				assert.Empty(t, got.Header.Get("Forwarded"))
+			} else {
+				assert.Equal(t, "for=198.51.100.1", got.Header.Get("Forwarded"))
+			}
+			assert.Equal(t, target, req.URL.String())
+			assert.Equal(t, originalHeaders, req.Header)
+			records := svc.RequestManager().Recent(RequestFilter{})
+			require.Len(t, records, 1)
+			assert.Equal(t, target, records[0].URL)
+			require.NotNil(t, records[0].Details)
+			assert.Equal(t, map[string][]string(originalHeaders), records[0].Details.RequestHeaders)
+		})
+	}
+}
+
 func TestCreateRouter_StampsHostnameStripsPort(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	workDir := t.TempDir()

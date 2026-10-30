@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.24 or later
+- Go 1.27.1 or later
 - mise (optional, for version management)
 
 ## Clone and Build
