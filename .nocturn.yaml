@@ -1,0 +1,11 @@
+version: 1
+targets:
+  cli:
+    kind: cli
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: prox }
+    # .goreleaser.yaml builds ./cmd/prox from go.mod.
+    ships: [go.mod]
+lockfiles:
+  # pyproject.toml has only the docs group (zensical and the docs theme): it
+  # builds the documentation site, which no release artifact contains.
+  uv.lock: { role: build-tool }
