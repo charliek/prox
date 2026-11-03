@@ -1,0 +1,45 @@
+# Dependabot version updates, written by Nocturn's onboarding: every package
+# ecosystem and directory in the repository, weekly on Mondays, with each
+# ecosystem's minor and patch updates grouped into one pull request. Majors
+# arrive alone, and a cooldown holds new releases back before Dependabot opens
+# a pull request. Security updates are unaffected.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
