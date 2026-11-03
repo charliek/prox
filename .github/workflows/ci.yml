@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
       # -timeout must match the Makefile's, or a local pass and a CI pass do not
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
       - uses: golangci/golangci-lint-action@v9
@@ -72,7 +72,7 @@ jobs:
           # credential is dropped while the depth is kept.
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - uses: goreleaser/goreleaser-action@v7
