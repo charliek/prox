@@ -32,7 +32,7 @@ jobs:
       # this repo's code AND every dependency's test code, with a writable
       # credential sitting on disk. Nothing here talks to the API, so there is
       # nothing to keep it for. (docs.yml and docs-pr.yml already set this.)
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@v6
@@ -49,7 +49,7 @@ jobs:
     steps:
       # See the test job: the linter loads and analyses the same third-party
       # code, so the token has no business being on disk here either.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@v6
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # GoReleaser needs the full history to compute a snapshot version;
           # it does not need (and this job never uses) the job token, so the
