@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -62,41 +62,44 @@ func TestAllProcessStates_MatchesTheEnumDeclaration(t *testing.T) {
 func processStateConstsFromSource(t *testing.T) map[string]string {
 	t.Helper()
 
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
-	require.NoError(t, err, "parsing the domain package's own source")
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err, "reading the domain package's source directory")
 
+	fset := token.NewFileSet()
 	found := make(map[string]string)
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				gen, ok := decl.(*ast.GenDecl)
-				if !ok || gen.Tok != token.CONST {
+	// Scan source regardless of build tags, just as ParseDir did.
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		require.NoError(t, err, "parsing the domain package's source file %s", name)
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
 					continue
 				}
-				for _, spec := range gen.Specs {
-					vs, ok := spec.(*ast.ValueSpec)
-					if !ok {
+				ident, ok := vs.Type.(*ast.Ident)
+				if !ok || ident.Name != "ProcessState" {
+					continue
+				}
+				for i, name := range vs.Names {
+					if i >= len(vs.Values) {
 						continue
 					}
-					ident, ok := vs.Type.(*ast.Ident)
-					if !ok || ident.Name != "ProcessState" {
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
 						continue
 					}
-					for i, name := range vs.Names {
-						if i >= len(vs.Values) {
-							continue
-						}
-						lit, ok := vs.Values[i].(*ast.BasicLit)
-						if !ok || lit.Kind != token.STRING {
-							continue
-						}
-						value, err := strconv.Unquote(lit.Value)
-						require.NoError(t, err, "unquoting %s's value", name.Name)
-						found[value] = name.Name
-					}
+					value, err := strconv.Unquote(lit.Value)
+					require.NoError(t, err, "unquoting %s's value", name.Name)
+					found[value] = name.Name
 				}
 			}
 		}

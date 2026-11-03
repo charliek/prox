@@ -1685,7 +1685,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.moveRequestCursor(-1)
 			return true, nil
 		}
-		b.viewport.LineUp(1)
+		b.viewport.ScrollUp(1)
 		b.followMode = false
 		return true, nil
 
@@ -1694,7 +1694,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.moveRequestCursor(1)
 			return true, nil
 		}
-		b.viewport.LineDown(1)
+		b.viewport.ScrollDown(1)
 		return true, nil
 
 	case "pgup":
@@ -1702,7 +1702,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.moveRequestCursor(-b.halfPageStep())
 			return true, nil
 		}
-		b.viewport.HalfViewUp()
+		b.viewport.HalfPageUp()
 		b.followMode = false
 		return true, nil
 
@@ -1711,7 +1711,7 @@ func (b *BaseModel) handleNavigationKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			b.moveRequestCursor(b.halfPageStep())
 			return true, nil
 		}
-		b.viewport.HalfViewDown()
+		b.viewport.HalfPageDown()
 		return true, nil
 
 	case "home", "g":

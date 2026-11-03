@@ -467,7 +467,7 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			Host:   fmt.Sprintf("%s:%d", route.Target.Host, route.Target.Port),
 		}
 
-		rp := httputil.NewSingleHostReverseProxy(target)
+		rp := &httputil.ReverseProxy{}
 		// A remote route rides its publisher's per-session transport, so
 		// keep-alive pools over tunnel streams exactly as the shared transport
 		// pools TCP connections for local routes.
@@ -482,9 +482,9 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 		// Determine protocol from the listener
 		proto := route.Protocol
 
-		// Capture the request body and headers before the Director mutates them.
+		// Capture the request body and headers before rewriting the outbound request.
 		// CaptureRequest clones the headers, so reqHeaders is unaffected by the
-		// Director's later header sets (mirrors the in-process proxy path).
+		// rewrite's later header sets (mirrors the in-process proxy path).
 		var reqBody *proxy.CapturedBody
 		var reqHeaders http.Header
 		if captureEnabled {
@@ -493,12 +493,41 @@ func (dp *DynamicProxy) handler(port int) http.Handler {
 			reqBody, r.Body, reqHeaders = dp.captureManager.CaptureRequest(requestID, r, route.MaxBodySize)
 		}
 
-		originalDirector := rp.Director
-		rp.Director = func(req *http.Request) {
-			originalDirector(req)
-			req.Header.Set("X-Forwarded-Host", r.Host)
-			req.Header.Set("X-Forwarded-Proto", proto)
-			req.Header.Set("X-Real-IP", getClientIP(r))
+		rp.Rewrite = func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			req.Out.Host = req.In.Host
+			// Capture and forwarding both retain the original query verbatim,
+			// including parameters that Rewrite would otherwise sanitize.
+			req.Out.URL.RawQuery = req.In.URL.RawQuery
+			// Retain the existing proxy chain, including the nil opt-out used
+			// by middleware, rather than replacing it with only the peer IP.
+			prior, exists := req.In.Header["X-Forwarded-For"]
+			// Preserve forwarding headers only when they are not explicitly
+			// designated hop-by-hop by Connection.
+			forwarded := req.In.Header.Values("Forwarded")
+			for _, connection := range req.In.Header.Values("Connection") {
+				for token := range strings.SplitSeq(connection, ",") {
+					switch {
+					case strings.EqualFold(strings.TrimSpace(token), "Forwarded"):
+						forwarded = nil
+					case strings.EqualFold(strings.TrimSpace(token), "X-Forwarded-For"):
+						prior, exists = nil, false
+					}
+				}
+			}
+			req.Out.Header["X-Forwarded-For"] = prior
+			req.SetXForwarded()
+			if exists && prior == nil {
+				req.Out.Header["X-Forwarded-For"] = nil
+			} else if _, _, err := net.SplitHostPort(req.In.RemoteAddr); err != nil {
+				req.Out.Header["X-Forwarded-For"] = prior
+			}
+			if len(forwarded) > 0 {
+				req.Out.Header["Forwarded"] = forwarded
+			}
+			// The registered listener, not r.TLS, determines the daemon protocol.
+			req.Out.Header.Set("X-Forwarded-Proto", proto)
+			req.Out.Header.Set("X-Real-IP", getClientIP(req.In))
 		}
 
 		// Choose the response writer: a capturing writer when enabled, otherwise

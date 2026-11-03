@@ -332,7 +332,7 @@ func (s *Service) createRouter() http.Handler {
 			Host:   fmt.Sprintf("%s:%d", svc.Host, svc.Port),
 		}
 
-		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy := &httputil.ReverseProxy{}
 
 		// Use shared transport for connection pooling
 		proxy.Transport = s.transport
@@ -355,14 +355,40 @@ func (s *Service) createRouter() http.Handler {
 			proto = "https"
 		}
 
-		// Customize the director to preserve the original request info
-		originalDirector := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			originalDirector(req)
-			// Preserve the original host header for applications that need it
-			req.Header.Set("X-Forwarded-Host", r.Host)
-			req.Header.Set("X-Forwarded-Proto", proto)
-			req.Header.Set("X-Real-IP", getClientIP(r))
+		proxy.Rewrite = func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			req.Out.Host = req.In.Host
+			// Capture and forwarding both retain the original query verbatim,
+			// including parameters that Rewrite would otherwise sanitize.
+			req.Out.URL.RawQuery = req.In.URL.RawQuery
+			// Retain the existing proxy chain, including the nil opt-out used
+			// by middleware, rather than replacing it with only the peer IP.
+			prior, exists := req.In.Header["X-Forwarded-For"]
+			// Preserve forwarding headers only when they are not explicitly
+			// designated hop-by-hop by Connection.
+			forwarded := req.In.Header.Values("Forwarded")
+			for _, connection := range req.In.Header.Values("Connection") {
+				for token := range strings.SplitSeq(connection, ",") {
+					switch {
+					case strings.EqualFold(strings.TrimSpace(token), "Forwarded"):
+						forwarded = nil
+					case strings.EqualFold(strings.TrimSpace(token), "X-Forwarded-For"):
+						prior, exists = nil, false
+					}
+				}
+			}
+			req.Out.Header["X-Forwarded-For"] = prior
+			req.SetXForwarded()
+			if exists && prior == nil {
+				req.Out.Header["X-Forwarded-For"] = nil
+			} else if _, _, err := net.SplitHostPort(req.In.RemoteAddr); err != nil {
+				req.Out.Header["X-Forwarded-For"] = prior
+			}
+			if len(forwarded) > 0 {
+				req.Out.Header["Forwarded"] = forwarded
+			}
+			req.Out.Header.Set("X-Forwarded-Proto", proto)
+			req.Out.Header.Set("X-Real-IP", getClientIP(req.In))
 		}
 
 		// Choose response writer based on capture mode

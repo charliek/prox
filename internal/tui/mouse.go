@@ -88,23 +88,23 @@ func (m *ClientModel) handleMouseWheel(delta int) (bool, tea.Cmd) {
 	case ViewModeRequestDetail:
 		if delta < 0 {
 			for i := 0; i < -delta; i++ {
-				m.viewport.LineUp(1)
+				m.viewport.ScrollUp(1)
 			}
 		} else {
 			for i := 0; i < delta; i++ {
-				m.viewport.LineDown(1)
+				m.viewport.ScrollDown(1)
 			}
 		}
 		return true, nil
 	default: // ViewModeLogs
 		if delta < 0 {
 			for i := 0; i < -delta; i++ {
-				m.viewport.LineUp(1)
+				m.viewport.ScrollUp(1)
 			}
 			m.followMode = false
 		} else {
 			for i := 0; i < delta; i++ {
-				m.viewport.LineDown(1)
+				m.viewport.ScrollDown(1)
 			}
 			if m.viewport.AtBottom() {
 				m.followMode = true

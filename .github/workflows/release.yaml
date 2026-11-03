@@ -42,7 +42,7 @@ jobs:
       - name: Run Linter
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.10.1
+          version: v2.13.2
 
       # Tag/manifest invariant check — the local-bump flow's safety net.
       # Replaces the deleted sync-version job's contract: instead of fixing
