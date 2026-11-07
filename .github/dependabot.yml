@@ -10,12 +10,12 @@ multi-ecosystem-groups:
     schedule:
       interval: cron
       cronjob: "0 11 1,15 * *"
+    open-pull-requests-limit: 5
 updates:
   - package-ecosystem: github-actions
     directory: /
     multi-ecosystem-group: dependencies
     patterns: ["*"]
-    open-pull-requests-limit: 5
     cooldown:
       default-days: 7
     groups:
@@ -29,7 +29,6 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
-    open-pull-requests-limit: 5
     cooldown:
       default-days: 7
     groups:
@@ -43,7 +42,6 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
-    open-pull-requests-limit: 5
     cooldown:
       default-days: 7
     groups:
