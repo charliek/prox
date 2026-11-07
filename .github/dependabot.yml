@@ -1,45 +1,52 @@
-# Dependabot version updates, written by Nocturn's onboarding: every package
-# ecosystem and directory in the repository, weekly on Mondays, with each
-# ecosystem's minor and patch updates grouped into one pull request. Majors
-# arrive alone, and a cooldown holds new releases back before Dependabot opens
-# a pull request. Security updates are unaffected.
+# Dependabot, the fleet's quiet standard (written by Nocturn's onboarding):
+# every package ecosystem and directory in the repository, in one pull
+# request on the 1st and 15th of each month. Majors are left out (Nocturn's
+# major work items take them), except for GitHub Actions, and a cooldown
+# holds new releases back. Security updates arrive as they're published,
+# grouped into one pull request per ecosystem.
 version: 2
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: cron
+      cronjob: "0 11 1,15 * *"
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]
   - package-ecosystem: gomod
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
-      semver-major-days: 14
     groups:
-      minor-and-patch:
+      security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]
   - package-ecosystem: uv
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
-      semver-major-days: 14
     groups:
-      minor-and-patch:
+      security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]
