@@ -442,13 +442,16 @@ func checkEarlyDeath(childErr <-chan error, pid int, cwd string, ops daemonStart
 func terminateChild(child daemonChild, childErr <-chan error, ops daemonStartupOps) {
 	_ = child.Signal(syscall.SIGTERM)
 	select {
-	case <-childErr:
+	case err := <-childErr:
+		// Consumed only to reap. The exit status does not change teardown.
+		_ = err
 		return // exited within the grace period
 	case <-time.After(ops.killGrace):
 	}
 	_ = child.Signal(syscall.SIGKILL)
 	select {
-	case <-childErr:
+	case err := <-childErr:
+		_ = err // reaped; the parent is exiting either way
 	case <-time.After(killWaitBound):
 		fmt.Fprintf(os.Stderr,
 			"Warning: child (pid %d) did not exit after SIGKILL; giving up on reap\n", child.Pid())

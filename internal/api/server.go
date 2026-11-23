@@ -56,7 +56,8 @@ func NewServer(config ServerConfig, handlers *Handlers) *Server {
 	// writer-wrapping middleware on the SSE routes must implement FlushError
 	// or Unwrap-without-Flush to preserve that detection.
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// RealIP is omitted: chi deprecated it because X-Forwarded-For can be
+	// spoofed, and nothing in this API reads a rewritten RemoteAddr.
 	r.Use(middleware.Recoverer)
 	// NOTE: the request timeout is applied per route group in registerRoutes,
 	// not globally here. Most routes get defaultRequestTimeout (30s); the
