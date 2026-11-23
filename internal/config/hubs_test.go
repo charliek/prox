@@ -763,6 +763,7 @@ func TestResolveHub_TokenFileMustBePrivate(t *testing.T) {
 	}}
 
 	require.NoError(t, os.WriteFile(tokenPath, []byte("s3cr3t\n"), 0644))
+	require.NoError(t, os.Chmod(tokenPath, 0644)) // umask must not soften the case
 	_, err := ResolveHub(cfg, "", "llt")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must not be readable by other users")

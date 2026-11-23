@@ -219,7 +219,7 @@ mise install
 This installs the correct versions of Go and golangci-lint as defined in `.mise.toml`.
 
 Alternatively, install manually:
-- Go 1.27.1+
+- Go 1.27.4+
 - golangci-lint v2 (`brew install golangci-lint` on macOS, or see [install docs](https://golangci-lint.run/docs/welcome/install/))
 
 ```bash
