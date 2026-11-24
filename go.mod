@@ -19,8 +19,8 @@ require (
 	github.com/muesli/termenv v0.16.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
+	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/sys v0.50.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -40,6 +40,5 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/text v0.3.8 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )

@@ -6,7 +6,7 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // CheckConfig is the raw YAML shape of a dependency's check: block (plan 013

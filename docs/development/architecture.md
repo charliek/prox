@@ -289,6 +289,6 @@ Every project registered with the shared daemon runs a forwarder (`internal/prox
 | TUI styling | [lipgloss](https://github.com/charmbracelet/lipgloss) | Styling for bubbletea |
 | HTTP router | [chi](https://github.com/go-chi/chi) or stdlib | Lightweight, idiomatic |
 | Reverse Proxy | [net/http/httputil](https://pkg.go.dev/net/http/httputil) | Standard library reverse proxy |
-| YAML parsing | [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3) | Standard YAML library |
+| YAML parsing | [go.yaml.in/yaml/v3](https://pkg.go.dev/go.yaml.in/yaml/v3) | Standard YAML library |
 | Env file | [godotenv](https://github.com/joho/godotenv) | .env file loading |
 | Certificates | [mkcert](https://github.com/FiloSottile/mkcert) | Local CA for development certs |

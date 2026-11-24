@@ -15,7 +15,7 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Hub host files and auth modes (plan 031 §4.1, D18).
