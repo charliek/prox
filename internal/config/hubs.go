@@ -10,7 +10,7 @@ import (
 
 	"github.com/charliek/prox/internal/constants"
 	"github.com/charliek/prox/internal/domain"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // hubsEntryAllowedKeys is the per-entry key set for a hubs: block (plan 031
